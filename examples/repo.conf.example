@@ -1,0 +1,31 @@
+# herdr-cats per-repo config.
+# Copy to ~/.config/herdr-cats/repos/<name>.conf  (<name> is what you pass to --repo).
+# Sourced as bash after the global ~/.config/herdr-cats/env.
+
+# --- target repo ------------------------------------------------------------
+HERDR_CATS_REPO_CWD="$HOME/dev/my-repo"        # MAIN (non-linked) checkout
+HERDR_CATS_BASE_REF="origin/main"              # branch worktrees fork from
+# HERDR_CATS_GH_REPO="owner/name"              # default: derived from the origin remote
+
+# --- jira (project/board/label/statuses for this repo) ----------------------
+HERDR_CATS_JIRA_PROJECT="PROJ"
+HERDR_CATS_JIRA_BOARD="123"
+HERDR_CATS_JIRA_LABEL="agent"
+HERDR_CATS_STATUS_TODO="To Do"
+HERDR_CATS_STATUS_IN_DEV="In Progress"
+HERDR_CATS_STATUS_REVIEW="In Review"
+
+# --- repo-specific worker steps (optional; generic wording if unset) --------
+# HERDR_CATS_BOOTSTRAP_CMD="npm ci"                 # how to install/setup the worktree
+# HERDR_CATS_DESLOP_CMD="/my-cleanup-command"       # quality/de-slop slash command
+# HERDR_CATS_RESOLVE_CMD="/my-pr-resolver"          # PR-comment resolution workflow
+# HERDR_CATS_BRIEF_GUIDANCE="$HOME/.config/herdr-cats/repos/my-repo-guidance.md"  # appended to every brief
+
+# --- tuning (optional) ------------------------------------------------------
+# HERDR_CATS_MAX_ACTIVE=3
+# HERDR_CATS_WATCH_HOURS=7
+# HERDR_CATS_DEVELOP_BUDGET=5400
+# HERDR_CATS_TICK_INTERVAL=180
+# HERDR_CATS_MAIN_TAB="main"     # herdr layout tab the worker runs in
+# HERDR_CATS_AGENT_PANE="agent"  # herdr layout pane the worker runs in
+# HERDR_CATS_CLAUDE_FLAGS="--dangerously-skip-permissions"
