@@ -6,7 +6,7 @@ reconciler (`tick`), driven by `launchd`, finds eligible Jira tickets, spins up
 one herdr worktree + Claude worker per ticket, watches the PR, and tears the
 worktree down on merge/close.
 
-This document is the canonical design. It targets a TypeScript implementation
+This document is the canonical design of the TypeScript implementation
 (run via `tsx`, no build step) backed by SQLite.
 
 ---
@@ -77,14 +77,15 @@ implementations and injects them. Tests substitute fakes + `:memory:` SQLite.
 ```
 herdr-cats/
   package.json  tsconfig.json  README.md  docs/ARCHITECTURE.md
+  bin/herdr-cats          cwd-robust shell launcher → `node --import tsx src/cli.ts`
+                          (resolves its own dir through symlinks; symlinked into ~/.local/bin)
   src/
-    cli.ts                commander program; builds deps, dispatches
+    cli.ts                commander program; builds deps, dispatches, structured log
     config.ts             env + repos/<name>/config.yml → zod → typed Config
-    log.ts                stderr structured log + DB event helper
     types.ts              shared domain types
     db/{index,migrate,store}.ts
     clients/{exec,herdr,jira,github,git}.ts
-    core/{phases,branch,worker,watch,reconcile}.ts
+    core/{deps,branch,worker,watch,reconcile}.ts
     launchd.ts
   templates/worker-brief.md
   examples/example-repo/{config.yml, guidelines-prompt.md}
@@ -117,8 +118,9 @@ out to `herdr …` and parses its JSON; it contains zero terminal/worktree logic
 **The fix layout** (a tab `main` with a pane `agent`, dev-server/de-slop/etc.) is
 applied by the external **workspace-manager herdr plugin** on `worktree.created`.
 herdr-cats does **not** apply layouts — it relies on the plugin and simply
-*targets* the resulting `main`/`agent` pane (configurable). If that pane is
-absent it degrades gracefully (see [§8](#8-worker-model)).
+*targets* the resulting `main`/`agent` pane (configurable via `worker.main_tab` /
+`worker.agent_pane`). If that pane is absent it degrades gracefully (see
+[§8](#8-worker-model)).
 
 **herdr-cats performs git/filesystem ops ONLY for things outside herdr's model:**
 
@@ -248,7 +250,8 @@ Phase gates of note:
 
 Unchanged from the proven design; all spawning is via herdr.
 
-1. **Dispatch into the layout's `main`/`agent` pane.** Wait (bounded) for the
+1. **Dispatch into the layout's worker pane** — the `main_tab` / `agent_pane`
+   labels from config (default `main`/`agent`). Wait (bounded) for the
    workspace-manager plugin to apply the layout, then `herdr agent send` the
    brief to the `claude` it started there + `pane send-keys Enter`. If the pane
    has no claude → `herdr pane run "claude …"` in it. If the pane never appears →
@@ -260,9 +263,11 @@ Unchanged from the proven design; all spawning is via herdr.
    the target repo's worktree*, so it inherits that repo's `CLAUDE.md`/skills
    natively — the brief stays generic.
 3. **Flow:** read ticket + downloaded images → implement → tests/verify →
-   de-slop → screenshot evidence (best-effort, under the machine-global capture
-   lock) → open PR → ~10-min automated round (CI green + bot comments) →
-   **signal done**.
+   de-slop → screenshot evidence to **gitignored `.memory/herdr-cats/evidence`**
+   (best-effort, under the machine-global capture lock) → open PR (**code only**)
+   → attach the screenshots **inline to the PR description** as GitHub
+   `user-attachments` (uploaded via the browser; **never committed to the repo**)
+   → ~10-min automated round (CI green + bot comments) → **signal done**.
 4. **worker-done handshake (CLI → DB):** the worker calls
    `herdr-cats --repo <name> worker-done <KEY>`, which sets `worker_done=1` and
    records a `worker_done` event. The reconciler reads the flag to gate
@@ -298,10 +303,21 @@ is GitHub's domain (merge auto-delete or left as-is).
 - **Global secrets** — `~/.config/herdr-cats/env` (chmod 600):
   `JIRA_BASE_URL`, `JIRA_EMAIL`, `JIRA_API_TOKEN`. One Atlassian account, all repos.
 - **Per-repo** — `~/.config/herdr-cats/repos/<name>/`:
-  - `config.yml` — parsed with `yaml`, validated with `zod` → typed `Config`
-    (repo path/base_ref/github · `workspace_name` branch template · jira
-    project/board/label/3 statuses · worker bootstrap/deslop/resolve commands +
-    fix-layout tab/pane · limits).
+  - `config.yml` — parsed with `yaml`, validated with `zod` → typed `Config`:
+    - `repo` — `path` / `base_ref` / `github`
+    - `workspace_name` — branch-name template for each cat (the worktree +
+      workspace derive from it). Vars: `{{ticket_id}}`, `{{ticket_short_slug}}`
+      (≤20 chars), `{{ticket_slug}}` (≤50), `{{ticket_type}}`, `{{ticket_prefix}}`
+      (`fix`/`chore`/`feature`, by issue type). The rendered name is sanitised to
+      a git-safe ref; zod requires the template to contain `{{ticket_id}}` (else
+      cats would collide on one branch). Default when unset:
+      `{{ticket_prefix}}/{{ticket_id}}-{{ticket_slug}}` (rendered by `core/branch.ts`).
+    - `jira` — `project` / `board` / `label` / 3 `status` names
+    - `worker` — `bootstrap_cmd` / `deslop_cmd` / `resolve_cmd`, plus
+      `main_tab` / `agent_pane` (the herdr fix-layout tab/pane the worker is
+      dispatched into; default `main`/`agent`)
+    - `limits` — `max_active` / `watch_hours` / `develop_budget_seconds` /
+      `tick_interval_seconds`
   - `guidelines-prompt.md` — optional; appended verbatim to every worker brief.
 - `config.ts` asserts `repo.path` is a **main checkout** (not a linked worktree),
   since herdr can't create worktrees from one.
@@ -322,6 +338,11 @@ herdr-cats capture-lock acquire|release <owner>     # machine-global, no --repo
 herdr-cats doctor                                   # herdr socket / gh / jira / db / claude checks
 herdr-cats help
 ```
+
+`status` is a dashboard, not just a count: an **ACTIVE** section (each cat's
+ledger phase + **live** herdr worker status + PR + summary) and a **FINISHED**
+section (each completed cat's outcome, newest first), under a
+`Cats: N running (cap M) · K finished` header. `runs`/`timeline` read the same DB.
 
 Each command builds `Deps` (open DB, construct clients from config) and calls
 core. `--repo` is a global option; repo-scoped commands assert it.
@@ -386,6 +407,11 @@ Hard-won from the bash prototype — encode as types/tests/asserts:
 
 The bash loop is already decommissioned, so there is no parallel-run/double-claim
 risk: build, validate read-only, do one guarded single-ticket run, then install.
+
+**Status:** M0–M6 complete — installed and running unsupervised
+(`com.herdr-cats.reckon-frontend`, 60 s tick); the full lifecycle has been
+validated end-to-end (claim → worktree → worker → In Development → PR → review →
+teardown).
 
 ---
 
