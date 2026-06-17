@@ -5,7 +5,7 @@
   "type": "module",
   "private": true,
   "bin": {
-    "herdr-cats": "bin/herdr-cats.mjs"
+    "herdr-cats": "bin/herdr-cats"
   },
   "scripts": {
     "cats": "node --import tsx src/cli.ts",

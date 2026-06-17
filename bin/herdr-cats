@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# Launcher for the herdr-cats CLI. Resolves its own location (through symlinks),
+# runs from the package dir so `tsx` + src/ resolve regardless of caller cwd.
+set -euo pipefail
+
+src="${BASH_SOURCE[0]}"
+while [ -h "$src" ]; do
+  dir="$(cd -P "$(dirname "$src")" && pwd)"
+  src="$(readlink "$src")"
+  [[ "$src" != /* ]] && src="$dir/$src"
+done
+pkg="$(cd -P "$(dirname "$src")/.." && pwd)"
+
+cd "$pkg"
+exec node --import tsx src/cli.ts "$@"
