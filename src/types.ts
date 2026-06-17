@@ -70,3 +70,58 @@ export type RunPatch = Partial<
 /** epoch-seconds clock, injected for testability. */
 export type Clock = () => number;
 export const systemClock: Clock = () => Math.floor(Date.now() / 1000);
+
+// --- client domain types ----------------------------------------------------
+
+export interface Ticket {
+  key: string;
+  summary: string;
+  type: string;
+}
+
+export interface JiraAttachment {
+  filename: string;
+  mimeType: string;
+  size: number;
+  content: string;
+}
+
+export interface JiraIssue {
+  key: string;
+  fields: {
+    summary: string;
+    status?: { name: string };
+    issuetype?: { name: string };
+    labels?: string[];
+    attachment?: JiraAttachment[];
+    description?: unknown;
+  };
+}
+
+export interface WorktreeResult {
+  workspaceId: string;
+  worktreePath: string;
+  paneId: string | null;
+}
+
+export interface Agent {
+  paneId: string;
+  workspaceId: string;
+  tabId: string;
+  agent: string;
+  agentStatus: string; // idle | working | done | blocked | unknown
+  cwd: string;
+}
+
+export type PrState = "OPEN" | "MERGED" | "CLOSED";
+export interface PrInfo {
+  number: number;
+  state: PrState;
+  url: string;
+}
+
+export interface ReviewSig {
+  unresolved: number;
+  failing: number;
+  sig: string;
+}
