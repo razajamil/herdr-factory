@@ -4,7 +4,7 @@ import { Command } from "commander";
 import { globalDbPath, loadConfig, type Config } from "./config.ts";
 import { openDb } from "./db/index.ts";
 import { Store } from "./db/store.ts";
-import { systemClock } from "./types.ts";
+import { systemClock, type Run } from "./types.ts";
 import { HerdrClient } from "./clients/herdr.ts";
 import { JiraClient } from "./clients/jira.ts";
 import { GitHubClient } from "./clients/github.ts";
@@ -98,20 +98,30 @@ program
     try {
       const deps = await buildDeps(requireRepo());
       const c = deps.config;
-      const runs = deps.store.activeRuns(c.repoName);
+      const active = deps.store.activeRuns(c.repoName);
+      const recent = deps.store.listRuns(c.repoName, true);
+      const finished = recent.filter((r) => r.endedAt !== null);
+      const fmt = (r: Run, statusCol: string) =>
+        `    ${`cat:${r.ticketKey}`.padEnd(16)} ${r.phase.padEnd(12)} ${statusCol.padEnd(16)} PR:${(r.prNumber ? `#${r.prNumber}` : "-").padEnd(6)} ${(r.summary ?? "").slice(0, 60)}`;
       console.log(
         `herdr-cats [${c.repoName}] — board ${c.jira.board}, label "${c.jira.label}", cap ${c.limits.maxActive}, watch ${c.limits.watchHours}h`,
       );
-      console.log(`Active cats: ${runs.length}/${c.limits.maxActive}${runs.length ? "" : "  (none running)"}`);
-      for (const r of runs) {
+      console.log(`Active cats: ${active.length}/${c.limits.maxActive}`);
+      console.log("");
+      console.log(`  ACTIVE (${active.length})`);
+      if (active.length === 0) console.log("    (none in flight)");
+      for (const r of active) {
         // live worker status from herdr (what the cat is actually doing), vs the
         // ledger phase (where the loop thinks it is).
         const worker = r.paneId ? await deps.herdr.paneState(r.paneId) : "no-pane";
-        const pr = r.prNumber ? `#${r.prNumber}` : "-";
-        console.log(
-          `  ${`cat:${r.ticketKey}`.padEnd(16)} ${r.phase.padEnd(12)} worker:${worker.padEnd(8)} PR:${pr.padEnd(6)} ${(r.summary ?? "").slice(0, 60)}`,
-        );
+        console.log(fmt(r, `worker:${worker}`));
       }
+      if (finished.length) {
+        console.log("");
+        console.log(`  FINISHED (${finished.length}${recent.length >= 100 ? ", latest 100" : ""}, newest first)`);
+        for (const r of finished) console.log(fmt(r, r.outcome ?? "—"));
+      }
+      console.log("");
       console.log(`launchd: ${(await launchd.isLoaded(c.repoName)) ? "loaded" : "not loaded"}`);
     } catch (e) {
       fail(e);
