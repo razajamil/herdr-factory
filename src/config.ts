@@ -114,6 +114,11 @@ export function assertMainCheckout(repoPath: string): void {
   }
 }
 
+/** Path to the one global DB (repo-agnostic commands like capture-lock need it). */
+export function globalDbPath(): string {
+  return join(stateRoot(), "herdr-cats.db");
+}
+
 export function loadSecrets(): Secrets {
   const env = parseEnvFile(join(configDir(), "env"));
   return {

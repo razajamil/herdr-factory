@@ -188,4 +188,24 @@ export class Store {
   touchTick(repo: string): void {
     this.db.prepare("UPDATE repos SET last_tick_at = ? WHERE name = ?").run(this.now(), repo);
   }
+
+  listRuns(repo: string, includeEnded: boolean): Run[] {
+    const sql = includeEnded
+      ? "SELECT * FROM runs WHERE repo = ? ORDER BY created_at DESC LIMIT 100"
+      : "SELECT * FROM runs WHERE repo = ? AND ended_at IS NULL ORDER BY created_at";
+    return (this.db.prepare(sql).all(repo) as RunRow[]).map(toRun);
+  }
+
+  /** Events for a ticket's most recent run (the timeline). */
+  timeline(repo: string, ticketKey: string): { ts: number; type: string; detail: string | null }[] {
+    const r = this.db
+      .prepare("SELECT id FROM runs WHERE repo = ? AND ticket_key = ? ORDER BY id DESC LIMIT 1")
+      .get(repo, ticketKey) as { id: number } | undefined;
+    if (!r) return [];
+    return this.db.prepare("SELECT ts, type, detail FROM events WHERE run_id = ? ORDER BY id").all(r.id) as {
+      ts: number;
+      type: string;
+      detail: string | null;
+    }[];
+  }
 }

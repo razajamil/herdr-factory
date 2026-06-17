@@ -199,3 +199,25 @@ async function teardown(deps: Deps, run: Run, outcome: Outcome): Promise<void> {
   deps.store.recordEvent({ runId: run.id, repo, ticketKey: run.ticketKey, type: "torn_down", detail: { outcome } });
   deps.log("info", `${run.ticketKey}: torn down (${outcome})`);
 }
+
+// --- manual entry points (used by the CLI) ----------------------------------
+
+/** Manually claim + start a single ticket (the `claim` command). */
+export async function claimTicket(deps: Deps, ticketKey: string): Promise<void> {
+  if (deps.store.activeRunForTicket(deps.config.repoName, ticketKey)) {
+    deps.log("warn", `${ticketKey}: already has an active run`);
+    return;
+  }
+  const issue = await deps.jira.getIssue(ticketKey);
+  await claim(deps, { key: issue.key, summary: issue.fields.summary, type: issue.fields.issuetype?.name ?? "Task" });
+}
+
+/** Manually tear down a ticket's active run (the `teardown` command). */
+export async function teardownTicket(deps: Deps, ticketKey: string): Promise<void> {
+  const run = deps.store.activeRunForTicket(deps.config.repoName, ticketKey);
+  if (!run) {
+    deps.log("warn", `${ticketKey}: no active run`);
+    return;
+  }
+  await teardown(deps, run, "abandoned");
+}
