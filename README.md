@@ -34,6 +34,8 @@ git clone <this> ~/dev/raza/herdr-cats
 ln -s ~/dev/raza/herdr-cats/bin/herdr-cats ~/.local/bin/herdr-cats   # optional, for PATH
 ```
 
+**Requirements:** `herdr`, `git`, `gh`, `jq`, `yq` (mikefarah v4, reads `config.yml`), `curl`, and the `claude` CLI — all on `PATH`.
+
 **Global secrets** — `~/.config/herdr-cats/env` (chmod 600):
 ```
 JIRA_BASE_URL=https://your-org.atlassian.net
@@ -43,9 +45,11 @@ JIRA_API_TOKEN=...        # id.atlassian.com → Security → API tokens
 
 ## Onboard a repo
 
-1. `cp examples/repo.conf.example ~/.config/herdr-cats/repos/<name>.conf` and fill it in
-   (repo checkout path, base branch, Jira project/board/label/statuses, and optionally
-   the repo's bootstrap / de-slop / resolve commands + a guidance file).
+1. `cp -r examples/example-repo ~/.config/herdr-cats/repos/<name>` and edit its
+   `config.yml` (repo checkout path, base branch, Jira project/board/label/statuses,
+   and optionally the repo's bootstrap / de-slop / resolve commands). Put any
+   repo-specific brief text in that folder's `guidelines-prompt.md` (optional —
+   appended verbatim to every worker brief; delete it if unused).
 2. Define that repo's herdr "fix" layout in the workspace-manager plugin — a tab
    `main` with a pane `agent` that starts `claude` (configurable via
    `HERDR_CATS_MAIN_TAB`/`AGENT_PANE`). The dispatcher sends the brief there;
@@ -65,12 +69,12 @@ herdr-cats capture-lock acquire|release <owner>     # machine-global, no --repo
 herdr-cats help
 ```
 
-## What's repo-specific (all in `repos/<name>.conf`)
+## What's repo-specific (all in `repos/<name>/config.yml`)
 
 repo checkout + base branch · Jira project/board/label/3 statuses · bootstrap
-command · de-slop command · PR-resolve command · optional brief-guidance file ·
-herdr layout tab/pane names · concurrency/watch/budget tuning. The Jira **token**
-is global (one Atlassian account) and lives in `~/.config/herdr-cats/env`.
+command · de-slop command · PR-resolve command · herdr layout tab/pane names ·
+concurrency/watch/budget tuning — plus the folder's optional `guidelines-prompt.md`.
+The Jira **token** is global (one Atlassian account) in `~/.config/herdr-cats/env`.
 
 ## Layout
 
@@ -79,8 +83,8 @@ bin/herdr-cats          CLI (selects a repo via --repo)
 lib/*.sh                generic engine: log lock jira ledger worktree worker pr watch reconcile config
 templates/worker-brief.md   generic worker brief (config-injected + guidance addendum)
 install-launchd.sh      per-repo launchd job (com.herdr-cats.<repo>)
-examples/               repo.conf.example, repo-guidance.md.example
-~/.config/herdr-cats/   env (secrets) + repos/<name>.conf
+examples/example-repo/  config.yml + guidelines-prompt.md (copy to repos/<name>/)
+~/.config/herdr-cats/   env (secrets) + repos/<name>/{config.yml, guidelines-prompt.md}
 ~/.local/state/herdr-cats/<repo>/   tickets, locks, logs   (+ _shared/locks for the global capture lock)
 ```
 

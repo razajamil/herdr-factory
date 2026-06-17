@@ -1,0 +1,35 @@
+# herdr-cats per-repo config.
+# Copy this folder to ~/.config/herdr-cats/repos/<name>/ (<name> = what you pass to --repo),
+# edit config.yml, and put any repo-specific brief text in guidelines-prompt.md (optional).
+# Read with `yq`. Anything omitted falls back to the engine defaults.
+
+repo:
+  path: $HOME/dev/my-repo        # MAIN (non-linked) checkout
+  base_ref: origin/main          # branch worktrees fork from
+  # github: owner/name           # default: derived from the origin remote
+
+jira:
+  project: PROJ
+  board: 123
+  label: agent
+  status:
+    todo: To Do
+    in_development: In Progress
+    review: In Review
+
+worker:
+  # All optional — generic wording is used when unset.
+  bootstrap_cmd: npm ci          # how to install/setup the worktree
+  deslop_cmd: ""                 # a quality/de-slop slash command, e.g. /my-cleanup
+  resolve_cmd: ""                # a PR-comment resolution workflow, e.g. /my-pr-resolver
+  # guidelines-prompt.md in this folder (if present) is appended to every brief.
+
+layout:                          # herdr fix-layout tab/pane the worker runs in
+  main_tab: main
+  agent_pane: agent
+
+limits:
+  max_active: 3
+  watch_hours: 7
+  develop_budget_seconds: 5400
+  tick_interval_seconds: 180

@@ -1,10 +1,9 @@
-<!-- Repo-specific guidance appended verbatim to every worker brief for this repo
-     (point HERDR_CATS_BRIEF_GUIDANCE at this file). Use it to name the repo's
-     own skills/commands/conventions the generic brief can't know about. -->
+<!-- Appended verbatim to every worker brief for this repo. Name the repo's own
+     skills/commands/conventions the generic brief can't know about. Delete if unused. -->
 
 - Open the PR using the repo's PR skill/command; if `gh pr edit --body` doesn't
   persist, set the body via the GitHub REST API.
-- Commit with the repo's semantic-commit skill/convention.
+- Commit with the repo's semantic-commit convention.
 - Run the repo's full verify gate (lint + type-check + tests) and fix all findings.
 - For dev servers + screenshots, use the repo's documented dev-server workflow,
   then drive `playwright-cli`.
