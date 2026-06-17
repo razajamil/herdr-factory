@@ -1,0 +1,35 @@
+{
+  "name": "herdr-cats",
+  "version": "0.1.0",
+  "description": "Autonomous Jira→PR loop that herds Claude worker agents across repos, on herdr worktrees.",
+  "type": "module",
+  "private": true,
+  "bin": {
+    "herdr-cats": "bin/herdr-cats.mjs"
+  },
+  "scripts": {
+    "cats": "node --import tsx src/cli.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": ["better-sqlite3", "esbuild"]
+  },
+  "dependencies": {
+    "better-sqlite3": "^12.11.1",
+    "commander": "^15.0.0",
+    "yaml": "^2.9.0",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^25.9.3",
+    "tsx": "^4.22.4",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.9"
+  }
+}
