@@ -98,13 +98,18 @@ program
     try {
       const deps = await buildDeps(requireRepo());
       const c = deps.config;
+      const runs = deps.store.activeRuns(c.repoName);
       console.log(
         `herdr-cats [${c.repoName}] — board ${c.jira.board}, label "${c.jira.label}", cap ${c.limits.maxActive}, watch ${c.limits.watchHours}h`,
       );
-      console.log(`Active: ${deps.store.countActive(c.repoName)}/${c.limits.maxActive}`);
-      for (const r of deps.store.activeRuns(c.repoName)) {
+      console.log(`Active cats: ${runs.length}/${c.limits.maxActive}${runs.length ? "" : "  (none running)"}`);
+      for (const r of runs) {
+        // live worker status from herdr (what the cat is actually doing), vs the
+        // ledger phase (where the loop thinks it is).
+        const worker = r.paneId ? await deps.herdr.paneState(r.paneId) : "no-pane";
+        const pr = r.prNumber ? `#${r.prNumber}` : "-";
         console.log(
-          `  ${r.ticketKey.padEnd(12)} ${r.phase.padEnd(12)} ${(r.branch ?? "").padEnd(42)} PR:${r.prNumber ?? "-"} ws:${r.workspaceId ?? "-"}`,
+          `  ${`cat:${r.ticketKey}`.padEnd(16)} ${r.phase.padEnd(12)} worker:${worker.padEnd(8)} PR:${pr.padEnd(6)} ${(r.summary ?? "").slice(0, 60)}`,
         );
       }
       console.log(`launchd: ${(await launchd.isLoaded(c.repoName)) ? "loaded" : "not loaded"}`);

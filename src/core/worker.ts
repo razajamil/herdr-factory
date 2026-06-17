@@ -9,7 +9,7 @@ export const WORKER_PROMPT =
   "Read .memory/herdr-cats/brief.md in this worktree and follow it exactly. This is an autonomous task — do not pause to ask for confirmation.";
 
 const TEMPLATE_PATH = fileURLToPath(new URL("../../templates/worker-brief.md", import.meta.url));
-const CLI_PATH = fileURLToPath(new URL("../../bin/herdr-cats.mjs", import.meta.url));
+const CLI_PATH = fileURLToPath(new URL("../../bin/herdr-cats", import.meta.url));
 const LAYOUT_WAIT_SEC = 120;
 const MAX_IMAGES = 8;
 const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
