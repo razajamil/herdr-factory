@@ -106,7 +106,7 @@ program
       console.log(
         `herdr-cats [${c.repoName}] — board ${c.jira.board}, label "${c.jira.label}", cap ${c.limits.maxActive}, watch ${c.limits.watchHours}h`,
       );
-      console.log(`Active cats: ${active.length}/${c.limits.maxActive}`);
+      console.log(`Cats: ${active.length} running (cap ${c.limits.maxActive}) · ${finished.length} finished`);
       console.log("");
       console.log(`  ACTIVE (${active.length})`);
       if (active.length === 0) console.log("    (none in flight)");
