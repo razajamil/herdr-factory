@@ -10,6 +10,14 @@ const RepoConfigSchema = z.object({
     base_ref: z.string().default("origin/main"),
     github: z.string().optional(),
   }),
+  // Branch-name template for each cat; worktree + workspace derive from it.
+  // Vars: {{ticket_id}} {{ticket_short_slug}} {{ticket_slug}} {{ticket_type}} {{ticket_prefix}}.
+  cat_name: z
+    .string()
+    .refine((s) => /\{\{\s*ticket_id\s*\}\}/.test(s), {
+      message: "cat_name must include {{ticket_id}} so each ticket gets a unique branch",
+    })
+    .optional(),
   jira: z.object({
     project: z.string(),
     board: z.coerce.string(),
@@ -54,6 +62,7 @@ export interface Secrets {
 export interface Config {
   repoName: string;
   repo: { path: string; baseRef: string; github?: string };
+  catName?: string;
   jira: {
     project: string;
     board: string;
@@ -148,6 +157,7 @@ export function loadConfig(repoName: string): Loaded {
   const config: Config = {
     repoName,
     repo: { path: parsed.repo.path, baseRef: parsed.repo.base_ref, github: parsed.repo.github },
+    catName: parsed.cat_name,
     jira: {
       project: parsed.jira.project,
       board: parsed.jira.board,

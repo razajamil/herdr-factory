@@ -70,6 +70,16 @@ worker:
     setup(`repo:\n  path: __REPO__\njira:\n  project: P\n  board: 1\n`);
     expect(() => loadConfig("nope")).toThrow(/no config for repo/);
   });
+
+  it("maps cat_name through, undefined when unset", () => {
+    setup(`repo:\n  path: __REPO__\njira:\n  project: RWR\n  board: 254\ncat_name: "fix/{{ticket_id}}-{{ticket_short_slug}}"\n`);
+    expect(loadConfig("demo").config.catName).toBe("fix/{{ticket_id}}-{{ticket_short_slug}}");
+  });
+
+  it("rejects a cat_name template missing {{ticket_id}}", () => {
+    setup(`repo:\n  path: __REPO__\njira:\n  project: RWR\n  board: 254\ncat_name: "fix/{{ticket_short_slug}}"\n`);
+    expect(() => loadConfig("demo")).toThrow(/ticket_id/);
+  });
 });
 
 describe("assertMainCheckout", () => {
