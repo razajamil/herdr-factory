@@ -36,7 +36,7 @@ export function renderBrief(deps: Deps, run: Run): string {
     "@@BRANCH@@": run.branch ?? "",
     "@@WORKTREE@@": run.worktreePath ?? "",
     "@@MEMORY_DIR@@": ".memory/herdr-cats",
-    "@@EVIDENCE_DIR@@": `.pr-evidence/${run.ticketKey}`,
+    "@@EVIDENCE_DIR@@": ".memory/herdr-cats/evidence",
     "@@CATS_CLI@@": CLI_PATH,
     "@@BOOTSTRAP@@": bootstrapText(deps.config.worker.bootstrapCmd),
     "@@DESLOP@@": deslopText(deps.config.worker.deslopCmd),
