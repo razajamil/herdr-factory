@@ -17,6 +17,10 @@ interface RunRow {
   watch_deadline: number | null;
   last_thread_sig: string | null;
   worker_done: number;
+  review_done: number;
+  review_pane: string | null;
+  progress_sig: string | null;
+  progress_at: number | null;
   attention_reason: string | null;
   outcome: string | null;
   created_at: number;
@@ -40,6 +44,10 @@ function toRun(r: RunRow): Run {
     watchDeadline: r.watch_deadline,
     lastThreadSig: r.last_thread_sig,
     workerDone: r.worker_done !== 0,
+    reviewDone: r.review_done !== 0,
+    reviewPane: r.review_pane,
+    progressSig: r.progress_sig,
+    progressAt: r.progress_at,
     attentionReason: r.attention_reason,
     outcome: r.outcome as Outcome | null,
     createdAt: r.created_at,
@@ -120,6 +128,10 @@ export class Store {
     if (patch.watchDeadline !== undefined) set("watch_deadline", patch.watchDeadline);
     if (patch.lastThreadSig !== undefined) set("last_thread_sig", patch.lastThreadSig);
     if (patch.workerDone !== undefined) set("worker_done", patch.workerDone ? 1 : 0);
+    if (patch.reviewDone !== undefined) set("review_done", patch.reviewDone ? 1 : 0);
+    if (patch.reviewPane !== undefined) set("review_pane", patch.reviewPane);
+    if (patch.progressSig !== undefined) set("progress_sig", patch.progressSig);
+    if (patch.progressAt !== undefined) set("progress_at", patch.progressAt);
     if (patch.attentionReason !== undefined) set("attention_reason", patch.attentionReason);
     if (patch.outcome !== undefined) set("outcome", patch.outcome);
     if (sets.length === 0) return;

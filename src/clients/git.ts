@@ -21,6 +21,14 @@ export class GitClient {
     const r = await run("git", ["-C", repoCwd, "remote", "get-url", "origin"], { allowFail: true });
     return r.stdout.trim();
   }
+
+  /** Current HEAD commit of a worktree, or null if git can't resolve it. Used as the
+   *  worker's progress heartbeat — a moving HEAD means real work happened. */
+  async headSha(repoCwd: string): Promise<string | null> {
+    const r = await run("git", ["-C", repoCwd, "rev-parse", "HEAD"], { allowFail: true });
+    const sha = r.stdout.trim();
+    return r.code === 0 && sha ? sha : null;
+  }
 }
 
 /** owner/name from a git origin URL (ssh or https), or null. */

@@ -3,6 +3,7 @@
 export type Phase =
   | "claiming"
   | "developing"
+  | "auto_review"
   | "reviewing"
   | "tearing_down"
   | "done"
@@ -18,6 +19,8 @@ export type EventType =
   | "pr_opened"
   | "resolver_woken"
   | "worker_done"
+  | "review_spawned"
+  | "review_done"
   | "merged"
   | "closed"
   | "torn_down"
@@ -40,6 +43,10 @@ export interface Run {
   watchDeadline: number | null; // epoch seconds
   lastThreadSig: string | null;
   workerDone: boolean;
+  reviewDone: boolean;
+  reviewPane: string | null;
+  progressSig: string | null; // last-seen branch HEAD (worker progress heartbeat)
+  progressAt: number | null; // epoch seconds the heartbeat last advanced
   attentionReason: string | null;
   outcome: Outcome | null;
   createdAt: number; // epoch seconds
@@ -62,6 +69,10 @@ export type RunPatch = Partial<
     | "watchDeadline"
     | "lastThreadSig"
     | "workerDone"
+    | "reviewDone"
+    | "reviewPane"
+    | "progressSig"
+    | "progressAt"
     | "attentionReason"
     | "outcome"
   >

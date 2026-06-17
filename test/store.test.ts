@@ -32,6 +32,22 @@ describe("Store", () => {
     expect(got.updatedAt).toBe(1005);
   });
 
+  it("round-trips review gate fields (default false, then patched)", () => {
+    const { store } = makeStore();
+    const run = store.createRun({ repo: "r", ticketKey: "K-R" });
+    expect(run.reviewDone).toBe(false);
+    expect(run.reviewPane).toBeNull();
+    expect(run.progressSig).toBeNull();
+    expect(run.progressAt).toBeNull();
+    store.updateRun(run.id, { phase: "auto_review", reviewPane: "w1:rp", reviewDone: true, progressSig: "abc123", progressAt: 1234 });
+    const got = store.getRun(run.id)!;
+    expect(got.phase).toBe("auto_review");
+    expect(got.reviewPane).toBe("w1:rp");
+    expect(got.reviewDone).toBe(true);
+    expect(got.progressSig).toBe("abc123");
+    expect(got.progressAt).toBe(1234);
+  });
+
   it("ends a run -> not active, has outcome + ended_at", () => {
     const { store } = makeStore();
     const run = store.createRun({ repo: "r", ticketKey: "K-3" });

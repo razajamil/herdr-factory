@@ -33,6 +33,20 @@ const MIGRATIONS: { version: number; sql: string }[] = [
       );
     `,
   },
+  {
+    version: 2,
+    sql: `
+      ALTER TABLE runs ADD COLUMN review_done INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE runs ADD COLUMN review_pane TEXT;
+    `,
+  },
+  {
+    version: 3,
+    sql: `
+      ALTER TABLE runs ADD COLUMN progress_sig TEXT;
+      ALTER TABLE runs ADD COLUMN progress_at INTEGER;
+    `,
+  },
 ];
 
 /** Apply pending migrations in a transaction. Idempotent. */

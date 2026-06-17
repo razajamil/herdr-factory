@@ -77,7 +77,12 @@ program
     try {
       const deps = await buildDeps(requireRepo());
       const owner = `pid:${process.pid}`;
-      if (!deps.store.acquireLock(`tick:${deps.config.repoName}`, owner, deps.config.limits.tickIntervalSeconds * 2)) {
+      // TTL must exceed the longest healthy tick (a tick can block up to ~120s waiting on
+      // the layout pane) so a slow-but-live tick can't have its lock stolen by a manual
+      // `tick`; floor it at 300s independent of the (now 60s) interval. It only auto-expires
+      // on a genuinely crashed tick that never released.
+      const lockTtl = Math.max(deps.config.limits.tickIntervalSeconds * 2, 300);
+      if (!deps.store.acquireLock(`tick:${deps.config.repoName}`, owner, lockTtl)) {
         deps.log("info", "another tick is already running — skipping");
         return;
       }
@@ -177,6 +182,25 @@ program
       deps.store.updateRun(run.id, { workerDone: true });
       deps.store.recordEvent({ runId: run.id, repo: deps.config.repoName, ticketKey: key, type: "worker_done" });
       deps.log("info", `${key}: worker-done recorded`);
+    } catch (e) {
+      fail(e);
+    }
+  });
+
+program
+  .command("review-done <key>")
+  .description("review agent signals it has finished the auto_review pass")
+  .action(async (key: string) => {
+    try {
+      const deps = await buildDeps(requireRepo());
+      const run = deps.store.activeRunForTicket(deps.config.repoName, key);
+      if (!run) {
+        deps.log("warn", `${key}: no active run to mark review-done`);
+        return;
+      }
+      deps.store.updateRun(run.id, { reviewDone: true });
+      deps.store.recordEvent({ runId: run.id, repo: deps.config.repoName, ticketKey: key, type: "review_done" });
+      deps.log("info", `${key}: review-done recorded`);
     } catch (e) {
       fail(e);
     }

@@ -1,6 +1,6 @@
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 import { parse as parseYaml } from "yaml";
 import { z } from "zod";
 
@@ -33,19 +33,32 @@ const RepoConfigSchema = z.object({
   worker: z
     .object({
       bootstrap_cmd: z.string().optional(),
-      deslop_cmd: z.string().optional(),
       resolve_cmd: z.string().optional(),
       // herdr fix-layout tab/pane the worker is dispatched into (defaults main/agent).
       main_tab: z.string().default("main"),
       agent_pane: z.string().default("agent"),
     })
     .prefault({}),
+  // Optional deterministic review pass. When present, the dispatcher inserts an
+  // `auto_review` phase after the worker opens its PR: a dedicated review agent is
+  // dispatched into tab/pane with prompt_file's CONTENTS as its prompt, and the ticket
+  // is gated until it signals `review-done`. Omit the whole block to skip review.
+  review: z
+    .object({
+      tab: z.string(),
+      pane: z.string(),
+      prompt_file: z.string(),
+    })
+    .optional(),
   limits: z
     .object({
       max_active: z.coerce.number().int().positive().default(3),
       watch_hours: z.coerce.number().positive().default(7),
       develop_budget_seconds: z.coerce.number().int().positive().default(5400),
-      tick_interval_seconds: z.coerce.number().int().positive().default(180),
+      worker_done_grace_seconds: z.coerce.number().int().positive().default(1800),
+      stall_seconds: z.coerce.number().int().positive().default(2700),
+      review_budget_seconds: z.coerce.number().int().positive().default(1800),
+      tick_interval_seconds: z.coerce.number().int().positive().default(60),
     })
     .prefault({}),
 });
@@ -68,8 +81,9 @@ export interface Config {
     statusInDev: string;
     statusReview: string;
   };
-  worker: { bootstrapCmd?: string; deslopCmd?: string; resolveCmd?: string; mainTab: string; agentPane: string };
-  limits: { maxActive: number; watchHours: number; developBudgetSeconds: number; tickIntervalSeconds: number };
+  worker: { bootstrapCmd?: string; resolveCmd?: string; mainTab: string; agentPane: string };
+  review?: { tab: string; pane: string; promptFile: string; prompt: string };
+  limits: { maxActive: number; watchHours: number; developBudgetSeconds: number; workerDoneGraceSeconds: number; stallSeconds: number; reviewBudgetSeconds: number; tickIntervalSeconds: number };
   guidance?: string;
   paths: {
     configDir: string;
@@ -147,6 +161,22 @@ export function loadConfig(repoName: string): Loaded {
   const guidancePath = join(repoDir, "guidelines-prompt.md");
   const guidance = existsSync(guidancePath) ? readFileSync(guidancePath, "utf8") : undefined;
 
+  let review: Config["review"];
+  if (parsed.review) {
+    const promptFile = isAbsolute(parsed.review.prompt_file)
+      ? parsed.review.prompt_file
+      : join(repoDir, parsed.review.prompt_file);
+    if (!existsSync(promptFile)) {
+      throw new Error(`review.prompt_file not found: ${promptFile}`);
+    }
+    review = {
+      tab: parsed.review.tab,
+      pane: parsed.review.pane,
+      promptFile,
+      prompt: readFileSync(promptFile, "utf8"),
+    };
+  }
+
   const root = stateRoot();
   const stateDir = join(root, repoName);
 
@@ -164,15 +194,18 @@ export function loadConfig(repoName: string): Loaded {
     },
     worker: {
       bootstrapCmd: parsed.worker.bootstrap_cmd,
-      deslopCmd: parsed.worker.deslop_cmd,
       resolveCmd: parsed.worker.resolve_cmd,
       mainTab: parsed.worker.main_tab,
       agentPane: parsed.worker.agent_pane,
     },
+    review,
     limits: {
       maxActive: parsed.limits.max_active,
       watchHours: parsed.limits.watch_hours,
       developBudgetSeconds: parsed.limits.develop_budget_seconds,
+      workerDoneGraceSeconds: parsed.limits.worker_done_grace_seconds,
+      stallSeconds: parsed.limits.stall_seconds,
+      reviewBudgetSeconds: parsed.limits.review_budget_seconds,
       tickIntervalSeconds: parsed.limits.tick_interval_seconds,
     },
     guidance,

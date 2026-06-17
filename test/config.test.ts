@@ -12,7 +12,7 @@ afterEach(() => {
   delete process.env.HERDR_CATS_STATE_ROOT;
 });
 
-function setup(yml: string, opts?: { guidance?: string }) {
+function setup(yml: string, opts?: { guidance?: string; reviewPrompt?: string }) {
   const base = mkdtempSync(join(tmpdir(), "cats-"));
   cleanups.push(() => rmSync(base, { recursive: true, force: true }));
   const repoPath = join(base, "repo");
@@ -21,6 +21,7 @@ function setup(yml: string, opts?: { guidance?: string }) {
   mkdirSync(repoDir, { recursive: true });
   writeFileSync(join(repoDir, "config.yml"), yml.replaceAll("__REPO__", repoPath));
   if (opts?.guidance) writeFileSync(join(repoDir, "guidelines-prompt.md"), opts.guidance);
+  if (opts?.reviewPrompt !== undefined) writeFileSync(join(repoDir, "review-prompt.md"), opts.reviewPrompt);
   writeFileSync(join(base, "cfg", "env"), "JIRA_BASE_URL=https://x.atlassian.net/\nJIRA_EMAIL=me@x.com\nJIRA_API_TOKEN=tok\n");
   process.env.HERDR_CATS_CONFIG_DIR = join(base, "cfg");
   process.env.HERDR_CATS_STATE_ROOT = join(base, "state");
@@ -53,8 +54,12 @@ worker:
     expect(config.jira.label).toBe("agent"); // default
     expect(config.jira.statusInDev).toBe("In development");
     expect(config.worker.bootstrapCmd).toBe("mise run setup");
-    expect(config.worker.deslopCmd).toBeUndefined();
     expect(config.worker.mainTab).toBe("main"); // default
+    expect(config.review).toBeUndefined(); // no review block → review skipped
+    expect(config.limits.workerDoneGraceSeconds).toBe(1800); // default
+    expect(config.limits.stallSeconds).toBe(2700); // default
+    expect(config.limits.reviewBudgetSeconds).toBe(1800); // default
+    expect(config.limits.tickIntervalSeconds).toBe(60); // default
     expect(config.limits.maxActive).toBe(3); // default
     expect(config.guidance).toContain("use the X skill");
     expect(secrets.jiraBaseUrl).toBe("https://x.atlassian.net");
@@ -79,6 +84,35 @@ worker:
   it("rejects a workspace_name template missing {{ticket_id}}", () => {
     setup(`repo:\n  path: __REPO__\njira:\n  project: RWR\n  board: 254\nworkspace_name: "fix/{{ticket_short_slug}}"\n`);
     expect(() => loadConfig("demo")).toThrow(/ticket_id/);
+  });
+
+  it("maps a review block and reads prompt_file contents as the prompt", () => {
+    setup(
+      `repo:
+  path: __REPO__
+jira:
+  project: RWR
+  board: 254
+review:
+  tab: review
+  pane: agent
+  prompt_file: review-prompt.md
+limits:
+  review_budget_seconds: 600
+`,
+      { reviewPrompt: "Run the mechanical review.\n" },
+    );
+    const { config } = loadConfig("demo");
+    expect(config.review?.tab).toBe("review");
+    expect(config.review?.pane).toBe("agent");
+    expect(config.review?.promptFile).toMatch(/review-prompt\.md$/);
+    expect(config.review?.prompt).toBe("Run the mechanical review.\n");
+    expect(config.limits.reviewBudgetSeconds).toBe(600);
+  });
+
+  it("throws when review.prompt_file is missing", () => {
+    setup(`repo:\n  path: __REPO__\njira:\n  project: RWR\n  board: 254\nreview:\n  tab: review\n  pane: agent\n  prompt_file: nope.md\n`);
+    expect(() => loadConfig("demo")).toThrow(/prompt_file not found/);
   });
 });
 

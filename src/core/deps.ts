@@ -40,6 +40,7 @@ export interface GitApi {
   branchDelete(repoCwd: string, branch: string): Promise<void>;
   worktreePrune(repoCwd: string): Promise<void>;
   originUrl(repoCwd: string): Promise<string>;
+  headSha(repoCwd: string): Promise<string | null>;
 }
 
 export type Logger = (level: "info" | "warn" | "error", msg: string) => void;

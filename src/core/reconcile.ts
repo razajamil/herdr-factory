@@ -2,6 +2,7 @@ import type { Deps } from "./deps.ts";
 import type { Outcome, Run, Ticket } from "../types.ts";
 import { branchName } from "./branch.ts";
 import { spawnWorker } from "./worker.ts";
+import { spawnReview } from "./review.ts";
 import { wakeResolver } from "./watch.ts";
 
 function err(e: unknown): string {
@@ -77,6 +78,8 @@ export async function reconcileRun(deps: Deps, run: Run): Promise<void> {
       return reconcileClaiming(deps, run);
     case "developing":
       return reconcileDeveloping(deps, run);
+    case "auto_review":
+      return reconcileAutoReview(deps, run);
     case "reviewing":
       return reconcileReviewing(deps, run);
     case "tearing_down":
@@ -121,41 +124,176 @@ async function reconcileClaiming(deps: Deps, run: Run): Promise<void> {
   }
 }
 
+/** Advance the worker's progress heartbeat when the branch HEAD moves; returns the
+ *  (possibly refreshed) run. A moving HEAD = real work, so it resets the stall clock. */
+async function trackProgress(deps: Deps, run: Run): Promise<Run> {
+  if (!run.worktreePath) return run;
+  const sha = await deps.git.headSha(run.worktreePath);
+  if (!sha || sha === run.progressSig) return run;
+  deps.store.updateRun(run.id, { progressSig: sha, progressAt: deps.now() });
+  return deps.store.getRun(run.id)!;
+}
+
+/** Park a run for human attention: flip phase, record the reason, fire a notification. */
+async function escalateAttention(
+  deps: Deps,
+  run: Run,
+  opts: { reason: string; attentionReason: string; body: string; detail?: Record<string, unknown> },
+): Promise<void> {
+  deps.store.updateRun(run.id, { phase: "attention", attentionReason: opts.attentionReason });
+  deps.store.recordEvent({
+    runId: run.id,
+    repo: deps.config.repoName,
+    ticketKey: run.ticketKey,
+    type: "attention",
+    detail: { reason: opts.reason, ...(opts.detail ?? {}) },
+  });
+  await deps.herdr.notify(`herdr-cats: ${run.ticketKey} needs attention`, opts.body).catch(() => {});
+}
+
 async function reconcileDeveloping(deps: Deps, run: Run): Promise<void> {
-  const repo = deps.config.repoName;
+  // Heartbeat: a moving branch HEAD resets the stall clock, so a worker that keeps
+  // committing is never flagged no matter how long it runs; a frozen HEAD past
+  // `stallSeconds` counts as stalled even while the agent still reports "working".
+  run = await trackProgress(deps, run);
+  const stallMin = Math.round(deps.config.limits.stallSeconds / 60);
+  const stalled =
+    run.progressSig != null && run.progressAt != null && deps.now() - run.progressAt > deps.config.limits.stallSeconds;
+
   const pr = run.branch ? await deps.github.prForBranch(deps.ghRepo, run.branch) : null;
 
   if (pr && (pr.state === "OPEN" || pr.state === "MERGED")) {
-    if (run.prNumber !== pr.number) deps.store.updateRun(run.id, { prNumber: pr.number });
-    const fresh = deps.store.getRun(run.id)!;
-    const ready = fresh.workerDone || pr.state === "MERGED";
-    if (ready) {
-      try {
-        const moved = await deps.jira.transition(run.ticketKey, deps.config.jira.statusReview);
-        if (moved) {
-          deps.store.recordEvent({ runId: run.id, repo, ticketKey: run.ticketKey, type: "transition", detail: { to: deps.config.jira.statusReview } });
-        }
-      } catch (e) {
-        deps.log("warn", `${run.ticketKey}: review transition deferred: ${err(e)}`);
-      }
-      deps.store.updateRun(run.id, { phase: "reviewing", watchDeadline: deps.now() + deps.config.limits.watchHours * 3600 });
-      deps.store.recordEvent({ runId: run.id, repo, ticketKey: run.ticketKey, type: "pr_opened", detail: { number: pr.number } });
-      deps.log("info", `${run.ticketKey}: PR #${pr.number} ready -> reviewing`);
-    } else {
-      deps.log("info", `${run.ticketKey}: PR #${pr.number} open; awaiting worker-done`);
+    if (run.prNumber !== pr.number) {
+      deps.store.updateRun(run.id, { prNumber: pr.number });
+      run = deps.store.getRun(run.id)!;
     }
+    const ready = run.workerDone || pr.state === "MERGED";
+    if (ready) {
+      // The optional review pass is a deterministic gate: spawn a dedicated review agent
+      // and hold in `auto_review` until it signals `review-done`. No review config → go
+      // straight to human review, exactly as before.
+      if (deps.config.review) {
+        await enterAutoReview(deps, run, pr.number);
+      } else {
+        await enterReviewing(deps, run, pr.number);
+      }
+      return;
+    }
+
+    // PR open but the worker hasn't signalled. Anchor a grace clock to PR-open (not run
+    // start, so the window is the same regardless of how long development took). Escalate
+    // if the worker has stalled, or the grace elapsed and the worker isn't actively working
+    // — a "working" worker (e.g. its CI/bot round) is extended; idle/gone/blocked is stuck.
+    if (!run.watchDeadline) {
+      deps.store.updateRun(run.id, { watchDeadline: deps.now() + deps.config.limits.workerDoneGraceSeconds });
+      deps.log("info", `${run.ticketKey}: PR #${pr.number} open; awaiting worker-done`);
+      return;
+    }
+    const ws = run.paneId ? await deps.herdr.paneState(run.paneId) : "gone";
+    const graceExpired = deps.now() > run.watchDeadline;
+    if (stalled || (graceExpired && ws !== "working")) {
+      const graceMin = Math.round(deps.config.limits.workerDoneGraceSeconds / 60);
+      await escalateAttention(deps, run, {
+        reason: stalled ? "worker_stalled" : "worker_done_grace",
+        attentionReason: `PR #${pr.number} open but worker ${stalled ? "stalled" : "silent"} (worker: ${ws})`,
+        body: stalled
+          ? `PR #${pr.number} open but worker stalled ${stallMin}min — no new commits (worker: ${ws}).`
+          : `PR #${pr.number} open but no worker-done after ${graceMin}min (worker: ${ws}).`,
+        detail: { prNumber: pr.number, worker: ws },
+      });
+      return;
+    }
+    deps.log("info", `${run.ticketKey}: PR #${pr.number} open; awaiting worker-done (worker: ${ws})`);
     return;
   }
 
-  // no PR yet — wall-clock budget is the stuck/dead-worker safety net
-  if (deps.now() - run.createdAt > deps.config.limits.developBudgetSeconds) {
-    const ws = run.paneId ? await deps.herdr.paneState(run.paneId) : "gone";
-    deps.store.updateRun(run.id, { phase: "attention", attentionReason: `no PR within develop budget (worker: ${ws})` });
-    deps.store.recordEvent({ runId: run.id, repo, ticketKey: run.ticketKey, type: "attention", detail: { reason: "develop_budget" } });
-    await deps.herdr
-      .notify(`herdr-cats: ${run.ticketKey} needs attention`, `No PR after ${Math.round(deps.config.limits.developBudgetSeconds / 60)}min (worker: ${ws}).`)
-      .catch(() => {});
+  // No PR yet. The develop budget bounds time-to-PR, but a worker still making progress
+  // (committing) is extended so a legitimately long task isn't false-flagged. Escalate if
+  // stalled, or past budget with the worker not actively working.
+  const overBudget = deps.now() - run.createdAt > deps.config.limits.developBudgetSeconds;
+  if (!stalled && !overBudget) return;
+  const ws = run.paneId ? await deps.herdr.paneState(run.paneId) : "gone";
+  if (!stalled && ws === "working") {
+    deps.log("info", `${run.ticketKey}: past develop budget but worker still working — extending`);
+    return;
   }
+  const budgetMin = Math.round(deps.config.limits.developBudgetSeconds / 60);
+  await escalateAttention(deps, run, {
+    reason: stalled ? "worker_stalled" : "develop_budget",
+    attentionReason: `${stalled ? "worker stalled" : "no PR within develop budget"} (worker: ${ws})`,
+    body: stalled
+      ? `No PR and worker stalled ${stallMin}min — no new commits (worker: ${ws}).`
+      : `No PR after ${budgetMin}min (worker: ${ws}).`,
+    detail: { worker: ws },
+  });
+}
+
+/** Transition Jira to its review status and move the run into the human-review watch phase. */
+async function enterReviewing(deps: Deps, run: Run, prNumber: number): Promise<void> {
+  const repo = deps.config.repoName;
+  try {
+    const moved = await deps.jira.transition(run.ticketKey, deps.config.jira.statusReview);
+    if (moved) {
+      deps.store.recordEvent({ runId: run.id, repo, ticketKey: run.ticketKey, type: "transition", detail: { to: deps.config.jira.statusReview } });
+    }
+  } catch (e) {
+    deps.log("warn", `${run.ticketKey}: review transition deferred: ${err(e)}`);
+  }
+  deps.store.updateRun(run.id, { phase: "reviewing", watchDeadline: deps.now() + deps.config.limits.watchHours * 3600 });
+  deps.store.recordEvent({ runId: run.id, repo, ticketKey: run.ticketKey, type: "pr_opened", detail: { number: prNumber } });
+  deps.log("info", `${run.ticketKey}: PR #${prNumber} -> reviewing`);
+}
+
+/** Spawn the dedicated review agent and hold the run in the `auto_review` gate. */
+async function enterAutoReview(deps: Deps, run: Run, prNumber: number): Promise<void> {
+  const repo = deps.config.repoName;
+  const pane = await spawnReview(deps, run);
+  deps.store.updateRun(run.id, {
+    phase: "auto_review",
+    reviewPane: pane,
+    reviewDone: false,
+    watchDeadline: deps.now() + deps.config.limits.reviewBudgetSeconds,
+  });
+  deps.store.recordEvent({ runId: run.id, repo, ticketKey: run.ticketKey, type: "review_spawned", detail: { paneId: pane, prNumber } });
+  deps.log("info", `${run.ticketKey}: PR #${prNumber} ready -> auto_review (pane ${pane})`);
+}
+
+/** Gate the run until the review agent signals `review-done` (or the review budget elapses). */
+async function reconcileAutoReview(deps: Deps, run: Run): Promise<void> {
+  const repo = deps.config.repoName;
+  const pr = run.branch ? await deps.github.prForBranch(deps.ghRepo, run.branch) : null;
+  if (pr && run.prNumber !== pr.number) deps.store.updateRun(run.id, { prNumber: pr.number });
+  const prNumber = pr?.number ?? run.prNumber ?? 0;
+
+  // PR resolved out from under us. A merged PR still flows through reviewing (consistent
+  // with developing's merged handling); a CLOSED/abandoned PR goes straight to teardown —
+  // routing it through enterReviewing would wrongly transition Jira to the review status.
+  if (pr && pr.state === "CLOSED") return teardown(deps, run, "closed");
+  if (pr && pr.state === "MERGED") return enterReviewing(deps, run, prNumber);
+
+  if (run.reviewDone) {
+    deps.store.recordEvent({ runId: run.id, repo, ticketKey: run.ticketKey, type: "review_done", detail: { paneId: run.reviewPane } });
+    deps.log("info", `${run.ticketKey}: review-done -> reviewing`);
+    return enterReviewing(deps, run, prNumber);
+  }
+
+  // Best-effort backstop: a stuck or silent review must not wedge the PR forever.
+  if (run.watchDeadline && deps.now() > run.watchDeadline) {
+    deps.log("warn", `${run.ticketKey}: review budget elapsed without review-done; proceeding to reviewing`);
+    deps.store.recordEvent({ runId: run.id, repo, ticketKey: run.ticketKey, type: "review_done", detail: { timedOut: true } });
+    return enterReviewing(deps, run, prNumber);
+  }
+
+  // Review agent died before signalling → re-spawn (idempotent recovery).
+  if (!run.reviewPane || !(await deps.herdr.paneAlive(run.reviewPane))) {
+    const pane = await spawnReview(deps, run);
+    deps.store.updateRun(run.id, { reviewPane: pane });
+    deps.store.recordEvent({ runId: run.id, repo, ticketKey: run.ticketKey, type: "review_spawned", detail: { paneId: pane, respawn: true } });
+    deps.log("info", `${run.ticketKey}: review agent re-spawned (pane ${pane})`);
+    return;
+  }
+
+  deps.log("info", `${run.ticketKey}: awaiting review-done (pane ${run.reviewPane})`);
 }
 
 async function reconcileReviewing(deps: Deps, run: Run): Promise<void> {
@@ -168,11 +306,11 @@ async function reconcileReviewing(deps: Deps, run: Run): Promise<void> {
   if (pr.state === "CLOSED") return teardown(deps, run, "closed");
 
   if (run.watchDeadline && deps.now() > run.watchDeadline) {
-    deps.store.updateRun(run.id, { phase: "attention", attentionReason: "review watch expired" });
-    deps.store.recordEvent({ runId: run.id, repo, ticketKey: run.ticketKey, type: "attention", detail: { reason: "watch_timeout" } });
-    await deps.herdr
-      .notify(`herdr-cats: ${run.ticketKey} watch timed out`, `${deps.config.limits.watchHours}h review watch expired; PR left open.`)
-      .catch(() => {});
+    await escalateAttention(deps, run, {
+      reason: "watch_timeout",
+      attentionReason: "review watch expired",
+      body: `${deps.config.limits.watchHours}h review watch expired; PR left open.`,
+    });
     return;
   }
 

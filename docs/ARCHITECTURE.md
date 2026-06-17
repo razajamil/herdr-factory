@@ -115,12 +115,13 @@ out to `herdr …` and parses its JSON; it contains zero terminal/worktree logic
 - agent **start / list / status / send / rename**
 - desktop **notifications**
 
-**The fix layout** (a tab `main` with a pane `agent`, dev-server/de-slop/etc.) is
-applied by the external **workspace-manager herdr plugin** on `worktree.created`.
-herdr-cats does **not** apply layouts — it relies on the plugin and simply
-*targets* the resulting `main`/`agent` pane (configurable via `worker.main_tab` /
-`worker.agent_pane`). If that pane is absent it degrades gracefully (see
-[§8](#8-worker-model)).
+**The fix layout** (a tab `main` with a pane `agent`, plus dev-server / review /
+etc. panes) is applied by the external **workspace-manager herdr plugin** on
+`worktree.created`. herdr-cats does **not** apply layouts — it relies on the plugin
+and simply *targets* the resulting panes: the `main`/`agent` pane for the worker
+(configurable via `worker.main_tab` / `worker.agent_pane`) and, if a `review` block
+is configured, its `review.tab` / `review.pane` for the review agent. If a targeted
+pane is absent it degrades gracefully (see [§8](#8-worker-model)).
 
 **herdr-cats performs git/filesystem ops ONLY for things outside herdr's model:**
 
@@ -183,6 +184,8 @@ CREATE TABLE runs(                       -- ONE attempt at a ticket (history kep
   summary TEXT, issue_type TEXT, branch TEXT, phase TEXT NOT NULL,
   workspace_id TEXT, pane_id TEXT, worktree_path TEXT, pr_number INTEGER,
   watch_deadline INTEGER, last_thread_sig TEXT, worker_done INTEGER DEFAULT 0,
+  review_done INTEGER DEFAULT 0, review_pane TEXT,   -- auto_review gate (migration v2)
+  progress_sig TEXT, progress_at INTEGER,            -- worker heartbeat (migration v3)
   attention_reason TEXT, outcome TEXT,   -- merged|closed|abandoned|timeout|NULL
   created_at INTEGER, updated_at INTEGER, ended_at INTEGER);
 CREATE INDEX idx_runs_active ON runs(repo) WHERE ended_at IS NULL;
@@ -225,7 +228,12 @@ A per-repo single-instance lock prevents overlapping ticks.
 ```
   To Do ──claim──────────> claiming ──ensure worktree+worker, transition In Dev──> developing
   (label)                                                                              │
-                          PR open AND worker_done ──transition Review, set 7h deadline─┤
+                                          PR open AND worker_done ─────────────────────┤
+                                                                                       │
+                          ┌─ review configured ─> auto_review ─review_done/budget─┐    │
+                          │  (spawn review agent; gate on review-done)            │    │
+                          └─ no review ──────────────────────────────────────────┴────┤
+                                              transition Review, set 7h deadline        │
                                                                                        ▼
                                                                                   reviewing
    ┌───────────────────────────────────────────────────────────────────────────────┤
@@ -234,15 +242,34 @@ A per-repo single-instance lock prevents overlapping ticks.
    ▼                                                                                  │
  tearing_down ──herdr worktree remove + git branch -D──> done (ended_at set)          │
                                                                                        │
- (no PR before develop budget elapses) ───────────────────────> attention ───────────┘
+ (no PR past develop budget, OR PR open but silent past worker_done grace — both        │
+  when not "working"; OR no commits for stall_seconds) ─────────> attention ───────────┘
 ```
 
 Phase gates of note:
-- **developing → reviewing** is gated on **`worker_done`** (the worker's
-  explicit signal), never on flappy agent status. A `developBudget` wall-clock is
-  the stuck/dead-worker safety net → `attention`.
+- **developing → reviewing** is gated on **`worker_done`** (the worker's explicit
+  signal), never on flappy agent status. Three safety nets catch a worker that
+  never signals, all escalating to `attention`:
+  - **no PR** within `develop_budget`, and **PR open but silent** for
+    `worker_done_grace` (anchored to PR-open, so the window is the same for a 5-min
+    and a 5-hr task) — both fire only when the worker isn't actively `working`, so a
+    still-working worker is *extended* and long tasks aren't false-flagged.
+  - **heartbeat/stall**: the branch HEAD is probed each tick (`git rev-parse HEAD`);
+    a moving HEAD resets a progress clock (`progress_at`), so any amount of real
+    work keeps the run alive regardless of total runtime. If HEAD doesn't move for
+    `stall_seconds`, the run is **stalled** → `attention`, *even if the agent still
+    reports `working`* — this is what catches a hung-but-`working` worker. (Residual:
+    a worker doing very long stretches of *uncommitted* work can look stalled; raise
+    `stall_seconds` if that's common — the signal is commits, not file edits.)
+- **auto_review** is inserted between developing and reviewing **only when a
+  `review` block is configured**. The dispatcher spawns the review agent and holds
+  the run until `review_done` (set by `herdr-cats review-done <KEY>`); a
+  `review_budget_seconds` timeout proceeds best-effort so a stuck review never
+  wedges the PR, and a dead review pane is re-spawned idempotently. With no `review`
+  block the lifecycle is unchanged (developing → reviewing directly).
 - The worker is always tracked by its **exact `pane_id`** (the layout spawns
-  other agents in the workspace; "first claude" would read the wrong one).
+  other agents in the workspace; "first claude" would read the wrong one); the
+  review agent is tracked separately by `review_pane`.
 
 ---
 
@@ -258,12 +285,13 @@ Unchanged from the proven design; all spawning is via herdr.
    fall back to `herdr agent start`. Store the resulting `pane_id`; rename the
    agent **`cat:<KEY>`**.
 2. **Brief** is rendered from `templates/worker-brief.md` (template literals — no
-   `sed` escaping), injecting the repo's bootstrap / de-slop commands, and the
-   per-repo `guidelines-prompt.md` is appended verbatim. The worker runs *inside
-   the target repo's worktree*, so it inherits that repo's `CLAUDE.md`/skills
-   natively — the brief stays generic.
+   `sed` escaping), injecting the repo's bootstrap command, and the per-repo
+   `guidelines-prompt.md` is appended verbatim. The worker runs *inside the target
+   repo's worktree*, so it inherits that repo's `CLAUDE.md`/skills natively — the
+   brief stays generic. The brief carries **no review step**: review is a
+   deterministic dispatcher-owned phase, not something the worker is asked to do.
 3. **Flow:** read ticket + downloaded images → implement → tests/verify →
-   de-slop → screenshot evidence to **gitignored `.memory/herdr-cats/evidence`**
+   screenshot evidence to **gitignored `.memory/herdr-cats/evidence`**
    (best-effort, under the machine-global capture lock) → open PR (**code only**)
    → attach the screenshots **inline to the PR description** as GitHub
    `user-attachments` (uploaded via the browser; **never committed to the repo**)
@@ -271,7 +299,16 @@ Unchanged from the proven design; all spawning is via herdr.
 4. **worker-done handshake (CLI → DB):** the worker calls
    `herdr-cats --repo <name> worker-done <KEY>`, which sets `worker_done=1` and
    records a `worker_done` event. The reconciler reads the flag to gate
-   developing → reviewing. (Replaces the old marker file; also a timeline entry.)
+   developing → (auto_review →) reviewing. (Replaces the old marker file; also a
+   timeline entry.)
+5. **Review agent (optional, `core/review.ts`):** if a `review` block is configured,
+   the reconciler — *not* the worker — dispatches a dedicated review agent into
+   `review.tab` / `review.pane` once the worker is done (see [§auto_review](#7-the-state-machine)).
+   Its prompt is the **contents** of `review.prompt_file` plus a footer telling it to
+   commit/push any changes and then run `herdr-cats --repo <name> review-done <KEY>`.
+   That `review-done` signal (sets `review_done=1`) is what releases the gate; a
+   `review_budget_seconds` timeout backstops a stuck or silent review. Same handshake
+   shape as worker-done, but driven entirely by the dispatcher so it can't be skipped.
 
 The capture lock is **machine-global** (one dev-server/browser at a time across
 all repos) — a `locks` row, acquired with a TTL, exposed via the CLI for workers.
@@ -313,10 +350,14 @@ is GitHub's domain (merge auto-delete or left as-is).
       cats would collide on one branch). Default when unset:
       `{{ticket_prefix}}/{{ticket_id}}-{{ticket_slug}}` (rendered by `core/branch.ts`).
     - `jira` — `project` / `board` / `label` / 3 `status` names
-    - `worker` — `bootstrap_cmd` / `deslop_cmd` / `resolve_cmd`, plus
-      `main_tab` / `agent_pane` (the herdr fix-layout tab/pane the worker is
-      dispatched into; default `main`/`agent`)
+    - `worker` — `bootstrap_cmd` / `resolve_cmd`, plus `main_tab` / `agent_pane`
+      (the herdr fix-layout tab/pane the worker is dispatched into; default
+      `main`/`agent`)
+    - `review` — **optional**; omit to skip review entirely. `tab` / `pane` (the
+      herdr layout pane the review agent runs in) + `prompt_file` (path relative to
+      the repo config dir; its contents become the review agent's prompt)
     - `limits` — `max_active` / `watch_hours` / `develop_budget_seconds` /
+      `worker_done_grace_seconds` / `stall_seconds` / `review_budget_seconds` /
       `tick_interval_seconds`
   - `guidelines-prompt.md` — optional; appended verbatim to every worker brief.
 - `config.ts` asserts `repo.path` is a **main checkout** (not a linked worktree),
