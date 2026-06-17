@@ -62,6 +62,6 @@ You are running inside a dedicated git worktree. Your entire job is to deliver
      threads). Address each (fix → commit → push → resolve the thread).
    - Only automated checks/bots in this window — do NOT wait on human reviewers
      (the dispatcher watches the PR for those afterwards).
-9. **Signal done + stop.** Create the file `@@MEMORY_DIR@@/worker-done` (this tells
-   the dispatcher you have finished and the ticket may move to code review),
-   print the PR URL as your final message, and end the session.
+9. **Signal done + stop.** Run `@@CATS_CLI@@ --repo @@REPO@@ worker-done @@KEY@@`
+   to tell the dispatcher you have finished (so the ticket can move to code
+   review). Then print the PR URL as your final message and end the session.
