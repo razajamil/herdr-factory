@@ -299,8 +299,9 @@ is GitHub's domain (merge auto-delete or left as-is).
   `JIRA_BASE_URL`, `JIRA_EMAIL`, `JIRA_API_TOKEN`. One Atlassian account, all repos.
 - **Per-repo** — `~/.config/herdr-cats/repos/<name>/`:
   - `config.yml` — parsed with `yaml`, validated with `zod` → typed `Config`
-    (repo path/base_ref/github · jira project/board/label/3 statuses · worker
-    bootstrap/deslop/resolve commands · layout tab/pane · limits).
+    (repo path/base_ref/github · `workspace_name` branch template · jira
+    project/board/label/3 statuses · worker bootstrap/deslop/resolve commands +
+    fix-layout tab/pane · limits).
   - `guidelines-prompt.md` — optional; appended verbatim to every worker brief.
 - `config.ts` asserts `repo.path` is a **main checkout** (not a linked worktree),
   since herdr can't create worktrees from one.

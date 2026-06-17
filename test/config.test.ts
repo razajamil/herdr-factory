@@ -54,7 +54,7 @@ worker:
     expect(config.jira.statusInDev).toBe("In development");
     expect(config.worker.bootstrapCmd).toBe("mise run setup");
     expect(config.worker.deslopCmd).toBeUndefined();
-    expect(config.layout.mainTab).toBe("main"); // default
+    expect(config.worker.mainTab).toBe("main"); // default
     expect(config.limits.maxActive).toBe(3); // default
     expect(config.guidance).toContain("use the X skill");
     expect(secrets.jiraBaseUrl).toBe("https://x.atlassian.net");
@@ -71,13 +71,13 @@ worker:
     expect(() => loadConfig("nope")).toThrow(/no config for repo/);
   });
 
-  it("maps cat_name through, undefined when unset", () => {
-    setup(`repo:\n  path: __REPO__\njira:\n  project: RWR\n  board: 254\ncat_name: "fix/{{ticket_id}}-{{ticket_short_slug}}"\n`);
-    expect(loadConfig("demo").config.catName).toBe("fix/{{ticket_id}}-{{ticket_short_slug}}");
+  it("maps workspace_name through", () => {
+    setup(`repo:\n  path: __REPO__\njira:\n  project: RWR\n  board: 254\nworkspace_name: "fix/{{ticket_id}}-{{ticket_short_slug}}"\n`);
+    expect(loadConfig("demo").config.workspaceName).toBe("fix/{{ticket_id}}-{{ticket_short_slug}}");
   });
 
-  it("rejects a cat_name template missing {{ticket_id}}", () => {
-    setup(`repo:\n  path: __REPO__\njira:\n  project: RWR\n  board: 254\ncat_name: "fix/{{ticket_short_slug}}"\n`);
+  it("rejects a workspace_name template missing {{ticket_id}}", () => {
+    setup(`repo:\n  path: __REPO__\njira:\n  project: RWR\n  board: 254\nworkspace_name: "fix/{{ticket_short_slug}}"\n`);
     expect(() => loadConfig("demo")).toThrow(/ticket_id/);
   });
 });

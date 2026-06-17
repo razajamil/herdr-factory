@@ -81,7 +81,7 @@ export async function spawnWorker(deps: Deps, run: Run): Promise<void> {
 
   let target: string | null = null;
   for (let waited = 0; waited < LAYOUT_WAIT_SEC; waited += 4) {
-    target = await deps.herdr.tabPaneByLabel(workspaceId, deps.config.layout.mainTab, deps.config.layout.agentPane);
+    target = await deps.herdr.tabPaneByLabel(workspaceId, deps.config.worker.mainTab, deps.config.worker.agentPane);
     if (target && (await deps.herdr.paneHasClaude(target))) break;
     await deps.sleep(4000);
   }

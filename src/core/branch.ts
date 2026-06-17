@@ -16,8 +16,8 @@ export function slugify(s: string, max: number): string {
     .replace(/-+$/, "");
 }
 
-/** Default cat_name — reproduces the historical fix|chore|feature/KEY-slug naming. */
-export const DEFAULT_CAT_NAME = "{{ticket_prefix}}/{{ticket_id}}-{{ticket_slug}}";
+/** Default workspace_name — reproduces the historical fix|chore|feature/KEY-slug naming. */
+export const DEFAULT_WORKSPACE_NAME = "{{ticket_prefix}}/{{ticket_id}}-{{ticket_slug}}";
 
 export interface TicketVars {
   key: string;
@@ -25,7 +25,7 @@ export interface TicketVars {
   summary: string;
 }
 
-/** Variables a `cat_name` template can interpolate. */
+/** Variables a `workspace_name` template can interpolate. */
 export function ticketVars(t: TicketVars): Record<string, string> {
   return {
     ticket_id: t.key, // e.g. RWR-17202 (case preserved)
@@ -37,11 +37,11 @@ export function ticketVars(t: TicketVars): Record<string, string> {
 }
 
 /**
- * Render a `cat_name` template into a git-safe branch name. The worktree +
+ * Render a `workspace_name` template into a git-safe branch name. The worktree +
  * workspace derive from this branch (herdr assigns the workspace id). Unknown
  * `{{vars}}` render empty; the output is sanitised to a valid-ish ref.
  */
-export function renderCatName(template: string, t: TicketVars): string {
+export function renderWorkspaceName(template: string, t: TicketVars): string {
   const vars = ticketVars(t);
   const out = template.replace(/\{\{\s*(\w+)\s*\}\}/g, (_m, name: string) => vars[name] ?? "");
   const safe = out
@@ -56,5 +56,5 @@ export function renderCatName(template: string, t: TicketVars): string {
 
 /** Branch name for a cat. `template` defaults to the historical naming when unset. */
 export function branchName(key: string, type: string, summary: string, template?: string): string {
-  return renderCatName(template || DEFAULT_CAT_NAME, { key, type, summary });
+  return renderWorkspaceName(template || DEFAULT_WORKSPACE_NAME, { key, type, summary });
 }

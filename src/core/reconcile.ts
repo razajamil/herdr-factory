@@ -58,7 +58,7 @@ export async function reconcileRepo(deps: Deps): Promise<void> {
 
 async function claim(deps: Deps, ticket: Ticket): Promise<void> {
   const repo = deps.config.repoName;
-  const branch = branchName(ticket.key, ticket.type, ticket.summary, deps.config.catName);
+  const branch = branchName(ticket.key, ticket.type, ticket.summary, deps.config.workspaceName);
   const run = deps.store.createRun({
     repo,
     ticketKey: ticket.key,

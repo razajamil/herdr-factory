@@ -47,12 +47,13 @@ JIRA_API_TOKEN=...        # id.atlassian.com → Security → API tokens
 
 1. `cp -r examples/example-repo ~/.config/herdr-cats/repos/<name>` and edit its
    `config.yml` (repo checkout path, base branch, Jira project/board/label/statuses,
-   and optionally the repo's bootstrap / de-slop / resolve commands). Put any
-   repo-specific brief text in that folder's `guidelines-prompt.md` (optional —
-   appended verbatim to every worker brief; delete it if unused).
+   the `workspace_name` branch template, and optionally the repo's bootstrap /
+   de-slop / resolve commands). Put any repo-specific brief text in that folder's
+   `guidelines-prompt.md` (optional — appended verbatim to every worker brief;
+   delete it if unused).
 2. Define that repo's herdr "fix" layout in the workspace-manager plugin — a tab
    `main` with a pane `agent` that starts `claude` (configurable via
-   `HERDR_CATS_MAIN_TAB`/`AGENT_PANE`). The dispatcher sends the brief there;
+   `worker.main_tab`/`worker.agent_pane`). The dispatcher sends the brief there;
    if the pane is absent it falls back to opening its own.
 3. `herdr-cats --repo <name> install`
 
@@ -71,9 +72,10 @@ herdr-cats help
 
 ## What's repo-specific (all in `repos/<name>/config.yml`)
 
-repo checkout + base branch · Jira project/board/label/3 statuses · bootstrap
-command · de-slop command · PR-resolve command · herdr layout tab/pane names ·
-concurrency/watch/budget tuning — plus the folder's optional `guidelines-prompt.md`.
+repo checkout + base branch · `workspace_name` branch template · Jira
+project/board/label/3 statuses · bootstrap command · de-slop command · PR-resolve
+command · worker fix-layout tab/pane names · concurrency/watch/budget tuning —
+plus the folder's optional `guidelines-prompt.md`.
 The Jira **token** is global (one Atlassian account) in `~/.config/herdr-cats/env`.
 
 ## Layout

@@ -10,12 +10,12 @@ const RepoConfigSchema = z.object({
     base_ref: z.string().default("origin/main"),
     github: z.string().optional(),
   }),
-  // Branch-name template for each cat; worktree + workspace derive from it.
+  // Branch-name template for each cat; the worktree + workspace derive from it.
   // Vars: {{ticket_id}} {{ticket_short_slug}} {{ticket_slug}} {{ticket_type}} {{ticket_prefix}}.
-  cat_name: z
+  workspace_name: z
     .string()
     .refine((s) => /\{\{\s*ticket_id\s*\}\}/.test(s), {
-      message: "cat_name must include {{ticket_id}} so each ticket gets a unique branch",
+      message: "workspace_name must include {{ticket_id}} so each ticket gets a unique branch",
     })
     .optional(),
   jira: z.object({
@@ -35,10 +35,7 @@ const RepoConfigSchema = z.object({
       bootstrap_cmd: z.string().optional(),
       deslop_cmd: z.string().optional(),
       resolve_cmd: z.string().optional(),
-    })
-    .prefault({}),
-  layout: z
-    .object({
+      // herdr fix-layout tab/pane the worker is dispatched into (defaults main/agent).
       main_tab: z.string().default("main"),
       agent_pane: z.string().default("agent"),
     })
@@ -62,7 +59,7 @@ export interface Secrets {
 export interface Config {
   repoName: string;
   repo: { path: string; baseRef: string; github?: string };
-  catName?: string;
+  workspaceName?: string;
   jira: {
     project: string;
     board: string;
@@ -71,8 +68,7 @@ export interface Config {
     statusInDev: string;
     statusReview: string;
   };
-  worker: { bootstrapCmd?: string; deslopCmd?: string; resolveCmd?: string };
-  layout: { mainTab: string; agentPane: string };
+  worker: { bootstrapCmd?: string; deslopCmd?: string; resolveCmd?: string; mainTab: string; agentPane: string };
   limits: { maxActive: number; watchHours: number; developBudgetSeconds: number; tickIntervalSeconds: number };
   guidance?: string;
   paths: {
@@ -157,7 +153,7 @@ export function loadConfig(repoName: string): Loaded {
   const config: Config = {
     repoName,
     repo: { path: parsed.repo.path, baseRef: parsed.repo.base_ref, github: parsed.repo.github },
-    catName: parsed.cat_name,
+    workspaceName: parsed.workspace_name,
     jira: {
       project: parsed.jira.project,
       board: parsed.jira.board,
@@ -170,8 +166,9 @@ export function loadConfig(repoName: string): Loaded {
       bootstrapCmd: parsed.worker.bootstrap_cmd,
       deslopCmd: parsed.worker.deslop_cmd,
       resolveCmd: parsed.worker.resolve_cmd,
+      mainTab: parsed.worker.main_tab,
+      agentPane: parsed.worker.agent_pane,
     },
-    layout: { mainTab: parsed.layout.main_tab, agentPane: parsed.layout.agent_pane },
     limits: {
       maxActive: parsed.limits.max_active,
       watchHours: parsed.limits.watch_hours,
