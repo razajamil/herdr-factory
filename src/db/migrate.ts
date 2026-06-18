@@ -47,6 +47,21 @@ const MIGRATIONS: { version: number; sql: string }[] = [
       ALTER TABLE runs ADD COLUMN progress_at INTEGER;
     `,
   },
+  {
+    version: 4,
+    sql: `
+      CREATE TABLE run_steps (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        run_id INTEGER NOT NULL,
+        step TEXT NOT NULL,                  -- fix | review | pr
+        pane_id TEXT, session_id TEXT,       -- on-demand cross-agent query handles
+        progress_sig TEXT, progress_at INTEGER,   -- per-step heartbeat
+        done INTEGER NOT NULL DEFAULT 0,
+        started_at INTEGER, done_at INTEGER
+      );
+      CREATE INDEX idx_run_steps ON run_steps(run_id, step);
+    `,
+  },
 ];
 
 /** Apply pending migrations in a transaction. Idempotent. */

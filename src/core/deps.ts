@@ -13,6 +13,7 @@ export interface HerdrApi {
   paneState(paneId: string): Promise<string>;
   paneAlive(paneId: string): Promise<boolean>;
   paneHasClaude(paneId: string): Promise<boolean>;
+  agentSessionId(paneId: string): Promise<string | null>;
   tabPaneByLabel(workspaceId: string, tabLabel: string, paneLabel: string): Promise<string | null>;
   agentStart(opts: { workspaceId: string; cwd: string; argv: string[]; env?: Record<string, string> }): Promise<string | null>;
   paneRun(paneId: string, command: string): Promise<void>;

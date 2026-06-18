@@ -1,12 +1,31 @@
 import type { Deps } from "./deps.ts";
-import type { Outcome, Run, Ticket } from "../types.ts";
+import type { Outcome, Run, RunStep, StepName, Ticket } from "../types.ts";
 import { branchName } from "./branch.ts";
-import { spawnWorker } from "./worker.ts";
-import { spawnReview } from "./review.ts";
+import { type StepDescriptor, materializeTicket, nextStep, spawnStep, stepForPhase } from "./step.ts";
 import { wakeResolver } from "./watch.ts";
 
 function err(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
+}
+
+/**
+ * Run `fn` under the per-repo single-instance tick lock; returns true if it ran, false if
+ * the lock was already held (a tick is mid-flight). The TTL is floored well above the
+ * longest healthy tick (which can block ~120s waiting on a layout pane) so a slow-but-live
+ * tick can't have its lock stolen — it only auto-expires on a genuinely crashed tick.
+ * Shared by the `tick` command and the `step-done` event-nudge.
+ */
+export async function withTickLock(deps: Deps, fn: () => Promise<void>): Promise<boolean> {
+  const key = `tick:${deps.config.repoName}`;
+  const owner = `pid:${process.pid}`;
+  const ttl = Math.max(deps.config.limits.tickIntervalSeconds * 2, 300);
+  if (!deps.store.acquireLock(key, owner, ttl)) return false;
+  try {
+    await fn();
+  } finally {
+    deps.store.releaseLock(key, owner);
+  }
+  return true;
 }
 
 /** One reconcile pass: advance active runs, then claim new work up to the cap. */
@@ -76,10 +95,13 @@ export async function reconcileRun(deps: Deps, run: Run): Promise<void> {
   switch (run.phase) {
     case "claiming":
       return reconcileClaiming(deps, run);
-    case "developing":
-      return reconcileDeveloping(deps, run);
+    case "fixing":
     case "auto_review":
-      return reconcileAutoReview(deps, run);
+    case "pr_round": {
+      const d = stepForPhase(run.phase);
+      if (d) return reconcileStep(deps, run, d);
+      return;
+    }
     case "reviewing":
       return reconcileReviewing(deps, run);
     case "tearing_down":
@@ -107,31 +129,36 @@ async function reconcileClaiming(deps: Deps, run: Run): Promise<void> {
     deps.log("info", `${run.ticketKey}: worktree ready (${wt.workspaceId})`);
   }
 
-  // 2. spawn the worker (idempotent)
-  await spawnWorker(deps, run);
-  run = deps.store.getRun(run.id)!;
+  // 2. fetch the ticket + images and spawn the fix agent (once)
+  if (!deps.store.getRunStep(run.id, "fix")?.paneId) {
+    await materializeTicket(deps, run);
+    await spawnStep(deps, run, "fix");
+    run = deps.store.getRun(run.id)!;
+  }
 
-  // 3. transition Jira → In development, then advance phase
+  // 3. Advance to fixing FIRST, then attempt the Jira transition best-effort. Gating the
+  //    phase on the transition would pin the run in `claiming` forever if the transition
+  //    keeps failing (auth/workflow) while its fix agent runs and finishes unobserved.
+  deps.store.updateRun(run.id, { phase: "fixing" });
+  deps.log("info", `${run.ticketKey}: fixing on ${branch}`);
   try {
     const moved = await deps.jira.transition(run.ticketKey, deps.config.jira.statusInDev);
     if (moved) {
       deps.store.recordEvent({ runId: run.id, repo, ticketKey: run.ticketKey, type: "transition", detail: { to: deps.config.jira.statusInDev } });
     }
-    deps.store.updateRun(run.id, { phase: "developing" });
-    deps.log("info", `${run.ticketKey}: developing on ${branch}`);
   } catch (e) {
     deps.log("warn", `${run.ticketKey}: In-development transition deferred: ${err(e)}`);
   }
 }
 
-/** Advance the worker's progress heartbeat when the branch HEAD moves; returns the
- *  (possibly refreshed) run. A moving HEAD = real work, so it resets the stall clock. */
-async function trackProgress(deps: Deps, run: Run): Promise<Run> {
-  if (!run.worktreePath) return run;
+/** Advance the active step's heartbeat when the branch HEAD moves; returns the fresh
+ *  step row. A moving HEAD = real work, so it resets that step's stall clock. */
+async function trackStepProgress(deps: Deps, run: Run, step: StepName): Promise<RunStep> {
+  const s = deps.store.getRunStep(run.id, step)!;
+  if (!run.worktreePath) return s;
   const sha = await deps.git.headSha(run.worktreePath);
-  if (!sha || sha === run.progressSig) return run;
-  deps.store.updateRun(run.id, { progressSig: sha, progressAt: deps.now() });
-  return deps.store.getRun(run.id)!;
+  if (!sha || sha === s.progressSig) return s;
+  return deps.store.upsertRunStep(run.id, step, { progressSig: sha, progressAt: deps.now() });
 }
 
 /** Park a run for human attention: flip phase, record the reason, fire a notification. */
@@ -151,81 +178,91 @@ async function escalateAttention(
   await deps.herdr.notify(`herdr-cats: ${run.ticketKey} needs attention`, opts.body).catch(() => {});
 }
 
-async function reconcileDeveloping(deps: Deps, run: Run): Promise<void> {
-  // Heartbeat: a moving branch HEAD resets the stall clock, so a worker that keeps
-  // committing is never flagged no matter how long it runs; a frozen HEAD past
-  // `stallSeconds` counts as stalled even while the agent still reports "working".
-  run = await trackProgress(deps, run);
-  const stallMin = Math.round(deps.config.limits.stallSeconds / 60);
+function budgetFor(deps: Deps, step: StepName): number {
+  return step === "fix"
+    ? deps.config.limits.developBudgetSeconds
+    : step === "review"
+      ? deps.config.limits.reviewBudgetSeconds
+      : deps.config.limits.prBudgetSeconds;
+}
+
+/**
+ * Generic per-step gate for fixing/auto_review/pr_round. Ensures the step's agent is
+ * alive, advances on `step-done` (or a merged PR), else runs the watchdog: a commit-HEAD
+ * stall heartbeat (fix/pr), a per-step budget, and liveness — escalating to `attention`
+ * only when the agent isn't actively working. Re-spawns a dead pane idempotently.
+ */
+async function reconcileStep(deps: Deps, run: Run, d: StepDescriptor): Promise<void> {
+  const step = deps.store.getRunStep(run.id, d.name);
+
+  // (Re)spawn if there's no live pane recorded for this step (first entry / crash gap).
+  if (!step || !step.paneId) {
+    await spawnStep(deps, run, d.name);
+    return;
+  }
+  // (Session id for on-demand query is captured at handoff time by spawnStep when the
+  // NEXT step starts — no per-tick backfill needed here.)
+
+  // The pr step opens the PR; fix/review run before any PR exists. Adopt only a live
+  // (open/merged) PR's number, and abandon only on a CLOSED PR that is *ours* — a stale
+  // CLOSED PR left on a reused branch name must not tear down a fresh attempt.
+  const pr = d.name === "pr" && run.branch ? await deps.github.prForBranch(deps.ghRepo, run.branch) : null;
+  if (pr && pr.state !== "CLOSED" && run.prNumber !== pr.number) deps.store.updateRun(run.id, { prNumber: pr.number });
+  if (pr && pr.state === "CLOSED" && pr.number === run.prNumber) return teardown(deps, run, "closed");
+  const livePr = pr && pr.state !== "CLOSED" ? pr : null;
+
+  // Advance when the agent signalled step-done (or its PR merged out from under us).
+  if (step.done || livePr?.state === "MERGED") {
+    const next = nextStep(d.name);
+    if (next) {
+      deps.store.updateRun(run.id, { phase: next.phase });
+      deps.log("info", `${run.ticketKey}: ${d.name} done -> ${next.phase}`);
+      await spawnStep(deps, run, next.name);
+      return;
+    }
+    // Last step (pr) done → hand off to the human-review watch, but only with a real PR.
+    // If the agent signalled done before a PR is visible (push lag / never opened), fall
+    // through to the watchdog rather than wedging in `reviewing` with no PR to watch.
+    if (livePr) return enterReviewing(deps, run, livePr.number);
+  }
+
+  // Not done — watchdog. Commit-HEAD heartbeat (fix/pr), per-step budget, and liveness.
+  const active = d.heartbeat ? await trackStepProgress(deps, run, d.name) : step;
   const stalled =
-    run.progressSig != null && run.progressAt != null && deps.now() - run.progressAt > deps.config.limits.stallSeconds;
+    d.heartbeat &&
+    active.progressSig != null &&
+    active.progressAt != null &&
+    deps.now() - active.progressAt > deps.config.limits.stallSeconds;
+  const budget = budgetFor(deps, d.name);
+  const overBudget = active.startedAt != null && deps.now() - active.startedAt > budget;
 
-  const pr = run.branch ? await deps.github.prForBranch(deps.ghRepo, run.branch) : null;
-
-  if (pr && (pr.state === "OPEN" || pr.state === "MERGED")) {
-    if (run.prNumber !== pr.number) {
-      deps.store.updateRun(run.id, { prNumber: pr.number });
-      run = deps.store.getRun(run.id)!;
-    }
-    const ready = run.workerDone || pr.state === "MERGED";
-    if (ready) {
-      // The optional review pass is a deterministic gate: spawn a dedicated review agent
-      // and hold in `auto_review` until it signals `review-done`. No review config → go
-      // straight to human review, exactly as before.
-      if (deps.config.review) {
-        await enterAutoReview(deps, run, pr.number);
-      } else {
-        await enterReviewing(deps, run, pr.number);
-      }
+  if (stalled || overBudget) {
+    const ws = active.paneId ? await deps.herdr.paneState(active.paneId) : "gone";
+    if (!stalled && ws === "working") {
+      deps.log("info", `${run.ticketKey}: ${d.name} past budget but still working — extending`);
       return;
     }
-
-    // PR open but the worker hasn't signalled. Anchor a grace clock to PR-open (not run
-    // start, so the window is the same regardless of how long development took). Escalate
-    // if the worker has stalled, or the grace elapsed and the worker isn't actively working
-    // — a "working" worker (e.g. its CI/bot round) is extended; idle/gone/blocked is stuck.
-    if (!run.watchDeadline) {
-      deps.store.updateRun(run.id, { watchDeadline: deps.now() + deps.config.limits.workerDoneGraceSeconds });
-      deps.log("info", `${run.ticketKey}: PR #${pr.number} open; awaiting worker-done`);
-      return;
-    }
-    const ws = run.paneId ? await deps.herdr.paneState(run.paneId) : "gone";
-    const graceExpired = deps.now() > run.watchDeadline;
-    if (stalled || (graceExpired && ws !== "working")) {
-      const graceMin = Math.round(deps.config.limits.workerDoneGraceSeconds / 60);
-      await escalateAttention(deps, run, {
-        reason: stalled ? "worker_stalled" : "worker_done_grace",
-        attentionReason: `PR #${pr.number} open but worker ${stalled ? "stalled" : "silent"} (worker: ${ws})`,
-        body: stalled
-          ? `PR #${pr.number} open but worker stalled ${stallMin}min — no new commits (worker: ${ws}).`
-          : `PR #${pr.number} open but no worker-done after ${graceMin}min (worker: ${ws}).`,
-        detail: { prNumber: pr.number, worker: ws },
-      });
-      return;
-    }
-    deps.log("info", `${run.ticketKey}: PR #${pr.number} open; awaiting worker-done (worker: ${ws})`);
+    await escalateAttention(deps, run, {
+      reason: stalled ? "step_stalled" : "step_budget",
+      attentionReason: `${d.name} step ${stalled ? "stalled" : "over budget"} (worker: ${ws})`,
+      body: stalled
+        ? `${d.name} step stalled ${Math.round(deps.config.limits.stallSeconds / 60)}min — no new commits (worker: ${ws}).`
+        : `${d.name} step over ${Math.round(budget / 60)}min budget (worker: ${ws}).`,
+      detail: { step: d.name, worker: ws },
+    });
     return;
   }
 
-  // No PR yet. The develop budget bounds time-to-PR, but a worker still making progress
-  // (committing) is extended so a legitimately long task isn't false-flagged. Escalate if
-  // stalled, or past budget with the worker not actively working.
-  const overBudget = deps.now() - run.createdAt > deps.config.limits.developBudgetSeconds;
-  if (!stalled && !overBudget) return;
-  const ws = run.paneId ? await deps.herdr.paneState(run.paneId) : "gone";
-  if (!stalled && ws === "working") {
-    deps.log("info", `${run.ticketKey}: past develop budget but worker still working — extending`);
+  // Agent pane died before signalling → re-spawn (idempotent recovery). Re-check `done`
+  // first: it may have flipped (step-done) after our earlier read, in which case the agent
+  // finished and exited — don't relaunch a completed step into a duplicate agent.
+  if (!(await deps.herdr.paneAlive(step.paneId))) {
+    if (deps.store.getRunStep(run.id, d.name)?.done) return; // finished; the next tick advances
+    deps.log("info", `${run.ticketKey}: ${d.name} pane gone — re-spawning`);
+    await spawnStep(deps, run, d.name);
     return;
   }
-  const budgetMin = Math.round(deps.config.limits.developBudgetSeconds / 60);
-  await escalateAttention(deps, run, {
-    reason: stalled ? "worker_stalled" : "develop_budget",
-    attentionReason: `${stalled ? "worker stalled" : "no PR within develop budget"} (worker: ${ws})`,
-    body: stalled
-      ? `No PR and worker stalled ${stallMin}min — no new commits (worker: ${ws}).`
-      : `No PR after ${budgetMin}min (worker: ${ws}).`,
-    detail: { worker: ws },
-  });
+  deps.log("info", `${run.ticketKey}: awaiting step-done ${d.name} (pane ${step.paneId})`);
 }
 
 /** Transition Jira to its review status and move the run into the human-review watch phase. */
@@ -242,58 +279,6 @@ async function enterReviewing(deps: Deps, run: Run, prNumber: number): Promise<v
   deps.store.updateRun(run.id, { phase: "reviewing", watchDeadline: deps.now() + deps.config.limits.watchHours * 3600 });
   deps.store.recordEvent({ runId: run.id, repo, ticketKey: run.ticketKey, type: "pr_opened", detail: { number: prNumber } });
   deps.log("info", `${run.ticketKey}: PR #${prNumber} -> reviewing`);
-}
-
-/** Spawn the dedicated review agent and hold the run in the `auto_review` gate. */
-async function enterAutoReview(deps: Deps, run: Run, prNumber: number): Promise<void> {
-  const repo = deps.config.repoName;
-  const pane = await spawnReview(deps, run);
-  deps.store.updateRun(run.id, {
-    phase: "auto_review",
-    reviewPane: pane,
-    reviewDone: false,
-    watchDeadline: deps.now() + deps.config.limits.reviewBudgetSeconds,
-  });
-  deps.store.recordEvent({ runId: run.id, repo, ticketKey: run.ticketKey, type: "review_spawned", detail: { paneId: pane, prNumber } });
-  deps.log("info", `${run.ticketKey}: PR #${prNumber} ready -> auto_review (pane ${pane})`);
-}
-
-/** Gate the run until the review agent signals `review-done` (or the review budget elapses). */
-async function reconcileAutoReview(deps: Deps, run: Run): Promise<void> {
-  const repo = deps.config.repoName;
-  const pr = run.branch ? await deps.github.prForBranch(deps.ghRepo, run.branch) : null;
-  if (pr && run.prNumber !== pr.number) deps.store.updateRun(run.id, { prNumber: pr.number });
-  const prNumber = pr?.number ?? run.prNumber ?? 0;
-
-  // PR resolved out from under us. A merged PR still flows through reviewing (consistent
-  // with developing's merged handling); a CLOSED/abandoned PR goes straight to teardown —
-  // routing it through enterReviewing would wrongly transition Jira to the review status.
-  if (pr && pr.state === "CLOSED") return teardown(deps, run, "closed");
-  if (pr && pr.state === "MERGED") return enterReviewing(deps, run, prNumber);
-
-  if (run.reviewDone) {
-    deps.store.recordEvent({ runId: run.id, repo, ticketKey: run.ticketKey, type: "review_done", detail: { paneId: run.reviewPane } });
-    deps.log("info", `${run.ticketKey}: review-done -> reviewing`);
-    return enterReviewing(deps, run, prNumber);
-  }
-
-  // Best-effort backstop: a stuck or silent review must not wedge the PR forever.
-  if (run.watchDeadline && deps.now() > run.watchDeadline) {
-    deps.log("warn", `${run.ticketKey}: review budget elapsed without review-done; proceeding to reviewing`);
-    deps.store.recordEvent({ runId: run.id, repo, ticketKey: run.ticketKey, type: "review_done", detail: { timedOut: true } });
-    return enterReviewing(deps, run, prNumber);
-  }
-
-  // Review agent died before signalling → re-spawn (idempotent recovery).
-  if (!run.reviewPane || !(await deps.herdr.paneAlive(run.reviewPane))) {
-    const pane = await spawnReview(deps, run);
-    deps.store.updateRun(run.id, { reviewPane: pane });
-    deps.store.recordEvent({ runId: run.id, repo, ticketKey: run.ticketKey, type: "review_spawned", detail: { paneId: pane, respawn: true } });
-    deps.log("info", `${run.ticketKey}: review agent re-spawned (pane ${pane})`);
-    return;
-  }
-
-  deps.log("info", `${run.ticketKey}: awaiting review-done (pane ${run.reviewPane})`);
 }
 
 async function reconcileReviewing(deps: Deps, run: Run): Promise<void> {
@@ -321,7 +306,13 @@ async function reconcileReviewing(deps: Deps, run: Run): Promise<void> {
   const wstate = run.paneId ? await deps.herdr.paneState(run.paneId) : "gone";
   if (wstate === "working") return; // don't pile on mid-fix
 
-  await wakeResolver(deps, run, pr.number);
+  // Only record the signature as handled if the resolver actually launched — otherwise a
+  // failed spawn would mark it done and never retry, silently dropping the review round.
+  const woke = await wakeResolver(deps, run, pr.number);
+  if (!woke) {
+    deps.log("warn", `${run.ticketKey}: resolver spawn failed; retrying next tick`);
+    return;
+  }
   deps.store.updateRun(run.id, { lastThreadSig: sig.sig });
   deps.store.recordEvent({ runId: run.id, repo, ticketKey: run.ticketKey, type: "resolver_woken", detail: { unresolved: sig.unresolved, failing: sig.failing } });
 }

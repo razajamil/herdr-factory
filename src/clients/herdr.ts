@@ -8,6 +8,7 @@ interface RawAgent {
   agent: string;
   agent_status: string;
   cwd: string;
+  agent_session?: { value?: string };
 }
 interface AgentListResp {
   result?: { agents?: RawAgent[] };
@@ -81,12 +82,18 @@ export class HerdrClient {
       agent: a.agent,
       agentStatus: a.agent_status,
       cwd: a.cwd,
+      sessionId: a.agent_session?.value ?? null,
     }));
   }
 
   async paneState(paneId: string): Promise<string> {
     const a = (await this.agents()).find((x) => x.paneId === paneId);
     return a?.agentStatus ?? "gone";
+  }
+
+  /** The claude session id herdr tracks for a pane (on-demand cross-agent query handle). */
+  async agentSessionId(paneId: string): Promise<string | null> {
+    return (await this.agents()).find((x) => x.paneId === paneId)?.sessionId ?? null;
   }
 
   async paneAlive(paneId: string): Promise<boolean> {

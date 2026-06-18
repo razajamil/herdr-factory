@@ -1,5 +1,5 @@
 import type Database from "better-sqlite3";
-import type { Clock, EventType, Outcome, Run, RunPatch } from "../types.ts";
+import type { Clock, EventType, Outcome, Run, RunPatch, RunStep, RunStepPatch, StepName } from "../types.ts";
 import { systemClock } from "../types.ts";
 
 interface RunRow {
@@ -16,11 +16,6 @@ interface RunRow {
   pr_number: number | null;
   watch_deadline: number | null;
   last_thread_sig: string | null;
-  worker_done: number;
-  review_done: number;
-  review_pane: string | null;
-  progress_sig: string | null;
-  progress_at: number | null;
   attention_reason: string | null;
   outcome: string | null;
   created_at: number;
@@ -43,16 +38,39 @@ function toRun(r: RunRow): Run {
     prNumber: r.pr_number,
     watchDeadline: r.watch_deadline,
     lastThreadSig: r.last_thread_sig,
-    workerDone: r.worker_done !== 0,
-    reviewDone: r.review_done !== 0,
-    reviewPane: r.review_pane,
-    progressSig: r.progress_sig,
-    progressAt: r.progress_at,
     attentionReason: r.attention_reason,
     outcome: r.outcome as Outcome | null,
     createdAt: r.created_at,
     updatedAt: r.updated_at,
     endedAt: r.ended_at,
+  };
+}
+
+interface RunStepRow {
+  id: number;
+  run_id: number;
+  step: string;
+  pane_id: string | null;
+  session_id: string | null;
+  progress_sig: string | null;
+  progress_at: number | null;
+  done: number;
+  started_at: number | null;
+  done_at: number | null;
+}
+
+function toRunStep(r: RunStepRow): RunStep {
+  return {
+    id: r.id,
+    runId: r.run_id,
+    step: r.step as StepName,
+    paneId: r.pane_id,
+    sessionId: r.session_id,
+    progressSig: r.progress_sig,
+    progressAt: r.progress_at,
+    done: r.done !== 0,
+    startedAt: r.started_at,
+    doneAt: r.done_at,
   };
 }
 
@@ -101,8 +119,8 @@ export class Store {
     const t = this.now();
     const info = this.db
       .prepare(
-        `INSERT INTO runs (repo, ticket_key, summary, issue_type, branch, phase, worker_done, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, 'claiming', 0, ?, ?)`,
+        `INSERT INTO runs (repo, ticket_key, summary, issue_type, branch, phase, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, 'claiming', ?, ?)`,
       )
       .run(input.repo, input.ticketKey, input.summary ?? null, input.issueType ?? null, input.branch ?? null, t, t);
     const run = this.getRun(Number(info.lastInsertRowid));
@@ -127,11 +145,6 @@ export class Store {
     if (patch.prNumber !== undefined) set("pr_number", patch.prNumber);
     if (patch.watchDeadline !== undefined) set("watch_deadline", patch.watchDeadline);
     if (patch.lastThreadSig !== undefined) set("last_thread_sig", patch.lastThreadSig);
-    if (patch.workerDone !== undefined) set("worker_done", patch.workerDone ? 1 : 0);
-    if (patch.reviewDone !== undefined) set("review_done", patch.reviewDone ? 1 : 0);
-    if (patch.reviewPane !== undefined) set("review_pane", patch.reviewPane);
-    if (patch.progressSig !== undefined) set("progress_sig", patch.progressSig);
-    if (patch.progressAt !== undefined) set("progress_at", patch.progressAt);
     if (patch.attentionReason !== undefined) set("attention_reason", patch.attentionReason);
     if (patch.outcome !== undefined) set("outcome", patch.outcome);
     if (sets.length === 0) return;
@@ -219,5 +232,50 @@ export class Store {
       type: string;
       detail: string | null;
     }[];
+  }
+
+  // --- run steps (one row per pipeline agent: fix / review / pr) --------------
+
+  getRunStep(runId: number, step: StepName): RunStep | undefined {
+    const row = this.db
+      .prepare("SELECT * FROM run_steps WHERE run_id = ? AND step = ?")
+      .get(runId, step) as RunStepRow | undefined;
+    return row ? toRunStep(row) : undefined;
+  }
+
+  runStepsFor(runId: number): RunStep[] {
+    return (this.db.prepare("SELECT * FROM run_steps WHERE run_id = ? ORDER BY id").all(runId) as RunStepRow[]).map(
+      toRunStep,
+    );
+  }
+
+  /** Insert the step row if missing, then apply the patch. Returns the fresh row. */
+  upsertRunStep(runId: number, step: StepName, patch: RunStepPatch = {}): RunStep {
+    if (!this.getRunStep(runId, step)) {
+      this.db.prepare("INSERT INTO run_steps (run_id, step, started_at) VALUES (?, ?, ?)").run(runId, step, this.now());
+    }
+    const sets: string[] = [];
+    const vals: Bind[] = [];
+    const set = (col: string, v: Bind) => {
+      sets.push(`${col} = ?`);
+      vals.push(v);
+    };
+    if (patch.paneId !== undefined) set("pane_id", patch.paneId);
+    if (patch.sessionId !== undefined) set("session_id", patch.sessionId);
+    if (patch.progressSig !== undefined) set("progress_sig", patch.progressSig);
+    if (patch.progressAt !== undefined) set("progress_at", patch.progressAt);
+    if (patch.startedAt !== undefined) set("started_at", patch.startedAt);
+    if (patch.done !== undefined) {
+      set("done", patch.done ? 1 : 0);
+      set("done_at", patch.done ? this.now() : null);
+    }
+    if (sets.length > 0) {
+      this.db.prepare(`UPDATE run_steps SET ${sets.join(", ")} WHERE run_id = ? AND step = ?`).run(...vals, runId, step);
+    }
+    return this.getRunStep(runId, step)!;
+  }
+
+  markStepDone(runId: number, step: StepName): void {
+    this.upsertRunStep(runId, step, { done: true });
   }
 }

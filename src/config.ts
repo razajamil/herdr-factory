@@ -4,6 +4,14 @@ import { isAbsolute, join } from "node:path";
 import { parse as parseYaml } from "yaml";
 import { z } from "zod";
 
+// Each pipeline agent (fix/review/pr) runs in its own herdr layout pane and is
+// driven by its own prompt file. All fields required — no defaults.
+const AgentSchema = z.object({
+  tab: z.string(),
+  pane: z.string(),
+  prompt_file: z.string(),
+});
+
 const RepoConfigSchema = z.object({
   repo: z.object({
     path: z.string(),
@@ -30,34 +38,22 @@ const RepoConfigSchema = z.object({
       })
       .prefault({}),
   }),
-  worker: z
-    .object({
-      bootstrap_cmd: z.string().optional(),
-      resolve_cmd: z.string().optional(),
-      // herdr fix-layout tab/pane the worker is dispatched into (defaults main/agent).
-      main_tab: z.string().default("main"),
-      agent_pane: z.string().default("agent"),
-    })
-    .prefault({}),
-  // Optional deterministic review pass. When present, the dispatcher inserts an
-  // `auto_review` phase after the worker opens its PR: a dedicated review agent is
-  // dispatched into tab/pane with prompt_file's CONTENTS as its prompt, and the ticket
-  // is gated until it signals `review-done`. Omit the whole block to skip review.
-  review: z
-    .object({
-      tab: z.string(),
-      pane: z.string(),
-      prompt_file: z.string(),
-    })
-    .optional(),
+  // The three pipeline agents — fix → review → pr — each in its own layout pane,
+  // each with its own prompt file. All three required (no defaults). Per-repo
+  // bootstrap/resolve guidance now lives inside these prompt files.
+  agents: z.object({
+    fix: AgentSchema,
+    review: AgentSchema,
+    pr: AgentSchema,
+  }),
   limits: z
     .object({
       max_active: z.coerce.number().int().positive().default(3),
       watch_hours: z.coerce.number().positive().default(7),
       develop_budget_seconds: z.coerce.number().int().positive().default(5400),
-      worker_done_grace_seconds: z.coerce.number().int().positive().default(1800),
       stall_seconds: z.coerce.number().int().positive().default(2700),
       review_budget_seconds: z.coerce.number().int().positive().default(1800),
+      pr_budget_seconds: z.coerce.number().int().positive().default(3600),
       tick_interval_seconds: z.coerce.number().int().positive().default(60),
     })
     .prefault({}),
@@ -67,6 +63,14 @@ export interface Secrets {
   jiraBaseUrl: string;
   jiraEmail: string;
   jiraApiToken: string;
+}
+
+/** One pipeline agent's layout target + its rendered prompt (file contents). */
+export interface AgentCfg {
+  tab: string;
+  pane: string;
+  promptFile: string;
+  prompt: string;
 }
 
 export interface Config {
@@ -81,9 +85,8 @@ export interface Config {
     statusInDev: string;
     statusReview: string;
   };
-  worker: { bootstrapCmd?: string; resolveCmd?: string; mainTab: string; agentPane: string };
-  review?: { tab: string; pane: string; promptFile: string; prompt: string };
-  limits: { maxActive: number; watchHours: number; developBudgetSeconds: number; workerDoneGraceSeconds: number; stallSeconds: number; reviewBudgetSeconds: number; tickIntervalSeconds: number };
+  agents: { fix: AgentCfg; review: AgentCfg; pr: AgentCfg };
+  limits: { maxActive: number; watchHours: number; developBudgetSeconds: number; stallSeconds: number; reviewBudgetSeconds: number; prBudgetSeconds: number; tickIntervalSeconds: number };
   guidance?: string;
   paths: {
     configDir: string;
@@ -161,21 +164,13 @@ export function loadConfig(repoName: string): Loaded {
   const guidancePath = join(repoDir, "guidelines-prompt.md");
   const guidance = existsSync(guidancePath) ? readFileSync(guidancePath, "utf8") : undefined;
 
-  let review: Config["review"];
-  if (parsed.review) {
-    const promptFile = isAbsolute(parsed.review.prompt_file)
-      ? parsed.review.prompt_file
-      : join(repoDir, parsed.review.prompt_file);
+  const mkAgent = (a: z.infer<typeof AgentSchema>, label: string): AgentCfg => {
+    const promptFile = isAbsolute(a.prompt_file) ? a.prompt_file : join(repoDir, a.prompt_file);
     if (!existsSync(promptFile)) {
-      throw new Error(`review.prompt_file not found: ${promptFile}`);
+      throw new Error(`agents.${label}.prompt_file not found: ${promptFile}`);
     }
-    review = {
-      tab: parsed.review.tab,
-      pane: parsed.review.pane,
-      promptFile,
-      prompt: readFileSync(promptFile, "utf8"),
-    };
-  }
+    return { tab: a.tab, pane: a.pane, promptFile, prompt: readFileSync(promptFile, "utf8") };
+  };
 
   const root = stateRoot();
   const stateDir = join(root, repoName);
@@ -192,20 +187,18 @@ export function loadConfig(repoName: string): Loaded {
       statusInDev: parsed.jira.status.in_development,
       statusReview: parsed.jira.status.review,
     },
-    worker: {
-      bootstrapCmd: parsed.worker.bootstrap_cmd,
-      resolveCmd: parsed.worker.resolve_cmd,
-      mainTab: parsed.worker.main_tab,
-      agentPane: parsed.worker.agent_pane,
+    agents: {
+      fix: mkAgent(parsed.agents.fix, "fix"),
+      review: mkAgent(parsed.agents.review, "review"),
+      pr: mkAgent(parsed.agents.pr, "pr"),
     },
-    review,
     limits: {
       maxActive: parsed.limits.max_active,
       watchHours: parsed.limits.watch_hours,
       developBudgetSeconds: parsed.limits.develop_budget_seconds,
-      workerDoneGraceSeconds: parsed.limits.worker_done_grace_seconds,
       stallSeconds: parsed.limits.stall_seconds,
       reviewBudgetSeconds: parsed.limits.review_budget_seconds,
+      prBudgetSeconds: parsed.limits.pr_budget_seconds,
       tickIntervalSeconds: parsed.limits.tick_interval_seconds,
     },
     guidance,

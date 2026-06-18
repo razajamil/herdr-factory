@@ -4,13 +4,13 @@ import { Command } from "commander";
 import { globalDbPath, loadConfig, type Config } from "./config.ts";
 import { openDb } from "./db/index.ts";
 import { Store } from "./db/store.ts";
-import { systemClock, type Run } from "./types.ts";
+import { systemClock, type Run, type StepName } from "./types.ts";
 import { HerdrClient } from "./clients/herdr.ts";
 import { JiraClient } from "./clients/jira.ts";
 import { GitHubClient } from "./clients/github.ts";
 import { GitClient, parseGhRepo } from "./clients/git.ts";
 import type { Deps, Logger } from "./core/deps.ts";
-import { claimTicket, reconcileRepo, teardownTicket } from "./core/reconcile.ts";
+import { claimTicket, reconcileRepo, reconcileRun, teardownTicket, withTickLock } from "./core/reconcile.ts";
 import { run } from "./clients/exec.ts";
 import * as launchd from "./launchd.ts";
 
@@ -76,21 +76,8 @@ program
   .action(async () => {
     try {
       const deps = await buildDeps(requireRepo());
-      const owner = `pid:${process.pid}`;
-      // TTL must exceed the longest healthy tick (a tick can block up to ~120s waiting on
-      // the layout pane) so a slow-but-live tick can't have its lock stolen by a manual
-      // `tick`; floor it at 300s independent of the (now 60s) interval. It only auto-expires
-      // on a genuinely crashed tick that never released.
-      const lockTtl = Math.max(deps.config.limits.tickIntervalSeconds * 2, 300);
-      if (!deps.store.acquireLock(`tick:${deps.config.repoName}`, owner, lockTtl)) {
-        deps.log("info", "another tick is already running — skipping");
-        return;
-      }
-      try {
-        await reconcileRepo(deps);
-      } finally {
-        deps.store.releaseLock(`tick:${deps.config.repoName}`, owner);
-      }
+      const ran = await withTickLock(deps, () => reconcileRepo(deps));
+      if (!ran) deps.log("info", "another tick is already running — skipping");
     } catch (e) {
       fail(e);
     }
@@ -120,6 +107,8 @@ program
         // ledger phase (where the loop thinks it is).
         const worker = r.paneId ? await deps.herdr.paneState(r.paneId) : "no-pane";
         console.log(fmt(r, `worker:${worker}`));
+        const steps = deps.store.runStepsFor(r.id);
+        if (steps.length) console.log(`      steps: ${steps.map((s) => `${s.step}${s.done ? "✓" : "●"}`).join(" ")}`);
       }
       if (finished.length) {
         console.log("");
@@ -169,38 +158,24 @@ program
   });
 
 program
-  .command("worker-done <key>")
-  .description("worker signals it has finished its automated round")
-  .action(async (key: string) => {
+  .command("step-done <key> <step>")
+  .description("a pipeline agent signals it finished its step (fix|review|pr)")
+  .action(async (key: string, step: string) => {
     try {
+      if (!["fix", "review", "pr"].includes(step)) fail(`step-done: step must be fix|review|pr (got "${step}")`);
       const deps = await buildDeps(requireRepo());
       const run = deps.store.activeRunForTicket(deps.config.repoName, key);
       if (!run) {
-        deps.log("warn", `${key}: no active run to mark worker-done`);
+        deps.log("warn", `${key}: no active run to mark step-done`);
         return;
       }
-      deps.store.updateRun(run.id, { workerDone: true });
-      deps.store.recordEvent({ runId: run.id, repo: deps.config.repoName, ticketKey: key, type: "worker_done" });
-      deps.log("info", `${key}: worker-done recorded`);
-    } catch (e) {
-      fail(e);
-    }
-  });
-
-program
-  .command("review-done <key>")
-  .description("review agent signals it has finished the auto_review pass")
-  .action(async (key: string) => {
-    try {
-      const deps = await buildDeps(requireRepo());
-      const run = deps.store.activeRunForTicket(deps.config.repoName, key);
-      if (!run) {
-        deps.log("warn", `${key}: no active run to mark review-done`);
-        return;
-      }
-      deps.store.updateRun(run.id, { reviewDone: true });
-      deps.store.recordEvent({ runId: run.id, repo: deps.config.repoName, ticketKey: key, type: "review_done" });
-      deps.log("info", `${key}: review-done recorded`);
+      deps.store.markStepDone(run.id, step as StepName);
+      deps.store.recordEvent({ runId: run.id, repo: deps.config.repoName, ticketKey: key, type: "step_done", detail: { step } });
+      deps.log("info", `${key}: step-done ${step} recorded`);
+      // Event nudge: advance the run immediately if no tick is mid-flight; otherwise the
+      // in-flight/next tick picks up the done flag. The tick is the backstop.
+      const ran = await withTickLock(deps, () => reconcileRun(deps, deps.store.getRun(run.id)!));
+      if (!ran) deps.log("info", `${key}: tick busy — next tick will advance the pipeline`);
     } catch (e) {
       fail(e);
     }

@@ -2,12 +2,16 @@
 
 export type Phase =
   | "claiming"
-  | "developing"
-  | "auto_review"
-  | "reviewing"
+  | "fixing" // fix agent
+  | "auto_review" // review agent
+  | "pr_round" // pr agent: opens the PR + drives the CI/bot round
+  | "reviewing" // human-review watch + resolver
   | "tearing_down"
   | "done"
   | "attention";
+
+/** The pipeline step a phase runs. */
+export type StepName = "fix" | "review" | "pr";
 
 export type Outcome = "merged" | "closed" | "abandoned" | "timeout";
 
@@ -21,6 +25,8 @@ export type EventType =
   | "worker_done"
   | "review_spawned"
   | "review_done"
+  | "step_spawned"
+  | "step_done"
   | "merged"
   | "closed"
   | "torn_down"
@@ -42,11 +48,6 @@ export interface Run {
   prNumber: number | null;
   watchDeadline: number | null; // epoch seconds
   lastThreadSig: string | null;
-  workerDone: boolean;
-  reviewDone: boolean;
-  reviewPane: string | null;
-  progressSig: string | null; // last-seen branch HEAD (worker progress heartbeat)
-  progressAt: number | null; // epoch seconds the heartbeat last advanced
   attentionReason: string | null;
   outcome: Outcome | null;
   createdAt: number; // epoch seconds
@@ -68,14 +69,28 @@ export type RunPatch = Partial<
     | "prNumber"
     | "watchDeadline"
     | "lastThreadSig"
-    | "workerDone"
-    | "reviewDone"
-    | "reviewPane"
-    | "progressSig"
-    | "progressAt"
     | "attentionReason"
     | "outcome"
   >
+>;
+
+/** One agent step of a run's pipeline (fix/review/pr), each in its own herdr pane. */
+export interface RunStep {
+  id: number;
+  runId: number;
+  step: StepName;
+  paneId: string | null;
+  sessionId: string | null; // the agent's claude session id (on-demand query handle)
+  progressSig: string | null; // last-seen branch HEAD (per-step heartbeat)
+  progressAt: number | null;
+  done: boolean;
+  startedAt: number | null;
+  doneAt: number | null;
+}
+
+/** Fields the reconciler may patch on a run step. */
+export type RunStepPatch = Partial<
+  Pick<RunStep, "paneId" | "sessionId" | "progressSig" | "progressAt" | "done" | "startedAt">
 >;
 
 /** epoch-seconds clock, injected for testability. */
@@ -122,6 +137,7 @@ export interface Agent {
   agent: string;
   agentStatus: string; // idle | working | done | blocked | unknown
   cwd: string;
+  sessionId: string | null; // herdr agent_session.value (the claude session id)
 }
 
 export type PrState = "OPEN" | "MERGED" | "CLOSED";

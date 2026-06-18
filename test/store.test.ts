@@ -14,7 +14,6 @@ describe("Store", () => {
     const { store } = makeStore();
     const run = store.createRun({ repo: "r", ticketKey: "K-1", summary: "s", issueType: "Bug", branch: "fix/K-1-s" });
     expect(run.phase).toBe("claiming");
-    expect(run.workerDone).toBe(false);
     expect(store.countActive("r")).toBe(1);
     expect(store.activeRunForTicket("r", "K-1")?.id).toBe(run.id);
   });
@@ -23,29 +22,40 @@ describe("Store", () => {
     const { store, tick } = makeStore(1000);
     const run = store.createRun({ repo: "r", ticketKey: "K-2" });
     tick(5);
-    store.updateRun(run.id, { phase: "developing", prNumber: 42, workerDone: true, workspaceId: "w1" });
+    store.updateRun(run.id, { phase: "fixing", prNumber: 42, workspaceId: "w1" });
     const got = store.getRun(run.id)!;
-    expect(got.phase).toBe("developing");
+    expect(got.phase).toBe("fixing");
     expect(got.prNumber).toBe(42);
-    expect(got.workerDone).toBe(true);
     expect(got.workspaceId).toBe("w1");
     expect(got.updatedAt).toBe(1005);
   });
 
-  it("round-trips review gate fields (default false, then patched)", () => {
+  it("run_steps: upsert inserts then patches, markStepDone, per-run listing", () => {
     const { store } = makeStore();
     const run = store.createRun({ repo: "r", ticketKey: "K-R" });
-    expect(run.reviewDone).toBe(false);
-    expect(run.reviewPane).toBeNull();
-    expect(run.progressSig).toBeNull();
-    expect(run.progressAt).toBeNull();
-    store.updateRun(run.id, { phase: "auto_review", reviewPane: "w1:rp", reviewDone: true, progressSig: "abc123", progressAt: 1234 });
-    const got = store.getRun(run.id)!;
-    expect(got.phase).toBe("auto_review");
-    expect(got.reviewPane).toBe("w1:rp");
-    expect(got.reviewDone).toBe(true);
-    expect(got.progressSig).toBe("abc123");
+    expect(store.getRunStep(run.id, "fix")).toBeUndefined();
+
+    // first upsert inserts the row + applies the patch
+    const fix = store.upsertRunStep(run.id, "fix", { paneId: "w1:p1" });
+    expect(fix.step).toBe("fix");
+    expect(fix.paneId).toBe("w1:p1");
+    expect(fix.done).toBe(false);
+    expect(fix.startedAt).not.toBeNull();
+
+    // subsequent upserts patch in place (no duplicate row)
+    store.upsertRunStep(run.id, "fix", { sessionId: "sess-1", progressSig: "sha1", progressAt: 1234 });
+    const got = store.getRunStep(run.id, "fix")!;
+    expect(got.paneId).toBe("w1:p1"); // preserved
+    expect(got.sessionId).toBe("sess-1");
+    expect(got.progressSig).toBe("sha1");
     expect(got.progressAt).toBe(1234);
+
+    store.markStepDone(run.id, "fix");
+    expect(store.getRunStep(run.id, "fix")!.done).toBe(true);
+    expect(store.getRunStep(run.id, "fix")!.doneAt).not.toBeNull();
+
+    store.upsertRunStep(run.id, "review", { paneId: "w1:p2" });
+    expect(store.runStepsFor(run.id).map((s) => s.step)).toEqual(["fix", "review"]);
   });
 
   it("ends a run -> not active, has outcome + ended_at", () => {

@@ -85,10 +85,9 @@ herdr-cats/
     types.ts              shared domain types
     db/{index,migrate,store}.ts
     clients/{exec,herdr,jira,github,git}.ts
-    core/{deps,branch,worker,watch,reconcile}.ts
+    core/{deps,branch,step,watch,reconcile}.ts
     launchd.ts
-  templates/worker-brief.md
-  examples/example-repo/{config.yml, guidelines-prompt.md}
+  examples/example-repo/{config.yml, fix.md, review.md, pr.md, guidelines-prompt.md}
   test/                   vitest
 ```
 
@@ -111,23 +110,22 @@ out to `herdr …` and parses its JSON; it contains zero terminal/worktree logic
   worktree registration)
 - workspace **close / get / list**
 - tab **create / list**
-- pane **split / run / send-text / send-keys / list**
-- agent **start / list / status / send / rename**
+- pane **split / run / send-text / send-keys / list / read**
+- agent **start / list / status / send / rename / read / wait**
 - desktop **notifications**
 
-**The fix layout** (a tab `main` with a pane `agent`, plus dev-server / review /
-etc. panes) is applied by the external **workspace-manager herdr plugin** on
-`worktree.created`. herdr-cats does **not** apply layouts — it relies on the plugin
-and simply *targets* the resulting panes: the `main`/`agent` pane for the worker
-(configurable via `worker.main_tab` / `worker.agent_pane`) and, if a `review` block
-is configured, its `review.tab` / `review.pane` for the review agent. If a targeted
-pane is absent it degrades gracefully (see [§8](#8-worker-model)).
+**The fix layout** (a tab/pane per pipeline agent) is applied by the external
+**workspace-manager herdr plugin** on `worktree.created`. herdr-cats does **not** apply
+layouts — it relies on the plugin and simply *targets* the resulting panes: one per
+agent, from `agents.{fix,review,pr}.tab` / `.pane` in config. If a targeted pane is
+absent it degrades gracefully (see [§8](#8-step-agent-model)).
 
 **herdr-cats performs git/filesystem ops ONLY for things outside herdr's model:**
 
 - `git branch -D <branch>` on teardown — the one remnant herdr leaves (herdr
   models worktrees, not branches)
-- read/maintenance git: `show-ref`, `remote get-url`, defensive `worktree prune`
+- read/maintenance git: `show-ref`, `remote get-url`, `rev-parse HEAD` (the worker
+  heartbeat), defensive `worktree prune`
 - everything non-terminal: Jira REST, GitHub via `gh`, SQLite, config, the
   reconciler logic
 
@@ -164,7 +162,8 @@ reverse-engineered during the bash prototype.
 - **`github.ts`** (`gh` via execFile) — `prForBranch(repo, branch)`,
   `reviewSignature(repo, n) → {unresolved, failing, sig}` (graphql review threads
   + `statusCheckRollup`).
-- **`git.ts`** — `branchExists`, `branchDelete`, `originUrl`, `worktreePrune`.
+- **`git.ts`** — `branchExists`, `branchDelete`, `originUrl`, `worktreePrune`,
+  `headSha` (the worker progress heartbeat).
 
 ---
 
@@ -183,12 +182,20 @@ CREATE TABLE runs(                       -- ONE attempt at a ticket (history kep
   id INTEGER PRIMARY KEY AUTOINCREMENT, repo TEXT NOT NULL, ticket_key TEXT NOT NULL,
   summary TEXT, issue_type TEXT, branch TEXT, phase TEXT NOT NULL,
   workspace_id TEXT, pane_id TEXT, worktree_path TEXT, pr_number INTEGER,
-  watch_deadline INTEGER, last_thread_sig TEXT, worker_done INTEGER DEFAULT 0,
-  review_done INTEGER DEFAULT 0, review_pane TEXT,   -- auto_review gate (migration v2)
-  progress_sig TEXT, progress_at INTEGER,            -- worker heartbeat (migration v3)
+  watch_deadline INTEGER, last_thread_sig TEXT,
+  -- worker_done/review_done/review_pane/progress_* (migrations v2-v3) are superseded
+  -- by run_steps and left in place for history only.
   attention_reason TEXT, outcome TEXT,   -- merged|closed|abandoned|timeout|NULL
   created_at INTEGER, updated_at INTEGER, ended_at INTEGER);
 CREATE INDEX idx_runs_active ON runs(repo) WHERE ended_at IS NULL;
+
+CREATE TABLE run_steps(                  -- one row per pipeline agent (migration v4)
+  id INTEGER PRIMARY KEY AUTOINCREMENT, run_id INTEGER NOT NULL,
+  step TEXT NOT NULL,                    -- fix | review | pr
+  pane_id TEXT, session_id TEXT,         -- on-demand cross-agent query handles
+  progress_sig TEXT, progress_at INTEGER,   -- per-step commit heartbeat
+  done INTEGER NOT NULL DEFAULT 0, started_at INTEGER, done_at INTEGER);
+CREATE INDEX idx_run_steps ON run_steps(run_id, step);
 
 CREATE TABLE events(                     -- the timeline (web-UI gold)
   id INTEGER PRIMARY KEY AUTOINCREMENT, run_id INTEGER, repo TEXT, ticket_key TEXT,
@@ -209,109 +216,184 @@ CREATE TABLE schema_version(version INTEGER);
 resolves it. History is never deleted (we set `ended_at`), so the web UI can show
 attempts, outcomes, and durations.
 
-**event types:** `claimed · transition · worktree_created · worker_spawned ·
-pr_opened · resolver_woken · worker_done · merged · closed · torn_down ·
-attention · error`.
+**event types:** `claimed · transition · worktree_created · step_spawned · step_done ·
+pr_opened · resolver_woken · merged · closed · torn_down · attention · error`
+(plus legacy `worker_*` / `review_*` kept for old-run history).
 
 ---
 
-## 7. The reconciler (phase machine)
+## 7. The reconciler — multi-agent pipeline
 
-`core/reconcile.ts` → `reconcileRepo(deps)`:
+`core/reconcile.ts` → `reconcileRepo(deps)`: **Phase A** advances every active run one
+idempotent step; **Phase B** claims eligible Jira tickets up to `maxActive`. Per-run
+errors are caught → recorded as an `error` event → the tick continues; a per-repo
+single-instance lock prevents overlapping ticks.
 
-- **Phase A** — advance every `activeRuns(repo)` one idempotent step.
-- **Phase B** — claim eligible Jira tickets up to `maxActive`.
+### The pipeline
 
-Per-run errors are caught → recorded as an `error` event → the tick continues.
-A per-repo single-instance lock prevents overlapping ticks.
+A ticket flows through a sequence of **single-responsibility agents**, each a separate
+herdr agent in its own tab/pane, dispatched and gated by the reconciler:
 
+| Phase | Agent | Does | Hands off |
+|---|---|---|---|
+| `fixing` | **fix** | read ticket + images → implement → lint/type/tests → commit | `handoff-fix.md` + `step-done fix` |
+| `auto_review` | **review** | fresh-eyes review of the diff → make changes → commit | `handoff-review.md` + `step-done review` |
+| `pr_round` | **pr** | open + push the PR → drive the automated round (CI green + bot comments) | `step-done pr` → human review |
+
+The agents come from the required `agents.{fix,review,pr}` config (each
+`{tab, pane, prompt_file}`); `core/step.ts` holds the ordered `STEPS` descriptors that
+sequence them and a generic `reconcileStep` gates each. After `pr_round`, the run enters
+the `reviewing` human-review watch (unchanged: watches the PR, wakes a resolver).
+
+```mermaid
+flowchart TD
+    subgraph PIPE["Pipeline — one agent per step, each in its own herdr pane"]
+      direction TB
+      fix["fix agent<br/>implement → verify → commit"]
+      review["review agent<br/>fresh-eyes review → commit"]
+      pr["pr agent<br/>open + push PR → CI / bot round"]
+      fix -->|"agent → herdr-cats step-done KEY fix<br/>(+ writes handoff-fix.md)"| review
+      review -->|"agent → herdr-cats step-done KEY review<br/>(+ writes handoff-review.md)"| pr
+    end
+
+    subgraph DISP["Dispatcher — core/reconcile"]
+      direction TB
+      tick["TICK · level-triggered<br/>disp → gh pr view / checks · Jira REST · watchdog"]
+      nudge["step-done EVENT · edge-triggered<br/>reconcile this run now"]
+    end
+
+    todo["Jira: To Do (labelled)"] -->|"disp → herdr worktree create<br/>Jira REST → In Development"| wt["herdr worktree + workspace"]
+    wt -->|"disp → herdr agent send (spawn fix)"| fix
+    pr -->|"agent → herdr-cats step-done KEY pr<br/>disp → Jira REST → In Review"| human["reviewing<br/>human review (dispatcher-watched)"]
+    human -->|"disp → herdr worktree remove<br/>· git branch -D"| done["done (merged / closed)"]
+
+    nudge -.->|"disp → herdr agent send (spawn next step)"| PIPE
+    tick -.->|"disp → gh pr checks · review threads"| human
+    tick -.->|"disp → herdr notification show"| attention["attention<br/>(holds slot)"]
+
+    review -.->|"on-demand → herdr agent read fix-pane"| fix
+    pr -.->|"on-demand → herdr agent read / send prior-pane"| review
 ```
-  To Do ──claim──────────> claiming ──ensure worktree+worker, transition In Dev──> developing
-  (label)                                                                              │
-                                          PR open AND worker_done ─────────────────────┤
-                                                                                       │
-                          ┌─ review configured ─> auto_review ─review_done/budget─┐    │
-                          │  (spawn review agent; gate on review-done)            │    │
-                          └─ no review ──────────────────────────────────────────┴────┤
-                                              transition Review, set 7h deadline        │
-                                                                                       ▼
-                                                                                  reviewing
-   ┌───────────────────────────────────────────────────────────────────────────────┤
-   │ watch.reviewStep each tick (≤ deadline): new comments/failing checks → wake     │
-   │ resolver (reuse worker pane); merged/closed → teardown; deadline → attention    │
-   ▼                                                                                  │
- tearing_down ──herdr worktree remove + git branch -D──> done (ended_at set)          │
-                                                                                       │
- (no PR past develop budget, OR PR open but silent past worker_done grace — both        │
-  when not "working"; OR no commits for stall_seconds) ─────────> attention ───────────┘
-```
 
-Phase gates of note:
-- **developing → reviewing** is gated on **`worker_done`** (the worker's explicit
-  signal), never on flappy agent status. Three safety nets catch a worker that
-  never signals, all escalating to `attention`:
-  - **no PR** within `develop_budget`, and **PR open but silent** for
-    `worker_done_grace` (anchored to PR-open, so the window is the same for a 5-min
-    and a 5-hr task) — both fire only when the worker isn't actively `working`, so a
-    still-working worker is *extended* and long tasks aren't false-flagged.
-  - **heartbeat/stall**: the branch HEAD is probed each tick (`git rev-parse HEAD`);
-    a moving HEAD resets a progress clock (`progress_at`), so any amount of real
-    work keeps the run alive regardless of total runtime. If HEAD doesn't move for
-    `stall_seconds`, the run is **stalled** → `attention`, *even if the agent still
-    reports `working`* — this is what catches a hung-but-`working` worker. (Residual:
-    a worker doing very long stretches of *uncommitted* work can look stalled; raise
-    `stall_seconds` if that's common — the signal is commits, not file edits.)
-- **auto_review** is inserted between developing and reviewing **only when a
-  `review` block is configured**. The dispatcher spawns the review agent and holds
-  the run until `review_done` (set by `herdr-cats review-done <KEY>`); a
-  `review_budget_seconds` timeout proceeds best-effort so a stuck review never
-  wedges the PR, and a dead review pane is re-spawned idempotently. With no `review`
-  block the lifecycle is unchanged (developing → reviewing directly).
-- The worker is always tracked by its **exact `pane_id`** (the layout spawns
-  other agents in the workspace; "first claude" would read the wrong one); the
-  review agent is tracked separately by `review_pane`.
+Every edge is labelled with the command(s) that propagate state across it, by actor:
+
+- **`agent →`** — run by the step agent in its pane. The single `herdr-cats step-done
+  KEY <step>` call is *all* an agent issues to advance the pipeline (it also writes its
+  handoff note first); the dispatcher does everything else.
+- **`disp →`** — run by the dispatcher (`core/reconcile`) over the herdr socket
+  (`herdr worktree …`, `herdr agent send`, `herdr notification show`), `gh`, and `git`,
+  plus Jira REST for the status transitions (not a CLI).
+- **`on-demand →`** — optional cross-agent context pulls a later agent may make.
+
+Solid edges are the deterministic forward flow; dashed edges are orchestration + queries.
+
+### Handoff between steps
+
+A step never inherits the prior step's chat context — that would bloat tokens and,
+for `review`, destroy the fresh-eyes value. Context crosses a boundary two ways:
+
+- **Structured handoff doc (default).** The outgoing agent writes
+  `.memory/herdr-cats/handoff-<step>.md`: what it did, key decisions and *why*,
+  what's uncertain, what the next step should verify. Deliberately lossy — keeps the
+  signal, drops the transcript noise. This is the next agent's primary input.
+- **On-demand pointer to the prior session.** The dispatcher hands the next agent the
+  prior step's **pane id + session id** (herdr exposes `agent_session.value` per pane via
+  `agent list`; captured into `run_steps.session_id`). When the doc isn't enough, the next
+  agent escalates cheapest-first — see [§8](#8-step-agent-model).
+
+The git worktree is the shared medium: commits flow forward automatically; the
+handoff doc + session pointer carry the *intent* the commits don't.
+
+### Orchestration — hybrid tick + event
+
+A single global poll fits a many-handoff pipeline poorly: internal handoffs need no
+polling (the dispatcher has everything the instant a step signals), so folding N of
+them into a 60 s tick injects N× latency for nothing. The target splits transitions
+by what they actually need:
+
+- **Tick (level-triggered) — robustness backbone.** External-state polling
+  (PR / CI / Jira — no cheap event source locally), per-step watchdogs / timeouts /
+  liveness, and the self-healing reconcile pass that re-derives truth and catches a
+  dropped signal. *More* valuable here than before: more steps = more signals = more
+  chances to miss one.
+- **Event nudge (edge-triggered) — latency.** A `step-done <step>` signal triggers an
+  immediate reconcile of that run, dispatching the next agent without waiting a tick.
+  The tick stays the backstop if a nudge is lost.
+
+### How it's wired
+
+- **State (§6):** a run tracks a *sequence* of panes (earlier ones stay alive for
+  querying) in `run_steps`, not a single `pane_id`. `run.pane_id` is kept pointed at the
+  *latest* step's pane (the `reviewing` resolver reuses it). Teardown (herdr `worktree
+  remove`) reaps all of a run's panes at once.
+- **Liveness:** the commit-HEAD heartbeat applies to `fix` / `pr` (they commit) but not
+  `review` (`STEPS[].heartbeat`); each step also has its own budget
+  (`develop_/review_/pr_budget_seconds`).
+- **Coordination:** on-demand `agent read` / `agent send` is agent-to-agent traffic
+  *outside* the tick, so the dispatcher is no longer the sole coordinator and the DB
+  timeline no longer captures every inter-agent interaction.
+
+### Trade-offs (why this isn't an obvious win)
+
+- **Lossy handoffs + feedback loops.** CI failures and review comments loop *back* to
+  code-fixing, so a clean linear `fix → review → pr` relay fights the work's real,
+  iterative shape; on-demand query softens the lossy part, the loops remain.
+- **Cost & accountability.** ~3 panes / sessions per ticket vs. 1; no single agent
+  owns the outcome end-to-end (diffusion of responsibility).
+- **Why keep the dispatcher in charge anyway:** the `pr` step does *not* re-implement
+  CI watching as an idle LLM — the **tick** still owns external watching
+  (deterministic, cheap). Separation is reserved for steps with genuine fresh-eyes /
+  specialization value (review), not "one agent per verb."
 
 ---
 
-## 8. Worker model
+## 8. Step-agent model
 
-Unchanged from the proven design; all spawning is via herdr.
+Each step is a Claude agent (`core/step.ts`) dispatched **by the reconciler, never by
+another agent**, through the shared `dispatchToLayout(tab, pane, prompt, …)` helper. Per
+step (`spawnStep`):
 
-1. **Dispatch into the layout's worker pane** — the `main_tab` / `agent_pane`
-   labels from config (default `main`/`agent`). Wait (bounded) for the
-   workspace-manager plugin to apply the layout, then `herdr agent send` the
-   brief to the `claude` it started there + `pane send-keys Enter`. If the pane
-   has no claude → `herdr pane run "claude …"` in it. If the pane never appears →
-   fall back to `herdr agent start`. Store the resulting `pane_id`; rename the
-   agent **`cat:<KEY>`**.
-2. **Brief** is rendered from `templates/worker-brief.md` (template literals — no
-   `sed` escaping), injecting the repo's bootstrap command, and the per-repo
-   `guidelines-prompt.md` is appended verbatim. The worker runs *inside the target
-   repo's worktree*, so it inherits that repo's `CLAUDE.md`/skills natively — the
-   brief stays generic. The brief carries **no review step**: review is a
-   deterministic dispatcher-owned phase, not something the worker is asked to do.
-3. **Flow:** read ticket + downloaded images → implement → tests/verify →
-   screenshot evidence to **gitignored `.memory/herdr-cats/evidence`**
-   (best-effort, under the machine-global capture lock) → open PR (**code only**)
-   → attach the screenshots **inline to the PR description** as GitHub
-   `user-attachments` (uploaded via the browser; **never committed to the repo**)
-   → ~10-min automated round (CI green + bot comments) → **signal done**.
-4. **worker-done handshake (CLI → DB):** the worker calls
-   `herdr-cats --repo <name> worker-done <KEY>`, which sets `worker_done=1` and
-   records a `worker_done` event. The reconciler reads the flag to gate
-   developing → (auto_review →) reviewing. (Replaces the old marker file; also a
-   timeline entry.)
-5. **Review agent (optional, `core/review.ts`):** if a `review` block is configured,
-   the reconciler — *not* the worker — dispatches a dedicated review agent into
-   `review.tab` / `review.pane` once the worker is done (see [§auto_review](#7-the-state-machine)).
-   Its prompt is the **contents** of `review.prompt_file` plus a footer telling it to
-   commit/push any changes and then run `herdr-cats --repo <name> review-done <KEY>`.
-   That `review-done` signal (sets `review_done=1`) is what releases the gate; a
-   `review_budget_seconds` timeout backstops a stuck or silent review. Same handshake
-   shape as worker-done, but driven entirely by the dispatcher so it can't be skipped.
+1. **Dispatch** into the step's configured `tab`/`pane` (`agents.<step>`): wait bounded
+   for that pane's idle claude → `agent send`; else `pane run "claude …"`; else
+   `agent start` a dedicated pane. Rename `<step>:<KEY>`; record the pane on the
+   `run_steps` row (and as `run.pane_id`, the latest active pane).
+2. **Prompt** — `renderStepPrompt` substitutes tokens (`@@KEY@@`, `@@HANDOFF_IN@@`,
+   `@@PRIOR_PANE@@`, `@@STEP_DONE_CMD@@`, …) into the step's `prompt_file` contents,
+   appends `guidelines-prompt.md`, and appends a standard footer that points the agent at
+   its inputs and tells it to write its handoff note + signal `step-done`. The rendered
+   prompt is written to `.memory/herdr-cats/prompt-<step>.md`; the agent is told to read it.
+3. **Handoff out** — before signalling, the agent writes
+   `.memory/herdr-cats/handoff-<step>.md` (did / why / uncertain / verify-next).
+4. **Signal** — `herdr-cats --repo <name> step-done <KEY> <step>` sets the step's `done`
+   flag + records a `step_done` event, then **event-nudges**: it grabs the per-repo tick
+   lock and reconciles the run immediately (dispatching the next agent) if no tick is
+   mid-flight; otherwise the next tick advances it.
 
-The capture lock is **machine-global** (one dev-server/browser at a time across
-all repos) — a `locks` row, acquired with a TTL, exposed via the CLI for workers.
+### On-demand context — the handoff+query protocol
+
+The next agent defaults to the handoff doc and escalates only when it's insufficient,
+cheapest-first, using herdr's agent-awareness:
+
+| Need | Mechanism | Cost / caveat |
+|---|---|---|
+| factual detail ("what did you try for X?") | `herdr agent read <prior-pane> --source recent`, or read the session transcript by its id | cheap; works even if the prior agent has exited |
+| intent ("*why* not handle Y?") | `agent send <prior-pane> "<q>"` → `agent wait --status idle` → `agent read` | needs the prior agent still alive; slow; prone to post-hoc confabulation |
+
+The example prompts tune this per step: **review** leans on the handoff note + session id
+for *factual* lookups only (to protect its independence); **pr** queries more freely since
+it must describe and defend work it didn't do. Prior agents stay alive until run teardown,
+so live Q&A is available — at the cost of up to 3 panes/sessions per run.
+
+### Per-step liveness
+
+The tick's watchdog (`reconcileStep`) gates each step on `step-done`, with safety nets:
+the commit-HEAD **stall** heartbeat (`fix` / `pr` only — `review` may not commit) and a
+per-step **budget** (`develop_/review_/pr_budget_seconds`). Past the budget while the
+agent isn't actively `working`, or stalled past `stall_seconds`, the run → `attention`; a
+dead pane is re-spawned idempotently. Same shape as the single-worker safety nets before.
+
+The capture lock stays **machine-global** (one dev-server / browser across all
+repos), acquired with a TTL via the CLI.
 
 ---
 
@@ -331,7 +413,8 @@ directory, and the git worktree registration; it leaves only the local branch
 **defensive-only fallbacks** (run only if herdr somehow leaves remnants), not the
 primary path. Deleting the local branch lets a re-claim of the same ticket start
 fresh off the base ref instead of reattaching old commits. The remote/PR branch
-is GitHub's domain (merge auto-delete or left as-is).
+is GitHub's domain (merge auto-delete or left as-is). (Under the §7/§8 proposal,
+teardown reaps **all** of a run's step panes, not just one.)
 
 ---
 
@@ -350,16 +433,15 @@ is GitHub's domain (merge auto-delete or left as-is).
       cats would collide on one branch). Default when unset:
       `{{ticket_prefix}}/{{ticket_id}}-{{ticket_slug}}` (rendered by `core/branch.ts`).
     - `jira` — `project` / `board` / `label` / 3 `status` names
-    - `worker` — `bootstrap_cmd` / `resolve_cmd`, plus `main_tab` / `agent_pane`
-      (the herdr fix-layout tab/pane the worker is dispatched into; default
-      `main`/`agent`)
-    - `review` — **optional**; omit to skip review entirely. `tab` / `pane` (the
-      herdr layout pane the review agent runs in) + `prompt_file` (path relative to
-      the repo config dir; its contents become the review agent's prompt)
-    - `limits` — `max_active` / `watch_hours` / `develop_budget_seconds` /
-      `worker_done_grace_seconds` / `stall_seconds` / `review_budget_seconds` /
+    - `agents` — **required**, one block each for `fix` / `review` / `pr`, every field
+      required (no defaults): `tab` / `pane` (the herdr layout pane that agent runs in) +
+      `prompt_file` (path relative to the repo config dir; its contents, with tokens
+      substituted, become that agent's prompt). Per-repo bootstrap/resolve guidance lives
+      inside these prompt files.
+    - `limits` — `max_active` / `watch_hours` / `develop_budget_seconds` (fix) /
+      `review_budget_seconds` / `pr_budget_seconds` / `stall_seconds` /
       `tick_interval_seconds`
-  - `guidelines-prompt.md` — optional; appended verbatim to every worker brief.
+  - `guidelines-prompt.md` — optional; appended verbatim to every agent prompt.
 - `config.ts` asserts `repo.path` is a **main checkout** (not a linked worktree),
   since herdr can't create worktrees from one.
 
@@ -372,7 +454,7 @@ layout (workspace-manager plugin), `herdr-cats --repo <name> install`.
 
 ```
 herdr-cats --repo <name> tick | status | eligible | claim <KEY> | teardown <KEY>
-herdr-cats --repo <name> worker-done <KEY>          # the worker calls this (CLI → DB)
+herdr-cats --repo <name> step-done <KEY> <fix|review|pr>   # an agent → dispatcher (CLI → DB, event-nudges)
 herdr-cats --repo <name> install | uninstall | start | stop | logs [N]
 herdr-cats --repo <name> runs [--all] | timeline <KEY>   # read the DB
 herdr-cats capture-lock acquire|release <owner>     # machine-global, no --repo
@@ -449,10 +531,11 @@ Hard-won from the bash prototype — encode as types/tests/asserts:
 The bash loop is already decommissioned, so there is no parallel-run/double-claim
 risk: build, validate read-only, do one guarded single-ticket run, then install.
 
-**Status:** M0–M6 complete — installed and running unsupervised
-(`com.herdr-cats.reckon-frontend`, 60 s tick); the full lifecycle has been
-validated end-to-end (claim → worktree → worker → In Development → PR → review →
-teardown).
+**Status:** M0–M6 complete. The §7/§8 multi-agent pipeline (fix → review → pr agents,
+handoff docs, on-demand session query, hybrid tick+event) is **implemented and
+unit-tested**; the single-worker lifecycle was previously validated end-to-end, and the
+pipeline still needs a live end-to-end run against herdr before re-installing
+unsupervised.
 
 ---
 

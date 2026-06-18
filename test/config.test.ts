@@ -12,7 +12,14 @@ afterEach(() => {
   delete process.env.HERDR_CATS_STATE_ROOT;
 });
 
-function setup(yml: string, opts?: { guidance?: string; reviewPrompt?: string }) {
+// A valid `agents` block (all three required) for configs that don't test agents themselves.
+const AGENTS = `agents:
+  fix:    { tab: fix,    pane: agent, prompt_file: fix.md }
+  review: { tab: review, pane: agent, prompt_file: review.md }
+  pr:     { tab: pr,     pane: agent, prompt_file: pr.md }
+`;
+
+function setup(yml: string, opts?: { guidance?: string; prompts?: Record<string, string> }) {
   const base = mkdtempSync(join(tmpdir(), "cats-"));
   cleanups.push(() => rmSync(base, { recursive: true, force: true }));
   const repoPath = join(base, "repo");
@@ -21,7 +28,8 @@ function setup(yml: string, opts?: { guidance?: string; reviewPrompt?: string })
   mkdirSync(repoDir, { recursive: true });
   writeFileSync(join(repoDir, "config.yml"), yml.replaceAll("__REPO__", repoPath));
   if (opts?.guidance) writeFileSync(join(repoDir, "guidelines-prompt.md"), opts.guidance);
-  if (opts?.reviewPrompt !== undefined) writeFileSync(join(repoDir, "review-prompt.md"), opts.reviewPrompt);
+  const prompts = opts?.prompts ?? { "fix.md": "FIX prompt\n", "review.md": "REVIEW prompt\n", "pr.md": "PR prompt\n" };
+  for (const [name, body] of Object.entries(prompts)) writeFileSync(join(repoDir, name), body);
   writeFileSync(join(base, "cfg", "env"), "JIRA_BASE_URL=https://x.atlassian.net/\nJIRA_EMAIL=me@x.com\nJIRA_API_TOKEN=tok\n");
   process.env.HERDR_CATS_CONFIG_DIR = join(base, "cfg");
   process.env.HERDR_CATS_STATE_ROOT = join(base, "state");
@@ -41,9 +49,7 @@ jira:
     todo: To Do
     in_development: In development
     review: Ready for Code Review
-worker:
-  bootstrap_cmd: mise run setup
-`,
+${AGENTS}`,
       { guidance: "- use the X skill" },
     );
     const { config, secrets } = loadConfig("demo");
@@ -53,12 +59,9 @@ worker:
     expect(config.jira.board).toBe("254"); // coerced number → string
     expect(config.jira.label).toBe("agent"); // default
     expect(config.jira.statusInDev).toBe("In development");
-    expect(config.worker.bootstrapCmd).toBe("mise run setup");
-    expect(config.worker.mainTab).toBe("main"); // default
-    expect(config.review).toBeUndefined(); // no review block → review skipped
-    expect(config.limits.workerDoneGraceSeconds).toBe(1800); // default
     expect(config.limits.stallSeconds).toBe(2700); // default
     expect(config.limits.reviewBudgetSeconds).toBe(1800); // default
+    expect(config.limits.prBudgetSeconds).toBe(3600); // default
     expect(config.limits.tickIntervalSeconds).toBe(60); // default
     expect(config.limits.maxActive).toBe(3); // default
     expect(config.guidance).toContain("use the X skill");
@@ -66,53 +69,55 @@ worker:
     expect(config.paths.dbPath).toContain("herdr-cats.db");
   });
 
-  it("rejects an invalid config (missing jira.project)", () => {
-    setup(`repo:\n  path: __REPO__\njira:\n  board: 1\n`);
-    expect(() => loadConfig("demo")).toThrow();
-  });
-
-  it("rejects a missing repo config", () => {
-    setup(`repo:\n  path: __REPO__\njira:\n  project: P\n  board: 1\n`);
-    expect(() => loadConfig("nope")).toThrow(/no config for repo/);
-  });
-
-  it("maps workspace_name through", () => {
-    setup(`repo:\n  path: __REPO__\njira:\n  project: RWR\n  board: 254\nworkspace_name: "fix/{{ticket_id}}-{{ticket_short_slug}}"\n`);
-    expect(loadConfig("demo").config.workspaceName).toBe("fix/{{ticket_id}}-{{ticket_short_slug}}");
-  });
-
-  it("rejects a workspace_name template missing {{ticket_id}}", () => {
-    setup(`repo:\n  path: __REPO__\njira:\n  project: RWR\n  board: 254\nworkspace_name: "fix/{{ticket_short_slug}}"\n`);
-    expect(() => loadConfig("demo")).toThrow(/ticket_id/);
-  });
-
-  it("maps a review block and reads prompt_file contents as the prompt", () => {
+  it("maps the three agent blocks + reads each prompt_file's contents", () => {
     setup(
       `repo:
   path: __REPO__
 jira:
   project: RWR
   board: 254
-review:
-  tab: review
-  pane: agent
-  prompt_file: review-prompt.md
-limits:
-  review_budget_seconds: 600
-`,
-      { reviewPrompt: "Run the mechanical review.\n" },
+${AGENTS}`,
+      { prompts: { "fix.md": "do the fix\n", "review.md": "review it\n", "pr.md": "open the PR\n" } },
     );
     const { config } = loadConfig("demo");
-    expect(config.review?.tab).toBe("review");
-    expect(config.review?.pane).toBe("agent");
-    expect(config.review?.promptFile).toMatch(/review-prompt\.md$/);
-    expect(config.review?.prompt).toBe("Run the mechanical review.\n");
-    expect(config.limits.reviewBudgetSeconds).toBe(600);
+    expect(config.agents.fix.tab).toBe("fix");
+    expect(config.agents.fix.pane).toBe("agent");
+    expect(config.agents.fix.promptFile).toMatch(/fix\.md$/);
+    expect(config.agents.fix.prompt).toBe("do the fix\n");
+    expect(config.agents.review.tab).toBe("review");
+    expect(config.agents.review.prompt).toBe("review it\n");
+    expect(config.agents.pr.tab).toBe("pr");
+    expect(config.agents.pr.prompt).toBe("open the PR\n");
   });
 
-  it("throws when review.prompt_file is missing", () => {
-    setup(`repo:\n  path: __REPO__\njira:\n  project: RWR\n  board: 254\nreview:\n  tab: review\n  pane: agent\n  prompt_file: nope.md\n`);
+  it("rejects a config missing the agents block", () => {
+    setup(`repo:\n  path: __REPO__\njira:\n  project: RWR\n  board: 254\n`, { prompts: {} });
+    expect(() => loadConfig("demo")).toThrow();
+  });
+
+  it("throws when an agent prompt_file is missing", () => {
+    setup(`repo:\n  path: __REPO__\njira:\n  project: RWR\n  board: 254\n${AGENTS}`, { prompts: {} });
     expect(() => loadConfig("demo")).toThrow(/prompt_file not found/);
+  });
+
+  it("rejects an invalid config (missing jira.project)", () => {
+    setup(`repo:\n  path: __REPO__\njira:\n  board: 1\n${AGENTS}`);
+    expect(() => loadConfig("demo")).toThrow();
+  });
+
+  it("rejects a missing repo config", () => {
+    setup(`repo:\n  path: __REPO__\njira:\n  project: P\n  board: 1\n${AGENTS}`);
+    expect(() => loadConfig("nope")).toThrow(/no config for repo/);
+  });
+
+  it("maps workspace_name through", () => {
+    setup(`repo:\n  path: __REPO__\njira:\n  project: RWR\n  board: 254\nworkspace_name: "fix/{{ticket_id}}-{{ticket_short_slug}}"\n${AGENTS}`);
+    expect(loadConfig("demo").config.workspaceName).toBe("fix/{{ticket_id}}-{{ticket_short_slug}}");
+  });
+
+  it("rejects a workspace_name template missing {{ticket_id}}", () => {
+    setup(`repo:\n  path: __REPO__\njira:\n  project: RWR\n  board: 254\nworkspace_name: "fix/{{ticket_short_slug}}"\n${AGENTS}`);
+    expect(() => loadConfig("demo")).toThrow(/ticket_id/);
   });
 });
 

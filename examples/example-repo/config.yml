@@ -23,29 +23,31 @@ jira:
     in_development: In Progress
     review: In Review
 
-worker:
-  # All optional — generic wording is used when unset.
-  bootstrap_cmd: npm ci          # how to install/setup the worktree
-  resolve_cmd: ""                # a PR-comment resolution workflow, e.g. /my-pr-resolver
-  main_tab: main                 # herdr fix-layout tab the worker is dispatched into
-  agent_pane: agent              # pane within that tab where the idle claude waits
-  # guidelines-prompt.md in this folder (if present) is appended to every brief.
-
-# Optional deterministic review pass. OMIT this whole block to skip review entirely.
-# When present, after the worker opens its PR the dispatcher inserts an `auto_review`
-# phase: it dispatches a dedicated review agent into the tab/pane below, using the
-# CONTENTS of prompt_file as its prompt, and gates the ticket until that agent runs
-# `herdr-cats --repo <name> review-done <KEY>`.
-# review:
-#   tab: review                  # herdr layout tab the review agent runs in
-#   pane: agent                  # pane within that tab
-#   prompt_file: review-prompt.md  # path (relative to this folder) read as the prompt
+# The three pipeline agents — fix → review → pr. All required, no defaults. Each runs
+# in its own herdr layout pane (tab/pane) and is driven by its own prompt file (path
+# relative to this folder; its CONTENTS become the agent's prompt, with tokens like
+# @@KEY@@ / @@HANDOFF_IN@@ / @@STEP_DONE_CMD@@ substituted). Each agent must, when done,
+# write its handoff note and run `herdr-cats --repo <name> step-done <KEY> <step>`.
+agents:
+  fix:
+    tab: fix
+    pane: agent
+    prompt_file: fix.md          # read ticket → implement → verify → commit
+  review:
+    tab: review
+    pane: agent
+    prompt_file: review.md       # fresh-eyes review of the diff → changes → commit
+  pr:
+    tab: pr
+    pane: agent
+    prompt_file: pr.md           # open + push the PR → drive the CI/bot round
+  # guidelines-prompt.md in this folder (if present) is appended to every agent prompt.
 
 limits:
   max_active: 3
   watch_hours: 7
-  develop_budget_seconds: 5400   # no-PR safety net (worker still making progress is extended)
-  worker_done_grace_seconds: 1800  # after the PR opens, how long to await worker-done before → attention
+  develop_budget_seconds: 5400   # fix step budget (a still-committing agent is extended)
   stall_seconds: 2700            # no new commits for this long → stalled → attention (even if "working")
-  review_budget_seconds: 1800    # cap for the auto_review gate (then proceeds best-effort)
+  review_budget_seconds: 1800    # review step budget
+  pr_budget_seconds: 3600        # pr step budget (open PR + CI/bot round)
   tick_interval_seconds: 60
