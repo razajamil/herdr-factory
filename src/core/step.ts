@@ -45,9 +45,11 @@ const dispatchPrompt = (step: StepName): string =>
   `Read ${MEMORY_DIR}/prompt-${step}.md in this worktree and follow it exactly. This is an autonomous task — do not pause to ask for confirmation.`;
 
 /**
- * Dispatch a claude agent the given `prompt` into the layout's `tab`/`pane`, with fallbacks:
- * send to the idle claude waiting there; else `pane run`; else spawn a dedicated pane in the
- * worktree. Renames the pane to `paneName` and returns its id. Shared by all step agents.
+ * Dispatch the given `prompt` to the agent in the layout's `tab`/`pane`. Agent-agnostic:
+ * `herdr agent send` delivers the prompt to whatever agent the layout put there (claude,
+ * opencode, …). Fallbacks for the no-layout/degraded case only: if the pane exists but has
+ * no agent, run `claude` in it; if the pane never appears, spawn a dedicated claude pane.
+ * Renames the pane to `paneName` and returns its id. Shared by all step agents.
  */
 export async function dispatchToLayout(
   deps: Deps,
@@ -56,19 +58,20 @@ export async function dispatchToLayout(
   let target: string | null = null;
   for (let waited = 0; waited < LAYOUT_WAIT_SEC; waited += 4) {
     target = await deps.herdr.tabPaneByLabel(opts.workspaceId, opts.tab, opts.pane);
-    if (target && (await deps.herdr.paneHasClaude(target))) break;
+    if (target && (await deps.herdr.paneAlive(target))) break; // any agent (claude/opencode) is ready
     await deps.sleep(4000);
   }
 
   if (target) {
-    if (await deps.herdr.paneHasClaude(target)) {
+    if (await deps.herdr.paneAlive(target)) {
       await deps.sleep(2000); // settle so the first keystrokes aren't dropped
       await deps.herdr.agentSend(target, opts.prompt);
       await deps.herdr.paneSendKeys(target, "Enter");
       deps.log("info", `${opts.ticketKey}: dispatched to layout pane ${target} (${opts.tab}/${opts.pane})`);
     } else {
+      // No agent in the configured pane (layout not applied) — start claude in it ourselves.
       await deps.herdr.paneRun(target, `claude ${CLAUDE_FLAGS.join(" ")} ${JSON.stringify(opts.prompt)}`);
-      deps.log("info", `${opts.ticketKey}: started agent in layout pane ${target} (${opts.tab}/${opts.pane})`);
+      deps.log("info", `${opts.ticketKey}: no agent in ${opts.tab}/${opts.pane} — started claude in ${target}`);
     }
   } else {
     target = await deps.herdr.agentStart({

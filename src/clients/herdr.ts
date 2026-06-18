@@ -66,6 +66,12 @@ export class HerdrClient {
     await run(this.bin, ["worktree", "remove", "--workspace", workspaceId, "--force", "--json"], { allowFail: true });
   }
 
+  /** Close the workspace + its panes (independent of git-worktree state). The fallback when
+   *  `worktree remove` deregisters the git worktree but then fails to close the workspace. */
+  async workspaceClose(workspaceId: string): Promise<void> {
+    await run(this.bin, ["workspace", "close", workspaceId], { allowFail: true });
+  }
+
   async workspaceExists(workspaceId: string): Promise<boolean> {
     const r = await run(this.bin, ["workspace", "get", workspaceId], { allowFail: true });
     return r.code === 0;
@@ -98,10 +104,6 @@ export class HerdrClient {
 
   async paneAlive(paneId: string): Promise<boolean> {
     return (await this.agents()).some((x) => x.paneId === paneId);
-  }
-
-  async paneHasClaude(paneId: string): Promise<boolean> {
-    return (await this.agents()).some((x) => x.paneId === paneId && x.agent === "claude");
   }
 
   /** Resolve the pane with `paneLabel` inside the tab labelled `tabLabel` (or null). */

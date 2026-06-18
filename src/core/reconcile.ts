@@ -317,13 +317,33 @@ async function reconcileReviewing(deps: Deps, run: Run): Promise<void> {
   deps.store.recordEvent({ runId: run.id, repo, ticketKey: run.ticketKey, type: "resolver_woken", detail: { unresolved: sig.unresolved, failing: sig.failing } });
 }
 
-/** herdr owns workspace+dir+registration; we delete only the local branch. */
+/**
+ * herdr owns workspace+dir+registration; we delete only the local branch. Robust to a
+ * partial `worktree remove`: herdr can deregister the git worktree but then error before
+ * closing the workspace (and exits 0 with an error body), leaking the workspace + dir.
+ * So: remove → verify the workspace is gone, else close it directly → clear the checkout
+ * dir → prune the stale git registration → delete the branch (now safely not "checked out").
+ */
 async function teardown(deps: Deps, run: Run, outcome: Outcome): Promise<void> {
   const repo = deps.config.repoName;
   deps.store.updateRun(run.id, { phase: "tearing_down" });
-  if (run.workspaceId) await deps.herdr.worktreeRemove(run.workspaceId);
-  if (run.branch) await deps.git.branchDelete(deps.config.repo.path, run.branch);
+
+  if (run.workspaceId) {
+    await deps.herdr.worktreeRemove(run.workspaceId);
+    if (await deps.herdr.workspaceExists(run.workspaceId)) {
+      deps.log("warn", `${run.ticketKey}: worktree remove left workspace ${run.workspaceId} — closing it directly`);
+      await deps.herdr.workspaceClose(run.workspaceId);
+    }
+  }
+  // The checkout dir can survive a partial remove. It's always a linked worktree under
+  // herdr's worktrees dir, never the main checkout — guard anyway, then prune the now-stale
+  // git registration so a re-claim of the same ticket starts clean.
+  if (run.worktreePath && run.worktreePath !== deps.config.repo.path) {
+    await deps.rmrf(run.worktreePath).catch(() => {});
+  }
   await deps.git.worktreePrune(deps.config.repo.path).catch(() => {});
+  if (run.branch) await deps.git.branchDelete(deps.config.repo.path, run.branch);
+
   deps.store.endRun(run.id, outcome);
   deps.store.recordEvent({ runId: run.id, repo, ticketKey: run.ticketKey, type: "torn_down", detail: { outcome } });
   deps.log("info", `${run.ticketKey}: torn down (${outcome})`);

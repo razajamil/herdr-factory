@@ -20,9 +20,10 @@ interface FakeState {
   pr: PrInfo | null;
   sig: ReviewSig;
   paneState: string;
-  paneAlive: boolean;
+  deadPanes: Set<string>; // panes herdr no longer tracks (paneAlive → false)
   headSha: string;
   sessionId: string | null;
+  workspaceExists: boolean; // does the workspace still exist after a worktree remove?
 }
 
 function makeConfig(worktree: string): Config {
@@ -43,11 +44,13 @@ function build() {
   tmps.push(worktree);
   let now = 1000;
   const store = new Store(openDb(":memory:"), () => now);
-  const state: FakeState = { eligible: [], pr: null, sig: { unresolved: 0, failing: 0, sig: "s0" }, paneState: "idle", paneAlive: true, headSha: "sha0", sessionId: "sess-1" };
+  const state: FakeState = { eligible: [], pr: null, sig: { unresolved: 0, failing: 0, sig: "s0" }, paneState: "idle", deadPanes: new Set(), headSha: "sha0", sessionId: "sess-1", workspaceExists: false };
   const calls = {
     transitions: [] as [string, string][],
     agentSend: [] as [string, string][],
     worktreeRemove: [] as string[],
+    workspaceClose: [] as string[],
+    rmrf: [] as string[],
     branchDelete: [] as string[],
     agentStart: 0,
     notify: 0,
@@ -56,10 +59,10 @@ function build() {
     worktreeCreate: async () => ({ workspaceId: "w1", worktreePath: worktree, paneId: "w1:p1" }),
     worktreeOpen: async () => ({ workspaceId: "w1", worktreePath: worktree, paneId: "w1:p1" }),
     worktreeRemove: async (id) => { calls.worktreeRemove.push(id); },
-    workspaceExists: async () => false,
+    workspaceClose: async (id) => { calls.workspaceClose.push(id); },
+    workspaceExists: async () => state.workspaceExists,
     paneState: async () => state.paneState,
-    paneAlive: async () => state.paneAlive,
-    paneHasClaude: async () => true,
+    paneAlive: async (id) => !state.deadPanes.has(id),
     agentSessionId: async () => state.sessionId,
     tabPaneByLabel: async () => "w1:p1",
     agentStart: async () => { calls.agentStart += 1; return "w1:p2"; },
@@ -88,7 +91,7 @@ function build() {
     headSha: async () => state.headSha,
   };
   const secrets: Secrets = { jiraBaseUrl: "https://x", jiraEmail: "e", jiraApiToken: "t" };
-  const deps: Deps = { config: makeConfig(worktree), secrets, store, ghRepo: "o/n", herdr, jira, github, git, log: () => {}, now: () => now, sleep: async () => {} };
+  const deps: Deps = { config: makeConfig(worktree), secrets, store, ghRepo: "o/n", herdr, jira, github, git, log: () => {}, now: () => now, sleep: async () => {}, rmrf: async (p) => { calls.rmrf.push(p); } };
   return { deps, store, state, calls, setNow: (n: number) => { now = n; }, worktree };
 }
 
@@ -261,10 +264,10 @@ describe("reconcile pipeline", () => {
     const { deps, store, state, worktree, calls } = build();
     const run = seed(store, worktree, "K-D1", "fixing", "fix", { paneId: "w1:dead" });
     store.upsertRunStep(run.id, "fix", { paneId: "w1:dead" });
-    state.paneAlive = false; // the fix pane is gone
+    state.deadPanes.add("w1:dead"); // the fix pane is gone; the layout pane (w1:p1) is alive
     await reconcileRun(deps, store.getRun(run.id)!);
     expect(store.getRun(run.id)!.phase).toBe("fixing"); // still gating
-    expect(calls.agentSend.length).toBe(1); // re-dispatched
+    expect(calls.agentSend.length).toBe(1); // re-dispatched into the live layout pane
   });
 
   it("reviewing + merged PR → teardown (worktree remove + branch delete, ended merged)", async () => {
@@ -278,6 +281,21 @@ describe("reconcile pipeline", () => {
     expect(store.countActive("demo")).toBe(0);
     expect(calls.worktreeRemove).toContain("w1");
     expect(calls.branchDelete).toContain("fix/K-9-s");
+  });
+
+  it("teardown falls back to workspace close + dir removal when worktree remove leaves the workspace", async () => {
+    const { deps, store, state, worktree, calls } = build();
+    state.workspaceExists = true; // herdr deregistered the git worktree but left the workspace
+    const run = seed(store, worktree, "K-12", "reviewing", null, { watchDeadline: 99999 });
+    state.pr = { number: 12, state: "MERGED", url: "u" };
+    await reconcileRun(deps, store.getRun(run.id)!);
+    const got = store.getRun(run.id)!;
+    expect(got.phase).toBe("done");
+    expect(got.outcome).toBe("merged");
+    expect(calls.worktreeRemove).toContain("w1"); // primary path attempted
+    expect(calls.workspaceClose).toContain("w1"); // verified-still-present → closed directly
+    expect(calls.rmrf).toContain(worktree); // orphaned checkout dir cleared
+    expect(calls.branchDelete).toContain("fix/K-12-s"); // branch still deleted
   });
 
   it("reviewing + actionable new signature + idle → wakes resolver", async () => {

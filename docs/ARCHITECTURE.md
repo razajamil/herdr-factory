@@ -151,7 +151,7 @@ reverse-engineered during the bash prototype.
     `idle|working|done|blocked|unknown`)
   - `agentStart({workspaceId, cwd, argv}) → paneId` where
     **`argv = ["claude", ...flags, prompt]`** (first token is the executable)
-  - `paneByLabel(ws, tabLabel, paneLabel)`, `paneHasClaude(pane)`,
+  - `paneByLabel(ws, tabLabel, paneLabel)`, `paneAlive(pane)` (any agent present),
     `paneRun(pane, cmd)`, `agentSend(pane, text)`, `paneSendKeys(pane, "Enter")`,
     `agentRename(pane, "cat:KEY")`, `notify(title, body)`
 - **`jira.ts`** (fetch + basic auth) — `listEligible()` via the Agile board
@@ -354,9 +354,10 @@ another agent**, through the shared `dispatchToLayout(tab, pane, prompt, …)` h
 step (`spawnStep`):
 
 1. **Dispatch** into the step's configured `tab`/`pane` (`agents.<step>`): wait bounded
-   for that pane's idle claude → `agent send`; else `pane run "claude …"`; else
-   `agent start` a dedicated pane. Rename `<step>:<KEY>`; record the pane on the
-   `run_steps` row (and as `run.pane_id`, the latest active pane).
+   for that pane's agent (agent-agnostic — claude *or* opencode, whatever the layout put
+   there) → `agent send` the prompt + Enter. Degraded fallbacks only if no agent appears:
+   `pane run "claude …"`, else `agent start` a dedicated claude pane. Rename `<step>:<KEY>`;
+   record the pane on the `run_steps` row (and as `run.pane_id`, the latest active pane).
 2. **Prompt** — `renderStepPrompt` substitutes tokens (`@@KEY@@`, `@@HANDOFF_IN@@`,
    `@@PRIOR_PANE@@`, `@@STEP_DONE_CMD@@`, …) into the step's `prompt_file` contents,
    appends `guidelines-prompt.md`, and appends a standard footer that points the agent at
@@ -399,22 +400,25 @@ repos), acquired with a TTL via the CLI.
 
 ## 9. Teardown
 
-herdr-first, with the single git-domain remnant:
+herdr-first, but **verify-and-fall-back** — because `herdr worktree remove` can
+deregister the git worktree and then error before closing the workspace (it exits 0
+with an error body, and once the git worktree is gone the command can't recover),
+which silently leaks the workspace + checkout dir. So:
 
 ```
-1. herdr worktree remove --workspace <id> --force   → workspace + checkout dir + git registration
-2. git branch -D <branch>                            → the only remnant herdr leaves
+1. herdr worktree remove --workspace <id> --force   → workspace + dir + git registration (primary)
+2. if workspaceExists(<id>) still true → herdr workspace close <id>   → close panes + workspace
+3. rmrf <worktreePath> (guarded: never the main checkout)             → clear any orphaned dir
+4. git worktree prune                                                → drop the stale registration
+5. git branch -D <branch>                                            → safe now (worktree deregistered)
 ```
 
-Verified empirically: current herdr `worktree remove` removes the workspace, the
-directory, and the git worktree registration; it leaves only the local branch
-(standard `git worktree remove` behavior — herdr doesn't model branches). So
-`rm -rf <dir>`, `git worktree prune`, and a separate `workspace close` are
-**defensive-only fallbacks** (run only if herdr somehow leaves remnants), not the
-primary path. Deleting the local branch lets a re-claim of the same ticket start
-fresh off the base ref instead of reattaching old commits. The remote/PR branch
-is GitHub's domain (merge auto-delete or left as-is). (Under the §7/§8 proposal,
-teardown reaps **all** of a run's step panes, not just one.)
+The fallbacks (steps 2–4) are no longer "defensive-only" — teardown actively verifies
+the workspace is gone and closes it directly if not, then clears the dir, so a partial
+`worktree remove` self-heals instead of leaking. Deleting the local branch (step 5, after
+the worktree is deregistered so it isn't "checked out") lets a re-claim of the same ticket
+start fresh off the base ref. The remote/PR branch is GitHub's domain (merge auto-delete or
+left as-is).
 
 ---
 
@@ -503,9 +507,11 @@ Hard-won from the bash prototype — encode as types/tests/asserts:
 - `agentStart` argv: first token is the `claude` executable. Track the worker by
   its **exact `pane_id`** (the layout spawns extra agents).
 - herdr `worktree create` only from the **main checkout** → asserted in config.
-- **Teardown = `herdr worktree remove --workspace --force` (herdr owns
-  workspace+dir+registration) + `git branch -D <branch>` (the sole git remnant).**
-  `rm -rf` / `prune` / `workspace close` are defensive-only fallbacks.
+- **Teardown verifies and falls back** (§9): `herdr worktree remove --workspace --force`,
+  then if the workspace still exists `herdr workspace close`, then `rmrf <worktreePath>` +
+  `git worktree prune` + `git branch -D <branch>` (in that order — branch delete last, after
+  the worktree is deregistered). `worktree remove` can exit 0 yet leak the workspace+dir, so
+  the fallbacks are active, not defensive-only.
 - Jira transition match is **case-insensitive** on `.to.name`; no-op if already
   in target.
 - worktree-create / agent-list JSON shapes are typed once in `herdr.ts`.

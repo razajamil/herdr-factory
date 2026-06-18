@@ -1,4 +1,5 @@
 import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
+import { rm } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { Command } from "commander";
 import { globalDbPath, loadConfig, type Config } from "./config.ts";
@@ -54,6 +55,7 @@ async function buildDeps(repoName: string): Promise<Deps> {
     log: makeLogger(config),
     now: systemClock,
     sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
+    rmrf: (p) => rm(p, { recursive: true, force: true }),
   };
 }
 

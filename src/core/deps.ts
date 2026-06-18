@@ -9,10 +9,10 @@ export interface HerdrApi {
   worktreeCreate(repoCwd: string, branch: string, baseRef: string): Promise<WorktreeResult>;
   worktreeOpen(repoCwd: string, branch: string): Promise<WorktreeResult>;
   worktreeRemove(workspaceId: string): Promise<void>;
+  workspaceClose(workspaceId: string): Promise<void>;
   workspaceExists(workspaceId: string): Promise<boolean>;
   paneState(paneId: string): Promise<string>;
   paneAlive(paneId: string): Promise<boolean>;
-  paneHasClaude(paneId: string): Promise<boolean>;
   agentSessionId(paneId: string): Promise<string | null>;
   tabPaneByLabel(workspaceId: string, tabLabel: string, paneLabel: string): Promise<string | null>;
   agentStart(opts: { workspaceId: string; cwd: string; argv: string[]; env?: Record<string, string> }): Promise<string | null>;
@@ -58,6 +58,7 @@ export interface Deps {
   log: Logger;
   now: () => number; // epoch seconds
   sleep: (ms: number) => Promise<void>;
+  rmrf: (path: string) => Promise<void>; // recursive force delete (teardown's defensive dir cleanup)
 }
 
 export type { Agent };
