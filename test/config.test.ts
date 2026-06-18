@@ -8,8 +8,8 @@ const cleanups: (() => void)[] = [];
 afterEach(() => {
   for (const f of cleanups) f();
   cleanups.length = 0;
-  delete process.env.HERDR_CATS_CONFIG_DIR;
-  delete process.env.HERDR_CATS_STATE_ROOT;
+  delete process.env.HERDR_FACTORY_CONFIG_DIR;
+  delete process.env.HERDR_FACTORY_STATE_ROOT;
 });
 
 // A valid `agents` block (all three required) for configs that don't test agents themselves.
@@ -31,8 +31,8 @@ function setup(yml: string, opts?: { guidance?: string; prompts?: Record<string,
   const prompts = opts?.prompts ?? { "fix.md": "FIX prompt\n", "review.md": "REVIEW prompt\n", "pr.md": "PR prompt\n" };
   for (const [name, body] of Object.entries(prompts)) writeFileSync(join(repoDir, name), body);
   writeFileSync(join(base, "cfg", "env"), "JIRA_BASE_URL=https://x.atlassian.net/\nJIRA_EMAIL=me@x.com\nJIRA_API_TOKEN=tok\n");
-  process.env.HERDR_CATS_CONFIG_DIR = join(base, "cfg");
-  process.env.HERDR_CATS_STATE_ROOT = join(base, "state");
+  process.env.HERDR_FACTORY_CONFIG_DIR = join(base, "cfg");
+  process.env.HERDR_FACTORY_STATE_ROOT = join(base, "state");
   return { repoPath };
 }
 
@@ -66,7 +66,7 @@ ${AGENTS}`,
     expect(config.limits.maxActive).toBe(3); // default
     expect(config.guidance).toContain("use the X skill");
     expect(secrets.jiraBaseUrl).toBe("https://x.atlassian.net");
-    expect(config.paths.dbPath).toContain("herdr-cats.db");
+    expect(config.paths.dbPath).toContain("herdr-factory.db");
   });
 
   it("maps the three agent blocks + reads each prompt_file's contents", () => {

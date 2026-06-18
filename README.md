@@ -1,6 +1,6 @@
-# herdr-cats 🐱
+# herdr-factory
 
-Autonomous Jira → PR loop that **herds Claude worker agents ("cats")** across one
+Autonomous Jira → PR **factory** that runs Claude worker agents across one
 or more repos, on top of [herdr](https://herdr.dev) worktrees.
 
 A single idempotent reconciler (`tick`), driven by `launchd`, finds eligible Jira
@@ -14,7 +14,7 @@ per-repo config, so the same engine drives many repos.
 ## How it works
 
 ```
-launchd ──every 60s──> herdr-cats --repo <name> tick   (idempotent reconciler)
+launchd ──every 60s──> herdr-factory --repo <name> tick   (idempotent reconciler)
         │ Phase A: advance each active ticket   │ Phase B: claim new work up to cap
         ▼
   To Do ─claim─> In Progress ─PR+automated round─> In Review ─merged/closed─> teardown
@@ -30,13 +30,13 @@ workers (they live in the herdr server); `bootstrap` resumes from the ledger.
 ## Install
 
 ```
-git clone <this> ~/dev/raza/herdr-cats
-ln -s ~/dev/raza/herdr-cats/bin/herdr-cats ~/.local/bin/herdr-cats   # optional, for PATH
+git clone <this> ~/dev/raza/herdr-factory
+ln -s ~/dev/raza/herdr-factory/bin/herdr-factory ~/.local/bin/herdr-factory   # optional, for PATH
 ```
 
 **Requirements:** `herdr`, `git`, `gh`, `jq`, `yq` (mikefarah v4, reads `config.yml`), `curl`, and the `claude` CLI — all on `PATH`.
 
-**Global secrets** — `~/.config/herdr-cats/env` (chmod 600):
+**Global secrets** — `~/.config/herdr-factory/env` (chmod 600):
 ```
 JIRA_BASE_URL=https://your-org.atlassian.net
 JIRA_EMAIL=you@org.com
@@ -45,7 +45,7 @@ JIRA_API_TOKEN=...        # id.atlassian.com → Security → API tokens
 
 ## Onboard a repo
 
-1. `cp -r examples/example-repo ~/.config/herdr-cats/repos/<name>` and edit its
+1. `cp -r examples/example-repo ~/.config/herdr-factory/repos/<name>` and edit its
    `config.yml` (repo checkout path, base branch, Jira project/board/label/statuses,
    the `workspace_name` branch template, and the required `agents.{fix,review,pr}`
    blocks). Author each agent's prompt file (`fix.md` / `review.md` / `pr.md` in that
@@ -55,7 +55,7 @@ JIRA_API_TOKEN=...        # id.atlassian.com → Security → API tokens
    agent that starts `claude`, matching `agents.fix.tab`/`.pane`, `agents.review.*`,
    `agents.pr.*`. The dispatcher dispatches each step's prompt into its pane; if a pane
    is absent it falls back to opening its own.
-3. `herdr-cats --repo <name> install`
+3. `herdr-factory --repo <name> install`
 
 The worker runs *inside* the target repo's worktree, so it picks up that repo's
 `CLAUDE.md`/skills natively — the brief stays generic, with only a few commands
@@ -64,11 +64,11 @@ injected from config plus an optional per-repo guidance addendum.
 ## Commands
 
 ```
-herdr-cats --repo <name> tick|status|eligible|claim <KEY>|teardown <KEY>|logs [N]
-herdr-cats --repo <name> install|uninstall|start|stop
-herdr-cats --repo <name> step-done <KEY> <fix|review|pr>   # an agent → dispatcher signal (event-nudges)
-herdr-cats capture-lock acquire|release <owner>     # machine-global, no --repo
-herdr-cats help
+herdr-factory --repo <name> tick|status|eligible|claim <KEY>|teardown <KEY>|logs [N]
+herdr-factory --repo <name> install|uninstall|start|stop
+herdr-factory --repo <name> step-done <KEY> <fix|review|pr>   # an agent → dispatcher signal (event-nudges)
+herdr-factory capture-lock acquire|release <owner>     # machine-global, no --repo
+herdr-factory help
 ```
 
 ## What's repo-specific (all in `repos/<name>/config.yml`)
@@ -77,23 +77,23 @@ repo checkout + base branch · `workspace_name` branch template · Jira
 project/board/label/3 statuses · the three `agents.{fix,review,pr}` blocks (each
 tab/pane + prompt_file) · concurrency/watch/budget tuning — plus the folder's
 agent prompt files and optional `guidelines-prompt.md`.
-The Jira **token** is global (one Atlassian account) in `~/.config/herdr-cats/env`.
+The Jira **token** is global (one Atlassian account) in `~/.config/herdr-factory/env`.
 
 ## Layout
 
 ```
-bin/herdr-cats          CLI (selects a repo via --repo)
+bin/herdr-factory          CLI (selects a repo via --repo)
 src/core/*.ts           generic engine: reconcile · step · watch · branch · deps
 examples/example-repo/  config.yml + fix.md/review.md/pr.md + guidelines-prompt.md (copy to repos/<name>/)
-~/.config/herdr-cats/   env (secrets) + repos/<name>/{config.yml, guidelines-prompt.md}
-~/.local/state/herdr-cats/<repo>/   tickets, locks, logs   (+ _shared/locks for the global capture lock)
+~/.config/herdr-factory/   env (secrets) + repos/<name>/{config.yml, guidelines-prompt.md}
+~/.local/state/herdr-factory/<repo>/   tickets, locks, logs   (+ _shared/locks for the global capture lock)
 ```
 
 ## Security note
 
 Workers launch with `--dangerously-skip-permissions` so the loop runs unattended.
 Each worker is confined to its own throwaway worktree, but can run commands, push
-branches, and open PRs without prompting. Review `HERDR_CATS_CLAUDE_FLAGS` and
+branches, and open PRs without prompting. Review `HERDR_FACTORY_CLAUDE_FLAGS` and
 tighten per repo if desired.
 
 ## Platform

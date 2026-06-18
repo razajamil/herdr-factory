@@ -5,11 +5,11 @@ import type { Deps } from "./deps.ts";
 import type { Phase, Run, RunStep, StepName } from "../types.ts";
 
 export const CLAUDE_FLAGS = ["--dangerously-skip-permissions"];
-export const CLI_PATH = fileURLToPath(new URL("../../bin/herdr-cats", import.meta.url));
+export const CLI_PATH = fileURLToPath(new URL("../../bin/herdr-factory", import.meta.url));
 const LAYOUT_WAIT_SEC = 120;
 const MAX_IMAGES = 8;
 const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
-const MEMORY_DIR = ".memory/herdr-cats";
+const MEMORY_DIR = ".memory/herdr-factory";
 
 /** One pipeline step: which phase runs it, which phase follows, and whether the
  *  commit-HEAD stall heartbeat applies (review may legitimately make no commits). */
@@ -78,7 +78,7 @@ export async function dispatchToLayout(
       workspaceId: opts.workspaceId,
       cwd: opts.worktree,
       argv: ["claude", ...CLAUDE_FLAGS, opts.prompt],
-      env: { HERDR_CATS_TICKET: opts.ticketKey },
+      env: { HERDR_FACTORY_TICKET: opts.ticketKey },
     });
     if (!target) throw new Error(`${opts.ticketKey}: failed to dispatch agent to ${opts.tab}/${opts.pane}`);
     deps.log("info", `${opts.ticketKey}: agent spawned in dedicated pane ${target}`);
@@ -143,7 +143,7 @@ export function renderStepPrompt(deps: Deps, run: Run, step: StepName, prior: Ru
     "@@STEP@@": step,
     "@@MEMORY_DIR@@": MEMORY_DIR,
     "@@EVIDENCE_DIR@@": `${MEMORY_DIR}/evidence`,
-    "@@CATS_CLI@@": CLI_PATH,
+    "@@CLI@@": CLI_PATH,
     "@@HANDOFF_IN@@": prior ? `${MEMORY_DIR}/handoff-${prior.step}.md` : "(none — first step)",
     "@@HANDOFF_OUT@@": `${MEMORY_DIR}/handoff-${step}.md`,
     "@@PRIOR_PANE@@": prior?.paneId ?? "(none)",

@@ -104,10 +104,10 @@ export interface Loaded {
 }
 
 function configDir(): string {
-  return process.env.HERDR_CATS_CONFIG_DIR ?? join(homedir(), ".config", "herdr-cats");
+  return process.env.HERDR_FACTORY_CONFIG_DIR ?? join(homedir(), ".config", "herdr-factory");
 }
 function stateRoot(): string {
-  return process.env.HERDR_CATS_STATE_ROOT ?? join(homedir(), ".local", "state", "herdr-cats");
+  return process.env.HERDR_FACTORY_STATE_ROOT ?? join(homedir(), ".local", "state", "herdr-factory");
 }
 
 function parseEnvFile(path: string): Record<string, string> {
@@ -138,7 +138,7 @@ export function assertMainCheckout(repoPath: string): void {
 
 /** Path to the one global DB (repo-agnostic commands like capture-lock need it). */
 export function globalDbPath(): string {
-  return join(stateRoot(), "herdr-cats.db");
+  return join(stateRoot(), "herdr-factory.db");
 }
 
 export function loadSecrets(): Secrets {
@@ -207,7 +207,7 @@ export function loadConfig(repoName: string): Loaded {
       repoDir,
       stateRoot: root,
       stateDir,
-      dbPath: join(root, "herdr-cats.db"),
+      dbPath: join(root, "herdr-factory.db"),
       logsDir: join(stateDir, "logs"),
     },
   };

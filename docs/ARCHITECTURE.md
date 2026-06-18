@@ -1,6 +1,6 @@
-# herdr-cats — Architecture
+# herdr-factory — Architecture
 
-Autonomous Jira → PR loop that herds Claude worker agents ("cats") across one or
+Autonomous Jira → PR factory that runs Claude worker agents across one or
 more repos, on top of [herdr](https://herdr.dev) worktrees. A single idempotent
 reconciler (`tick`), driven by `launchd`, finds eligible Jira tickets, spins up
 one herdr worktree + Claude worker per ticket, watches the PR, and tears the
@@ -13,9 +13,9 @@ This document is the canonical design of the TypeScript implementation
 
 ## 1. Principles
 
-1. **herdr owns the terminal world; herdr-cats orchestrates it.** All
+1. **herdr owns the terminal world; herdr-factory orchestrates it.** All
    workspace / worktree / tab / pane / layout / agent lifecycle is performed by
-   the `herdr` CLI. herdr-cats never reimplements pane splitting, layout
+   the `herdr` CLI. herdr-factory never reimplements pane splitting, layout
    application, terminal multiplexing, raw `git worktree add`, or spawning
    `claude` as a bare child process. See [§4](#4-herdr-ownership-boundary).
 2. **SQLite is the single source of truth for runtime state**, designed as the
@@ -75,9 +75,9 @@ implementations and injects them. Tests substitute fakes + `:memory:` SQLite.
 ### Repo layout
 
 ```
-herdr-cats/
+herdr-factory/
   package.json  tsconfig.json  README.md  docs/ARCHITECTURE.md
-  bin/herdr-cats          cwd-robust shell launcher → `node --import tsx src/cli.ts`
+  bin/herdr-factory          cwd-robust shell launcher → `node --import tsx src/cli.ts`
                           (resolves its own dir through symlinks; symlinked into ~/.local/bin)
   src/
     cli.ts                commander program; builds deps, dispatches, structured log
@@ -92,8 +92,8 @@ herdr-cats/
 ```
 
 Config/state live OUTSIDE any repo:
-`~/.config/herdr-cats/{env, repos/<name>/{config.yml, guidelines-prompt.md}}` and
-`~/.local/state/herdr-cats/{herdr-cats.db, <repo>/logs/}`.
+`~/.config/herdr-factory/{env, repos/<name>/{config.yml, guidelines-prompt.md}}` and
+`~/.local/state/herdr-factory/{herdr-factory.db, <repo>/logs/}`.
 
 ---
 
@@ -115,12 +115,12 @@ out to `herdr …` and parses its JSON; it contains zero terminal/worktree logic
 - desktop **notifications**
 
 **The fix layout** (a tab/pane per pipeline agent) is applied by the external
-**workspace-manager herdr plugin** on `worktree.created`. herdr-cats does **not** apply
+**workspace-manager herdr plugin** on `worktree.created`. herdr-factory does **not** apply
 layouts — it relies on the plugin and simply *targets* the resulting panes: one per
 agent, from `agents.{fix,review,pr}.tab` / `.pane` in config. If a targeted pane is
 absent it degrades gracefully (see [§8](#8-step-agent-model)).
 
-**herdr-cats performs git/filesystem ops ONLY for things outside herdr's model:**
+**herdr-factory performs git/filesystem ops ONLY for things outside herdr's model:**
 
 - `git branch -D <branch>` on teardown — the one remnant herdr leaves (herdr
   models worktrees, not branches)
@@ -153,7 +153,7 @@ reverse-engineered during the bash prototype.
     **`argv = ["claude", ...flags, prompt]`** (first token is the executable)
   - `paneByLabel(ws, tabLabel, paneLabel)`, `paneAlive(pane)` (any agent present),
     `paneRun(pane, cmd)`, `agentSend(pane, text)`, `paneSendKeys(pane, "Enter")`,
-    `agentRename(pane, "cat:KEY")`, `notify(title, body)`
+    `agentRename(pane, "<step>:KEY")`, `notify(title, body)`
 - **`jira.ts`** (fetch + basic auth) — `listEligible()` via the Agile board
   endpoint `/rest/agile/1.0/board/<id>/issue?jql=…` (keeps board scoping);
   `getIssue`, `currentStatus`, `transition(key, target)` (case-insensitive
@@ -169,7 +169,7 @@ reverse-engineered during the bash prototype.
 
 ## 6. State — SQLite (better-sqlite3)
 
-One global DB `~/.local/state/herdr-cats/herdr-cats.db`. `db/index.ts` sets
+One global DB `~/.local/state/herdr-factory/herdr-factory.db`. `db/index.ts` sets
 `PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;` then runs migrations
 (`schema_version` + ordered SQL). Per-repo ticks write concurrently to the one
 DB; WAL + busy_timeout + the per-repo single-instance lock keep that safe.
@@ -252,8 +252,8 @@ flowchart TD
       fix["fix agent<br/>implement → verify → commit"]
       review["review agent<br/>fresh-eyes review → commit"]
       pr["pr agent<br/>open + push PR → CI / bot round"]
-      fix -->|"agent → herdr-cats step-done KEY fix<br/>(+ writes handoff-fix.md)"| review
-      review -->|"agent → herdr-cats step-done KEY review<br/>(+ writes handoff-review.md)"| pr
+      fix -->|"agent → herdr-factory step-done KEY fix<br/>(+ writes handoff-fix.md)"| review
+      review -->|"agent → herdr-factory step-done KEY review<br/>(+ writes handoff-review.md)"| pr
     end
 
     subgraph DISP["Dispatcher — core/reconcile"]
@@ -264,7 +264,7 @@ flowchart TD
 
     todo["Jira: To Do (labelled)"] -->|"disp → herdr worktree create<br/>Jira REST → In Development"| wt["herdr worktree + workspace"]
     wt -->|"disp → herdr agent send (spawn fix)"| fix
-    pr -->|"agent → herdr-cats step-done KEY pr<br/>disp → Jira REST → In Review"| human["reviewing<br/>human review (dispatcher-watched)"]
+    pr -->|"agent → herdr-factory step-done KEY pr<br/>disp → Jira REST → In Review"| human["reviewing<br/>human review (dispatcher-watched)"]
     human -->|"disp → herdr worktree remove<br/>· git branch -D"| done["done (merged / closed)"]
 
     nudge -.->|"disp → herdr agent send (spawn next step)"| PIPE
@@ -277,7 +277,7 @@ flowchart TD
 
 Every edge is labelled with the command(s) that propagate state across it, by actor:
 
-- **`agent →`** — run by the step agent in its pane. The single `herdr-cats step-done
+- **`agent →`** — run by the step agent in its pane. The single `herdr-factory step-done
   KEY <step>` call is *all* an agent issues to advance the pipeline (it also writes its
   handoff note first); the dispatcher does everything else.
 - **`disp →`** — run by the dispatcher (`core/reconcile`) over the herdr socket
@@ -293,7 +293,7 @@ A step never inherits the prior step's chat context — that would bloat tokens 
 for `review`, destroy the fresh-eyes value. Context crosses a boundary two ways:
 
 - **Structured handoff doc (default).** The outgoing agent writes
-  `.memory/herdr-cats/handoff-<step>.md`: what it did, key decisions and *why*,
+  `.memory/herdr-factory/handoff-<step>.md`: what it did, key decisions and *why*,
   what's uncertain, what the next step should verify. Deliberately lossy — keeps the
   signal, drops the transcript noise. This is the next agent's primary input.
 - **On-demand pointer to the prior session.** The dispatcher hands the next agent the
@@ -362,10 +362,10 @@ step (`spawnStep`):
    `@@PRIOR_PANE@@`, `@@STEP_DONE_CMD@@`, …) into the step's `prompt_file` contents,
    appends `guidelines-prompt.md`, and appends a standard footer that points the agent at
    its inputs and tells it to write its handoff note + signal `step-done`. The rendered
-   prompt is written to `.memory/herdr-cats/prompt-<step>.md`; the agent is told to read it.
+   prompt is written to `.memory/herdr-factory/prompt-<step>.md`; the agent is told to read it.
 3. **Handoff out** — before signalling, the agent writes
-   `.memory/herdr-cats/handoff-<step>.md` (did / why / uncertain / verify-next).
-4. **Signal** — `herdr-cats --repo <name> step-done <KEY> <step>` sets the step's `done`
+   `.memory/herdr-factory/handoff-<step>.md` (did / why / uncertain / verify-next).
+4. **Signal** — `herdr-factory --repo <name> step-done <KEY> <step>` sets the step's `done`
    flag + records a `step_done` event, then **event-nudges**: it grabs the per-repo tick
    lock and reconciles the run immediately (dispatching the next agent) if no tick is
    mid-flight; otherwise the next tick advances it.
@@ -424,9 +424,9 @@ left as-is).
 
 ## 10. Config
 
-- **Global secrets** — `~/.config/herdr-cats/env` (chmod 600):
+- **Global secrets** — `~/.config/herdr-factory/env` (chmod 600):
   `JIRA_BASE_URL`, `JIRA_EMAIL`, `JIRA_API_TOKEN`. One Atlassian account, all repos.
-- **Per-repo** — `~/.config/herdr-cats/repos/<name>/`:
+- **Per-repo** — `~/.config/herdr-factory/repos/<name>/`:
   - `config.yml` — parsed with `yaml`, validated with `zod` → typed `Config`:
     - `repo` — `path` / `base_ref` / `github`
     - `workspace_name` — branch-name template for each cat (the worktree +
@@ -450,20 +450,20 @@ left as-is).
   since herdr can't create worktrees from one.
 
 Onboarding a repo is pure data: drop a `repos/<name>/` folder, define its herdr
-layout (workspace-manager plugin), `herdr-cats --repo <name> install`.
+layout (workspace-manager plugin), `herdr-factory --repo <name> install`.
 
 ---
 
 ## 11. CLI surface (commander)
 
 ```
-herdr-cats --repo <name> tick | status | eligible | claim <KEY> | teardown <KEY>
-herdr-cats --repo <name> step-done <KEY> <fix|review|pr>   # an agent → dispatcher (CLI → DB, event-nudges)
-herdr-cats --repo <name> install | uninstall | start | stop | logs [N]
-herdr-cats --repo <name> runs [--all] | timeline <KEY>   # read the DB
-herdr-cats capture-lock acquire|release <owner>     # machine-global, no --repo
-herdr-cats doctor                                   # herdr socket / gh / jira / db / claude checks
-herdr-cats help
+herdr-factory --repo <name> tick | status | eligible | claim <KEY> | teardown <KEY>
+herdr-factory --repo <name> step-done <KEY> <fix|review|pr>   # an agent → dispatcher (CLI → DB, event-nudges)
+herdr-factory --repo <name> install | uninstall | start | stop | logs [N]
+herdr-factory --repo <name> runs [--all] | timeline <KEY>   # read the DB
+herdr-factory capture-lock acquire|release <owner>     # machine-global, no --repo
+herdr-factory doctor                                   # herdr socket / gh / jira / db / claude checks
+herdr-factory help
 ```
 
 `status` is a dashboard, not just a count: an **ACTIVE** section (each cat's
@@ -478,7 +478,7 @@ core. `--repo` is a global option; repo-scoped commands assert it.
 
 ## 12. launchd
 
-One job per repo, `com.herdr-cats.<repo>`. `launchd.ts` generates the plist and
+One job per repo, `com.herdr-factory.<repo>`. `launchd.ts` generates the plist and
 drives `launchctl bootstrap/bootout`.
 
 - `ProgramArguments = [node, "--import", "tsx", "<abs>/src/cli.ts", "--repo", "<name>", "tick"]`
@@ -526,7 +526,7 @@ Hard-won from the bash prototype — encode as types/tests/asserts:
 
 | M | Deliverable | Gate |
 |---|---|---|
-| M0 | scaffold (package.json, tsconfig, tsx, commander `help`, dirs) | `herdr-cats help` runs |
+| M0 | scaffold (package.json, tsconfig, tsx, commander `help`, dirs) | `herdr-factory help` runs |
 | M1 | `db/` + `store` + migrations | vitest store suite green (`:memory:`) |
 | M2 | `config.ts` (yaml + zod) | loads real reckon-frontend config.yml; rejects a bad one |
 | M3 | clients (herdr/jira/github/git) | read-only live: `eligible`, `getIssue`, `agents`, `prForBranch` match known shapes |
@@ -551,5 +551,5 @@ The SQLite schema is the contract; a future UI is a *reader*. Active dashboard =
 `runs WHERE ended_at IS NULL`; history + metrics (time-to-PR, success rate,
 time-in-review) derive from `runs` + `events`; per-ticket timeline = `events`
 joined to `run`. Options: point **Datasette** at the DB for an instant read-only
-view; later a `herdr-cats serve` JSON API or a Next.js app reading via
+view; later a `herdr-factory serve` JSON API or a Next.js app reading via
 better-sqlite3.

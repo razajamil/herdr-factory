@@ -9,7 +9,7 @@ const PKG_ROOT = fileURLToPath(new URL("..", import.meta.url));
 const CLI_ENTRY = join(PKG_ROOT, "src", "cli.ts");
 
 export function label(repo: string): string {
-  return `com.herdr-cats.${repo}`;
+  return `com.herdr-factory.${repo}`;
 }
 function plistFile(repo: string): string {
   return join(homedir(), "Library", "LaunchAgents", `${label(repo)}.plist`);

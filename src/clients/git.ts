@@ -1,6 +1,6 @@
 import { run } from "./exec.ts";
 
-/** Git operations herdr-cats performs directly (outside herdr's model). */
+/** Git operations herdr-factory performs directly (outside herdr's model). */
 export class GitClient {
   async branchExists(repoCwd: string, branch: string): Promise<boolean> {
     const r = await run("git", ["-C", repoCwd, "show-ref", "--verify", "--quiet", `refs/heads/${branch}`], {

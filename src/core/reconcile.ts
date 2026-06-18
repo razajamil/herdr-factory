@@ -175,7 +175,7 @@ async function escalateAttention(
     type: "attention",
     detail: { reason: opts.reason, ...(opts.detail ?? {}) },
   });
-  await deps.herdr.notify(`herdr-cats: ${run.ticketKey} needs attention`, opts.body).catch(() => {});
+  await deps.herdr.notify(`herdr-factory: ${run.ticketKey} needs attention`, opts.body).catch(() => {});
 }
 
 function budgetFor(deps: Deps, step: StepName): number {

@@ -1,11 +1,11 @@
 {
-  "name": "herdr-cats",
+  "name": "herdr-factory",
   "version": "0.1.0",
-  "description": "Autonomous Jira→PR loop that herds Claude worker agents across repos, on herdr worktrees.",
+  "description": "Autonomous Jira→PR factory: runs Claude worker agents across repos on herdr worktrees.",
   "type": "module",
   "private": true,
   "bin": {
-    "herdr-cats": "bin/herdr-cats"
+    "herdr-factory": "bin/herdr-factory"
   },
   "scripts": {
     "cats": "node --import tsx src/cli.ts",

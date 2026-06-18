@@ -119,7 +119,7 @@ describe("reconcile pipeline", () => {
     expect(calls.agentSend.length).toBe(1); // fix prompt dispatched
     expect(calls.transitions).toContainEqual(["K-1", "In development"]);
     // materializeTicket wrote the ticket body the fix agent reads
-    expect(existsSync(join(worktree, ".memory/herdr-cats/ticket.json"))).toBe(true);
+    expect(existsSync(join(worktree, ".memory/herdr-factory/ticket.json"))).toBe(true);
   });
 
   it("withTickLock runs fn when the lock is free, skips it when a tick already holds it", async () => {
@@ -160,7 +160,7 @@ describe("reconcile pipeline", () => {
     expect(calls.transitions).not.toContainEqual(["K-4", "Ready for Code Review"]);
     // the rendered review prompt (written to the worktree) carries the work body, the
     // prior handoff pointer, and the engine-injected step-done footer.
-    const body = readFileSync(join(worktree, ".memory/herdr-cats/prompt-review.md"), "utf8");
+    const body = readFileSync(join(worktree, ".memory/herdr-factory/prompt-review.md"), "utf8");
     expect(body).toContain("REVIEW prompt");
     expect(body).toContain("handoff-fix.md");
     expect(body).toContain("step-done K-4 review");

@@ -6,9 +6,9 @@ branch `@@BRANCH@@`.
 
 ## Do
 1. **Visual evidence (best-effort, only if this ticket changes a UI surface):** acquire the
-   shared capture slot (`@@CATS_CLI@@ capture-lock acquire @@KEY@@`), start the dev server on
+   shared capture slot (`@@CLI@@ capture-lock acquire @@KEY@@`), start the dev server on
    a free port, use `playwright-cli` to capture screenshot(s) into `@@EVIDENCE_DIR@@/` (PNG),
-   stop the server, then `@@CATS_CLI@@ capture-lock release @@KEY@@`. This folder is
+   stop the server, then `@@CLI@@ capture-lock release @@KEY@@`. This folder is
    **gitignored** — screenshots must NEVER be committed. Always release the lock.
 2. `git push -u origin @@BRANCH@@` and **open the PR** following the repo's PR conventions
    (clear summary + testing notes). If you captured screenshots, attach them **inline to the

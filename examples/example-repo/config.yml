@@ -1,5 +1,5 @@
-# herdr-cats per-repo config.
-# Copy this folder to ~/.config/herdr-cats/repos/<name>/ (<name> = what you pass to --repo),
+# herdr-factory per-repo config.
+# Copy this folder to ~/.config/herdr-factory/repos/<name>/ (<name> = what you pass to --repo),
 # edit config.yml, and put any repo-specific brief text in guidelines-prompt.md (optional).
 # Read with `yq`. Anything omitted falls back to the engine defaults.
 
@@ -27,7 +27,7 @@ jira:
 # in its own herdr layout pane (tab/pane) and is driven by its own prompt file (path
 # relative to this folder; its CONTENTS become the agent's prompt, with tokens like
 # @@KEY@@ / @@HANDOFF_IN@@ / @@STEP_DONE_CMD@@ substituted). Each agent must, when done,
-# write its handoff note and run `herdr-cats --repo <name> step-done <KEY> <step>`.
+# write its handoff note and run `herdr-factory --repo <name> step-done <KEY> <step>`.
 agents:
   fix:
     tab: fix

@@ -61,14 +61,14 @@ async function buildDeps(repoName: string): Promise<Deps> {
 
 const program = new Command();
 program
-  .name("herdr-cats")
-  .description('Autonomous Jira→PR loop that herds Claude worker agents ("cats") across repos.')
+  .name("herdr-factory")
+  .description("Autonomous Jira→PR factory — runs Claude worker agents across repos on herdr worktrees.")
   .version("0.1.0")
-  .option("--repo <name>", "target repo (its ~/.config/herdr-cats/repos/<name>/)");
+  .option("--repo <name>", "target repo (its ~/.config/herdr-factory/repos/<name>/)");
 
 function requireRepo(): string {
   const repo = (program.opts() as { repo?: string }).repo;
-  if (!repo) fail("this command needs a repo: herdr-cats --repo <name> <command>");
+  if (!repo) fail("this command needs a repo: herdr-factory --repo <name> <command>");
   return repo;
 }
 
@@ -96,11 +96,11 @@ program
       const recent = deps.store.listRuns(c.repoName, true);
       const finished = recent.filter((r) => r.endedAt !== null);
       const fmt = (r: Run, statusCol: string) =>
-        `    ${`cat:${r.ticketKey}`.padEnd(16)} ${r.phase.padEnd(12)} ${statusCol.padEnd(16)} PR:${(r.prNumber ? `#${r.prNumber}` : "-").padEnd(6)} ${(r.summary ?? "").slice(0, 60)}`;
+        `    ${r.ticketKey.padEnd(16)} ${r.phase.padEnd(12)} ${statusCol.padEnd(16)} PR:${(r.prNumber ? `#${r.prNumber}` : "-").padEnd(6)} ${(r.summary ?? "").slice(0, 60)}`;
       console.log(
-        `herdr-cats [${c.repoName}] — board ${c.jira.board}, label "${c.jira.label}", cap ${c.limits.maxActive}, watch ${c.limits.watchHours}h`,
+        `herdr-factory [${c.repoName}] — board ${c.jira.board}, label "${c.jira.label}", cap ${c.limits.maxActive}, watch ${c.limits.watchHours}h`,
       );
-      console.log(`Cats: ${active.length} running (cap ${c.limits.maxActive}) · ${finished.length} finished`);
+      console.log(`Runs: ${active.length} running (cap ${c.limits.maxActive}) · ${finished.length} finished`);
       console.log("");
       console.log(`  ACTIVE (${active.length})`);
       if (active.length === 0) console.log("    (none in flight)");

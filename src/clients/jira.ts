@@ -12,7 +12,7 @@ export class JiraClient {
 
   requireAuth(): void {
     if (!this.email || !this.token) {
-      throw new Error("Jira auth missing — set JIRA_EMAIL + JIRA_API_TOKEN in ~/.config/herdr-cats/env");
+      throw new Error("Jira auth missing — set JIRA_EMAIL + JIRA_API_TOKEN in ~/.config/herdr-factory/env");
     }
   }
 
