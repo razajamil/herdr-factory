@@ -57,7 +57,7 @@ run). Everything else is Node built-ins or the external CLIs.
                  └───────────────┬───────────────────────────┬───────────────┘
                                  ▼                           ▼
         ┌──────────────── core/ (PURE, testable) ────────────────┐     launchd.ts
-        │  reconcile · watch · worker(brief) · branch · phases     │  (plist + ctl)
+        │  reconcile · watch · step · branch · phases              │  (plist + ctl)
         │  depends only on interfaces ↓↓↓                          │
         └───────┬───────────────────────────────┬─────────────────┘
                 ▼                                 ▼
@@ -111,7 +111,8 @@ out to `herdr …` and parses its JSON; it contains zero terminal/worktree logic
 - workspace **close / get / list**
 - tab **create / list**
 - pane **split / run / send-text / send-keys / list / read**
-- agent **start / list / status / send / rename / read / wait**
+- agent **start / list / status / send / focus / rename / read / wait**
+- pane **list / current** (incl. the `focused` flag — which pane the user is viewing)
 - desktop **notifications**
 
 **The fix layout** (a tab/pane per pipeline agent) is applied by the external
@@ -154,6 +155,9 @@ reverse-engineered during the bash prototype.
   - `paneByLabel(ws, tabLabel, paneLabel)`, `paneAlive(pane)` (any agent present),
     `paneRun(pane, cmd)`, `agentSend(pane, text)`, `paneSendKeys(pane, "Enter")`,
     `agentRename(pane, "<step>:KEY")`, `notify(title, body)`
+  - `agentFocus(pane)` (bring a pane + its tab to the front) and `focusedPane() →
+    {paneId, workspaceId, tabId, label}` (the one globally-focused pane, from `pane list`'s
+    `focused` flag — herdr exposes no focus-change event to subscribe to, so it's polled)
 - **`jira.ts`** (fetch + basic auth) — `listEligible()` via the Agile board
   endpoint `/rest/agile/1.0/board/<id>/issue?jql=…` (keeps board scoping);
   `getIssue`, `currentStatus`, `transition(key, target)` (case-insensitive
@@ -183,6 +187,7 @@ CREATE TABLE runs(                       -- ONE attempt at a ticket (history kep
   summary TEXT, issue_type TEXT, branch TEXT, phase TEXT NOT NULL,
   workspace_id TEXT, pane_id TEXT, worktree_path TEXT, pr_number INTEGER,
   watch_deadline INTEGER, last_thread_sig TEXT,
+  focus_pending INTEGER NOT NULL DEFAULT 0, -- active step changed; focus shift deferred (v5)
   -- worker_done/review_done/review_pane/progress_* (migrations v2-v3) are superseded
   -- by run_steps and left in place for history only.
   attention_reason TEXT, outcome TEXT,   -- merged|closed|abandoned|timeout|NULL
@@ -217,7 +222,7 @@ resolves it. History is never deleted (we set `ended_at`), so the web UI can sho
 attempts, outcomes, and durations.
 
 **event types:** `claimed · transition · worktree_created · step_spawned · step_done ·
-pr_opened · resolver_woken · merged · closed · torn_down · attention · error`
+focus_applied · pr_opened · resolver_woken · merged · closed · torn_down · attention · error`
 (plus legacy `worker_*` / `review_*` kept for old-run history).
 
 ---
@@ -332,6 +337,17 @@ by what they actually need:
 - **Coordination:** on-demand `agent read` / `agent send` is agent-to-agent traffic
   *outside* the tick, so the dispatcher is no longer the sole coordinator and the DB
   timeline no longer captures every inter-agent interaction.
+- **Focus follows the active step.** `spawnStep` sets `run.focus_pending` instead of focusing
+  a pane outright. On every reconcile pass `applyPendingFocus` brings the active step's pane to
+  the front **only if** the user is currently viewing *this* worktree (the globally-focused
+  pane — from `herdr pane list` — is in this run's workspace) **and** is on one of its pipeline
+  panes, then clears the flag. Otherwise the shift is deferred and retried on later ticks, so a
+  transition in an unfocused worktree is applied when the user navigates to it — never stealing
+  focus from another worktree, never yanking the user off an unrelated (editor/scratch) pane.
+  herdr has no focus-change event, so the focused pane is polled — but only when a focus is
+  actually pending (the common case reads one boolean and stops). A single tick handles this
+  (no second timer): the same-worktree transition focuses within the tick that advanced it;
+  only the deferred case waits a tick.
 
 ### Trade-offs (why this isn't an obvious win)
 
@@ -357,7 +373,9 @@ step (`spawnStep`):
    for that pane's agent (agent-agnostic — claude *or* opencode, whatever the layout put
    there) → `agent send` the prompt + Enter. Degraded fallbacks only if no agent appears:
    `pane run "claude …"`, else `agent start` a dedicated claude pane. Rename `<step>:<KEY>`;
-   record the pane on the `run_steps` row (and as `run.pane_id`, the latest active pane).
+   record the pane on the `run_steps` row (and as `run.pane_id`, the latest active pane), and
+   set `run.focus_pending` so the worktree view can follow the active step (§7, *Focus follows
+   the active step* — applied later, never stealing focus from another worktree).
 2. **Prompt** — `renderStepPrompt` substitutes tokens (`@@KEY@@`, `@@HANDOFF_IN@@`,
    `@@PRIOR_PANE@@`, `@@STEP_DONE_CMD@@`, …) into the step's `prompt_file` contents,
    appends `guidelines-prompt.md`, and appends a standard footer that points the agent at
@@ -429,12 +447,12 @@ left as-is).
 - **Per-repo** — `~/.config/herdr-factory/repos/<name>/`:
   - `config.yml` — parsed with `yaml`, validated with `zod` → typed `Config`:
     - `repo` — `path` / `base_ref` / `github`
-    - `workspace_name` — branch-name template for each cat (the worktree +
+    - `workspace_name` — branch-name template per ticket (the worktree +
       workspace derive from it). Vars: `{{ticket_id}}`, `{{ticket_short_slug}}`
       (≤20 chars), `{{ticket_slug}}` (≤50), `{{ticket_type}}`, `{{ticket_prefix}}`
       (`fix`/`chore`/`feature`, by issue type). The rendered name is sanitised to
       a git-safe ref; zod requires the template to contain `{{ticket_id}}` (else
-      cats would collide on one branch). Default when unset:
+      tickets would collide on one branch). Default when unset:
       `{{ticket_prefix}}/{{ticket_id}}-{{ticket_slug}}` (rendered by `core/branch.ts`).
     - `jira` — `project` / `board` / `label` / 3 `status` names
     - `agents` — **required**, one block each for `fix` / `review` / `pr`, every field
@@ -466,10 +484,10 @@ herdr-factory doctor                                   # herdr socket / gh / jir
 herdr-factory help
 ```
 
-`status` is a dashboard, not just a count: an **ACTIVE** section (each cat's
-ledger phase + **live** herdr worker status + PR + summary) and a **FINISHED**
-section (each completed cat's outcome, newest first), under a
-`Cats: N running (cap M) · K finished` header. `runs`/`timeline` read the same DB.
+`status` is a dashboard, not just a count: an **ACTIVE** section (each run's
+ledger phase + **live** herdr agent status + PR + summary) and a **FINISHED**
+section (each completed run's outcome, newest first), under a
+`Runs: N running (cap M) · K finished` header. `runs`/`timeline` read the same DB.
 
 Each command builds `Deps` (open DB, construct clients from config) and calls
 core. `--repo` is a global option; repo-scoped commands assert it.
@@ -516,8 +534,12 @@ Hard-won from the bash prototype — encode as types/tests/asserts:
   in target.
 - worktree-create / agent-list JSON shapes are typed once in `herdr.ts`.
 - attachment `content` is site-host → basic-auth download; image/* + size cap.
-- developing → reviewing gates on **`worker_done`**, not flappy status;
-  `developBudget` is the stuck-worker safety net.
+- each step gates on its own **`step-done`** signal (the `run_steps.done` flag), not flappy
+  agent status; per-step budgets + the commit-HEAD stall heartbeat are the stuck-agent safety
+  nets.
+- **focus follows the active step only within the focused worktree** — never steals focus
+  across worktrees; a transition in an unfocused worktree is deferred via `run.focus_pending`
+  and applied when the user navigates back (herdr has no focus event → polled when pending).
 - single-instance per-repo tick lock; WAL + `busy_timeout` for the shared DB.
 
 ---
@@ -538,10 +560,12 @@ The bash loop is already decommissioned, so there is no parallel-run/double-clai
 risk: build, validate read-only, do one guarded single-ticket run, then install.
 
 **Status:** M0–M6 complete. The §7/§8 multi-agent pipeline (fix → review → pr agents,
-handoff docs, on-demand session query, hybrid tick+event) is **implemented and
-unit-tested**; the single-worker lifecycle was previously validated end-to-end, and the
-pipeline still needs a live end-to-end run against herdr before re-installing
-unsupervised.
+handoff docs, on-demand session query, hybrid tick+event) is **implemented, unit-tested, and
+validated live end-to-end** on a real ticket (RWR-17269 → merged PR; `fix`=claude,
+`review`/`pr`=opencode — confirming agent-agnostic dispatch). It is installed and running
+under `launchd` (`com.herdr-factory.<repo>`). Step-focus following (§7, *Focus follows the
+active step*) is the most recent addition. Still early — watch live runs before trusting it
+fully unsupervised.
 
 ---
 
