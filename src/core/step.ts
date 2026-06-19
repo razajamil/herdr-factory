@@ -202,5 +202,10 @@ export async function spawnStep(deps: Deps, run: Run, step: StepName): Promise<s
     type: "step_spawned",
     detail: { step, paneId: pane },
   });
+  // Mark that the active step changed. The actual focus shift is deferred to
+  // applyPendingFocus, which brings this pane to the front only when the user is already
+  // viewing THIS worktree on one of its pipeline panes — never stealing focus from another
+  // worktree, and never yanking the user off an unrelated pane.
+  deps.store.updateRun(run.id, { focusPending: true });
   return pane;
 }

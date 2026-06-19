@@ -27,6 +27,7 @@ export type EventType =
   | "review_done"
   | "step_spawned"
   | "step_done"
+  | "focus_applied"
   | "merged"
   | "closed"
   | "torn_down"
@@ -50,6 +51,7 @@ export interface Run {
   lastThreadSig: string | null;
   attentionReason: string | null;
   outcome: Outcome | null;
+  focusPending: boolean; // active step changed; focus shift deferred until the user views this worktree
   createdAt: number; // epoch seconds
   updatedAt: number;
   endedAt: number | null;
@@ -71,6 +73,7 @@ export type RunPatch = Partial<
     | "lastThreadSig"
     | "attentionReason"
     | "outcome"
+    | "focusPending"
   >
 >;
 
@@ -128,6 +131,14 @@ export interface WorktreeResult {
   workspaceId: string;
   worktreePath: string;
   paneId: string | null;
+}
+
+/** The single globally-focused pane (what the user is looking at right now). */
+export interface FocusedPane {
+  paneId: string;
+  workspaceId: string;
+  tabId: string;
+  label: string | null;
 }
 
 export interface Agent {

@@ -4,10 +4,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openDb } from "../src/db/index.ts";
 import { Store } from "../src/db/store.ts";
-import { reconcileRepo, reconcileRun, withTickLock } from "../src/core/reconcile.ts";
+import { applyPendingFocus, reconcileRepo, reconcileRun, withTickLock } from "../src/core/reconcile.ts";
 import type { Deps, GitApi, GitHubApi, HerdrApi, JiraApi } from "../src/core/deps.ts";
 import type { Config, Secrets } from "../src/config.ts";
-import type { Phase, PrInfo, ReviewSig, StepName, Ticket } from "../src/types.ts";
+import type { FocusedPane, Phase, PrInfo, ReviewSig, StepName, Ticket } from "../src/types.ts";
 
 const tmps: string[] = [];
 afterEach(() => {
@@ -24,6 +24,7 @@ interface FakeState {
   headSha: string;
   sessionId: string | null;
   workspaceExists: boolean; // does the workspace still exist after a worktree remove?
+  focusedPane: FocusedPane | null; // the pane the user is currently looking at
 }
 
 function makeConfig(worktree: string): Config {
@@ -44,10 +45,11 @@ function build() {
   tmps.push(worktree);
   let now = 1000;
   const store = new Store(openDb(":memory:"), () => now);
-  const state: FakeState = { eligible: [], pr: null, sig: { unresolved: 0, failing: 0, sig: "s0" }, paneState: "idle", deadPanes: new Set(), headSha: "sha0", sessionId: "sess-1", workspaceExists: false };
+  const state: FakeState = { eligible: [], pr: null, sig: { unresolved: 0, failing: 0, sig: "s0" }, paneState: "idle", deadPanes: new Set(), headSha: "sha0", sessionId: "sess-1", workspaceExists: false, focusedPane: { paneId: "w1:p1", workspaceId: "w1", tabId: "w1:t1", label: "agent" } };
   const calls = {
     transitions: [] as [string, string][],
     agentSend: [] as [string, string][],
+    agentFocus: [] as string[],
     worktreeRemove: [] as string[],
     workspaceClose: [] as string[],
     rmrf: [] as string[],
@@ -68,6 +70,8 @@ function build() {
     agentStart: async () => { calls.agentStart += 1; return "w1:p2"; },
     paneRun: async () => {},
     agentSend: async (p, t) => { calls.agentSend.push([p, t]); },
+    agentFocus: async (id) => { calls.agentFocus.push(id); },
+    focusedPane: async () => state.focusedPane,
     paneSendKeys: async () => {},
     agentRename: async () => {},
     notify: async () => { calls.notify += 1; },
@@ -157,6 +161,10 @@ describe("reconcile pipeline", () => {
     expect(got.phase).toBe("auto_review");
     expect(store.getRunStep(run.id, "review")?.paneId).toBe("w1:p1");
     expect(calls.agentSend.length).toBe(1); // review prompt dispatched
+    // user is viewing this worktree on a pipeline pane (default focusedPane) → focus follows
+    // the active step to the review pane, and the pending flag is cleared
+    expect(calls.agentFocus).toContain("w1:p1");
+    expect(got.focusPending).toBe(false);
     expect(calls.transitions).not.toContainEqual(["K-4", "Ready for Code Review"]);
     // the rendered review prompt (written to the worktree) carries the work body, the
     // prior handoff pointer, and the engine-injected step-done footer.
@@ -317,5 +325,71 @@ describe("reconcile pipeline", () => {
     state.paneState = "working";
     await reconcileRun(deps, store.getRun(run.id)!);
     expect(calls.agentSend.length).toBe(0);
+  });
+});
+
+describe("applyPendingFocus — focus follows the active step", () => {
+  it("applies the focus shift when the user is viewing this worktree on a pipeline pane", async () => {
+    const { deps, store, state, worktree, calls } = build();
+    const run = seed(store, worktree, "F-1", "auto_review", "review", { focusPending: true });
+    state.focusedPane = { paneId: "w1:p1", workspaceId: "w1", tabId: "w1:t1", label: "agent" };
+    await applyPendingFocus(deps, store.getRun(run.id)!);
+    expect(calls.agentFocus).toEqual(["w1:p1"]); // active step (review) pane brought to front
+    expect(store.getRun(run.id)!.focusPending).toBe(false); // and the flag is cleared
+  });
+
+  it("defers (keeps pending, no focus) when the user is viewing a different worktree", async () => {
+    const { deps, store, state, worktree, calls } = build();
+    const run = seed(store, worktree, "F-2", "auto_review", "review", { focusPending: true });
+    state.focusedPane = { paneId: "w2:p1", workspaceId: "w2", tabId: "w2:t1", label: "agent" };
+    await applyPendingFocus(deps, store.getRun(run.id)!);
+    expect(calls.agentFocus).toEqual([]); // never steal focus from another worktree
+    expect(store.getRun(run.id)!.focusPending).toBe(true); // stored for later
+  });
+
+  it("defers when the user is on a non-pipeline pane in this worktree", async () => {
+    const { deps, store, state, worktree, calls } = build();
+    const run = seed(store, worktree, "F-3", "auto_review", "review", { focusPending: true });
+    state.focusedPane = { paneId: "w1:p9", workspaceId: "w1", tabId: "w1:t9", label: "editor" };
+    await applyPendingFocus(deps, store.getRun(run.id)!);
+    expect(calls.agentFocus).toEqual([]); // don't yank the user off an editor/scratch pane
+    expect(store.getRun(run.id)!.focusPending).toBe(true);
+  });
+
+  it("defers when herdr is not frontmost (no focused pane)", async () => {
+    const { deps, store, state, worktree, calls } = build();
+    const run = seed(store, worktree, "F-4", "auto_review", "review", { focusPending: true });
+    state.focusedPane = null;
+    await applyPendingFocus(deps, store.getRun(run.id)!);
+    expect(calls.agentFocus).toEqual([]);
+    expect(store.getRun(run.id)!.focusPending).toBe(true);
+  });
+
+  it("applies a deferred focus on a later pass once the user navigates to the worktree", async () => {
+    const { deps, store, state, worktree, calls } = build();
+    const run = seed(store, worktree, "F-5", "auto_review", "review", { focusPending: true });
+    state.focusedPane = { paneId: "w2:p1", workspaceId: "w2", tabId: "w2:t1", label: "agent" };
+    await applyPendingFocus(deps, store.getRun(run.id)!); // user elsewhere → deferred
+    expect(calls.agentFocus).toEqual([]);
+    expect(store.getRun(run.id)!.focusPending).toBe(true);
+    state.focusedPane = { paneId: "w1:p1", workspaceId: "w1", tabId: "w1:t1", label: "agent" }; // navigates back
+    await applyPendingFocus(deps, store.getRun(run.id)!);
+    expect(calls.agentFocus).toEqual(["w1:p1"]); // now applied
+    expect(store.getRun(run.id)!.focusPending).toBe(false);
+  });
+
+  it("does nothing when no focus is pending (never re-yanks the user)", async () => {
+    const { deps, store, worktree, calls } = build();
+    const run = seed(store, worktree, "F-6", "auto_review", "review"); // focusPending defaults to false
+    await applyPendingFocus(deps, store.getRun(run.id)!);
+    expect(calls.agentFocus).toEqual([]);
+  });
+
+  it("clears a stale pending flag in a phase with no active step (reviewing)", async () => {
+    const { deps, store, worktree, calls } = build();
+    const run = seed(store, worktree, "F-7", "reviewing", null, { focusPending: true });
+    await applyPendingFocus(deps, store.getRun(run.id)!);
+    expect(calls.agentFocus).toEqual([]);
+    expect(store.getRun(run.id)!.focusPending).toBe(false);
   });
 });

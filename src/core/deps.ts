@@ -1,6 +1,6 @@
 import type { Config, Secrets } from "../config.ts";
 import type { Store } from "../db/store.ts";
-import type { Agent, JiraIssue, PrInfo, ReviewSig, Ticket, WorktreeResult } from "../types.ts";
+import type { Agent, FocusedPane, JiraIssue, PrInfo, ReviewSig, Ticket, WorktreeResult } from "../types.ts";
 
 // Interfaces the core depends on (concrete clients satisfy them structurally;
 // tests provide fakes). Keeping these here is what makes the reconciler testable.
@@ -18,6 +18,8 @@ export interface HerdrApi {
   agentStart(opts: { workspaceId: string; cwd: string; argv: string[]; env?: Record<string, string> }): Promise<string | null>;
   paneRun(paneId: string, command: string): Promise<void>;
   agentSend(paneId: string, text: string): Promise<void>;
+  agentFocus(paneId: string): Promise<void>;
+  focusedPane(): Promise<FocusedPane | null>;
   paneSendKeys(paneId: string, ...keys: string[]): Promise<void>;
   agentRename(paneId: string, name: string): Promise<void>;
   notify(title: string, body: string): Promise<void>;

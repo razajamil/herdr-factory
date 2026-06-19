@@ -1,7 +1,7 @@
 import type { Deps } from "./deps.ts";
 import type { Outcome, Run, RunStep, StepName, Ticket } from "../types.ts";
 import { branchName } from "./branch.ts";
-import { type StepDescriptor, materializeTicket, nextStep, spawnStep, stepForPhase } from "./step.ts";
+import { STEPS, type StepDescriptor, materializeTicket, nextStep, spawnStep, stepForPhase } from "./step.ts";
 import { wakeResolver } from "./watch.ts";
 
 function err(e: unknown): string {
@@ -92,6 +92,15 @@ async function claim(deps: Deps, ticket: Ticket): Promise<void> {
 }
 
 export async function reconcileRun(deps: Deps, run: Run): Promise<void> {
+  await dispatchPhase(deps, run);
+  // Then, on every pass for every active run, try to apply any deferred focus shift. Doing
+  // it here (not only on the tick that transitioned) is what lets a transition in an
+  // unfocused worktree be picked up later, once the user navigates to it.
+  const fresh = deps.store.getRun(run.id);
+  if (fresh) await applyPendingFocus(deps, fresh);
+}
+
+async function dispatchPhase(deps: Deps, run: Run): Promise<void> {
   switch (run.phase) {
     case "claiming":
       return reconcileClaiming(deps, run);
@@ -110,6 +119,48 @@ export async function reconcileRun(deps: Deps, run: Run): Promise<void> {
     case "done":
       return;
   }
+}
+
+/**
+ * Apply a deferred focus shift, if one is pending. The active step's pane is brought to the
+ * front ONLY when the user is currently viewing this run's worktree AND sitting on one of its
+ * pipeline panes — so we never steal focus from another worktree, and never yank the user off
+ * an unrelated (editor/server/scratch) pane. If those conditions don't hold, the pending flag
+ * is left set and re-checked on later ticks. herdr exposes no focus-change event, so we poll
+ * the focused pane here — but only when there's actually something pending (the cheap path
+ * for the common case is a single boolean read).
+ */
+export async function applyPendingFocus(deps: Deps, run: Run): Promise<void> {
+  if (!run.focusPending) return;
+  const active = stepForPhase(run.phase);
+  if (!active) {
+    // No active pipeline step (reviewing/teardown/done) — nothing to focus; clear the flag.
+    deps.store.updateRun(run.id, { focusPending: false });
+    return;
+  }
+  const focused = await deps.herdr.focusedPane();
+  if (!focused) return; // herdr not frontmost / no focused pane — keep pending
+  if (focused.workspaceId !== run.workspaceId) return; // user is in another worktree — keep pending
+
+  // "one of the predefined fix/review/pr panes" = the panes we've dispatched steps to for
+  // this run. If the user is parked on some other pane, hold the focus rather than pull them.
+  const pipelinePanes = STEPS.map((s) => deps.store.getRunStep(run.id, s.name)?.paneId).filter(Boolean);
+  if (!pipelinePanes.includes(focused.paneId)) return; // on a non-pipeline pane — keep pending
+
+  const target = deps.store.getRunStep(run.id, active.name)?.paneId;
+  if (!target) {
+    deps.store.updateRun(run.id, { focusPending: false });
+    return;
+  }
+  await deps.herdr.agentFocus(target);
+  deps.store.updateRun(run.id, { focusPending: false });
+  deps.store.recordEvent({
+    runId: run.id,
+    repo: deps.config.repoName,
+    ticketKey: run.ticketKey,
+    type: "focus_applied",
+    detail: { step: active.name, paneId: target },
+  });
 }
 
 async function reconcileClaiming(deps: Deps, run: Run): Promise<void> {

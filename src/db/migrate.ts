@@ -62,6 +62,13 @@ const MIGRATIONS: { version: number; sql: string }[] = [
       CREATE INDEX idx_run_steps ON run_steps(run_id, step);
     `,
   },
+  {
+    version: 5,
+    // "the active step changed but the user hasn't been shown it yet" — set when a step is
+    // (re)spawned, cleared once the focus shift is applied (applyPendingFocus). Persisting it
+    // is what lets a transition in an unfocused worktree be deferred across ticks.
+    sql: `ALTER TABLE runs ADD COLUMN focus_pending INTEGER NOT NULL DEFAULT 0;`,
+  },
 ];
 
 /** Apply pending migrations in a transaction. Idempotent. */

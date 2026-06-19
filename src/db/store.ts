@@ -18,6 +18,7 @@ interface RunRow {
   last_thread_sig: string | null;
   attention_reason: string | null;
   outcome: string | null;
+  focus_pending: number;
   created_at: number;
   updated_at: number;
   ended_at: number | null;
@@ -40,6 +41,7 @@ function toRun(r: RunRow): Run {
     lastThreadSig: r.last_thread_sig,
     attentionReason: r.attention_reason,
     outcome: r.outcome as Outcome | null,
+    focusPending: r.focus_pending !== 0,
     createdAt: r.created_at,
     updatedAt: r.updated_at,
     endedAt: r.ended_at,
@@ -147,6 +149,7 @@ export class Store {
     if (patch.lastThreadSig !== undefined) set("last_thread_sig", patch.lastThreadSig);
     if (patch.attentionReason !== undefined) set("attention_reason", patch.attentionReason);
     if (patch.outcome !== undefined) set("outcome", patch.outcome);
+    if (patch.focusPending !== undefined) set("focus_pending", patch.focusPending ? 1 : 0);
     if (sets.length === 0) return;
     set("updated_at", this.now());
     this.db.prepare(`UPDATE runs SET ${sets.join(", ")} WHERE id = ?`).run(...vals, id);

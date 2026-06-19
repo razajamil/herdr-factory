@@ -1,5 +1,5 @@
 import { run, runJson } from "./exec.ts";
-import type { Agent, WorktreeResult } from "../types.ts";
+import type { Agent, FocusedPane, WorktreeResult } from "../types.ts";
 
 interface RawAgent {
   pane_id: string;
@@ -23,7 +23,7 @@ interface TabListResp {
   result?: { tabs?: { tab_id: string; label?: string }[] };
 }
 interface PaneListResp {
-  result?: { panes?: { pane_id: string; tab_id: string; label?: string }[] };
+  result?: { panes?: { pane_id: string; workspace_id: string; tab_id: string; label?: string; focused?: boolean }[] };
 }
 interface AgentStartResp {
   result?: { agent?: { pane_id?: string } };
@@ -142,6 +142,21 @@ export class HerdrClient {
 
   async agentSend(paneId: string, text: string): Promise<void> {
     await run(this.bin, ["agent", "send", paneId, text], { allowFail: true });
+  }
+
+  /** Focus the agent's pane (and its tab) so a worktree view follows the active step. */
+  async agentFocus(paneId: string): Promise<void> {
+    await run(this.bin, ["agent", "focus", paneId], { allowFail: true });
+  }
+
+  /** The one globally-focused pane (what the user is looking at), or null if none/herdr is
+   *  not frontmost. herdr has no focus-change event, so the dispatcher polls this each tick. */
+  async focusedPane(): Promise<FocusedPane | null> {
+    const j = await runJson<PaneListResp>(this.bin, ["pane", "list"], { allowFail: true }).catch(
+      () => ({}) as PaneListResp,
+    );
+    const p = (j.result?.panes ?? []).find((x) => x.focused);
+    return p ? { paneId: p.pane_id, workspaceId: p.workspace_id, tabId: p.tab_id, label: p.label ?? null } : null;
   }
 
   async paneSendKeys(paneId: string, ...keys: string[]): Promise<void> {
