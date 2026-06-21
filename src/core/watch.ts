@@ -7,8 +7,8 @@ export function resolverPrompt(key: string, prNumber: number): string {
   return (
     `New review activity on PR #${prNumber} for ${key}. Address ALL unresolved review comments and fix ALL ` +
     `failing CI checks on this PR: fix each thread, commit per thread, push, resolve the thread. ` +
-    `Review your changes for quality before pushing. Do NOT transition Jira. When every thread is resolved and ` +
-    `CI is green, or you are blocked, stop and say so.`
+    `Review your changes for quality before pushing. Do NOT change the work item's status. When every thread is ` +
+    `resolved and CI is green, or you are blocked, stop and say so.`
   );
 }
 

@@ -1,11 +1,18 @@
 # herdr-factory — Architecture
 
-Autonomous Jira → PR factory that runs Claude worker agents across one or
+Autonomous work → PR factory that runs Claude worker agents across one or
 more repos, on top of [herdr](https://herdr.dev) worktrees. A single idempotent
 reconciler (`reconcileRepo`, looped by the resident `watch` daemon under `launchd`),
-finds eligible Jira tickets, spins up
-one herdr worktree + Claude worker per ticket, watches the PR, and tears the
-worktree down on merge/close.
+pulls eligible work from one or more **work sources** (a Jira board, a folder of
+markdown briefs, …) in priority order, spins up one herdr worktree + Claude worker
+per item, watches the PR, and tears the worktree down on merge/close.
+
+**Work sources** are the pluggable front of the engine. Each repo configures an ordered,
+priority-ranked list of them (`work_sources`); two types ship today — `jira` (poll a board;
+status of record lives in Jira) and `local_markdown` (a folder of `*.md` files; lifecycle
+tracked internally in SQLite). Everything downstream of "here is an eligible item" — the
+worktree, the fix→review→pr pipeline, the watch — is source-agnostic. `workspace_name` and the
+pipeline `agents` are configured **per source**; `repo` and `limits` are repo-global.
 
 This document is the canonical design of the TypeScript implementation
 (run directly by Node's built-in type stripping, no build step) backed by SQLite.
@@ -23,7 +30,7 @@ This document is the canonical design of the TypeScript implementation
    data contract for a future web UI — including a rich **event timeline**, not
    just current state. Config is never in SQLite.
 3. **The reconciler is pure and testable.** It depends on injected interfaces
-   (`Store`, `HerdrClient`, `JiraClient`, …, `now()`), so it runs against fakes
+   (`Store`, `HerdrClient`, `WorkSource`, …, `now()`), so it runs against fakes
    and an in-memory DB in tests.
 4. **Repo-specifics are decoupled into per-repo config**, not code. The engine
    is generic; onboarding a repo is pure data.
@@ -79,15 +86,17 @@ implementations and injects them. Tests substitute fakes + `:memory:` SQLite.
 ```
 herdr-factory/
   package.json  tsconfig.json  README.md  docs/ARCHITECTURE.md
-  bin/herdr-factory          cwd-robust shell launcher → `node src/cli.ts`
-                          (resolves its own dir through symlinks; symlinked into ~/.local/bin)
+  bin/herdr-factory          cwd-robust launcher → `mise exec -- node src/cli.ts` (mise.toml pins
+                          node 24; resolves its own dir through symlinks; symlinked into ~/.local/bin)
+  mise.toml                  pins node 24 for this package (runtime + native-module build ABI)
   src/
-    cli.ts                commander program; builds deps, dispatches, structured log
-    config.ts             env + repos/<name>/config.yml → zod → typed Config
-    types.ts              shared domain types
+    cli.ts                commander program; builds deps (incl. work-source clients), dispatches
+    config.ts             env + repos/<name>/config.yml → zod → typed Config (work_sources[])
+    types.ts              shared domain types (incl. WorkState, WorkItem)
     db/{index,migrate,store}.ts
-    clients/{exec,herdr,jira,github,git}.ts
+    clients/{exec,herdr,jira,jira-source,local-markdown-source,github,git}.ts
     core/{deps,branch,step,watch,reconcile}.ts
+    prompts/{fix,review,pr}.md + prompts/local_markdown/fix.md  (per-source-type built-ins)
     launchd.ts
   examples/example-repo/{config.yml, fix.md, review.md, pr.md, guidelines-prompt.md}
   test/                   vitest
@@ -161,12 +170,33 @@ reverse-engineered during the bash prototype.
   - `agentFocus(pane)` (bring a pane + its tab to the front) and `focusedPane() →
     {paneId, workspaceId, tabId, label}` (the one globally-focused pane, from `pane list`'s
     `focused` flag — herdr exposes no focus-change event to subscribe to, so it's polled)
-- **`jira.ts`** (fetch + basic auth) — `listEligible()` via the Agile board
-  endpoint `/rest/agile/1.0/board/<id>/issue?jql=…` (keeps board scoping);
-  `getIssue` (description + comments + attachment metadata), `currentStatus`,
-  `transition(key, target)` (case-insensitive `.to.name` match, no-op if already
-  there), `downloadAttachments(key, dir)` (image/* and video/*, count + per-type
-  size capped; site-host `content` URL + basic auth).
+- **Work sources** — the polymorphic front of the engine. The core depends only on the
+  `WorkSource` interface (in `core/deps.ts`) and the canonical `WorkState` lifecycle
+  (`todo → in_development → in_review → merged|aborted`):
+  - `listEligible() → Ticket[]` (todo items, in claim order)
+  - `describe(key) → Ticket` (metadata for the manual `claim`)
+  - `transition(key, WorkState) → boolean` (maps the canonical state onto the backend; returns
+    false — a no-op — when already there or the state is unmapped for this source, **with no
+    network call** for an unmapped state)
+  - `materialize(key, memDir, log)` (write the work doc + any media; idempotent, best-effort)
+  - `health()` (throws if misconfigured/unreachable — the `doctor` per-source check)
+  A `SourceRuntime` bundles a source's config identity (`name`/`type`/`priority`/`workspaceName`/
+  `agents`) with its live `client`. `Deps.sources` is the priority-ordered list; `resolveSource`
+  maps a run's `work_source` back to its runtime.
+- **`jira.ts`** (fetch + basic auth) — the low-level Jira REST client: `listEligible()` via the
+  Agile board endpoint `/rest/agile/1.0/board/<id>/issue?jql=…`; `getIssue`, `currentStatus`,
+  `transition(key, statusName)` (case-insensitive `.to.name` match, no-op if already there),
+  `downloadAttachments` (image/* and video/*, count + per-type size capped). **`jira-source.ts`**
+  adapts it to `WorkSource`: it holds the configured status map and maps canonical→Jira status —
+  `merged`/`aborted` are **unmapped** (Jira's terminal state is owned by its GitHub integration),
+  so `transition` short-circuits to a no-op **before any network call** and teardown stays
+  Jira-silent. `materialize` writes `ticket.json` + attachments.
+- **`local-markdown-source.ts`** — a folder of `*.md` files (top-level only; dot/`_`-prefixed
+  skipped). herdr-factory owns the status of record in the `work_items` table (the files are never
+  modified). Key = filename stem; title/type from optional YAML front-matter, else the first H1 /
+  humanized filename and `"task"`. `listEligible` returns files whose `work_items.status` is
+  absent/`todo` AND have no active run (a backstop over the run-table dedup); `transition` upserts
+  `work_items.status`; `materialize` snapshots the file to `task.md`; `health` stats the folder.
 - **`github.ts`** (`gh` via execFile) — `prForBranch(repo, branch)`,
   `reviewSignature(repo, n) → {unresolved, failing, sig}` (graphql review threads
   + `statusCheckRollup`).
@@ -186,8 +216,10 @@ DB; WAL + busy_timeout + the per-repo single-instance lock keep that safe.
 CREATE TABLE repos(name TEXT PRIMARY KEY, repo_path TEXT, base_ref TEXT, github TEXT,
   last_tick_at INTEGER, enabled INTEGER DEFAULT 1);
 
-CREATE TABLE runs(                       -- ONE attempt at a ticket (history kept)
-  id INTEGER PRIMARY KEY AUTOINCREMENT, repo TEXT NOT NULL, ticket_key TEXT NOT NULL,
+CREATE TABLE runs(                       -- ONE attempt at a work item (history kept)
+  id INTEGER PRIMARY KEY AUTOINCREMENT, repo TEXT NOT NULL,
+  work_source TEXT,                      -- which configured source it was claimed from (v6)
+  ticket_key TEXT NOT NULL,
   summary TEXT, issue_type TEXT, branch TEXT, phase TEXT NOT NULL,
   workspace_id TEXT, pane_id TEXT, worktree_path TEXT, pr_number INTEGER,
   watch_deadline INTEGER, last_thread_sig TEXT,
@@ -211,14 +243,33 @@ CREATE TABLE events(                     -- the timeline (web-UI gold)
   ts INTEGER NOT NULL, type TEXT NOT NULL, detail TEXT);  -- detail = JSON
 CREATE INDEX idx_events_run ON events(run_id, ts);
 
+CREATE TABLE work_items(                 -- internal lifecycle ledger for sources with no
+  id INTEGER PRIMARY KEY AUTOINCREMENT,  -- external status of record (local_markdown). (v6)
+  repo TEXT NOT NULL, source TEXT NOT NULL, key TEXT NOT NULL,
+  title TEXT, item_type TEXT, path TEXT,
+  status TEXT NOT NULL CHECK (status IN ('todo','in_development','in_review','merged','aborted')),
+  created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, UNIQUE(repo, source, key));
+CREATE INDEX idx_work_items ON work_items(repo, source, status);
+
 CREATE TABLE locks(name TEXT PRIMARY KEY, owner TEXT, acquired_at INTEGER, expires_at INTEGER);
 CREATE TABLE schema_version(version INTEGER);
 ```
 
 `db/store.ts` (synchronous): `countActive(repo)`, `activeRuns(repo)`,
-`activeRunForTicket(repo,key)`, `createRun`, `updateRun(id,patch)`,
-`endRun(id,outcome)`, `recordEvent(runId,repo,key,type,detail?)`,
-`acquireLock/releaseLock(name,owner,ttl)`, `upsertRepo`, `touchTick`.
+`activeRunForTicket(repo,source,key)` (the Phase-B dedup, now **source-scoped** so two sources
+can carry the same key), `activeRunsForKey(repo,key)` (key-only, across sources — for the manual
+CLI; the caller errors on >1 match), `createRun({…,workSource})`, `updateRun(id,patch)`,
+`endRun(id,outcome)`, `recordEvent(…)`, `acquireLock/releaseLock`, `upsertRepo`, `touchTick`,
+and the `work_items` ledger: `getWorkItem`, `listWorkItems(repo,source,status?)`,
+`setWorkItemStatus(repo,source,key,status,meta?)` (idempotent, tolerant any→any, returns false
+if already there).
+
+**Migration v6** adds `runs.work_source` (nullable — an unresolvable source must surface loudly,
+not be masked by a default) and backfills existing rows to `'jira'` in the same transaction, then
+creates `work_items`. Because the only pre-existing source was Jira, in-flight runs survive the
+upgrade **iff the configured Jira source keeps the default name `jira`** (see §10/§14). `runs`
+stays the dedup source of truth; `work_items.status` is the best-effort lifecycle label that gates
+which markdown files are eligible.
 
 **Active = `ended_at IS NULL`** (this is what the concurrency cap counts).
 `attention` keeps `ended_at` NULL so it still holds a slot until a human/teardown
@@ -234,9 +285,17 @@ focus_applied · pr_opened · resolver_woken · merged · closed · torn_down ·
 ## 7. The reconciler — multi-agent pipeline
 
 `core/reconcile.ts` → `reconcileRepo(deps)`: **Phase A** advances every active run one
-idempotent step; **Phase B** claims eligible Jira tickets up to `maxActive`. Per-run
-errors are caught → recorded as an `error` event → the tick continues; a per-repo
-single-instance lock prevents overlapping ticks.
+idempotent step (resolving its `work_source` to a `SourceRuntime` once at the top of
+`reconcileRun` and threading that concrete object down — a run whose source was removed from
+config escalates to `attention`, but a `tearing_down` run still finishes local cleanup without
+it); **Phase B** walks `deps.sources` in **priority order** (lower number first; ties by config
+order) and claims each source's eligible work up to the shared `maxActive` cap — a higher-priority
+source drains first; one source's backend hiccup is caught per-source and never starves the
+others. Per-run errors are caught → recorded as an `error` event → the tick continues; a per-repo
+single-instance lock prevents overlapping ticks. Each claim stamps `run.work_source` and renders
+the branch from that source's `workspace_name`; status transitions go through the source's client
+(`in_development` on claim, `in_review` when the PR opens, `merged`/`aborted` written back at
+teardown — a no-op for Jira, the lifecycle of record for local_markdown).
 
 ### The pipeline
 
@@ -249,9 +308,10 @@ herdr agent in its own tab/pane, dispatched and gated by the reconciler:
 | `auto_review` | **review** | fresh-eyes review of the diff → make changes → commit | `handoff-review.md` + `step-done review` |
 | `pr_round` | **pr** | open + push the PR → drive the automated round (CI green + bot comments) | `step-done pr` → human review |
 
-The agents come from the required `agents.{fix,review,pr}` config (each
-`{tab?, pane?, prompt_type, prompt_file?}`); `core/step.ts` holds the ordered `STEPS` descriptors that
-sequence them and a generic `reconcileStep` gates each. After `pr_round`, the run enters
+The agents come from the run's source's `agents.{fix,review,pr}` config (each
+`{tab?, pane?, prompt_type, prompt_file?}` — **per source**, read off the resolved
+`SourceRuntime`); `core/step.ts` holds the ordered `STEPS` descriptors that sequence them and a
+generic `reconcileStep` gates each. After `pr_round`, the run enters
 the `reviewing` human-review watch (unchanged: watches the PR, wakes a resolver).
 
 ```mermaid
@@ -373,7 +433,7 @@ Each step is a Claude agent (`core/step.ts`) dispatched **by the reconciler, nev
 another agent**, through the shared `dispatchToLayout(tab, pane, prompt, …)` helper. Per
 step (`spawnStep`):
 
-1. **Dispatch** — two modes, by whether the step has a configured `tab`/`pane` (`agents.<step>`):
+1. **Dispatch** — two modes, by whether the step has a configured `tab`/`pane` (`src.agents.<step>`):
    - **Configured** (the user's layout owns the pane): find that pane and require an agent
      that is present **and idle** (agent-agnostic — claude *or* opencode), then `agent send`
      the prompt + Enter. If the pane isn't up yet or its agent is still busy starting up,
@@ -389,12 +449,15 @@ step (`spawnStep`):
    clock); set `run.focus_pending` so the worktree view can follow the active step (§7,
    *Focus follows the active step* — applied later, never stealing focus from another worktree).
 2. **Prompt** — config load resolves each step's prompt by `prompt_type`: `augment` =
-   the engine's built-in step prompt (`src/prompts/<step>.md`) + the repo's `prompt_file`
-   (if any) as additions; `replace` = the `prompt_file` verbatim. `renderStepPrompt` then
-   substitutes tokens (`@@KEY@@`, `@@HANDOFF_IN@@`, `@@PRIOR_PANE@@`, `@@STEP_DONE_CMD@@`,
-   …) into that resolved prompt, appends `guidelines-prompt.md`, and appends a standard
-   footer that points the agent at its inputs and tells it to write its handoff note +
-   signal `step-done`. The rendered prompt is written to
+   the engine's built-in step prompt + the repo's `prompt_file` (if any) as additions; `replace`
+   = the `prompt_file` verbatim. The built-in is resolved **per source type**:
+   `src/prompts/<type>/<step>.md` if present, else the shared `src/prompts/<step>.md` (so
+   `local_markdown` gets its own `fix` prompt pointing at `task.md`, while review/pr share the
+   defaults). `renderStepPrompt` then substitutes tokens (`@@KEY@@`, `@@WORK_DOC@@` —
+   `ticket.json` for Jira, `task.md` for local_markdown — `@@HANDOFF_IN@@`, `@@PRIOR_PANE@@`,
+   `@@STEP_DONE_CMD@@` — which carries `--source` so the signal resolves unambiguously, …) into
+   that resolved prompt, appends `guidelines-prompt.md`, and appends a standard footer that points
+   the agent at its inputs and tells it to write its handoff note + signal `step-done`. The rendered prompt is written to
    `.memory/herdr-factory/prompt-<step>.md`; the agent is told to read it.
 3. **Handoff out** — before signalling, the agent writes
    `.memory/herdr-factory/handoff-<step>.md` (did / why / uncertain / verify-next).
@@ -425,6 +488,12 @@ the commit-HEAD **stall** heartbeat (`fix` / `pr` only — `review` may not comm
 per-step **budget** (`develop_/review_/pr_budget_seconds`). Past the budget while the
 agent isn't actively `working`, or stalled past `stall_seconds`, the run → `attention`; a
 dead pane is re-spawned idempotently. Same shape as the single-worker safety nets before.
+
+On escalation, `escalateAttention` (besides flipping the phase, recording the event, and firing a
+notification) **relabels the run's active pane** to `⚠ ATTENTION <KEY>`. herdr's `agent_status`
+(idle/working/blocked) is owned by the agent's own lifecycle hook and can't be set externally — so
+the pane label is the most visible *persistent* cue (the notification is one-shot). The label is
+reset to `<step>:<KEY>` if the step is later re-spawned, and the pane is reaped on teardown.
 
 The capture lock stays **machine-global** (one dev-server / browser across all
 repos), acquired with a TTL via the CLI.
@@ -463,34 +532,38 @@ left as-is).
   Atlassian site `base_url`) is per-repo config, not a global secret.
 - **Per-repo** — `~/.config/herdr-factory/repos/<name>/`:
   - `config.yml` — parsed with `yaml`, validated with `zod` → typed `Config`:
-    - `repo` — `path` / `base_ref` / `github`
-    - `workspace_name` — branch-name template per ticket (the worktree +
-      workspace derive from it). Vars: `{{ticket_id}}`, `{{ticket_short_slug}}`
-      (≤20 chars), `{{ticket_slug}}` (≤50), `{{ticket_type}}`, `{{ticket_prefix}}`
-      (`fix`/`chore`/`feature`, by issue type). The rendered name is sanitised to
-      a git-safe ref; zod requires the template to contain `{{ticket_id}}` (else
-      tickets would collide on one branch). Default when unset:
-      `{{ticket_prefix}}/{{ticket_id}}-{{ticket_slug}}` (rendered by `core/branch.ts`).
-    - `jira` — where this repo polls work from (per-repo, so different repos can target
-      different Atlassian sites): `base_url` (the Atlassian site) / `project` / `board` /
-      `label` / 3 `status` names
-    - `agents` — **required**, one block each for `fix` / `review` / `pr`: `tab` / `pane`
-      (**optional, both-or-neither** — the herdr layout pane that agent runs in; when set the
-      dispatcher waits for that pane's idle agent and never spawns its own, when omitted it
-      spawns a dedicated pane) + `prompt_type` (**required, no default**:
-      `augment` | `replace`) + `prompt_file` (path relative to the repo config dir; tokens
-      substituted at render time). `augment` (recommended) combines the engine's built-in
-      step prompt (`src/prompts/<step>.md`) with the `prompt_file` as additions — `prompt_file`
-      is optional; `replace` sends the `prompt_file` verbatim — `prompt_file` is required.
-      Per-repo bootstrap/resolve guidance lives in these prompt files (or in `augment`
-      additions / `guidelines-prompt.md`).
-    - `limits` — `max_active` / `watch_hours` / `develop_budget_seconds` (fix) /
-      `review_budget_seconds` / `pr_budget_seconds` / `stall_seconds` /
-      `tick_interval_seconds` / `layout_wait_seconds` (how long to wait for a step's
-      configured tab/pane before escalating to `attention`)
-  - `guidelines-prompt.md` — optional; appended verbatim to every agent prompt.
-- `config.ts` asserts `repo.path` is a **main checkout** (not a linked worktree),
-  since herdr can't create worktrees from one.
+    - `repo` — `path` / `base_ref` / `github` (repo-global). `path` (and any source path) supports
+      `~` / `$HOME` expansion (`expandHome`), a safe no-op when already absolute.
+    - `limits` — repo-global, shared across every source: `max_active` (the global concurrency cap)
+      / `watch_hours` / `develop_budget_seconds` (fix) / `review_budget_seconds` / `pr_budget_seconds`
+      / `stall_seconds` / `tick_interval_seconds` / `layout_wait_seconds`.
+    - `work_sources` — **required, ≥1**, an ordered list (`zod` discriminated union on `type`).
+      Each entry:
+      - `type` — `jira` | `local_markdown`.
+      - `name` — optional identifier, **default = `type`**, must be unique within the repo
+        (validated on the *resolved* names, so two unnamed `jira` sources collide). Stored on each
+        run's `work_source`. **The pre-existing Jira source must keep the default name `jira`** so
+        v6-backfilled in-flight runs resolve.
+      - `priority` — optional, default `100`; **lower = pulled first**; ties break by list order.
+      - `workspace_name` — **per source** now. Branch-name template (worktree + workspace derive
+        from it). Vars: `{{ticket_id}}` `{{ticket_short_slug}}` (≤20) `{{ticket_slug}}` (≤50)
+        `{{ticket_type}}` `{{ticket_prefix}}` (`fix`/`chore`/`feature`). zod requires `{{ticket_id}}`.
+        Default `{{ticket_prefix}}/{{ticket_id}}-{{ticket_slug}}`. (Keys should be unique across
+        sources, and per-source templates should differ, so two sources can't collide on a branch.)
+      - `agents` — **per source**, required, one block each for `fix`/`review`/`pr`: `tab`/`pane`
+        (optional, both-or-neither) + `prompt_type` (required, no default: `augment` | `replace`)
+        + `prompt_file`. `augment` combines the per-type built-in (`src/prompts/<type>/<step>.md`,
+        else `src/prompts/<step>.md`) with the optional `prompt_file`; `replace` sends `prompt_file`
+        verbatim (required).
+      - type block: `jira` (`base_url` / `project` / `board` / `label` / 3 `status` names —
+        `merged`/`aborted` are intentionally absent, so teardown never transitions Jira) **or**
+        `local_markdown` (`folder`).
+  - `guidelines-prompt.md` — optional; appended verbatim to every agent prompt (all sources).
+- **Global secrets** stay the same: `JIRA_EMAIL` / `JIRA_API_TOKEN` (auth only; *where* a Jira
+  source polls is its per-source `base_url`).
+- `config.ts` asserts `repo.path` is a **main checkout** (not a linked worktree), since herdr can't
+  create worktrees from one. The work-source *clients* are constructed in `cli.ts`'s `buildDeps`
+  (the `local_markdown` client needs the `Store`); `config.ts` stays pure data + prompt resolution.
 
 Onboarding a repo is pure data: drop a `repos/<name>/` folder, define its herdr
 layout (workspace-manager plugin), `herdr-factory --repo <name> install`.
@@ -500,19 +573,25 @@ layout (workspace-manager plugin), `herdr-factory --repo <name> install`.
 ## 11. CLI surface (commander)
 
 ```
-herdr-factory --repo <name> tick | status | eligible | claim <KEY> | teardown <KEY>
-herdr-factory --repo <name> step-done <KEY> <fix|review|pr>   # an agent → dispatcher (CLI → DB, event-nudges)
+herdr-factory --repo <name> tick | status | eligible
+herdr-factory --repo <name> claim <KEY> [--source <name>] | teardown <KEY> [--source <name>]
+herdr-factory --repo <name> step-done <KEY> <fix|review|pr> [--source <name>]  # agent → dispatcher (event-nudges)
 herdr-factory --repo <name> install | uninstall | start | stop | logs [N]
 herdr-factory --repo <name> runs [--all] | timeline <KEY>   # read the DB
 herdr-factory capture-lock acquire|release <owner>     # machine-global, no --repo
-herdr-factory doctor                                   # herdr socket / gh / jira / db / claude checks
+herdr-factory doctor                                   # herdr / gh / claude / per-source health / db
 herdr-factory help
 ```
 
-`status` is a dashboard, not just a count: an **ACTIVE** section (each run's
-ledger phase + **live** herdr agent status + PR + summary) and a **FINISHED**
-section (each completed run's outcome, newest first), under a
-`Runs: N running (cap M) · K finished` header. `runs`/`timeline` read the same DB.
+`eligible` lists todo items **across all sources** (each annotated with its `source`). `doctor`
+runs a **per-source** `health()` check (Jira auth/board; local_markdown folder exists). `claim`
+takes `--source` (defaulted when there's a single source, required when >1); `teardown`/`step-done`
+resolve the run by key and take `--source` to disambiguate when a key is active in more than one
+source (the agent's rendered `step-done` always carries `--source`). `status` is a dashboard, not
+just a count: a header listing the configured **sources** (name/type/priority), then an **ACTIVE**
+section (each run's `work_source` + ledger phase + **live** herdr agent status + PR + summary) and
+a **FINISHED** section (outcome, newest first), under a `Runs: N running (cap M) · K finished`
+line. `runs`/`timeline` read the same DB.
 
 Each command builds `Deps` (open DB, construct clients from config) and calls
 core. `--repo` is a global option; repo-scoped commands assert it.
@@ -560,6 +639,20 @@ Hard-won from the bash prototype — encode as types/tests/asserts:
   the fallbacks are active, not defensive-only.
 - Jira transition match is **case-insensitive** on `.to.name`; no-op if already
   in target.
+- **Work-source parity:** the `WorkSource.transition` of any source returns `false` (a no-op)
+  for an unmapped/already-there state **with no side effect**. For Jira, `merged`/`aborted` are
+  unmapped and short-circuit **before any network call**, so teardown stays Jira-silent exactly
+  as before multi-source (a unit test asserts zero `fetch` calls). `local_markdown.transition` is
+  an idempotent, tolerant any→any upsert that never throws on a "non-adjacent" jump.
+- **Source identity:** runs carry `work_source`; the Phase-B dedup is `(repo, source, key)`. The
+  v6 backfill stamps pre-upgrade runs `'jira'`, so the pre-existing Jira source MUST keep the
+  default name `jira`. A run whose source vanished from config escalates to `attention` (but a
+  `tearing_down` run still completes local cleanup). The agent's `step-done` carries `--source`;
+  manual CLI mutations by key error on cross-source ambiguity.
+- **local_markdown eligibility:** `runs` is the dedup source of truth; a file is listed only when
+  its `work_items.status` is absent/`todo` **and** it has no active run. `merged`/`aborted` are
+  terminal — such a file is never re-listed even with no active run (the file itself is never
+  modified; re-running it means resetting its `work_items` row).
 - worktree-create / agent-list JSON shapes are typed once in `herdr.ts`.
 - attachment `content` is site-host → basic-auth download; image/* + size cap.
 - each step gates on its own **`step-done`** signal (the `run_steps.done` flag), not flappy
@@ -569,6 +662,12 @@ Hard-won from the bash prototype — encode as types/tests/asserts:
   across worktrees; a transition in an unfocused worktree is deferred via `run.focus_pending`
   and applied when the user navigates back (herdr has no focus event → polled when pending).
 - single-instance per-repo tick lock; WAL + `busy_timeout` for the shared DB.
+- **Native-module ABI must match the runtime Node.** `better-sqlite3` is compiled for one Node ABI
+  (`NODE_MODULE_VERSION`, == the Node major). The CLI is invoked by worker agents **from another
+  repo's worktree**, which may have a different Node activated by mise — so `bin/herdr-factory`
+  runs via `mise exec -- node` against this package's pinned node (`mise.toml` → node 24), never a
+  bare `node` (a `cd` in the non-interactive launcher does NOT change the inherited PATH's Node).
+  The launchd daemon is immune (its plist bakes `process.execPath`, the node 24 that ran `install`).
 
 ---
 
@@ -592,7 +691,9 @@ handoff docs, on-demand session query, hybrid tick+event) is **implemented, unit
 validated live end-to-end** on a real ticket (RWR-17269 → merged PR; `fix`=claude,
 `review`/`pr`=opencode — confirming agent-agnostic dispatch). It is installed and running
 under `launchd` (`com.herdr-factory.<repo>`). Step-focus following (§7, *Focus follows the
-active step*) is the most recent addition. Still early — watch live runs before trusting it
+active step*) and then **multi-source work** (the `WorkSource` abstraction + the `local_markdown`
+source + per-source `agents`/`workspace_name`, this section) are the most recent additions; the
+Jira path is preserved byte-for-byte (see §14). Still early — watch live runs before trusting it
 fully unsupervised.
 
 ---

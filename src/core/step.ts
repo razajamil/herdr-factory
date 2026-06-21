@@ -1,16 +1,11 @@
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import type { Deps } from "./deps.ts";
+import type { Deps, SourceRuntime } from "./deps.ts";
 import type { Phase, Run, RunStep, StepName } from "../types.ts";
-
-const isMedia = (mime: string): boolean => mime.startsWith("image/") || mime.startsWith("video/");
 
 export const CLAUDE_FLAGS = ["--dangerously-skip-permissions"];
 export const CLI_PATH = fileURLToPath(new URL("../../bin/herdr-factory", import.meta.url));
-const MAX_ATTACHMENTS = 12; // images + videos share this budget
-const MAX_IMAGE_BYTES = 10 * 1024 * 1024; // 10 MB
-const MAX_VIDEO_BYTES = 50 * 1024 * 1024; // 50 MB
 const MEMORY_DIR = ".memory/herdr-factory";
 
 /** One pipeline step: which phase runs it, which phase follows, and whether the
@@ -93,40 +88,20 @@ export async function dispatchToLayout(
   return { status: "ready", paneId: target };
 }
 
-/** Fetch ticket JSON (description + comments) + image/video attachments into the
- *  worktree's .memory. Idempotent: a no-op once ticket.json exists, so it's safe to call on
+/** Materialize the work item (its work doc + any media) into the worktree's .memory for the
+ *  agents to read. Delegates to the source: Jira writes ticket.json + image/video attachments;
+ *  local_markdown snapshots the file to task.md. Idempotent (the source guards against
+ *  re-materializing) and best-effort (it logs rather than throwing), so it's safe to call on
  *  every claiming tick while we wait for the step's layout pane to come up. */
-export async function materializeTicket(deps: Deps, run: Run): Promise<void> {
+export async function materializeWork(deps: Deps, run: Run, src: SourceRuntime): Promise<void> {
   const worktree = run.worktreePath;
   if (!worktree) throw new Error(`${run.ticketKey}: no worktree path`);
   const mem = join(worktree, MEMORY_DIR);
-  if (existsSync(join(mem, "ticket.json"))) return; // already materialized this run
-  mkdirSync(join(mem, "attachments"), { recursive: true });
-  let mediaCount = 0;
+  mkdirSync(mem, { recursive: true });
   try {
-    const issue = await deps.jira.getIssue(run.ticketKey);
-    writeFileSync(join(mem, "ticket.json"), JSON.stringify(issue, null, 2));
-    mediaCount = (issue.fields.attachment ?? []).filter((a) => isMedia(a.mimeType ?? "")).length;
+    await src.client.materialize(run.ticketKey, mem, deps.log);
   } catch {
-    deps.log("warn", `${run.ticketKey}: could not save ticket.json`);
-  }
-  try {
-    const saved = await deps.jira.downloadAttachments(
-      run.ticketKey,
-      join(mem, "attachments"),
-      MAX_ATTACHMENTS,
-      MAX_IMAGE_BYTES,
-      MAX_VIDEO_BYTES,
-    );
-    // Don't silently swallow truncation — the fix agent is told to study every attachment.
-    if (mediaCount > saved.length) {
-      deps.log(
-        "warn",
-        `${run.ticketKey}: saved ${saved.length}/${mediaCount} media attachments — rest skipped (over the ${MAX_ATTACHMENTS} cap or size limit)`,
-      );
-    }
-  } catch {
-    deps.log("warn", `${run.ticketKey}: attachment download had issues`);
+    deps.log("warn", `${run.ticketKey}: materialize had issues`);
   }
 }
 
@@ -145,17 +120,22 @@ function footer(step: StepName, prior: RunStep | null, stepDoneCmd: string): str
     `\n## Finishing this step (required)\n` +
     `1. Write your handoff note to \`${MEMORY_DIR}/handoff-${step}.md\` — what you did, key decisions and why, ` +
     `anything uncertain, and what the next step should verify.\n` +
-    `2. Then run \`${stepDoneCmd}\` and stop. Do NOT transition the Jira ticket.\n`
+    `2. Then run \`${stepDoneCmd}\` and stop. Do NOT change the work item's status — the ` +
+    `dispatcher owns all status transitions.\n`
   );
 }
 
 /** Render a step's prompt (config prompt_file contents + tokens + guidance + footer) and
  *  write it into the worktree's .memory for the agent to read. Function replacers avoid
  *  `$`-pattern interpretation. */
-export function renderStepPrompt(deps: Deps, run: Run, step: StepName, prior: RunStep | null): void {
+export function renderStepPrompt(deps: Deps, run: Run, src: SourceRuntime, step: StepName, prior: RunStep | null): void {
   const worktree = run.worktreePath;
   if (!worktree) throw new Error(`${run.ticketKey}: no worktree path`);
-  const stepDoneCmd = `${CLI_PATH} --repo ${deps.config.repoName} step-done ${run.ticketKey} ${step}`;
+  // The step-done command carries --source so the signal resolves to the right run even when two
+  // sources share a key (the worker only knows its key, via HERDR_FACTORY_TICKET).
+  const stepDoneCmd = `${CLI_PATH} --repo ${deps.config.repoName} step-done ${run.ticketKey} ${step} --source ${src.name}`;
+  // Where the work item's spec lives — per source type (Jira → ticket.json; local_markdown → task.md).
+  const workDoc = src.type === "jira" ? `${MEMORY_DIR}/ticket.json` : `${MEMORY_DIR}/task.md`;
   const sub: Record<string, string> = {
     "@@KEY@@": run.ticketKey,
     "@@REPO@@": deps.config.repoName,
@@ -165,6 +145,7 @@ export function renderStepPrompt(deps: Deps, run: Run, step: StepName, prior: Ru
     "@@WORKTREE@@": worktree,
     "@@STEP@@": step,
     "@@MEMORY_DIR@@": MEMORY_DIR,
+    "@@WORK_DOC@@": workDoc,
     "@@EVIDENCE_DIR@@": `${MEMORY_DIR}/evidence`,
     "@@CLI@@": CLI_PATH,
     "@@HANDOFF_IN@@": prior ? `${MEMORY_DIR}/handoff-${prior.step}.md` : "(none — first step)",
@@ -173,7 +154,7 @@ export function renderStepPrompt(deps: Deps, run: Run, step: StepName, prior: Ru
     "@@PRIOR_SESSION@@": prior?.sessionId ?? "(none)",
     "@@STEP_DONE_CMD@@": stepDoneCmd,
   };
-  let out = deps.config.agents[step].prompt;
+  let out = src.agents[step].prompt;
   for (const [token, value] of Object.entries(sub)) out = out.replaceAll(token, () => value);
   if (deps.config.guidance) out += `\n\n## Repo-specific guidance\n\n${deps.config.guidance}\n`;
   out += footer(step, prior, stepDoneCmd);
@@ -190,11 +171,11 @@ export function renderStepPrompt(deps: Deps, run: Run, step: StepName, prior: Ru
  *     `started_at` (stamped on first touch below) times the bounded wait; the caller decides
  *     whether to retry next tick or escalate to attention.
  */
-export async function spawnStep(deps: Deps, run: Run, step: StepName): Promise<DispatchResult> {
+export async function spawnStep(deps: Deps, run: Run, src: SourceRuntime, step: StepName): Promise<DispatchResult> {
   const workspaceId = run.workspaceId;
   const worktree = run.worktreePath;
   if (!workspaceId || !worktree) throw new Error(`${run.ticketKey}: missing workspace/worktree`);
-  const cfg = deps.config.agents[step];
+  const cfg = src.agents[step];
 
   // Capture the prior step's session id at handoff time (herdr only knows it once the
   // prior agent has reported in) so this step's prompt can point at it.
@@ -205,7 +186,7 @@ export async function spawnStep(deps: Deps, run: Run, step: StepName): Promise<D
     if (sid) prior = deps.store.upsertRunStep(run.id, prevName!, { sessionId: sid });
   }
 
-  renderStepPrompt(deps, run, step, prior);
+  renderStepPrompt(deps, run, src, step, prior);
 
   // Ensure the step row exists so its started_at clock runs from the first attempt — this is
   // what bounds the layout wait across ticks. (started_at is set to now() on first insert and

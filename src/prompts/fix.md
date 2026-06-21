@@ -26,5 +26,6 @@ commit it — you do NOT open the PR (a later step does that).
 6. **Commit** your work to the branch — code only, and commit incrementally as you go
    (this keeps the dispatcher's progress heartbeat alive).
 
-Do NOT open a PR, and do NOT transition the Jira ticket. If you get truly stuck (can't
-build, ambiguous requirements, repeated failures), explain why in your handoff note and stop.
+Do NOT open a PR, and do NOT change the ticket's status (the dispatcher owns that). If you get
+truly stuck (can't build, ambiguous requirements, repeated failures), explain why in your
+handoff note and stop.

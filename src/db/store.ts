@@ -1,10 +1,11 @@
 import type Database from "better-sqlite3";
-import type { Clock, EventType, Outcome, Run, RunPatch, RunStep, RunStepPatch, StepName } from "../types.ts";
+import type { Clock, EventType, Outcome, Run, RunPatch, RunStep, RunStepPatch, StepName, WorkItem, WorkState } from "../types.ts";
 import { systemClock } from "../types.ts";
 
 interface RunRow {
   id: number;
   repo: string;
+  work_source: string | null;
   ticket_key: string;
   summary: string | null;
   issue_type: string | null;
@@ -28,6 +29,7 @@ function toRun(r: RunRow): Run {
   return {
     id: r.id,
     repo: r.repo,
+    workSource: r.work_source,
     ticketKey: r.ticket_key,
     summary: r.summary,
     issueType: r.issue_type,
@@ -76,6 +78,34 @@ function toRunStep(r: RunStepRow): RunStep {
   };
 }
 
+interface WorkItemRow {
+  id: number;
+  repo: string;
+  source: string;
+  key: string;
+  title: string | null;
+  item_type: string | null;
+  path: string | null;
+  status: string;
+  created_at: number;
+  updated_at: number;
+}
+
+function toWorkItem(r: WorkItemRow): WorkItem {
+  return {
+    id: r.id,
+    repo: r.repo,
+    source: r.source,
+    key: r.key,
+    title: r.title,
+    itemType: r.item_type,
+    path: r.path,
+    status: r.status as WorkState,
+    createdAt: r.created_at,
+    updatedAt: r.updated_at,
+  };
+}
+
 type Bind = string | number | null;
 
 /** Typed repository over the SQLite DB. All methods are synchronous. */
@@ -101,11 +131,22 @@ export class Store {
     return rows.map(toRun);
   }
 
-  activeRunForTicket(repo: string, key: string): Run | undefined {
+  /** The active run for a ticket WITHIN a source — the Phase-B dedup key. Scoped by source so
+   *  two sources can legitimately carry the same key (e.g. a Jira ticket and a like-named .md). */
+  activeRunForTicket(repo: string, source: string, key: string): Run | undefined {
     const row = this.db
-      .prepare("SELECT * FROM runs WHERE repo = ? AND ticket_key = ? AND ended_at IS NULL")
-      .get(repo, key) as RunRow | undefined;
+      .prepare("SELECT * FROM runs WHERE repo = ? AND work_source = ? AND ticket_key = ? AND ended_at IS NULL")
+      .get(repo, source, key) as RunRow | undefined;
     return row ? toRun(row) : undefined;
+  }
+
+  /** All active runs for a ticket key, across sources — for the manual CLI (claim/teardown/
+   *  step-done) which is given only a key. The caller errors when this returns >1 (ambiguous). */
+  activeRunsForKey(repo: string, key: string): Run[] {
+    const rows = this.db
+      .prepare("SELECT * FROM runs WHERE repo = ? AND ticket_key = ? AND ended_at IS NULL ORDER BY id")
+      .all(repo, key) as RunRow[];
+    return rows.map(toRun);
   }
 
   getRun(id: number): Run | undefined {
@@ -115,6 +156,7 @@ export class Store {
 
   createRun(input: {
     repo: string;
+    workSource: string;
     ticketKey: string;
     summary?: string | null;
     issueType?: string | null;
@@ -123,10 +165,10 @@ export class Store {
     const t = this.now();
     const info = this.db
       .prepare(
-        `INSERT INTO runs (repo, ticket_key, summary, issue_type, branch, phase, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, 'claiming', ?, ?)`,
+        `INSERT INTO runs (repo, work_source, ticket_key, summary, issue_type, branch, phase, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, 'claiming', ?, ?)`,
       )
-      .run(input.repo, input.ticketKey, input.summary ?? null, input.issueType ?? null, input.branch ?? null, t, t);
+      .run(input.repo, input.workSource, input.ticketKey, input.summary ?? null, input.issueType ?? null, input.branch ?? null, t, t);
     const run = this.getRun(Number(info.lastInsertRowid));
     if (!run) throw new Error("createRun: row vanished after insert");
     return run;
@@ -282,5 +324,69 @@ export class Store {
 
   markStepDone(runId: number, step: StepName): void {
     this.upsertRunStep(runId, step, { done: true });
+  }
+
+  // --- work_items (internal lifecycle ledger for sources with no external status; local_markdown) ---
+
+  getWorkItem(repo: string, source: string, key: string): WorkItem | undefined {
+    const row = this.db
+      .prepare("SELECT * FROM work_items WHERE repo = ? AND source = ? AND key = ?")
+      .get(repo, source, key) as WorkItemRow | undefined;
+    return row ? toWorkItem(row) : undefined;
+  }
+
+  /** All items for a source, optionally filtered by status (newest activity first). */
+  listWorkItems(repo: string, source: string, status?: WorkState): WorkItem[] {
+    const rows = (
+      status
+        ? this.db
+            .prepare("SELECT * FROM work_items WHERE repo = ? AND source = ? AND status = ? ORDER BY updated_at DESC")
+            .all(repo, source, status)
+        : this.db
+            .prepare("SELECT * FROM work_items WHERE repo = ? AND source = ? ORDER BY updated_at DESC")
+            .all(repo, source)
+    ) as WorkItemRow[];
+    return rows.map(toWorkItem);
+  }
+
+  /**
+   * Upsert an item's status (and optional metadata). Idempotent and tolerant: any state → any
+   * state, never throws on a "non-adjacent" transition — work_items.status is a best-effort
+   * label, not a strict state machine (the run lifecycle is the source of truth). Returns false
+   * if the status was already the target (no-op), mirroring JiraClient.transition's contract.
+   */
+  setWorkItemStatus(
+    repo: string,
+    source: string,
+    key: string,
+    status: WorkState,
+    meta: { title?: string | null; itemType?: string | null; path?: string | null } = {},
+  ): boolean {
+    const t = this.now();
+    const existing = this.getWorkItem(repo, source, key);
+    if (existing && existing.status === status) {
+      // Still refresh metadata if newly provided, but report no status change.
+      if (meta.title !== undefined || meta.itemType !== undefined || meta.path !== undefined) {
+        this.db
+          .prepare(
+            "UPDATE work_items SET title = COALESCE(?, title), item_type = COALESCE(?, item_type), path = COALESCE(?, path), updated_at = ? WHERE repo = ? AND source = ? AND key = ?",
+          )
+          .run(meta.title ?? null, meta.itemType ?? null, meta.path ?? null, t, repo, source, key);
+      }
+      return false;
+    }
+    this.db
+      .prepare(
+        `INSERT INTO work_items (repo, source, key, title, item_type, path, status, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(repo, source, key) DO UPDATE SET
+           status = excluded.status,
+           title = COALESCE(excluded.title, work_items.title),
+           item_type = COALESCE(excluded.item_type, work_items.item_type),
+           path = COALESCE(excluded.path, work_items.path),
+           updated_at = excluded.updated_at`,
+      )
+      .run(repo, source, key, meta.title ?? null, meta.itemType ?? null, meta.path ?? null, status, t, t);
+    return true;
   }
 }

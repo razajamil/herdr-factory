@@ -7,10 +7,11 @@ import { openDb } from "./db/index.ts";
 import { Store } from "./db/store.ts";
 import { systemClock, type Run, type StepName } from "./types.ts";
 import { HerdrClient } from "./clients/herdr.ts";
-import { JiraClient } from "./clients/jira.ts";
+import { JiraSource } from "./clients/jira-source.ts";
+import { LocalMarkdownSource } from "./clients/local-markdown-source.ts";
 import { GitHubClient } from "./clients/github.ts";
 import { GitClient, parseGhRepo } from "./clients/git.ts";
-import type { Deps, Logger } from "./core/deps.ts";
+import type { Deps, Logger, SourceRuntime } from "./core/deps.ts";
 import { claimTicket, reconcileRepo, reconcileRun, teardownTicket, withTickLock } from "./core/reconcile.ts";
 import { run } from "./clients/exec.ts";
 import * as launchd from "./launchd.ts";
@@ -43,13 +44,27 @@ async function buildDeps(repoName: string): Promise<Deps> {
   const store = new Store(openDb(config.paths.dbPath), systemClock);
   const git = new GitClient();
   const ghRepo = config.repo.github ?? parseGhRepo(await git.originUrl(config.repo.path)) ?? "";
+  // config.sources is already priority-ordered; build a live client per source.
+  const sources: SourceRuntime[] = config.sources.map((s) => ({
+    name: s.name,
+    type: s.type,
+    priority: s.priority,
+    workspaceName: s.workspaceName,
+    agents: s.agents,
+    client:
+      s.type === "jira"
+        ? new JiraSource(s.jira!, secrets.jiraEmail, secrets.jiraApiToken)
+        : new LocalMarkdownSource(s.localMarkdown!.folder, store, repoName, s.name),
+  }));
+  const byName = new Map(sources.map((s) => [s.name, s]));
   return {
     config,
     secrets,
     store,
     ghRepo,
     herdr: new HerdrClient(process.env.HERDR_BIN_PATH ?? "herdr"),
-    jira: new JiraClient(config.jira.baseUrl, secrets.jiraEmail, secrets.jiraApiToken),
+    sources,
+    resolveSource: (name) => (name == null ? undefined : byName.get(name)),
     github: new GitHubClient(),
     git,
     log: makeLogger(config),
@@ -59,10 +74,34 @@ async function buildDeps(repoName: string): Promise<Deps> {
   };
 }
 
+/** Resolve the source name for a manual command: the --source flag if given (validated), else
+ *  the sole source, else fail asking which. */
+function resolveSourceName(deps: Deps, optSource: string | undefined): string {
+  if (optSource) {
+    if (!deps.sources.some((s) => s.name === optSource)) {
+      fail(`unknown source "${optSource}"; configured: ${deps.sources.map((s) => s.name).join(", ")}`);
+    }
+    return optSource;
+  }
+  if (deps.sources.length === 1) return deps.sources[0]!.name;
+  fail(`multiple sources configured — pass --source <name> (one of: ${deps.sources.map((s) => s.name).join(", ")})`);
+}
+
+/** Resolve a single active run by key for a manual mutation, erroring on cross-source ambiguity. */
+function resolveActiveRun(deps: Deps, key: string, optSource: string | undefined): Run | undefined {
+  const repo = deps.config.repoName;
+  if (optSource) return deps.store.activeRunForTicket(repo, optSource, key);
+  const runs = deps.store.activeRunsForKey(repo, key);
+  if (runs.length > 1) {
+    fail(`${key}: active in multiple sources (${runs.map((r) => r.workSource).join(", ")}) — pass --source <name>`);
+  }
+  return runs[0];
+}
+
 const program = new Command();
 program
   .name("herdr-factory")
-  .description("Autonomous Jira→PR factory — runs Claude worker agents across repos on herdr worktrees.")
+  .description("Autonomous work→PR factory — runs Claude worker agents across repos on herdr worktrees.")
   .version("0.1.0")
   .option("--repo <name>", "target repo (its ~/.config/herdr-factory/repos/<name>/)");
 
@@ -133,9 +172,10 @@ program
       const recent = deps.store.listRuns(c.repoName, true);
       const finished = recent.filter((r) => r.endedAt !== null);
       const fmt = (r: Run, statusCol: string) =>
-        `    ${r.ticketKey.padEnd(16)} ${r.phase.padEnd(12)} ${statusCol.padEnd(16)} PR:${(r.prNumber ? `#${r.prNumber}` : "-").padEnd(6)} ${(r.summary ?? "").slice(0, 60)}`;
+        `    ${r.ticketKey.padEnd(16)} ${(r.workSource ?? "?").padEnd(14)} ${r.phase.padEnd(12)} ${statusCol.padEnd(16)} PR:${(r.prNumber ? `#${r.prNumber}` : "-").padEnd(6)} ${(r.summary ?? "").slice(0, 50)}`;
+      console.log(`herdr-factory [${c.repoName}] — cap ${c.limits.maxActive}, watch ${c.limits.watchHours}h`);
       console.log(
-        `herdr-factory [${c.repoName}] — board ${c.jira.board}, label "${c.jira.label}", cap ${c.limits.maxActive}, watch ${c.limits.watchHours}h`,
+        `Sources (priority order): ${c.sources.map((s) => `${s.name}(${s.type}, p${s.priority})`).join(" · ")}`,
       );
       console.log(`Runs: ${active.length} running (cap ${c.limits.maxActive}) · ${finished.length} finished`);
       console.log("");
@@ -163,12 +203,19 @@ program
 
 program
   .command("eligible")
-  .description("list eligible To-Do + agent-labelled tickets")
+  .description("list eligible (todo) work items across all sources")
   .action(async () => {
     try {
       const deps = await buildDeps(requireRepo());
-      const tickets = await deps.jira.listEligible(deps.config.jira.board, deps.config.jira.label, deps.config.jira.statusTodo);
-      console.log(JSON.stringify(tickets, null, 2));
+      const out: { source: string; key: string; summary: string; type: string }[] = [];
+      for (const src of deps.sources) {
+        try {
+          for (const t of await src.client.listEligible()) out.push({ source: src.name, ...t });
+        } catch (e) {
+          deps.log("warn", `${src.name}: eligible query failed: ${e instanceof Error ? e.message : String(e)}`);
+        }
+      }
+      console.log(JSON.stringify(out, null, 2));
     } catch (e) {
       fail(e);
     }
@@ -176,10 +223,12 @@ program
 
 program
   .command("claim <key>")
-  .description("manually claim + start one ticket")
-  .action(async (key: string) => {
+  .description("manually claim + start one work item")
+  .option("--source <name>", "which work source the key belongs to (required if >1 source)")
+  .action(async (key: string, opts: { source?: string }) => {
     try {
-      await claimTicket(await buildDeps(requireRepo()), key);
+      const deps = await buildDeps(requireRepo());
+      await claimTicket(deps, resolveSourceName(deps, opts.source), key);
     } catch (e) {
       fail(e);
     }
@@ -187,10 +236,11 @@ program
 
 program
   .command("teardown <key>")
-  .description("tear down one ticket's worktree")
-  .action(async (key: string) => {
+  .description("tear down one work item's worktree")
+  .option("--source <name>", "disambiguate when the key is active in more than one source")
+  .action(async (key: string, opts: { source?: string }) => {
     try {
-      await teardownTicket(await buildDeps(requireRepo()), key);
+      await teardownTicket(await buildDeps(requireRepo()), key, opts.source);
     } catch (e) {
       fail(e);
     }
@@ -199,11 +249,12 @@ program
 program
   .command("step-done <key> <step>")
   .description("a pipeline agent signals it finished its step (fix|review|pr)")
-  .action(async (key: string, step: string) => {
+  .option("--source <name>", "the work source the run belongs to (passed by the agent)")
+  .action(async (key: string, step: string, opts: { source?: string }) => {
     try {
       if (!["fix", "review", "pr"].includes(step)) fail(`step-done: step must be fix|review|pr (got "${step}")`);
       const deps = await buildDeps(requireRepo());
-      const run = deps.store.activeRunForTicket(deps.config.repoName, key);
+      const run = resolveActiveRun(deps, key, opts.source);
       if (!run) {
         deps.log("warn", `${key}: no active run to mark step-done`);
         return;
@@ -369,9 +420,9 @@ program
       await check("herdr socket", () => run(herdrBin, ["workspace", "list"]));
       await check("gh auth", () => run("gh", ["auth", "status"]));
       await check("claude on PATH", () => run("claude", ["--version"]));
-      await check("jira auth", () =>
-        deps.jira.listEligible(deps.config.jira.board, deps.config.jira.label, deps.config.jira.statusTodo),
-      );
+      for (const src of deps.sources) {
+        await check(`source ${src.name} (${src.type})`, () => src.client.health());
+      }
       await check("git origin resolved", async () => {
         if (!deps.ghRepo) throw new Error("no origin");
       });

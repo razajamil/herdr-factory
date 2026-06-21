@@ -69,6 +69,36 @@ const MIGRATIONS: { version: number; sql: string }[] = [
     // is what lets a transition in an unfocused worktree be deferred across ticks.
     sql: `ALTER TABLE runs ADD COLUMN focus_pending INTEGER NOT NULL DEFAULT 0;`,
   },
+  {
+    version: 6,
+    // Multi-source work. Every run now records WHICH configured work source it was claimed
+    // from. The column is left NULLABLE (no DEFAULT) on purpose: a future run that somehow
+    // lands without a source should surface loudly (resolveSource → escalate) rather than be
+    // silently coerced to 'jira'. The one-time backfill stamps pre-upgrade in-flight runs as
+    // 'jira' — the only source that existed before — so they keep resolving after the upgrade.
+    // INVARIANT: the pre-existing Jira source MUST keep the default name 'jira' (see config.ts
+    // / ARCHITECTURE §10) or backfilled in-flight runs won't match a configured source.
+    // The ALTER + UPDATE + CREATE commit atomically (migrate() wraps each version in a txn).
+    //
+    // work_items is herdr-factory's internal status ledger for sources with no external status
+    // of record (local_markdown). Jira keeps its status in Jira; this table is never touched by
+    // the Jira source. `runs` remains the dedup source of truth; work_items.status is the
+    // best-effort lifecycle label that gates which markdown files are eligible.
+    sql: `
+      ALTER TABLE runs ADD COLUMN work_source TEXT;
+      UPDATE runs SET work_source = 'jira' WHERE work_source IS NULL;
+      CREATE TABLE work_items (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        repo TEXT NOT NULL, source TEXT NOT NULL, key TEXT NOT NULL,
+        title TEXT, item_type TEXT, path TEXT,
+        status TEXT NOT NULL
+          CHECK (status IN ('todo','in_development','in_review','merged','aborted')),
+        created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+        UNIQUE(repo, source, key)
+      );
+      CREATE INDEX idx_work_items ON work_items(repo, source, status);
+    `,
+  },
 ];
 
 /** Apply pending migrations in a transaction. Idempotent. */

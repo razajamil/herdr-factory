@@ -1,7 +1,8 @@
-import type { Deps } from "./deps.ts";
+import type { Deps, SourceRuntime } from "./deps.ts";
 import type { Outcome, Run, RunStep, StepName, Ticket } from "../types.ts";
+import { outcomeToWorkState } from "../types.ts";
 import { branchName } from "./branch.ts";
-import { STEPS, type StepDescriptor, materializeTicket, nextStep, spawnStep, stepForPhase } from "./step.ts";
+import { STEPS, type StepDescriptor, materializeWork, nextStep, spawnStep, stepForPhase } from "./step.ts";
 import { wakeResolver } from "./watch.ts";
 
 function err(e: unknown): string {
@@ -43,56 +44,84 @@ export async function reconcileRepo(deps: Deps): Promise<void> {
     }
   }
 
-  // Phase B — claim new tickets up to the cap.
+  // Phase B — claim new work up to the cap, walking sources in priority order. The cap is
+  // global across all sources; a higher-priority source drains its eligible work first.
   const active = deps.store.countActive(repo);
-  const slots = deps.config.limits.maxActive - active;
+  let slots = deps.config.limits.maxActive - active;
   if (slots <= 0) {
     deps.log("info", `at capacity (${active}/${deps.config.limits.maxActive})`);
     deps.store.touchTick(repo);
     return;
   }
 
-  let eligible: Ticket[];
-  try {
-    eligible = await deps.jira.listEligible(deps.config.jira.board, deps.config.jira.label, deps.config.jira.statusTodo);
-  } catch (e) {
-    deps.log("warn", `eligible query failed: ${err(e)}`);
-    deps.store.touchTick(repo);
-    return;
-  }
-
   let claimed = 0;
-  for (const ticket of eligible) {
-    if (claimed >= slots) break;
-    if (deps.store.activeRunForTicket(repo, ticket.key)) continue;
+  for (const src of deps.sources) {
+    if (slots <= 0) break;
+    let eligible: Ticket[];
     try {
-      await claim(deps, ticket);
-      claimed += 1;
+      eligible = await src.client.listEligible();
     } catch (e) {
-      deps.log("error", `${ticket.key}: claim failed: ${err(e)}`);
+      // One source's backend hiccup must not starve the others — log and move on.
+      deps.log("warn", `${src.name}: eligible query failed: ${err(e)}`);
+      continue;
+    }
+    for (const ticket of eligible) {
+      if (slots <= 0) break;
+      if (deps.store.activeRunForTicket(repo, src.name, ticket.key)) continue;
+      // claim() creates the run row FIRST (which immediately counts toward countActive), so the
+      // slot is consumed even if the rest of the claim throws — decrement before the try, or a
+      // burst of claim failures in one pass would transiently spawn past maxActive.
+      slots -= 1;
+      try {
+        await claim(deps, src, ticket);
+        claimed += 1;
+      } catch (e) {
+        deps.log("error", `${src.name}/${ticket.key}: claim failed: ${err(e)}`);
+      }
     }
   }
   deps.log("info", `claimed ${claimed}; active ${deps.store.countActive(repo)}/${deps.config.limits.maxActive}`);
   deps.store.touchTick(repo);
 }
 
-async function claim(deps: Deps, ticket: Ticket): Promise<void> {
+async function claim(deps: Deps, src: SourceRuntime, ticket: Ticket): Promise<void> {
   const repo = deps.config.repoName;
-  const branch = branchName(ticket.key, ticket.type, ticket.summary, deps.config.workspaceName);
+  const branch = branchName(ticket.key, ticket.type, ticket.summary, src.workspaceName);
   const run = deps.store.createRun({
     repo,
+    workSource: src.name,
     ticketKey: ticket.key,
     summary: ticket.summary,
     issueType: ticket.type,
     branch,
   });
-  deps.store.recordEvent({ runId: run.id, repo, ticketKey: ticket.key, type: "claimed", detail: { branch } });
-  deps.log("info", `${ticket.key}: claimed -> ${branch}`);
+  deps.store.recordEvent({ runId: run.id, repo, ticketKey: ticket.key, type: "claimed", detail: { branch, source: src.name } });
+  deps.log("info", `${src.name}/${ticket.key}: claimed -> ${branch}`);
   await reconcileRun(deps, run);
 }
 
 export async function reconcileRun(deps: Deps, run: Run): Promise<void> {
-  await dispatchPhase(deps, run);
+  // Resolve the run's source ONCE and thread it down — every site that needs per-source agents,
+  // workspace_name, or the client reads it off `src` (no per-site re-lookup or null-guard).
+  const src = deps.resolveSource(run.workSource);
+  if (!src) {
+    // The source was renamed/removed from config between claim and now. A tearing_down run must
+    // still finish its local cleanup (worktree/branch) — the source client isn't needed for that.
+    // Anything else can't be advanced: escalate to attention (idempotent) so an operator notices.
+    if (run.phase === "tearing_down") {
+      await teardown(deps, run, "abandoned", undefined);
+    } else if (run.phase !== "attention" && run.phase !== "done") {
+      deps.log("error", `${run.ticketKey}: work source "${run.workSource}" is not configured — escalating`);
+      await escalateAttention(deps, run, {
+        reason: "source_missing",
+        attentionReason: `work source "${run.workSource}" not configured`,
+        body: `${run.ticketKey}: its work source "${run.workSource}" is no longer in this repo's config — re-add it or tear the run down.`,
+        detail: { workSource: run.workSource },
+      });
+    }
+    return;
+  }
+  await dispatchPhase(deps, run, src);
   // Then, on every pass for every active run, try to apply any deferred focus shift. Doing
   // it here (not only on the tick that transitioned) is what lets a transition in an
   // unfocused worktree be picked up later, once the user navigates to it.
@@ -100,21 +129,21 @@ export async function reconcileRun(deps: Deps, run: Run): Promise<void> {
   if (fresh) await applyPendingFocus(deps, fresh);
 }
 
-async function dispatchPhase(deps: Deps, run: Run): Promise<void> {
+async function dispatchPhase(deps: Deps, run: Run, src: SourceRuntime): Promise<void> {
   switch (run.phase) {
     case "claiming":
-      return reconcileClaiming(deps, run);
+      return reconcileClaiming(deps, run, src);
     case "fixing":
     case "auto_review":
     case "pr_round": {
       const d = stepForPhase(run.phase);
-      if (d) return reconcileStep(deps, run, d);
+      if (d) return reconcileStep(deps, run, src, d);
       return;
     }
     case "reviewing":
-      return reconcileReviewing(deps, run);
+      return reconcileReviewing(deps, run, src);
     case "tearing_down":
-      return teardown(deps, run, "abandoned");
+      return teardown(deps, run, "abandoned", src);
     case "attention":
     case "done":
       return;
@@ -163,7 +192,7 @@ export async function applyPendingFocus(deps: Deps, run: Run): Promise<void> {
   });
 }
 
-async function reconcileClaiming(deps: Deps, run: Run): Promise<void> {
+async function reconcileClaiming(deps: Deps, run: Run, src: SourceRuntime): Promise<void> {
   const repo = deps.config.repoName;
   const branch = run.branch;
   if (!branch) throw new Error(`${run.ticketKey}: claiming without a branch`);
@@ -180,28 +209,28 @@ async function reconcileClaiming(deps: Deps, run: Run): Promise<void> {
     deps.log("info", `${run.ticketKey}: worktree ready (${wt.workspaceId})`);
   }
 
-  // 2. fetch the ticket + attachments (idempotent) and dispatch the fix agent. If the
-  //    configured layout pane isn't up yet, stay in `claiming` and retry next tick (bounded;
-  //    escalate to attention on timeout) — never spawn our own when a tab/pane is configured.
+  // 2. materialize the work item (idempotent) and dispatch the fix agent. If the configured
+  //    layout pane isn't up yet, stay in `claiming` and retry next tick (bounded; escalate to
+  //    attention on timeout) — never spawn our own when a tab/pane is configured.
   if (!deps.store.getRunStep(run.id, "fix")?.paneId) {
-    await materializeTicket(deps, run);
-    const res = await spawnStep(deps, run, "fix");
-    if (res.status === "waiting") return handleLayoutWait(deps, run, "fix");
+    await materializeWork(deps, run, src);
+    const res = await spawnStep(deps, run, src, "fix");
+    if (res.status === "waiting") return handleLayoutWait(deps, run, src, "fix");
     run = deps.store.getRun(run.id)!;
   }
 
-  // 3. Advance to fixing FIRST, then attempt the Jira transition best-effort. Gating the
-  //    phase on the transition would pin the run in `claiming` forever if the transition
+  // 3. Advance to fixing FIRST, then attempt the in-development transition best-effort. Gating
+  //    the phase on the transition would pin the run in `claiming` forever if the transition
   //    keeps failing (auth/workflow) while its fix agent runs and finishes unobserved.
   deps.store.updateRun(run.id, { phase: "fixing" });
   deps.log("info", `${run.ticketKey}: fixing on ${branch}`);
   try {
-    const moved = await deps.jira.transition(run.ticketKey, deps.config.jira.statusInDev);
+    const moved = await src.client.transition(run.ticketKey, "in_development");
     if (moved) {
-      deps.store.recordEvent({ runId: run.id, repo, ticketKey: run.ticketKey, type: "transition", detail: { to: deps.config.jira.statusInDev } });
+      deps.store.recordEvent({ runId: run.id, repo, ticketKey: run.ticketKey, type: "transition", detail: { to: "in_development" } });
     }
   } catch (e) {
-    deps.log("warn", `${run.ticketKey}: In-development transition deferred: ${err(e)}`);
+    deps.log("warn", `${run.ticketKey}: in-development transition deferred: ${err(e)}`);
   }
 }
 
@@ -229,6 +258,11 @@ async function escalateAttention(
     type: "attention",
     detail: { reason: opts.reason, ...(opts.detail ?? {}) },
   });
+  // Make it obvious in herdr: relabel the active pane. herdr won't let us set agent_status to
+  // "blocked" (that's owned by the agent's own lifecycle hook), so a glaring pane label is the
+  // most visible persistent cue — unlike the one-shot notification, it stays in the tab/pane list
+  // until the run resolves (re-spawn renames it back; teardown removes the pane). Best-effort.
+  if (run.paneId) await deps.herdr.agentRename(run.paneId, `⚠ ATTENTION ${run.ticketKey}`).catch(() => {});
   await deps.herdr.notify(`herdr-factory: ${run.ticketKey} needs attention`, opts.body).catch(() => {});
 }
 
@@ -236,8 +270,8 @@ async function escalateAttention(
  *  Stay put and retry next tick, but escalate to attention once we've waited past
  *  `layout_wait_seconds` (measured from the step row's started_at). Only steps that HAVE a
  *  tab/pane ever wait — steps without one spawn their own pane and never reach here. */
-async function handleLayoutWait(deps: Deps, run: Run, step: StepName): Promise<void> {
-  const cfg = deps.config.agents[step];
+async function handleLayoutWait(deps: Deps, run: Run, src: SourceRuntime, step: StepName): Promise<void> {
+  const cfg = src.agents[step];
   const where = `${cfg.tab}/${cfg.pane}`;
   const since = deps.store.getRunStep(run.id, step)?.startedAt ?? deps.now();
   const waited = deps.now() - since;
@@ -267,15 +301,15 @@ function budgetFor(deps: Deps, step: StepName): number {
  * stall heartbeat (fix/pr), a per-step budget, and liveness — escalating to `attention`
  * only when the agent isn't actively working. Re-spawns a dead pane idempotently.
  */
-async function reconcileStep(deps: Deps, run: Run, d: StepDescriptor): Promise<void> {
+async function reconcileStep(deps: Deps, run: Run, src: SourceRuntime, d: StepDescriptor): Promise<void> {
   const step = deps.store.getRunStep(run.id, d.name);
 
   // (Re)spawn if there's no live pane recorded for this step (first entry / crash gap). If
   // the step's configured layout pane isn't up yet, wait (bounded → attention) rather than
   // spawning our own.
   if (!step || !step.paneId) {
-    const res = await spawnStep(deps, run, d.name);
-    if (res.status === "waiting") await handleLayoutWait(deps, run, d.name);
+    const res = await spawnStep(deps, run, src, d.name);
+    if (res.status === "waiting") await handleLayoutWait(deps, run, src, d.name);
     return;
   }
   // (Session id for on-demand query is captured at handoff time by spawnStep when the
@@ -286,7 +320,7 @@ async function reconcileStep(deps: Deps, run: Run, d: StepDescriptor): Promise<v
   // CLOSED PR left on a reused branch name must not tear down a fresh attempt.
   const pr = d.name === "pr" && run.branch ? await deps.github.prForBranch(deps.ghRepo, run.branch) : null;
   if (pr && pr.state !== "CLOSED" && run.prNumber !== pr.number) deps.store.updateRun(run.id, { prNumber: pr.number });
-  if (pr && pr.state === "CLOSED" && pr.number === run.prNumber) return teardown(deps, run, "closed");
+  if (pr && pr.state === "CLOSED" && pr.number === run.prNumber) return teardown(deps, run, "closed", src);
   const livePr = pr && pr.state !== "CLOSED" ? pr : null;
 
   // Advance when the agent signalled step-done (or its PR merged out from under us).
@@ -295,13 +329,13 @@ async function reconcileStep(deps: Deps, run: Run, d: StepDescriptor): Promise<v
     if (next) {
       deps.store.updateRun(run.id, { phase: next.phase });
       deps.log("info", `${run.ticketKey}: ${d.name} done -> ${next.phase}`);
-      await spawnStep(deps, run, next.name);
+      await spawnStep(deps, run, src, next.name);
       return;
     }
     // Last step (pr) done → hand off to the human-review watch, but only with a real PR.
     // If the agent signalled done before a PR is visible (push lag / never opened), fall
     // through to the watchdog rather than wedging in `reviewing` with no PR to watch.
-    if (livePr) return enterReviewing(deps, run, livePr.number);
+    if (livePr) return enterReviewing(deps, run, src, livePr.number);
   }
 
   // Not done — watchdog. Commit-HEAD heartbeat (fix/pr), per-step budget, and liveness.
@@ -337,19 +371,19 @@ async function reconcileStep(deps: Deps, run: Run, d: StepDescriptor): Promise<v
   if (!(await deps.herdr.paneAlive(step.paneId))) {
     if (deps.store.getRunStep(run.id, d.name)?.done) return; // finished; the next tick advances
     deps.log("info", `${run.ticketKey}: ${d.name} pane gone — re-spawning`);
-    await spawnStep(deps, run, d.name);
+    await spawnStep(deps, run, src, d.name);
     return;
   }
   deps.log("info", `${run.ticketKey}: awaiting step-done ${d.name} (pane ${step.paneId})`);
 }
 
-/** Transition Jira to its review status and move the run into the human-review watch phase. */
-async function enterReviewing(deps: Deps, run: Run, prNumber: number): Promise<void> {
+/** Transition the work item to its review state and move the run into the human-review watch. */
+async function enterReviewing(deps: Deps, run: Run, src: SourceRuntime, prNumber: number): Promise<void> {
   const repo = deps.config.repoName;
   try {
-    const moved = await deps.jira.transition(run.ticketKey, deps.config.jira.statusReview);
+    const moved = await src.client.transition(run.ticketKey, "in_review");
     if (moved) {
-      deps.store.recordEvent({ runId: run.id, repo, ticketKey: run.ticketKey, type: "transition", detail: { to: deps.config.jira.statusReview } });
+      deps.store.recordEvent({ runId: run.id, repo, ticketKey: run.ticketKey, type: "transition", detail: { to: "in_review" } });
     }
   } catch (e) {
     deps.log("warn", `${run.ticketKey}: review transition deferred: ${err(e)}`);
@@ -359,14 +393,14 @@ async function enterReviewing(deps: Deps, run: Run, prNumber: number): Promise<v
   deps.log("info", `${run.ticketKey}: PR #${prNumber} -> reviewing`);
 }
 
-async function reconcileReviewing(deps: Deps, run: Run): Promise<void> {
+async function reconcileReviewing(deps: Deps, run: Run, src: SourceRuntime): Promise<void> {
   const repo = deps.config.repoName;
   const pr = run.branch ? await deps.github.prForBranch(deps.ghRepo, run.branch) : null;
   if (!pr) return;
   if (run.prNumber !== pr.number) deps.store.updateRun(run.id, { prNumber: pr.number });
 
-  if (pr.state === "MERGED") return teardown(deps, run, "merged");
-  if (pr.state === "CLOSED") return teardown(deps, run, "closed");
+  if (pr.state === "MERGED") return teardown(deps, run, "merged", src);
+  if (pr.state === "CLOSED") return teardown(deps, run, "closed", src);
 
   if (run.watchDeadline && deps.now() > run.watchDeadline) {
     await escalateAttention(deps, run, {
@@ -402,9 +436,24 @@ async function reconcileReviewing(deps: Deps, run: Run): Promise<void> {
  * So: remove → verify the workspace is gone, else close it directly → clear the checkout
  * dir → prune the stale git registration → delete the branch (now safely not "checked out").
  */
-async function teardown(deps: Deps, run: Run, outcome: Outcome): Promise<void> {
+async function teardown(deps: Deps, run: Run, outcome: Outcome, src: SourceRuntime | undefined): Promise<void> {
   const repo = deps.config.repoName;
   deps.store.updateRun(run.id, { phase: "tearing_down" });
+
+  // Write the terminal lifecycle state back to the source (best-effort, never blocks cleanup).
+  // No-op for Jira (merged/aborted are unmapped → no network); records the merged/aborted label
+  // for local_markdown so the file is never re-listed. Skipped entirely if the source is gone.
+  if (src) {
+    const finalState = outcomeToWorkState(outcome);
+    try {
+      const moved = await src.client.transition(run.ticketKey, finalState);
+      if (moved) {
+        deps.store.recordEvent({ runId: run.id, repo, ticketKey: run.ticketKey, type: "transition", detail: { to: finalState } });
+      }
+    } catch (e) {
+      deps.log("warn", `${run.ticketKey}: terminal (${finalState}) transition skipped: ${err(e)}`);
+    }
+  }
 
   if (run.workspaceId) {
     await deps.herdr.worktreeRemove(run.workspaceId);
@@ -429,22 +478,38 @@ async function teardown(deps: Deps, run: Run, outcome: Outcome): Promise<void> {
 
 // --- manual entry points (used by the CLI) ----------------------------------
 
-/** Manually claim + start a single ticket (the `claim` command). */
-export async function claimTicket(deps: Deps, ticketKey: string): Promise<void> {
-  if (deps.store.activeRunForTicket(deps.config.repoName, ticketKey)) {
-    deps.log("warn", `${ticketKey}: already has an active run`);
+/** Manually claim + start a single item from a named source (the `claim` command). */
+export async function claimTicket(deps: Deps, sourceName: string, ticketKey: string): Promise<void> {
+  const src = deps.resolveSource(sourceName);
+  if (!src) {
+    throw new Error(`unknown work source "${sourceName}" — configured: ${deps.sources.map((s) => s.name).join(", ") || "(none)"}`);
+  }
+  if (deps.store.activeRunForTicket(deps.config.repoName, src.name, ticketKey)) {
+    deps.log("warn", `${ticketKey}: already has an active run in source "${src.name}"`);
     return;
   }
-  const issue = await deps.jira.getIssue(ticketKey);
-  await claim(deps, { key: issue.key, summary: issue.fields.summary, type: issue.fields.issuetype?.name ?? "Task" });
+  const ticket = await src.client.describe(ticketKey);
+  await claim(deps, src, ticket);
 }
 
-/** Manually tear down a ticket's active run (the `teardown` command). */
-export async function teardownTicket(deps: Deps, ticketKey: string): Promise<void> {
-  const run = deps.store.activeRunForTicket(deps.config.repoName, ticketKey);
+/** Manually tear down an item's active run (the `teardown` command). With no `sourceName`,
+ *  resolves the run by key across sources and errors if the key is ambiguous (active in >1). */
+export async function teardownTicket(deps: Deps, ticketKey: string, sourceName?: string): Promise<void> {
+  const repo = deps.config.repoName;
+  let run: Run | undefined;
+  if (sourceName) {
+    run = deps.store.activeRunForTicket(repo, sourceName, ticketKey);
+  } else {
+    const runs = deps.store.activeRunsForKey(repo, ticketKey);
+    if (runs.length > 1) {
+      throw new Error(`${ticketKey}: active in multiple sources (${runs.map((r) => r.workSource).join(", ")}) — pass --source <name>`);
+    }
+    run = runs[0];
+  }
   if (!run) {
     deps.log("warn", `${ticketKey}: no active run`);
     return;
   }
-  await teardown(deps, run, "abandoned");
+  // Resolve the source for the lifecycle write-back; undefined (removed source) → teardown skips it.
+  await teardown(deps, run, "abandoned", deps.resolveSource(run.workSource));
 }

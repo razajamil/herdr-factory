@@ -18,4 +18,4 @@ branch `@@BRANCH@@`.
    is green or the time elapses. Only automated checks/bots in this window — human reviewers
    are watched by the dispatcher afterwards.
 
-Do NOT transition the Jira ticket. Put the PR URL in your handoff note.
+Do NOT change the work item's status. Put the PR URL in your handoff note.

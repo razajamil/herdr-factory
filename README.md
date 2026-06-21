@@ -1,12 +1,14 @@
 # herdr-factory
 
-Autonomous Jira → PR **factory** that runs Claude worker agents across one
+Autonomous work → PR **factory** that runs Claude worker agents across one
 or more repos, on top of [herdr](https://herdr.dev) worktrees.
 
-Label a Jira ticket and walk away: the factory claims it, spins up a herdr
-worktree, runs Claude through fix → review → PR, watches the PR, and tears the
-worktree down on merge. All the polling is plain shell — Claude only runs for the
-work that needs reasoning.
+Point it at one or more **work sources** — a Jira board, a folder of markdown task
+briefs — and walk away: the factory claims an item, spins up a herdr worktree, runs
+Claude through fix → review → PR, watches the PR, and tears the worktree down on merge.
+Sources are pulled in priority order under one global concurrency cap; each source has its
+own branch template and pipeline agents. Two source types ship today: `jira` (status of
+record lives in Jira) and `local_markdown` (lifecycle tracked internally by herdr-factory).
 
 ## Quick start
 
@@ -14,7 +16,11 @@ work that needs reasoning.
 
 All of these must be on your `PATH`:
 
-- `node` ≥ 24 and `pnpm` — the CLI runs `src/*.ts` directly via Node's built-in TypeScript support
+- `node` ≥ 24 and `pnpm` — the CLI runs `src/*.ts` directly via Node's built-in TypeScript support.
+  [`mise`](https://mise.jdx.dev) is recommended: `mise.toml` pins node 24, and `bin/herdr-factory`
+  runs via `mise exec` so it always uses node 24 even when a worker agent invokes it from another
+  repo's worktree that activates a different node (`better-sqlite3` is a native module — the
+  runtime node ABI must match the one it was built against)
 - `herdr` — the worktree/workspace server ([herdr.dev](https://herdr.dev))
 - `claude` — the Claude Code CLI
 - `git`, `gh` (authenticated), `curl`
@@ -58,11 +64,18 @@ cp -r examples/example-repo ~/.config/herdr-factory/repos/<name>
 In `repos/<name>/config.yml`, set:
 
 - `repo.path` / `repo.base_ref` — the main checkout and the branch worktrees fork from
-- `jira.base_url` / `project` / `board` / `label` / the three `status` names — where this
-  repo polls work from (per-repo, so different repos can target different Atlassian sites)
-- `workspace_name` — the branch-name template (must include `{{ticket_id}}`)
-- the `agents.{fix,review,pr}` blocks — each agent's **`prompt_type`**, optionally a
-  `prompt_file`, and optionally a `tab` / `pane`
+  (repo-global; `~` / `$HOME` are expanded)
+- `limits` — repo-global tuning, incl. `max_active` (the global concurrency cap across sources)
+- `work_sources` — an ordered, **priority-ranked** list (≥1). Each entry has a `type`
+  (`jira` | `local_markdown`), an optional `name` (default = type, unique per repo) and
+  `priority` (lower = pulled first), its own `workspace_name` branch template (must include
+  `{{ticket_id}}`), its own `agents.{fix,review,pr}` blocks, and a type-specific block:
+  - `jira:` — `base_url` / `project` / `board` / `label` / the three `status` names
+  - `local_markdown:` — `folder` (a directory of `*.md` task briefs; each top-level file is one
+    work item, keyed by filename, with status tracked internally — the files are never modified)
+
+Each agent block has the agent's **`prompt_type`**, optionally a `prompt_file`, and optionally a
+`tab` / `pane`:
 
 Each agent can target a herdr layout **`tab` / `pane`** (set both, or neither):
 
@@ -85,8 +98,10 @@ prompt the agent receives is never a surprise:
   full control.
 
 In both modes the `prompt_file` lives in the repo folder and supports tokens like `@@KEY@@`,
-`@@MEMORY_DIR@@`, and `@@STEP_DONE_CMD@@`. Optionally add repo-specific guidance to
-`guidelines-prompt.md` (appended to every agent prompt in either mode; delete it if unused).
+`@@WORK_DOC@@` (the item's spec — `ticket.json` for Jira, `task.md` for local_markdown), and
+`@@STEP_DONE_CMD@@`. Optionally add repo-specific guidance to `guidelines-prompt.md` (appended to
+every agent prompt in either mode; delete it if unused). The `augment` built-in is resolved per
+source type (`src/prompts/<type>/<step>.md`, else the shared `src/prompts/<step>.md`).
 
 ### 4. Define the herdr layout
 
@@ -103,8 +118,9 @@ herdr-factory --repo <name> install
 ```
 
 This registers the `launchd` job — a resident `watch` daemon that reconciles every 60s and
-that launchd restarts if it ever dies. Label a Jira ticket with your configured `label`,
-move it to the `todo` status, and the factory takes it from there.
+that launchd restarts if it ever dies. Feed it work via any configured source — label a Jira
+ticket with your configured `label` and move it to the `todo` status, or drop a `*.md` brief in
+a local_markdown source's folder — and the factory takes it from there.
 
 ```sh
 herdr-factory --repo <name> status      # see what's in flight
@@ -146,21 +162,26 @@ injected from config plus an optional per-repo guidance addendum.
 ## Commands
 
 ```
-herdr-factory --repo <name> tick|status|eligible|claim <KEY>|teardown <KEY>|logs [N]
+herdr-factory --repo <name> tick|status|eligible|logs [N]
+herdr-factory --repo <name> claim <KEY> [--source <name>]|teardown <KEY> [--source <name>]
 herdr-factory --repo <name> install|uninstall|start|stop
-herdr-factory --repo <name> step-done <KEY> <fix|review|pr>   # an agent → dispatcher signal (event-nudges)
+herdr-factory --repo <name> step-done <KEY> <fix|review|pr> [--source <name>]   # agent → dispatcher (event-nudge)
 herdr-factory capture-lock acquire|release <owner>     # machine-global, no --repo
 herdr-factory help
 ```
 
+`eligible` lists todo items across all sources; `doctor` runs a per-source health check. `claim`
+takes `--source` (defaulted when there's a single source); `teardown`/`step-done` take `--source`
+to disambiguate a key active in more than one source.
+
 ## What's repo-specific (all in `repos/<name>/config.yml`)
 
-repo checkout + base branch · `workspace_name` branch template · Jira
-`base_url`/project/board/label/3 statuses (where this repo polls work from) · the three
-`agents.{fix,review,pr}` blocks (each tab/pane + `prompt_type` + optional prompt_file) ·
-concurrency/watch/budget tuning — plus the folder's agent prompt files and optional
-`guidelines-prompt.md`. The engine's built-in step prompts (used by `prompt_type: augment`)
-live in `src/prompts/`.
+repo checkout + base branch (repo-global) · `limits` incl. the global `max_active` cap ·
+the `work_sources` list — each with its own `workspace_name` branch template, `agents.{fix,review,pr}`
+blocks (each tab/pane + `prompt_type` + optional prompt_file), and type block (`jira`
+base_url/project/board/label/3 statuses, or `local_markdown` folder) — plus the folder's agent
+prompt files and optional `guidelines-prompt.md`. The engine's built-in step prompts (used by
+`prompt_type: augment`) live in `src/prompts/` (per source type under `src/prompts/<type>/`).
 Only the Jira **auth** (email + token, one Atlassian account) is global, in
 `~/.config/herdr-factory/env`.
 

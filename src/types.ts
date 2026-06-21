@@ -15,6 +15,28 @@ export type StepName = "fix" | "review" | "pr";
 
 export type Outcome = "merged" | "closed" | "abandoned" | "timeout";
 
+/**
+ * The canonical work lifecycle, source-agnostic. Each work source maps these onto its own
+ * backend: Jira maps todo/in_development/in_review onto configured Jira statuses (merged/aborted
+ * are deliberately UNMAPPED — Jira's terminal state is owned by its GitHub integration, so a
+ * transition to them is a no-op with no network call); local_markdown maps all five onto rows
+ * in the `work_items` table (todo → in_development → in_review → merged|aborted, both terminal).
+ */
+export type WorkState = "todo" | "in_development" | "in_review" | "merged" | "aborted";
+
+/** Map a run Outcome to the terminal WorkState written back at teardown. */
+export function outcomeToWorkState(outcome: Outcome): "merged" | "aborted" {
+  // merged is the only success; everything else (PR closed, abandoned, watch timeout) is aborted.
+  switch (outcome) {
+    case "merged":
+      return "merged";
+    case "closed":
+    case "abandoned":
+    case "timeout":
+      return "aborted";
+  }
+}
+
 export type EventType =
   | "claimed"
   | "transition"
@@ -38,6 +60,7 @@ export type EventType =
 export interface Run {
   id: number;
   repo: string;
+  workSource: string | null; // which configured work source this run was claimed from
   ticketKey: string;
   summary: string | null;
   issueType: string | null;
@@ -95,6 +118,21 @@ export interface RunStep {
 export type RunStepPatch = Partial<
   Pick<RunStep, "paneId" | "sessionId" | "progressSig" | "progressAt" | "done" | "startedAt">
 >;
+
+/** A local_markdown work item's internally-tracked lifecycle row (the `work_items` table).
+ *  This is herdr-factory's own status ledger for sources that have no external status of record. */
+export interface WorkItem {
+  id: number;
+  repo: string;
+  source: string;
+  key: string;
+  title: string | null;
+  itemType: string | null;
+  path: string | null;
+  status: WorkState;
+  createdAt: number;
+  updatedAt: number;
+}
 
 /** epoch-seconds clock, injected for testability. */
 export type Clock = () => number;

@@ -1,13 +1,13 @@
 import { describe, it, expect, afterEach } from "vitest";
-import { mkdtempSync, rmSync, readFileSync, existsSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, readFileSync, existsSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openDb } from "../src/db/index.ts";
 import { Store } from "../src/db/store.ts";
 import { applyPendingFocus, reconcileRepo, reconcileRun, withTickLock } from "../src/core/reconcile.ts";
-import type { Deps, GitApi, GitHubApi, HerdrApi, JiraApi } from "../src/core/deps.ts";
-import type { Config, Secrets } from "../src/config.ts";
-import type { FocusedPane, Phase, PrInfo, ReviewSig, StepName, Ticket } from "../src/types.ts";
+import type { Deps, GitApi, GitHubApi, HerdrApi, SourceRuntime, WorkSource } from "../src/core/deps.ts";
+import type { AgentCfg, Config, Secrets, SourceConfig } from "../src/config.ts";
+import type { FocusedPane, Phase, PrInfo, ReviewSig, StepName, Ticket, WorkState } from "../src/types.ts";
 
 const tmps: string[] = [];
 afterEach(() => {
@@ -17,6 +17,7 @@ afterEach(() => {
 
 interface FakeState {
   eligible: Ticket[];
+  eligible2: Ticket[]; // eligible items for the optional second source (the `lm` runtime)
   pr: PrInfo | null;
   sig: ReviewSig;
   paneState: string;
@@ -27,28 +28,35 @@ interface FakeState {
   focusedPane: FocusedPane | null; // the pane the user is currently looking at
 }
 
-function makeConfig(worktree: string): Config {
-  const agent = (tab: string) => ({ tab, pane: "agent", promptType: "replace" as const, promptFile: `/c/repos/demo/${tab}.md`, prompt: `${tab.toUpperCase()} prompt` });
+const agentCfg = (tab: string): AgentCfg => ({
+  tab,
+  pane: "agent",
+  promptType: "replace",
+  promptFile: `/c/repos/demo/${tab}.md`,
+  prompt: `${tab.toUpperCase()} prompt`,
+});
+
+function makeConfig(worktree: string, source: SourceConfig): Config {
   return {
     repoName: "demo",
     repo: { path: "/main-checkout", baseRef: "origin/master" },
-    jira: { baseUrl: "https://x", project: "RWR", board: "254", label: "agent", statusTodo: "To Do", statusInDev: "In development", statusReview: "Ready for Code Review" },
-    agents: { fix: agent("fix"), review: agent("review"), pr: agent("pr") },
     limits: { maxActive: 3, watchHours: 7, developBudgetSeconds: 5400, stallSeconds: 2700, reviewBudgetSeconds: 1800, prBudgetSeconds: 3600, tickIntervalSeconds: 60, layoutWaitSeconds: 600 },
+    sources: [source],
     guidance: undefined,
     paths: { configDir: "/c", repoDir: "/c/repos/demo", stateRoot: "/s", stateDir: "/s/demo", dbPath: "/s/db", logsDir: join(worktree, "logs") },
   };
 }
 
-function build() {
+function build(opts: { multi?: boolean } = {}) {
   const worktree = mkdtempSync(join(tmpdir(), "cats-wt-"));
   tmps.push(worktree);
   let now = 1000;
   const store = new Store(openDb(":memory:"), () => now);
-  const state: FakeState = { eligible: [], pr: null, sig: { unresolved: 0, failing: 0, sig: "s0" }, paneState: "idle", deadPanes: new Set(), headSha: "sha0", sessionId: "sess-1", workspaceExists: false, focusedPane: { paneId: "w1:p1", workspaceId: "w1", tabId: "w1:t1", label: "agent" } };
+  const state: FakeState = { eligible: [], eligible2: [], pr: null, sig: { unresolved: 0, failing: 0, sig: "s0" }, paneState: "idle", deadPanes: new Set(), headSha: "sha0", sessionId: "sess-1", workspaceExists: false, focusedPane: { paneId: "w1:p1", workspaceId: "w1", tabId: "w1:t1", label: "agent" } };
   const calls = {
-    transitions: [] as [string, string][],
+    transitions: [] as [string, WorkState][],
     agentSend: [] as [string, string][],
+    agentRename: [] as [string, string][],
     agentFocus: [] as string[],
     worktreeRemove: [] as string[],
     workspaceClose: [] as string[],
@@ -57,6 +65,18 @@ function build() {
     agentStart: 0,
     notify: 0,
   };
+  // One fake work source (type "jira"); transitions record the CANONICAL WorkState now (the
+  // canonical→backend mapping lives inside the real JiraSource, which this fake stands in for).
+  const agents = { fix: agentCfg("fix"), review: agentCfg("review"), pr: agentCfg("pr") };
+  const client: WorkSource = {
+    listEligible: async () => state.eligible,
+    describe: async (key) => ({ key, summary: "Fix the thing", type: "Bug" }),
+    transition: async (key, to) => { calls.transitions.push([key, to]); return true; },
+    materialize: async (_key, memDir) => { mkdirSync(memDir, { recursive: true }); writeFileSync(join(memDir, "ticket.json"), "{}"); },
+    health: async () => {},
+  };
+  const runtime: SourceRuntime = { name: "jira", type: "jira", priority: 1, workspaceName: undefined, agents, client };
+  const source: SourceConfig = { name: "jira", type: "jira", priority: 1, workspaceName: undefined, agents, jira: { baseUrl: "https://x", project: "RWR", board: "254", label: "agent", statusTodo: "To Do", statusInDev: "In development", statusReview: "Ready for Code Review" } };
   const herdr: HerdrApi = {
     worktreeCreate: async () => ({ workspaceId: "w1", worktreePath: worktree, paneId: "w1:p1" }),
     worktreeOpen: async () => ({ workspaceId: "w1", worktreePath: worktree, paneId: "w1:p1" }),
@@ -73,15 +93,8 @@ function build() {
     agentFocus: async (id) => { calls.agentFocus.push(id); },
     focusedPane: async () => state.focusedPane,
     paneSendKeys: async () => {},
-    agentRename: async () => {},
+    agentRename: async (p, n) => { calls.agentRename.push([p, n]); },
     notify: async () => { calls.notify += 1; },
-  };
-  const jira: JiraApi = {
-    listEligible: async () => state.eligible,
-    getIssue: async (key) => ({ key, fields: { summary: "s", status: { name: "To Do" }, issuetype: { name: "Bug" }, labels: [], attachment: [] } }),
-    currentStatus: async () => "To Do",
-    transition: async (k, t) => { calls.transitions.push([k, t]); return true; },
-    downloadAttachments: async () => [],
   };
   const github: GitHubApi = {
     prForBranch: async () => state.pr,
@@ -95,15 +108,45 @@ function build() {
     headSha: async () => state.headSha,
   };
   const secrets: Secrets = { jiraEmail: "e", jiraApiToken: "t" };
-  const deps: Deps = { config: makeConfig(worktree), secrets, store, ghRepo: "o/n", herdr, jira, github, git, log: () => {}, now: () => now, sleep: async () => {}, rmrf: async (p) => { calls.rmrf.push(p); } };
-  return { deps, store, state, calls, setNow: (n: number) => { now = n; }, worktree };
+  const deps: Deps = {
+    config: makeConfig(worktree, source),
+    secrets,
+    store,
+    ghRepo: "o/n",
+    herdr,
+    sources: [runtime],
+    resolveSource: (name) => (name === "jira" ? runtime : undefined),
+    github,
+    git,
+    log: () => {},
+    now: () => now,
+    sleep: async () => {},
+    rmrf: async (p) => { calls.rmrf.push(p); },
+  };
+  // Optional second source (`lm`, type local_markdown, priority 2) for multi-source tests. Shares
+  // the store + herdr fakes; its eligible work comes from state.eligible2.
+  let lmRuntime: SourceRuntime | undefined;
+  if (opts.multi) {
+    const lmAgents = { fix: agentCfg("fix"), review: agentCfg("review"), pr: agentCfg("pr") };
+    const lmClient: WorkSource = {
+      listEligible: async () => state.eligible2,
+      describe: async (key) => ({ key, summary: "md work", type: "task" }),
+      transition: async (key, to) => { calls.transitions.push([key, to]); return true; },
+      materialize: async (_key, memDir) => { mkdirSync(memDir, { recursive: true }); writeFileSync(join(memDir, "task.md"), "# md"); },
+      health: async () => {},
+    };
+    lmRuntime = { name: "lm", type: "local_markdown", priority: 2, workspaceName: "feature/{{ticket_id}}", agents: lmAgents, client: lmClient };
+    deps.sources = [runtime, lmRuntime];
+    deps.resolveSource = (name) => (name === "jira" ? runtime : name === "lm" ? lmRuntime : undefined);
+  }
+  return { deps, store, state, calls, setNow: (n: number) => { now = n; }, worktree, runtime, lmRuntime };
 }
 
 const ticket = (key: string): Ticket => ({ key, summary: "Fix the thing", type: "Bug" });
 
 /** Seed an active run already parked at `phase`, with the active step's run_step spawned. */
 function seed(store: Store, worktree: string, key: string, phase: Phase, step: StepName | null, extra: Record<string, unknown> = {}) {
-  const run = store.createRun({ repo: "demo", ticketKey: key, summary: "s", issueType: "Bug", branch: `fix/${key}-s` });
+  const run = store.createRun({ repo: "demo", workSource: "jira", ticketKey: key, summary: "s", issueType: "Bug", branch: `fix/${key}-s` });
   store.updateRun(run.id, { phase, workspaceId: "w1", worktreePath: worktree, paneId: "w1:p1", ...extra });
   if (step) store.upsertRunStep(run.id, step, { paneId: "w1:p1" });
   return store.getRun(run.id)!;
@@ -114,15 +157,15 @@ describe("reconcile pipeline", () => {
     const { deps, store, state, calls, worktree } = build();
     state.eligible = [ticket("K-1")];
     await reconcileRepo(deps);
-    const run = store.activeRunForTicket("demo", "K-1")!;
+    const run = store.activeRunForTicket("demo", "jira", "K-1")!;
     expect(run.phase).toBe("fixing");
     expect(run.branch).toBe("fix/K-1-fix-the-thing");
     expect(run.workspaceId).toBe("w1");
     expect(run.paneId).toBe("w1:p1"); // latest active pane = the fix agent
     expect(store.getRunStep(run.id, "fix")?.paneId).toBe("w1:p1");
     expect(calls.agentSend.length).toBe(1); // fix prompt dispatched
-    expect(calls.transitions).toContainEqual(["K-1", "In development"]);
-    // materializeTicket wrote the ticket body the fix agent reads
+    expect(calls.transitions).toContainEqual(["K-1", "in_development"]);
+    // materializeWork wrote the work doc the fix agent reads
     expect(existsSync(join(worktree, ".memory/herdr-factory/ticket.json"))).toBe(true);
   });
 
@@ -131,12 +174,12 @@ describe("reconcile pipeline", () => {
     state.eligible = [ticket("W-1")];
     state.paneState = "working"; // the layout pane exists but its agent isn't idle yet
     await reconcileRepo(deps);
-    const run = store.activeRunForTicket("demo", "W-1")!;
+    const run = store.activeRunForTicket("demo", "jira", "W-1")!;
     expect(run.phase).toBe("claiming"); // did NOT advance to fixing
     expect(calls.agentSend.length).toBe(0); // nothing dispatched yet
     expect(calls.agentStart).toBe(0); // and crucially did NOT spawn its own
     expect(store.getRunStep(run.id, "fix")?.paneId).toBeNull();
-    expect(calls.transitions).not.toContainEqual(["W-1", "In development"]);
+    expect(calls.transitions).not.toContainEqual(["W-1", "in_development"]);
   });
 
   it("claiming + configured pane never comes up past layout_wait → attention (no own pane)", async () => {
@@ -144,9 +187,9 @@ describe("reconcile pipeline", () => {
     state.eligible = [ticket("W-2")];
     state.paneState = "working";
     await reconcileRepo(deps); // first pass begins the wait (fix.started_at = 1000)
-    expect(store.activeRunForTicket("demo", "W-2")!.phase).toBe("claiming");
+    expect(store.activeRunForTicket("demo", "jira", "W-2")!.phase).toBe("claiming");
     setNow(1000 + 601); // past layout_wait_seconds (600)
-    const run = store.activeRunForTicket("demo", "W-2")!;
+    const run = store.activeRunForTicket("demo", "jira", "W-2")!;
     await reconcileRun(deps, store.getRun(run.id)!);
     expect(store.getRun(run.id)!.phase).toBe("attention");
     expect(calls.notify).toBe(1);
@@ -154,16 +197,16 @@ describe("reconcile pipeline", () => {
   });
 
   it("step with no tab/pane configured → spawns its own dedicated pane", async () => {
-    const { deps, store, state, calls } = build();
-    deps.config.agents.fix = { ...deps.config.agents.fix, tab: undefined, pane: undefined };
+    const { deps, store, state, calls, runtime } = build();
+    runtime.agents.fix = { ...runtime.agents.fix, tab: undefined, pane: undefined };
     state.eligible = [ticket("S-1")];
     await reconcileRepo(deps);
-    const run = store.activeRunForTicket("demo", "S-1")!;
+    const run = store.activeRunForTicket("demo", "jira", "S-1")!;
     expect(run.phase).toBe("fixing");
     expect(calls.agentStart).toBe(1); // spawned its own (the only path that creates a pane)
     expect(store.getRunStep(run.id, "fix")?.paneId).toBe("w1:p2"); // agentStart's pane
     expect(calls.agentSend.length).toBe(0); // prompt was passed as argv, not sent to a layout pane
-    expect(calls.transitions).toContainEqual(["S-1", "In development"]);
+    expect(calls.transitions).toContainEqual(["S-1", "in_development"]);
   });
 
   it("withTickLock runs fn when the lock is free, skips it when a tick already holds it", async () => {
@@ -205,7 +248,7 @@ describe("reconcile pipeline", () => {
     // the active step to the review pane, and the pending flag is cleared
     expect(calls.agentFocus).toContain("w1:p1");
     expect(got.focusPending).toBe(false);
-    expect(calls.transitions).not.toContainEqual(["K-4", "Ready for Code Review"]);
+    expect(calls.transitions).not.toContainEqual(["K-4", "in_review"]);
     // the rendered review prompt (written to the worktree) carries the work body, the
     // prior handoff pointer, and the engine-injected step-done footer.
     const body = readFileSync(join(worktree, ".memory/herdr-factory/prompt-review.md"), "utf8");
@@ -238,7 +281,7 @@ describe("reconcile pipeline", () => {
     const got = store.getRun(run.id)!;
     expect(got.phase).toBe("reviewing");
     expect(got.watchDeadline).toBe(1000 + 7 * 3600);
-    expect(calls.transitions).toContainEqual(["K-6", "Ready for Code Review"]);
+    expect(calls.transitions).toContainEqual(["K-6", "in_review"]);
   });
 
   it("pr_round + PR merged out-of-band → reviewing", async () => {
@@ -257,7 +300,8 @@ describe("reconcile pipeline", () => {
     const got = store.getRun(run.id)!;
     expect(got.phase).toBe("done");
     expect(got.outcome).toBe("closed");
-    expect(calls.transitions).not.toContainEqual(["K-8", "Ready for Code Review"]);
+    expect(calls.transitions).not.toContainEqual(["K-8", "in_review"]);
+    expect(calls.transitions).toContainEqual(["K-8", "aborted"]); // teardown writes the terminal state back
     expect(calls.worktreeRemove).toContain("w1");
   });
 
@@ -296,6 +340,8 @@ describe("reconcile pipeline", () => {
     await reconcileRun(deps, store.getRun(run.id)!);
     expect(store.getRun(run.id)!.phase).toBe("attention");
     expect(calls.notify).toBe(1);
+    // the active pane is relabelled to a glaring attention marker (the persistent herdr cue)
+    expect(calls.agentRename).toContainEqual(["w1:p1", "⚠ ATTENTION K-B1"]);
   });
 
   it("review step over budget but still working → extended (stays auto_review)", async () => {
@@ -327,6 +373,7 @@ describe("reconcile pipeline", () => {
     expect(got.phase).toBe("done");
     expect(got.outcome).toBe("merged");
     expect(store.countActive("demo")).toBe(0);
+    expect(calls.transitions).toContainEqual(["K-9", "merged"]); // terminal state written back
     expect(calls.worktreeRemove).toContain("w1");
     expect(calls.branchDelete).toContain("fix/K-9-s");
   });
@@ -365,6 +412,62 @@ describe("reconcile pipeline", () => {
     state.paneState = "working";
     await reconcileRun(deps, store.getRun(run.id)!);
     expect(calls.agentSend.length).toBe(0);
+  });
+});
+
+describe("multi-source claim (Phase B)", () => {
+  it("drains the higher-priority source first under a shared cap", async () => {
+    const { deps, store, state } = build({ multi: true });
+    deps.config.limits.maxActive = 1;
+    state.eligible = [ticket("J-1")]; // jira, priority 1
+    state.eligible2 = [ticket("M-1")]; // lm, priority 2
+    await reconcileRepo(deps);
+    expect(store.countActive("demo")).toBe(1);
+    expect(store.activeRunForTicket("demo", "jira", "J-1")).toBeTruthy(); // jira drained first
+    expect(store.activeRunForTicket("demo", "lm", "M-1")).toBeUndefined(); // no slot left for lm
+  });
+
+  it("the cap is global across sources (not per source)", async () => {
+    const { deps, store, state } = build({ multi: true });
+    deps.config.limits.maxActive = 2;
+    state.eligible = [ticket("J-1"), ticket("J-2")];
+    state.eligible2 = [ticket("M-1")];
+    await reconcileRepo(deps);
+    expect(store.countActive("demo")).toBe(2); // both jira slots used; lm gets none
+    expect(store.activeRunForTicket("demo", "lm", "M-1")).toBeUndefined();
+  });
+
+  it("the same key in two sources is claimed as two distinct runs", async () => {
+    const { deps, store, state } = build({ multi: true });
+    deps.config.limits.maxActive = 5;
+    state.eligible = [ticket("DUP")];
+    state.eligible2 = [ticket("DUP")];
+    await reconcileRepo(deps);
+    expect(store.countActive("demo")).toBe(2);
+    expect(store.activeRunForTicket("demo", "jira", "DUP")?.workSource).toBe("jira");
+    expect(store.activeRunForTicket("demo", "lm", "DUP")?.workSource).toBe("lm");
+  });
+});
+
+describe("missing source resolution", () => {
+  it("escalates an active run to attention when its source is gone from config", async () => {
+    const { deps, store, worktree, calls } = build();
+    const run = seed(store, worktree, "GONE-1", "fixing", "fix");
+    deps.resolveSource = () => undefined; // simulate the source removed from config
+    await reconcileRun(deps, store.getRun(run.id)!);
+    expect(store.getRun(run.id)!.phase).toBe("attention");
+    expect(calls.notify).toBe(1);
+  });
+
+  it("a tearing_down run with a gone source still completes local cleanup (no source needed)", async () => {
+    const { deps, store, worktree, calls } = build();
+    const run = seed(store, worktree, "GONE-2", "tearing_down", null);
+    deps.resolveSource = () => undefined;
+    await reconcileRun(deps, store.getRun(run.id)!);
+    const got = store.getRun(run.id)!;
+    expect(got.phase).toBe("done");
+    expect(calls.worktreeRemove).toContain("w1"); // worktree still removed
+    expect(calls.branchDelete).toContain("fix/GONE-2-s"); // branch still deleted
   });
 });
 

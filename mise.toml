@@ -1,0 +1,7 @@
+# Pin the Node this package runs + builds against. better-sqlite3 is a native module compiled
+# for one Node ABI; the CLI is invoked by worker agents from OTHER repos' worktrees, which may
+# activate a different Node via mise. Pinning here (and resolving it in bin/herdr-factory via
+# `mise exec`) keeps the runtime Node and the built native module on the same major (ABI), and
+# makes `pnpm install` / `npm rebuild` from this dir build for the right Node.
+[tools]
+node = "24"

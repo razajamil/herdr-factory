@@ -13,5 +13,5 @@ independent reviewer would — you did not write it, so don't assume its choices
 3. If the change is sound as-is, that's a fine outcome — say so in your handoff note.
 
 Use the previous step's handoff note and, if you need detail it doesn't capture, query the
-fix agent on demand (see the inputs section below). Do NOT open a PR, and do NOT transition
-the Jira ticket.
+fix agent on demand (see the inputs section below). Do NOT open a PR, and do NOT change the
+work item's status (the dispatcher owns all status transitions).

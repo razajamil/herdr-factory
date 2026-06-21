@@ -1,67 +1,72 @@
 # herdr-factory per-repo config.
 # Copy this folder to ~/.config/herdr-factory/repos/<name>/ (<name> = what you pass to --repo),
 # edit config.yml, and put any repo-specific brief text in guidelines-prompt.md (optional).
-# Read with `yq`. Anything omitted falls back to the engine defaults.
+# Anything omitted falls back to the engine defaults.
 
 repo:
-  path: $HOME/dev/my-repo        # MAIN (non-linked) checkout
+  path: $HOME/dev/my-repo        # MAIN (non-linked) checkout. ~ and $HOME are expanded.
   base_ref: origin/main          # branch worktrees fork from
   # github: owner/name           # default: derived from the origin remote
 
-# Branch name for each cat (the worktree + workspace derive from it). Must include
-# {{ticket_id}}. Vars: {{ticket_id}} {{ticket_short_slug}} (<=20) {{ticket_slug}}
-# (<=50) {{ticket_type}} {{ticket_prefix}} (fix|chore|feature, by issue type).
-# Default when unset: {{ticket_prefix}}/{{ticket_id}}-{{ticket_slug}}.
-workspace_name: "{{ticket_prefix}}/{{ticket_id}}-{{ticket_short_slug}}"
-
-# Where this repo polls work from. Per-repo, so different repos can target different
-# Atlassian sites / projects / boards. base_url is the Atlassian site (not a secret);
-# the Jira auth (email + token) stays in the shared ~/.config/herdr-factory/env.
-jira:
-  base_url: https://your-org.atlassian.net
-  project: PROJ
-  board: 123
-  label: agent
-  status:
-    todo: To Do
-    in_development: In Progress
-    review: In Review
-
-# The three pipeline agents — fix → review → pr. All required, no defaults. Each runs in
-# its own herdr layout pane (tab/pane). Each agent must, when done, write its handoff note
-# and run `herdr-factory --repo <name> step-done <KEY> <step>`.
-#
-# prompt_type is REQUIRED for every agent (there is no silent default):
-#   augment — the engine ships a sensible built-in prompt for the step and appends your
-#             prompt_file (OPTIONAL here) as extra, repo-specific instructions. Recommended
-#             while you're getting a feel for how the agents behave.
-#   replace — your prompt_file (REQUIRED here) is sent to the agent verbatim, so you own the
-#             whole prompt. Switch to this once you know the system and want full control.
-# prompt_file paths are relative to this folder; tokens like @@KEY@@ / @@HANDOFF_IN@@ /
-# @@STEP_DONE_CMD@@ are substituted in both the built-in prompt and your additions.
-agents:
-  fix:
-    tab: fix
-    pane: agent
-    prompt_type: augment
-    prompt_file: fix.md          # extra fix-step notes, appended to the built-in fix prompt
-  review:
-    tab: review
-    pane: agent
-    prompt_type: augment
-    prompt_file: review.md       # extra review-step notes
-  pr:
-    tab: pr
-    pane: agent
-    prompt_type: augment
-    prompt_file: pr.md           # extra pr-step notes
-  # guidelines-prompt.md in this folder (if present) is appended to every agent prompt.
-
+# Repo-global limits (shared across every work source below).
 limits:
-  max_active: 3
+  max_active: 3                  # global concurrency cap across ALL sources
   watch_hours: 7
   develop_budget_seconds: 5400   # fix step budget (a still-committing agent is extended)
-  stall_seconds: 2700            # no new commits for this long → stalled → attention (even if "working")
+  stall_seconds: 2700            # no new commits for this long → stalled → attention
   review_budget_seconds: 1800    # review step budget
   pr_budget_seconds: 3600        # pr step budget (open PR + CI/bot round)
   tick_interval_seconds: 60
+
+# Where this repo pulls work from — an ordered, priority-ranked list. When there are open slots
+# (under max_active), the reconciler walks sources in PRIORITY order (lower number first; ties
+# break by the order listed here) and claims their eligible work. Each source owns its own
+# workspace_name + agents + type-specific block; repo + limits above are shared.
+work_sources:
+  # ── Jira: poll an Agile board; status of record lives in Jira. ───────────────────────────────
+  - type: jira
+    name: jira                   # OPTIONAL identifier (default = type); must be unique in this repo
+    priority: 1                  # pulled before lower-priority sources
+    # Branch name for each item (the worktree + workspace derive from it). Must include
+    # {{ticket_id}}. Vars: {{ticket_id}} {{ticket_short_slug}} (<=20) {{ticket_slug}} (<=50)
+    # {{ticket_type}} {{ticket_prefix}} (fix|chore|feature, by issue type).
+    workspace_name: "{{ticket_prefix}}/{{ticket_id}}-{{ticket_short_slug}}"
+    # base_url is the Atlassian site (not a secret); the Jira auth (email + token) stays in the
+    # shared ~/.config/herdr-factory/env. merged/aborted are NOT mapped here — Jira's terminal
+    # state is owned by its GitHub integration, so herdr-factory never writes it.
+    jira:
+      base_url: https://your-org.atlassian.net
+      project: PROJ
+      board: 123
+      label: agent
+      status:
+        todo: To Do
+        in_development: In Progress
+        review: In Review
+    # The three pipeline agents — fix → review → pr. All required, no defaults. Each runs in its
+    # own herdr layout pane (tab/pane). prompt_type is REQUIRED for every agent (no silent default):
+    #   augment — engine's built-in step prompt + your prompt_file (OPTIONAL) as extra notes.
+    #   replace — your prompt_file (REQUIRED) is sent verbatim. prompt_file paths are relative to
+    # this folder; tokens @@KEY@@ / @@WORK_DOC@@ / @@HANDOFF_IN@@ / @@STEP_DONE_CMD@@ are substituted.
+    agents:
+      fix:    { tab: fix,    pane: agent, prompt_type: augment, prompt_file: fix.md }
+      review: { tab: review, pane: agent, prompt_type: augment }
+      pr:     { tab: pr,     pane: agent, prompt_type: augment }
+
+  # ── local_markdown: a folder of *.md files; herdr-factory tracks the lifecycle internally. ──
+  # Each top-level *.md (dot/underscore-prefixed files are skipped) is one work item, keyed by
+  # filename. Status (todo → in_development → in_review → merged|aborted) is tracked in the DB's
+  # work_items table — the files are never modified. Title/type come from optional YAML
+  # front-matter (`title:` / `type:`), else the first H1 / humanized filename, and "task".
+  - type: local_markdown
+    name: local_markdown
+    priority: 2
+    workspace_name: "feature/{{ticket_id}}-{{ticket_short_slug}}"
+    local_markdown:
+      folder: $HOME/dev/my-repo-work-items   # ~ and $HOME are expanded
+    agents:
+      # fix here uses the markdown-specific built-in prompt (prompts/local_markdown/fix.md).
+      fix:    { tab: fix,    pane: agent, prompt_type: augment }
+      review: { tab: review, pane: agent, prompt_type: augment }
+      pr:     { tab: pr,     pane: agent, prompt_type: augment }
+  # guidelines-prompt.md in this folder (if present) is appended to every agent prompt.

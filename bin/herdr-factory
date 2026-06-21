@@ -12,4 +12,14 @@ done
 pkg="$(cd -P "$(dirname "$src")/.." && pwd)"
 
 cd "$pkg"
-exec node src/cli.ts "$@"
+# Run with THIS package's pinned Node (mise.toml → node 24), not the caller's. Worker agents
+# invoke this from a target repo's worktree that may activate a different Node via mise; `cd`
+# alone doesn't change the inherited PATH in a non-interactive shell, so a bare `node` would pick
+# up that other Node — and better-sqlite3 (a native module built for node 24) fails under a
+# mismatched ABI (NODE_MODULE_VERSION). `mise exec` re-resolves node for THIS dir, overriding the
+# inherited PATH. Falls back to a bare `node` when mise isn't installed.
+if command -v mise >/dev/null 2>&1; then
+  exec mise exec -- node src/cli.ts "$@"
+else
+  exec node src/cli.ts "$@"
+fi
