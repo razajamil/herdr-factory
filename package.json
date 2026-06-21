@@ -8,16 +8,13 @@
     "herdr-factory": "bin/herdr-factory"
   },
   "scripts": {
-    "cats": "node --import tsx src/cli.ts",
+    "cats": "node src/cli.ts",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest"
   },
   "engines": {
-    "node": ">=22"
-  },
-  "pnpm": {
-    "onlyBuiltDependencies": ["better-sqlite3", "esbuild"]
+    "node": ">=24"
   },
   "dependencies": {
     "better-sqlite3": "^12.11.1",
@@ -28,7 +25,6 @@
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^25.9.3",
-    "tsx": "^4.22.4",
     "typescript": "^6.0.3",
     "vitest": "^4.1.9"
   }

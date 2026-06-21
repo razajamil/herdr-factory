@@ -35,7 +35,10 @@ interface AgentStartResp {
  * reimplements none of it.
  */
 export class HerdrClient {
-  constructor(private readonly bin: string = "herdr") {}
+  private readonly bin: string;
+  constructor(bin: string = "herdr") {
+    this.bin = bin;
+  }
 
   private parseWorktree(j: WorktreeResp): WorktreeResult {
     const workspaceId = j.result?.workspace?.workspace_id ?? j.result?.root_pane?.workspace_id;

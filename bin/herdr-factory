@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Launcher for the herdr-factory CLI. Resolves its own location (through symlinks),
-# runs from the package dir so `tsx` + src/ resolve regardless of caller cwd.
+# runs from the package dir so src/ resolves regardless of caller cwd.
 set -euo pipefail
 
 src="${BASH_SOURCE[0]}"
@@ -12,4 +12,4 @@ done
 pkg="$(cd -P "$(dirname "$src")/.." && pwd)"
 
 cd "$pkg"
-exec node --import tsx src/cli.ts "$@"
+exec node src/cli.ts "$@"

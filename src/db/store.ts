@@ -80,10 +80,12 @@ type Bind = string | number | null;
 
 /** Typed repository over the SQLite DB. All methods are synchronous. */
 export class Store {
-  constructor(
-    private readonly db: Database.Database,
-    private readonly now: Clock = systemClock,
-  ) {}
+  private readonly db: Database.Database;
+  private readonly now: Clock;
+  constructor(db: Database.Database, now: Clock = systemClock) {
+    this.db = db;
+    this.now = now;
+  }
 
   countActive(repo: string): number {
     const row = this.db

@@ -19,7 +19,10 @@ const FAILING = /FAIL|ERROR|TIMED_OUT|CANCELLED|FAILURE/;
 
 /** Read-only GitHub queries via the `gh` CLI (uses the user's gh auth). */
 export class GitHubClient {
-  constructor(private readonly gh: string = "gh") {}
+  private readonly gh: string;
+  constructor(gh: string = "gh") {
+    this.gh = gh;
+  }
 
   async prForBranch(repo: string, branch: string): Promise<PrInfo | null> {
     const arr = await runJson<{ number: number; state: string; url: string }[]>(
