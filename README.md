@@ -51,10 +51,11 @@ JIRA_API_TOKEN=...        # id.atlassian.com → Security → API tokens
    blocks). Author each agent's prompt file (`fix.md` / `review.md` / `pr.md` in that
    folder); put any repo-specific guidance in `guidelines-prompt.md` (optional —
    appended verbatim to every agent prompt; delete it if unused).
-2. Define that repo's herdr layout in the workspace-manager plugin — one tab/pane per
-   agent that starts `claude`, matching `agents.fix.tab`/`.pane`, `agents.review.*`,
-   `agents.pr.*`. The dispatcher dispatches each step's prompt into its pane; if a pane
-   is absent it falls back to opening its own.
+2. Define that repo's herdr layout — one tab/pane per agent that starts `claude`,
+   matching `agents.fix.tab`/`.pane`, `agents.review.*`, `agents.pr.*`. The dispatcher
+   dispatches each step's prompt into its pane; if a pane is absent it falls back to
+   opening its own. The [herdr-plugin-workspace-manager](https://github.com/razajamil/herdr-plugin-workspace-manager)
+   plugin is recommended for easier management of herdr layouts per workspace or repo.
 3. `herdr-factory --repo <name> install`
 
 The worker runs *inside* the target repo's worktree, so it picks up that repo's
