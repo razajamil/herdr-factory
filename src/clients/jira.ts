@@ -4,11 +4,14 @@ import type { JiraIssue, Ticket } from "../types.ts";
 
 /** Jira Cloud REST via fetch + API-token basic auth. */
 export class JiraClient {
-  constructor(
-    private readonly baseUrl: string,
-    private readonly email: string,
-    private readonly token: string,
-  ) {}
+  private readonly baseUrl: string;
+  private readonly email: string;
+  private readonly token: string;
+  constructor(baseUrl: string, email: string, token: string) {
+    this.baseUrl = baseUrl;
+    this.email = email;
+    this.token = token;
+  }
 
   requireAuth(): void {
     if (!this.email || !this.token) {
@@ -42,7 +45,7 @@ export class JiraClient {
   async getIssue(key: string): Promise<JiraIssue> {
     this.requireAuth();
     return this.getJson<JiraIssue>(
-      `/rest/api/3/issue/${key}?fields=summary,description,issuetype,status,labels,attachment`,
+      `/rest/api/3/issue/${key}?fields=summary,description,issuetype,status,labels,attachment,comment`,
     );
   }
 
@@ -69,15 +72,31 @@ export class JiraClient {
     return true;
   }
 
-  /** Download image attachments (image/* only, count + size capped). Returns saved filenames. */
-  async downloadImages(key: string, outDir: string, max: number, maxBytes: number): Promise<string[]> {
+  /**
+   * Download image + video attachments (image/* and video/*, count + per-type size
+   * capped). Returns saved filenames. Other mime types (PDFs, logs, …) are skipped.
+   */
+  async downloadAttachments(
+    key: string,
+    outDir: string,
+    max: number,
+    maxImageBytes: number,
+    maxVideoBytes: number,
+  ): Promise<string[]> {
     const issue = await this.getIssue(key);
     mkdirSync(outDir, { recursive: true });
-    const images = (issue.fields.attachment ?? [])
-      .filter((a) => (a.mimeType ?? "").startsWith("image/") && (a.size ?? 0) <= maxBytes)
+    const media = (issue.fields.attachment ?? [])
+      .filter((a) => {
+        const mime = a.mimeType ?? "";
+        const size = a.size ?? 0;
+        return (
+          (mime.startsWith("image/") && size <= maxImageBytes) ||
+          (mime.startsWith("video/") && size <= maxVideoBytes)
+        );
+      })
       .slice(0, max);
     const saved: string[] = [];
-    for (const a of images) {
+    for (const a of media) {
       const res = await fetch(a.content, { headers: this.headers(), redirect: "follow" });
       if (!res.ok) continue;
       const buf = Buffer.from(await res.arrayBuffer());

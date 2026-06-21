@@ -2,12 +2,13 @@
 
 Autonomous Jira → PR factory that runs Claude worker agents across one or
 more repos, on top of [herdr](https://herdr.dev) worktrees. A single idempotent
-reconciler (`tick`), driven by `launchd`, finds eligible Jira tickets, spins up
+reconciler (`reconcileRepo`, looped by the resident `watch` daemon under `launchd`),
+finds eligible Jira tickets, spins up
 one herdr worktree + Claude worker per ticket, watches the PR, and tears the
 worktree down on merge/close.
 
 This document is the canonical design of the TypeScript implementation
-(run via `tsx`, no build step) backed by SQLite.
+(run directly by Node's built-in type stripping, no build step) backed by SQLite.
 
 ---
 
@@ -35,7 +36,7 @@ This document is the canonical design of the TypeScript implementation
 
 | Concern | Choice |
 |---|---|
-| Language / runtime | TypeScript on Node 22, run via **`tsx`** (no build step) |
+| Language / runtime | TypeScript on Node ≥24, run via **native type stripping** (no build step) |
 | CLI | **commander** |
 | State store | **better-sqlite3** (synchronous — ideal for a short-lived tick) |
 | Config | **`yaml`** + **`zod`** (parse + validate → types) |
@@ -44,8 +45,9 @@ This document is the canonical design of the TypeScript implementation
 | Tests | **vitest** (dev-only) |
 | External CLIs | **herdr**, **gh**, **git** |
 
-Runtime dep footprint: `commander`, `better-sqlite3`, `yaml`, `zod` (+ `tsx` to
-run). Everything else is Node built-ins or the external CLIs.
+Runtime dep footprint: `commander`, `better-sqlite3`, `yaml`, `zod`. Everything
+else is Node built-ins or the external CLIs; the `.ts` sources run unbuilt via
+Node's native type stripping.
 
 ---
 
@@ -77,7 +79,7 @@ implementations and injects them. Tests substitute fakes + `:memory:` SQLite.
 ```
 herdr-factory/
   package.json  tsconfig.json  README.md  docs/ARCHITECTURE.md
-  bin/herdr-factory          cwd-robust shell launcher → `node --import tsx src/cli.ts`
+  bin/herdr-factory          cwd-robust shell launcher → `node src/cli.ts`
                           (resolves its own dir through symlinks; symlinked into ~/.local/bin)
   src/
     cli.ts                commander program; builds deps, dispatches, structured log
@@ -118,8 +120,9 @@ out to `herdr …` and parses its JSON; it contains zero terminal/worktree logic
 **The fix layout** (a tab/pane per pipeline agent) is applied by the external
 **workspace-manager herdr plugin** on `worktree.created`. herdr-factory does **not** apply
 layouts — it relies on the plugin and simply *targets* the resulting panes: one per
-agent, from `agents.{fix,review,pr}.tab` / `.pane` in config. If a targeted pane is
-absent it degrades gracefully (see [§8](#8-step-agent-model)).
+agent, from `agents.{fix,review,pr}.tab` / `.pane` in config. herdr-factory **waits** for a
+targeted pane to come up (escalating to `attention` after `layout_wait_seconds`) and only
+spawns a pane itself for steps that have **no** tab/pane configured (see [§8](#8-step-agent-model)).
 
 **herdr-factory performs git/filesystem ops ONLY for things outside herdr's model:**
 
@@ -160,9 +163,10 @@ reverse-engineered during the bash prototype.
     `focused` flag — herdr exposes no focus-change event to subscribe to, so it's polled)
 - **`jira.ts`** (fetch + basic auth) — `listEligible()` via the Agile board
   endpoint `/rest/agile/1.0/board/<id>/issue?jql=…` (keeps board scoping);
-  `getIssue`, `currentStatus`, `transition(key, target)` (case-insensitive
-  `.to.name` match, no-op if already there), `downloadImages(key, dir)` (image/*
-  only, capped; site-host `content` URL + basic auth).
+  `getIssue` (description + comments + attachment metadata), `currentStatus`,
+  `transition(key, target)` (case-insensitive `.to.name` match, no-op if already
+  there), `downloadAttachments(key, dir)` (image/* and video/*, count + per-type
+  size capped; site-host `content` URL + basic auth).
 - **`github.ts`** (`gh` via execFile) — `prForBranch(repo, branch)`,
   `reviewSignature(repo, n) → {unresolved, failing, sig}` (graphql review threads
   + `statusCheckRollup`).
@@ -246,7 +250,7 @@ herdr agent in its own tab/pane, dispatched and gated by the reconciler:
 | `pr_round` | **pr** | open + push the PR → drive the automated round (CI green + bot comments) | `step-done pr` → human review |
 
 The agents come from the required `agents.{fix,review,pr}` config (each
-`{tab, pane, prompt_file}`); `core/step.ts` holds the ordered `STEPS` descriptors that
+`{tab?, pane?, prompt_type, prompt_file?}`); `core/step.ts` holds the ordered `STEPS` descriptors that
 sequence them and a generic `reconcileStep` gates each. After `pr_round`, the run enters
 the `reviewing` human-review watch (unchanged: watches the PR, wakes a resolver).
 
@@ -369,18 +373,29 @@ Each step is a Claude agent (`core/step.ts`) dispatched **by the reconciler, nev
 another agent**, through the shared `dispatchToLayout(tab, pane, prompt, …)` helper. Per
 step (`spawnStep`):
 
-1. **Dispatch** into the step's configured `tab`/`pane` (`agents.<step>`): wait bounded
-   for that pane's agent (agent-agnostic — claude *or* opencode, whatever the layout put
-   there) → `agent send` the prompt + Enter. Degraded fallbacks only if no agent appears:
-   `pane run "claude …"`, else `agent start` a dedicated claude pane. Rename `<step>:<KEY>`;
-   record the pane on the `run_steps` row (and as `run.pane_id`, the latest active pane), and
-   set `run.focus_pending` so the worktree view can follow the active step (§7, *Focus follows
-   the active step* — applied later, never stealing focus from another worktree).
-2. **Prompt** — `renderStepPrompt` substitutes tokens (`@@KEY@@`, `@@HANDOFF_IN@@`,
-   `@@PRIOR_PANE@@`, `@@STEP_DONE_CMD@@`, …) into the step's `prompt_file` contents,
-   appends `guidelines-prompt.md`, and appends a standard footer that points the agent at
-   its inputs and tells it to write its handoff note + signal `step-done`. The rendered
-   prompt is written to `.memory/herdr-factory/prompt-<step>.md`; the agent is told to read it.
+1. **Dispatch** — two modes, by whether the step has a configured `tab`/`pane` (`agents.<step>`):
+   - **Configured** (the user's layout owns the pane): find that pane and require an agent
+     that is present **and idle** (agent-agnostic — claude *or* opencode), then `agent send`
+     the prompt + Enter. If the pane isn't up yet or its agent is still busy starting up,
+     `spawnStep` returns `waiting` — the run stays in its phase and retries on later ticks
+     (the wait is bounded by `layout_wait_seconds`, measured from the `run_steps` row's
+     `started_at`; on timeout the reconciler escalates to `attention`). It **never** spawns
+     its own pane when a tab/pane is configured — so the user's auto-spawned layout (setup
+     commands, dev servers, agent startup) can settle before work begins.
+   - **Not configured** (no tab/pane): `agent start` a dedicated claude pane — the only path
+     that creates a pane.
+   On dispatch: rename `<step>:<KEY>`; record the pane on the `run_steps` row (and as
+   `run.pane_id`, the latest active pane) and reset `started_at` (now the per-step budget
+   clock); set `run.focus_pending` so the worktree view can follow the active step (§7,
+   *Focus follows the active step* — applied later, never stealing focus from another worktree).
+2. **Prompt** — config load resolves each step's prompt by `prompt_type`: `augment` =
+   the engine's built-in step prompt (`src/prompts/<step>.md`) + the repo's `prompt_file`
+   (if any) as additions; `replace` = the `prompt_file` verbatim. `renderStepPrompt` then
+   substitutes tokens (`@@KEY@@`, `@@HANDOFF_IN@@`, `@@PRIOR_PANE@@`, `@@STEP_DONE_CMD@@`,
+   …) into that resolved prompt, appends `guidelines-prompt.md`, and appends a standard
+   footer that points the agent at its inputs and tells it to write its handoff note +
+   signal `step-done`. The rendered prompt is written to
+   `.memory/herdr-factory/prompt-<step>.md`; the agent is told to read it.
 3. **Handoff out** — before signalling, the agent writes
    `.memory/herdr-factory/handoff-<step>.md` (did / why / uncertain / verify-next).
 4. **Signal** — `herdr-factory --repo <name> step-done <KEY> <step>` sets the step's `done`
@@ -443,7 +458,9 @@ left as-is).
 ## 10. Config
 
 - **Global secrets** — `~/.config/herdr-factory/env` (chmod 600):
-  `JIRA_BASE_URL`, `JIRA_EMAIL`, `JIRA_API_TOKEN`. One Atlassian account, all repos.
+  `JIRA_EMAIL`, `JIRA_API_TOKEN` — Jira **auth** only (one Atlassian account; an API token
+  authenticates against any site that account can reach). *Where* work is polled from (the
+  Atlassian site `base_url`) is per-repo config, not a global secret.
 - **Per-repo** — `~/.config/herdr-factory/repos/<name>/`:
   - `config.yml` — parsed with `yaml`, validated with `zod` → typed `Config`:
     - `repo` — `path` / `base_ref` / `github`
@@ -454,15 +471,23 @@ left as-is).
       a git-safe ref; zod requires the template to contain `{{ticket_id}}` (else
       tickets would collide on one branch). Default when unset:
       `{{ticket_prefix}}/{{ticket_id}}-{{ticket_slug}}` (rendered by `core/branch.ts`).
-    - `jira` — `project` / `board` / `label` / 3 `status` names
-    - `agents` — **required**, one block each for `fix` / `review` / `pr`, every field
-      required (no defaults): `tab` / `pane` (the herdr layout pane that agent runs in) +
-      `prompt_file` (path relative to the repo config dir; its contents, with tokens
-      substituted, become that agent's prompt). Per-repo bootstrap/resolve guidance lives
-      inside these prompt files.
+    - `jira` — where this repo polls work from (per-repo, so different repos can target
+      different Atlassian sites): `base_url` (the Atlassian site) / `project` / `board` /
+      `label` / 3 `status` names
+    - `agents` — **required**, one block each for `fix` / `review` / `pr`: `tab` / `pane`
+      (**optional, both-or-neither** — the herdr layout pane that agent runs in; when set the
+      dispatcher waits for that pane's idle agent and never spawns its own, when omitted it
+      spawns a dedicated pane) + `prompt_type` (**required, no default**:
+      `augment` | `replace`) + `prompt_file` (path relative to the repo config dir; tokens
+      substituted at render time). `augment` (recommended) combines the engine's built-in
+      step prompt (`src/prompts/<step>.md`) with the `prompt_file` as additions — `prompt_file`
+      is optional; `replace` sends the `prompt_file` verbatim — `prompt_file` is required.
+      Per-repo bootstrap/resolve guidance lives in these prompt files (or in `augment`
+      additions / `guidelines-prompt.md`).
     - `limits` — `max_active` / `watch_hours` / `develop_budget_seconds` (fix) /
       `review_budget_seconds` / `pr_budget_seconds` / `stall_seconds` /
-      `tick_interval_seconds`
+      `tick_interval_seconds` / `layout_wait_seconds` (how long to wait for a step's
+      configured tab/pane before escalating to `attention`)
   - `guidelines-prompt.md` — optional; appended verbatim to every agent prompt.
 - `config.ts` asserts `repo.path` is a **main checkout** (not a linked worktree),
   since herdr can't create worktrees from one.
@@ -499,12 +524,15 @@ core. `--repo` is a global option; repo-scoped commands assert it.
 One job per repo, `com.herdr-factory.<repo>`. `launchd.ts` generates the plist and
 drives `launchctl bootstrap/bootout`.
 
-- `ProgramArguments = [node, "--import", "tsx", "<abs>/src/cli.ts", "--repo", "<name>", "tick"]`
+- `ProgramArguments = [node, "<abs>/src/cli.ts", "--repo", "<name>", "watch"]` — a
+  resident loop that reconciles every `tick_interval_seconds` itself.
 - `EnvironmentVariables`: captured `PATH` + `HOME` (no experimental flags —
-  better-sqlite3 needs none). Secrets are **not** in the plist; the tick
-  re-reads the env file.
-- `StartInterval` from config; per-repo stdout/err logs. launchd won't run two
-  copies of a job concurrently (backs up the tick's own lock).
+  native type stripping is on by default on Node ≥24, and better-sqlite3 needs
+  none). Secrets are **not** in the plist; `watch` re-reads the env file at start.
+- `KeepAlive` + `ThrottleInterval` (not `StartInterval`): launchd restarts the daemon if it
+  dies, and the internal loop owns the cadence — this avoids the per-user launchd
+  interval-timer wedging that `StartInterval` is prone to after sleep/wake. Per-repo
+  stdout/err logs. The cross-process tick lock still guards against any overlapping pass.
 
 ---
 

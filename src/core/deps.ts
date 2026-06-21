@@ -30,7 +30,13 @@ export interface JiraApi {
   getIssue(key: string): Promise<JiraIssue>;
   currentStatus(key: string): Promise<string>;
   transition(key: string, targetName: string): Promise<boolean>;
-  downloadImages(key: string, outDir: string, max: number, maxBytes: number): Promise<string[]>;
+  downloadAttachments(
+    key: string,
+    outDir: string,
+    max: number,
+    maxImageBytes: number,
+    maxVideoBytes: number,
+  ): Promise<string[]>;
 }
 
 export interface GitHubApi {

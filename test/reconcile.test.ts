@@ -28,13 +28,13 @@ interface FakeState {
 }
 
 function makeConfig(worktree: string): Config {
-  const agent = (tab: string) => ({ tab, pane: "agent", promptFile: `/c/repos/demo/${tab}.md`, prompt: `${tab.toUpperCase()} prompt` });
+  const agent = (tab: string) => ({ tab, pane: "agent", promptType: "replace" as const, promptFile: `/c/repos/demo/${tab}.md`, prompt: `${tab.toUpperCase()} prompt` });
   return {
     repoName: "demo",
     repo: { path: "/main-checkout", baseRef: "origin/master" },
-    jira: { project: "RWR", board: "254", label: "agent", statusTodo: "To Do", statusInDev: "In development", statusReview: "Ready for Code Review" },
+    jira: { baseUrl: "https://x", project: "RWR", board: "254", label: "agent", statusTodo: "To Do", statusInDev: "In development", statusReview: "Ready for Code Review" },
     agents: { fix: agent("fix"), review: agent("review"), pr: agent("pr") },
-    limits: { maxActive: 3, watchHours: 7, developBudgetSeconds: 5400, stallSeconds: 2700, reviewBudgetSeconds: 1800, prBudgetSeconds: 3600, tickIntervalSeconds: 60 },
+    limits: { maxActive: 3, watchHours: 7, developBudgetSeconds: 5400, stallSeconds: 2700, reviewBudgetSeconds: 1800, prBudgetSeconds: 3600, tickIntervalSeconds: 60, layoutWaitSeconds: 600 },
     guidance: undefined,
     paths: { configDir: "/c", repoDir: "/c/repos/demo", stateRoot: "/s", stateDir: "/s/demo", dbPath: "/s/db", logsDir: join(worktree, "logs") },
   };
@@ -81,7 +81,7 @@ function build() {
     getIssue: async (key) => ({ key, fields: { summary: "s", status: { name: "To Do" }, issuetype: { name: "Bug" }, labels: [], attachment: [] } }),
     currentStatus: async () => "To Do",
     transition: async (k, t) => { calls.transitions.push([k, t]); return true; },
-    downloadImages: async () => [],
+    downloadAttachments: async () => [],
   };
   const github: GitHubApi = {
     prForBranch: async () => state.pr,
@@ -94,7 +94,7 @@ function build() {
     originUrl: async () => "git@github.com:o/n.git",
     headSha: async () => state.headSha,
   };
-  const secrets: Secrets = { jiraBaseUrl: "https://x", jiraEmail: "e", jiraApiToken: "t" };
+  const secrets: Secrets = { jiraEmail: "e", jiraApiToken: "t" };
   const deps: Deps = { config: makeConfig(worktree), secrets, store, ghRepo: "o/n", herdr, jira, github, git, log: () => {}, now: () => now, sleep: async () => {}, rmrf: async (p) => { calls.rmrf.push(p); } };
   return { deps, store, state, calls, setNow: (n: number) => { now = n; }, worktree };
 }
@@ -124,6 +124,46 @@ describe("reconcile pipeline", () => {
     expect(calls.transitions).toContainEqual(["K-1", "In development"]);
     // materializeTicket wrote the ticket body the fix agent reads
     expect(existsSync(join(worktree, ".memory/herdr-factory/ticket.json"))).toBe(true);
+  });
+
+  it("claiming + configured pane not idle yet → waits (stays claiming, never spawns its own)", async () => {
+    const { deps, store, state, calls } = build();
+    state.eligible = [ticket("W-1")];
+    state.paneState = "working"; // the layout pane exists but its agent isn't idle yet
+    await reconcileRepo(deps);
+    const run = store.activeRunForTicket("demo", "W-1")!;
+    expect(run.phase).toBe("claiming"); // did NOT advance to fixing
+    expect(calls.agentSend.length).toBe(0); // nothing dispatched yet
+    expect(calls.agentStart).toBe(0); // and crucially did NOT spawn its own
+    expect(store.getRunStep(run.id, "fix")?.paneId).toBeNull();
+    expect(calls.transitions).not.toContainEqual(["W-1", "In development"]);
+  });
+
+  it("claiming + configured pane never comes up past layout_wait → attention (no own pane)", async () => {
+    const { deps, store, state, calls, setNow } = build();
+    state.eligible = [ticket("W-2")];
+    state.paneState = "working";
+    await reconcileRepo(deps); // first pass begins the wait (fix.started_at = 1000)
+    expect(store.activeRunForTicket("demo", "W-2")!.phase).toBe("claiming");
+    setNow(1000 + 601); // past layout_wait_seconds (600)
+    const run = store.activeRunForTicket("demo", "W-2")!;
+    await reconcileRun(deps, store.getRun(run.id)!);
+    expect(store.getRun(run.id)!.phase).toBe("attention");
+    expect(calls.notify).toBe(1);
+    expect(calls.agentStart).toBe(0); // never spawned its own
+  });
+
+  it("step with no tab/pane configured → spawns its own dedicated pane", async () => {
+    const { deps, store, state, calls } = build();
+    deps.config.agents.fix = { ...deps.config.agents.fix, tab: undefined, pane: undefined };
+    state.eligible = [ticket("S-1")];
+    await reconcileRepo(deps);
+    const run = store.activeRunForTicket("demo", "S-1")!;
+    expect(run.phase).toBe("fixing");
+    expect(calls.agentStart).toBe(1); // spawned its own (the only path that creates a pane)
+    expect(store.getRunStep(run.id, "fix")?.paneId).toBe("w1:p2"); // agentStart's pane
+    expect(calls.agentSend.length).toBe(0); // prompt was passed as argv, not sent to a layout pane
+    expect(calls.transitions).toContainEqual(["S-1", "In development"]);
   });
 
   it("withTickLock runs fn when the lock is free, skips it when a tick already holds it", async () => {

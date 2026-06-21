@@ -124,6 +124,7 @@ export interface JiraIssue {
     labels?: string[];
     attachment?: JiraAttachment[];
     description?: unknown;
+    comment?: unknown; // { comments: [{ author, created, body (ADF), … }], … }
   };
 }
 

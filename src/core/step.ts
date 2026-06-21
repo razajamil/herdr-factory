@@ -1,14 +1,16 @@
-import { mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Deps } from "./deps.ts";
 import type { Phase, Run, RunStep, StepName } from "../types.ts";
 
+const isMedia = (mime: string): boolean => mime.startsWith("image/") || mime.startsWith("video/");
+
 export const CLAUDE_FLAGS = ["--dangerously-skip-permissions"];
 export const CLI_PATH = fileURLToPath(new URL("../../bin/herdr-factory", import.meta.url));
-const LAYOUT_WAIT_SEC = 120;
-const MAX_IMAGES = 8;
-const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
+const MAX_ATTACHMENTS = 12; // images + videos share this budget
+const MAX_IMAGE_BYTES = 10 * 1024 * 1024; // 10 MB
+const MAX_VIDEO_BYTES = 50 * 1024 * 1024; // 50 MB
 const MEMORY_DIR = ".memory/herdr-factory";
 
 /** One pipeline step: which phase runs it, which phase follows, and whether the
@@ -44,66 +46,87 @@ export const nextStep = (step: StepName): StepDescriptor | undefined => {
 const dispatchPrompt = (step: StepName): string =>
   `Read ${MEMORY_DIR}/prompt-${step}.md in this worktree and follow it exactly. This is an autonomous task — do not pause to ask for confirmation.`;
 
+/** Result of one dispatch attempt: the agent got the prompt (`ready` + its pane), or the
+ *  configured layout pane isn't up yet (`waiting`) so the caller should retry on a later tick. */
+export type DispatchResult = { status: "ready"; paneId: string } | { status: "waiting" };
+
 /**
- * Dispatch the given `prompt` to the agent in the layout's `tab`/`pane`. Agent-agnostic:
- * `herdr agent send` delivers the prompt to whatever agent the layout put there (claude,
- * opencode, …). Fallbacks for the no-layout/degraded case only: if the pane exists but has
- * no agent, run `claude` in it; if the pane never appears, spawn a dedicated claude pane.
- * Renames the pane to `paneName` and returns its id. Shared by all step agents.
+ * Deliver `prompt` to a step's agent. Two modes, chosen by whether a `tab`/`pane` is configured:
+ *
+ *  - **Configured** (the user's layout owns this pane): find that pane and require an agent
+ *    that is present AND idle, then `agent send` the prompt to it (agent-agnostic — claude,
+ *    opencode, …). If the pane isn't up yet, or its agent is still busy starting up, return
+ *    `waiting` — we NEVER spawn our own when a tab/pane is configured; the caller waits (and
+ *    eventually escalates to attention). This is what lets the user's auto-spawned layout
+ *    (setup commands, dev servers, agent startup) settle before work begins.
+ *  - **Not configured** (no tab/pane): spawn a dedicated claude pane ourselves. This is the
+ *    only path that creates a pane.
+ *
+ * Renames the target pane to `paneName`. Shared by all step agents.
  */
 export async function dispatchToLayout(
   deps: Deps,
-  opts: { workspaceId: string; worktree: string; tab: string; pane: string; prompt: string; paneName: string; ticketKey: string },
-): Promise<string> {
-  let target: string | null = null;
-  for (let waited = 0; waited < LAYOUT_WAIT_SEC; waited += 4) {
-    target = await deps.herdr.tabPaneByLabel(opts.workspaceId, opts.tab, opts.pane);
-    if (target && (await deps.herdr.paneAlive(target))) break; // any agent (claude/opencode) is ready
-    await deps.sleep(4000);
+  opts: { workspaceId: string; worktree: string; tab?: string; pane?: string; prompt: string; paneName: string; ticketKey: string },
+): Promise<DispatchResult> {
+  if (opts.tab && opts.pane) {
+    const target = await deps.herdr.tabPaneByLabel(opts.workspaceId, opts.tab, opts.pane);
+    if (!target) return { status: "waiting" }; // the layout hasn't created this tab/pane yet
+    if ((await deps.herdr.paneState(target)) !== "idle") return { status: "waiting" }; // no agent, or still busy
+    await deps.sleep(2000); // settle so the first keystrokes aren't dropped
+    await deps.herdr.agentSend(target, opts.prompt);
+    await deps.herdr.paneSendKeys(target, "Enter");
+    await deps.herdr.agentRename(target, opts.paneName);
+    deps.log("info", `${opts.ticketKey}: dispatched to layout pane ${target} (${opts.tab}/${opts.pane})`);
+    return { status: "ready", paneId: target };
   }
 
-  if (target) {
-    if (await deps.herdr.paneAlive(target)) {
-      await deps.sleep(2000); // settle so the first keystrokes aren't dropped
-      await deps.herdr.agentSend(target, opts.prompt);
-      await deps.herdr.paneSendKeys(target, "Enter");
-      deps.log("info", `${opts.ticketKey}: dispatched to layout pane ${target} (${opts.tab}/${opts.pane})`);
-    } else {
-      // No agent in the configured pane (layout not applied) — start claude in it ourselves.
-      await deps.herdr.paneRun(target, `claude ${CLAUDE_FLAGS.join(" ")} ${JSON.stringify(opts.prompt)}`);
-      deps.log("info", `${opts.ticketKey}: no agent in ${opts.tab}/${opts.pane} — started claude in ${target}`);
-    }
-  } else {
-    target = await deps.herdr.agentStart({
-      workspaceId: opts.workspaceId,
-      cwd: opts.worktree,
-      argv: ["claude", ...CLAUDE_FLAGS, opts.prompt],
-      env: { HERDR_FACTORY_TICKET: opts.ticketKey },
-    });
-    if (!target) throw new Error(`${opts.ticketKey}: failed to dispatch agent to ${opts.tab}/${opts.pane}`);
-    deps.log("info", `${opts.ticketKey}: agent spawned in dedicated pane ${target}`);
-  }
-
+  // No tab/pane configured for this step → spawn our own dedicated pane.
+  const target = await deps.herdr.agentStart({
+    workspaceId: opts.workspaceId,
+    cwd: opts.worktree,
+    argv: ["claude", ...CLAUDE_FLAGS, opts.prompt],
+    env: { HERDR_FACTORY_TICKET: opts.ticketKey },
+  });
+  if (!target) throw new Error(`${opts.ticketKey}: failed to spawn dedicated agent (no tab/pane configured)`);
   await deps.herdr.agentRename(target, opts.paneName);
-  return target;
+  deps.log("info", `${opts.ticketKey}: no tab/pane configured — spawned dedicated pane ${target}`);
+  return { status: "ready", paneId: target };
 }
 
-/** Fetch ticket JSON + images into the worktree's .memory (once per run, at claiming). */
+/** Fetch ticket JSON (description + comments) + image/video attachments into the
+ *  worktree's .memory. Idempotent: a no-op once ticket.json exists, so it's safe to call on
+ *  every claiming tick while we wait for the step's layout pane to come up. */
 export async function materializeTicket(deps: Deps, run: Run): Promise<void> {
   const worktree = run.worktreePath;
   if (!worktree) throw new Error(`${run.ticketKey}: no worktree path`);
   const mem = join(worktree, MEMORY_DIR);
-  mkdirSync(join(mem, "images"), { recursive: true });
+  if (existsSync(join(mem, "ticket.json"))) return; // already materialized this run
+  mkdirSync(join(mem, "attachments"), { recursive: true });
+  let mediaCount = 0;
   try {
     const issue = await deps.jira.getIssue(run.ticketKey);
     writeFileSync(join(mem, "ticket.json"), JSON.stringify(issue, null, 2));
+    mediaCount = (issue.fields.attachment ?? []).filter((a) => isMedia(a.mimeType ?? "")).length;
   } catch {
     deps.log("warn", `${run.ticketKey}: could not save ticket.json`);
   }
   try {
-    await deps.jira.downloadImages(run.ticketKey, join(mem, "images"), MAX_IMAGES, MAX_IMAGE_BYTES);
+    const saved = await deps.jira.downloadAttachments(
+      run.ticketKey,
+      join(mem, "attachments"),
+      MAX_ATTACHMENTS,
+      MAX_IMAGE_BYTES,
+      MAX_VIDEO_BYTES,
+    );
+    // Don't silently swallow truncation — the fix agent is told to study every attachment.
+    if (mediaCount > saved.length) {
+      deps.log(
+        "warn",
+        `${run.ticketKey}: saved ${saved.length}/${mediaCount} media attachments — rest skipped (over the ${MAX_ATTACHMENTS} cap or size limit)`,
+      );
+    }
   } catch {
-    deps.log("warn", `${run.ticketKey}: image download had issues`);
+    deps.log("warn", `${run.ticketKey}: attachment download had issues`);
   }
 }
 
@@ -160,11 +183,14 @@ export function renderStepPrompt(deps: Deps, run: Run, step: StepName, prior: Ru
 }
 
 /**
- * Spawn the agent for `step` into its configured pane. Renders + writes its prompt
- * (wiring in the prior step's handoff + pane/session for on-demand query), dispatches,
- * records the pane on the run_step and as the run's latest pane. Returns the pane id.
+ * Spawn (or hand off to) the agent for `step`. Renders + writes its prompt (wiring in the
+ * prior step's handoff + pane/session for on-demand query), then dispatches:
+ *   - `ready`  → records the pane on the run_step and as the run's latest pane, flags focus.
+ *   - `waiting`→ the configured layout pane isn't up yet; nothing is recorded. The run_step's
+ *     `started_at` (stamped on first touch below) times the bounded wait; the caller decides
+ *     whether to retry next tick or escalate to attention.
  */
-export async function spawnStep(deps: Deps, run: Run, step: StepName): Promise<string> {
+export async function spawnStep(deps: Deps, run: Run, step: StepName): Promise<DispatchResult> {
   const workspaceId = run.workspaceId;
   const worktree = run.worktreePath;
   if (!workspaceId || !worktree) throw new Error(`${run.ticketKey}: missing workspace/worktree`);
@@ -181,7 +207,12 @@ export async function spawnStep(deps: Deps, run: Run, step: StepName): Promise<s
 
   renderStepPrompt(deps, run, step, prior);
 
-  const pane = await dispatchToLayout(deps, {
+  // Ensure the step row exists so its started_at clock runs from the first attempt — this is
+  // what bounds the layout wait across ticks. (started_at is set to now() on first insert and
+  // only reset below once we actually dispatch.)
+  deps.store.upsertRunStep(run.id, step);
+
+  const result = await dispatchToLayout(deps, {
     workspaceId,
     worktree,
     tab: cfg.tab,
@@ -190,22 +221,23 @@ export async function spawnStep(deps: Deps, run: Run, step: StepName): Promise<s
     paneName: `${step}:${run.ticketKey}`,
     ticketKey: run.ticketKey,
   });
+  if (result.status === "waiting") return result; // still waiting on the user's layout pane
 
-  // Reset started_at on every (re)spawn so the per-step budget is measured per attempt,
-  // not cumulatively across crash-recovery re-spawns.
-  deps.store.upsertRunStep(run.id, step, { paneId: pane, startedAt: deps.now() });
-  deps.store.updateRun(run.id, { paneId: pane }); // latest active pane (reviewing/resolver reuse it)
+  // Dispatched. Reset started_at so the per-step budget is measured from now (per attempt,
+  // not cumulatively across crash-recovery re-spawns or the preceding layout wait).
+  deps.store.upsertRunStep(run.id, step, { paneId: result.paneId, startedAt: deps.now() });
+  deps.store.updateRun(run.id, { paneId: result.paneId }); // latest active pane (reviewing/resolver reuse it)
   deps.store.recordEvent({
     runId: run.id,
     repo: deps.config.repoName,
     ticketKey: run.ticketKey,
     type: "step_spawned",
-    detail: { step, paneId: pane },
+    detail: { step, paneId: result.paneId },
   });
   // Mark that the active step changed. The actual focus shift is deferred to
   // applyPendingFocus, which brings this pane to the front only when the user is already
   // viewing THIS worktree on one of its pipeline panes — never stealing focus from another
   // worktree, and never yanking the user off an unrelated pane.
   deps.store.updateRun(run.id, { focusPending: true });
-  return pane;
+  return result;
 }

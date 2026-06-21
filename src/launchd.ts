@@ -28,18 +28,21 @@ function plistXml(config: Config): string {
   <key>ProgramArguments</key>
   <array>
     <string>${process.execPath}</string>
-    <string>--import</string><string>tsx</string>
     <string>${CLI_ENTRY}</string>
     <string>--repo</string><string>${config.repoName}</string>
-    <string>tick</string>
+    <string>watch</string>
   </array>
   <key>EnvironmentVariables</key>
   <dict>
     <key>PATH</key><string>${process.env.PATH ?? ""}</string>
     <key>HOME</key><string>${homedir()}</string>
   </dict>
-  <key>StartInterval</key><integer>${config.limits.tickIntervalSeconds}</integer>
+  <!-- Resident daemon: \`watch\` loops every tick_interval_seconds itself. KeepAlive (not
+       StartInterval) restarts it if it ever dies, and the internal loop is immune to the
+       per-user launchd interval-timer wedging that StartInterval is prone to after sleep. -->
+  <key>KeepAlive</key><true/>
   <key>RunAtLoad</key><true/>
+  <key>ThrottleInterval</key><integer>10</integer>
   <key>ProcessType</key><string>Background</string>
   <key>StandardOutPath</key><string>${join(config.paths.logsDir, "launchd.out.log")}</string>
   <key>StandardErrorPath</key><string>${join(config.paths.logsDir, "launchd.err.log")}</string>

@@ -14,7 +14,11 @@ repo:
 # Default when unset: {{ticket_prefix}}/{{ticket_id}}-{{ticket_slug}}.
 workspace_name: "{{ticket_prefix}}/{{ticket_id}}-{{ticket_short_slug}}"
 
+# Where this repo polls work from. Per-repo, so different repos can target different
+# Atlassian sites / projects / boards. base_url is the Atlassian site (not a secret);
+# the Jira auth (email + token) stays in the shared ~/.config/herdr-factory/env.
 jira:
+  base_url: https://your-org.atlassian.net
   project: PROJ
   board: 123
   label: agent
@@ -23,24 +27,34 @@ jira:
     in_development: In Progress
     review: In Review
 
-# The three pipeline agents — fix → review → pr. All required, no defaults. Each runs
-# in its own herdr layout pane (tab/pane) and is driven by its own prompt file (path
-# relative to this folder; its CONTENTS become the agent's prompt, with tokens like
-# @@KEY@@ / @@HANDOFF_IN@@ / @@STEP_DONE_CMD@@ substituted). Each agent must, when done,
-# write its handoff note and run `herdr-factory --repo <name> step-done <KEY> <step>`.
+# The three pipeline agents — fix → review → pr. All required, no defaults. Each runs in
+# its own herdr layout pane (tab/pane). Each agent must, when done, write its handoff note
+# and run `herdr-factory --repo <name> step-done <KEY> <step>`.
+#
+# prompt_type is REQUIRED for every agent (there is no silent default):
+#   augment — the engine ships a sensible built-in prompt for the step and appends your
+#             prompt_file (OPTIONAL here) as extra, repo-specific instructions. Recommended
+#             while you're getting a feel for how the agents behave.
+#   replace — your prompt_file (REQUIRED here) is sent to the agent verbatim, so you own the
+#             whole prompt. Switch to this once you know the system and want full control.
+# prompt_file paths are relative to this folder; tokens like @@KEY@@ / @@HANDOFF_IN@@ /
+# @@STEP_DONE_CMD@@ are substituted in both the built-in prompt and your additions.
 agents:
   fix:
     tab: fix
     pane: agent
-    prompt_file: fix.md          # read ticket → implement → verify → commit
+    prompt_type: augment
+    prompt_file: fix.md          # extra fix-step notes, appended to the built-in fix prompt
   review:
     tab: review
     pane: agent
-    prompt_file: review.md       # fresh-eyes review of the diff → changes → commit
+    prompt_type: augment
+    prompt_file: review.md       # extra review-step notes
   pr:
     tab: pr
     pane: agent
-    prompt_file: pr.md           # open + push the PR → drive the CI/bot round
+    prompt_type: augment
+    prompt_file: pr.md           # extra pr-step notes
   # guidelines-prompt.md in this folder (if present) is appended to every agent prompt.
 
 limits:

@@ -180,10 +180,13 @@ async function reconcileClaiming(deps: Deps, run: Run): Promise<void> {
     deps.log("info", `${run.ticketKey}: worktree ready (${wt.workspaceId})`);
   }
 
-  // 2. fetch the ticket + images and spawn the fix agent (once)
+  // 2. fetch the ticket + attachments (idempotent) and dispatch the fix agent. If the
+  //    configured layout pane isn't up yet, stay in `claiming` and retry next tick (bounded;
+  //    escalate to attention on timeout) — never spawn our own when a tab/pane is configured.
   if (!deps.store.getRunStep(run.id, "fix")?.paneId) {
     await materializeTicket(deps, run);
-    await spawnStep(deps, run, "fix");
+    const res = await spawnStep(deps, run, "fix");
+    if (res.status === "waiting") return handleLayoutWait(deps, run, "fix");
     run = deps.store.getRun(run.id)!;
   }
 
@@ -229,6 +232,27 @@ async function escalateAttention(
   await deps.herdr.notify(`herdr-factory: ${run.ticketKey} needs attention`, opts.body).catch(() => {});
 }
 
+/** A step is waiting for its configured layout pane to come up (an idle agent in tab/pane).
+ *  Stay put and retry next tick, but escalate to attention once we've waited past
+ *  `layout_wait_seconds` (measured from the step row's started_at). Only steps that HAVE a
+ *  tab/pane ever wait — steps without one spawn their own pane and never reach here. */
+async function handleLayoutWait(deps: Deps, run: Run, step: StepName): Promise<void> {
+  const cfg = deps.config.agents[step];
+  const where = `${cfg.tab}/${cfg.pane}`;
+  const since = deps.store.getRunStep(run.id, step)?.startedAt ?? deps.now();
+  const waited = deps.now() - since;
+  if (waited <= deps.config.limits.layoutWaitSeconds) {
+    deps.log("info", `${run.ticketKey}: ${step} waiting for layout pane ${where} (${waited}s/${deps.config.limits.layoutWaitSeconds}s)`);
+    return;
+  }
+  await escalateAttention(deps, run, {
+    reason: "layout_wait_timeout",
+    attentionReason: `${step}: layout pane ${where} never became available`,
+    body: `${step} step: configured pane ${where} didn't come up with an idle agent within ${Math.round(deps.config.limits.layoutWaitSeconds / 60)}min — is the herdr layout for this worktree running?`,
+    detail: { step, tab: cfg.tab, pane: cfg.pane },
+  });
+}
+
 function budgetFor(deps: Deps, step: StepName): number {
   return step === "fix"
     ? deps.config.limits.developBudgetSeconds
@@ -246,9 +270,12 @@ function budgetFor(deps: Deps, step: StepName): number {
 async function reconcileStep(deps: Deps, run: Run, d: StepDescriptor): Promise<void> {
   const step = deps.store.getRunStep(run.id, d.name);
 
-  // (Re)spawn if there's no live pane recorded for this step (first entry / crash gap).
+  // (Re)spawn if there's no live pane recorded for this step (first entry / crash gap). If
+  // the step's configured layout pane isn't up yet, wait (bounded → attention) rather than
+  // spawning our own.
   if (!step || !step.paneId) {
-    await spawnStep(deps, run, d.name);
+    const res = await spawnStep(deps, run, d.name);
+    if (res.status === "waiting") await handleLayoutWait(deps, run, d.name);
     return;
   }
   // (Session id for on-demand query is captured at handoff time by spawnStep when the

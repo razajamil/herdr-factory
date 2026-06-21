@@ -49,7 +49,7 @@ async function buildDeps(repoName: string): Promise<Deps> {
     store,
     ghRepo,
     herdr: new HerdrClient(process.env.HERDR_BIN_PATH ?? "herdr"),
-    jira: new JiraClient(secrets.jiraBaseUrl, secrets.jiraEmail, secrets.jiraApiToken),
+    jira: new JiraClient(config.jira.baseUrl, secrets.jiraEmail, secrets.jiraApiToken),
     github: new GitHubClient(),
     git,
     log: makeLogger(config),
@@ -74,7 +74,7 @@ function requireRepo(): string {
 
 program
   .command("tick")
-  .description("run one reconcile pass (what launchd invokes)")
+  .description("run one reconcile pass (handy for manual/one-shot runs)")
   .action(async () => {
     try {
       const deps = await buildDeps(requireRepo());
@@ -83,6 +83,43 @@ program
     } catch (e) {
       fail(e);
     }
+  });
+
+program
+  .command("watch")
+  .description("resident daemon: reconcile in a loop every tick_interval_seconds (what launchd keeps alive)")
+  .action(async () => {
+    let deps: Deps;
+    try {
+      deps = await buildDeps(requireRepo());
+    } catch (e) {
+      fail(e); // exits non-zero; launchd KeepAlive retries after ThrottleInterval
+    }
+    const intervalMs = deps.config.limits.tickIntervalSeconds * 1000;
+    let stopping = false;
+    const shutdown = (sig: string) => {
+      if (stopping) return;
+      stopping = true;
+      deps.log("info", `watch: received ${sig}, stopping after the current pass`);
+    };
+    process.on("SIGTERM", () => shutdown("SIGTERM"));
+    process.on("SIGINT", () => shutdown("SIGINT"));
+    deps.log("info", `watch: started — reconciling every ${deps.config.limits.tickIntervalSeconds}s`);
+    while (!stopping) {
+      try {
+        const ran = await withTickLock(deps, () => reconcileRepo(deps));
+        if (!ran) deps.log("info", "another tick is already running — skipping");
+      } catch (e) {
+        // A single failed pass must never kill the loop — log and keep polling.
+        deps.log("error", `watch: tick failed — ${e instanceof Error ? e.message : String(e)}`);
+      }
+      // Interruptible sleep, so SIGTERM (launchd bootout) stops us within ~1s.
+      for (let waited = 0; waited < intervalMs && !stopping; waited += 1000) {
+        await deps.sleep(Math.min(1000, intervalMs - waited));
+      }
+    }
+    deps.log("info", "watch: stopped");
+    process.exit(0);
   });
 
 program
@@ -250,7 +287,7 @@ program
     try {
       const deps = await buildDeps(requireRepo());
       await launchd.install(deps.config);
-      console.log(`installed + loaded ${launchd.label(deps.config.repoName)} (every ${deps.config.limits.tickIntervalSeconds}s)`);
+      console.log(`installed + loaded ${launchd.label(deps.config.repoName)} (resident watch, reconciles every ${deps.config.limits.tickIntervalSeconds}s)`);
     } catch (e) {
       fail(e);
     }
