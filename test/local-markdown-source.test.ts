@@ -22,18 +22,28 @@ function build(files: Record<string, string> = {}) {
 }
 
 describe("LocalMarkdownSource", () => {
-  it("lists top-level *.md as todo, skipping dot/underscore files", async () => {
+  it("lists top-level *.md as todo, skipping dot- and __-prefixed files (single _ is allowed)", async () => {
     const { src } = build({
       "task-a.md": "# Alpha\n\nbody",
       "task-b.md": "do b",
-      "_draft.md": "# skip me",
+      "_single.md": "# kept", // single underscore is fine now — only __ means "being prepared"
+      "__draft.md": "# skip me", // __ prefix → ignored
       ".notes.md": "# hidden",
       "notes.txt": "not markdown",
     });
     const eligible = await src.listEligible();
-    expect(eligible.map((t) => t.key).sort()).toEqual(["task-a", "task-b"]);
+    expect(eligible.map((t) => t.key).sort()).toEqual(["_single", "task-a", "task-b"]);
     expect(eligible.find((t) => t.key === "task-a")!.summary).toBe("Alpha"); // first H1
     expect(eligible.find((t) => t.key === "task-b")!.summary).toBe("task b"); // no H1 → humanized filename
+  });
+
+  it("ignores a __-prefixed top-level directory (work still being prepared)", async () => {
+    const { src, folder } = build();
+    mkdirSync(join(folder, "__wip"));
+    writeFileSync(join(folder, "__wip", "spec.md"), "# Not ready");
+    mkdirSync(join(folder, "ready"));
+    writeFileSync(join(folder, "ready", "spec.md"), "# Ready to go");
+    expect((await src.listEligible()).map((t) => t.key)).toEqual(["ready"]);
   });
 
   it("derives title/type from front-matter when present", async () => {
@@ -110,6 +120,69 @@ describe("LocalMarkdownSource", () => {
     mkdirSync(mem2, { recursive: true });
     await src.materialize("ghost", mem2, () => {});
     expect(readFileSync(join(mem2, "task.md"), "utf8")).toContain("not found");
+  });
+
+  it("lists a top-level directory holding a top-level *.md as a work item (key = dir name)", async () => {
+    const { src, folder } = build({ "loose.md": "# Loose" });
+    mkdirSync(join(folder, "feature-x"));
+    writeFileSync(join(folder, "feature-x", "spec.md"), "# Build feature X\n\nthe brief");
+    const eligible = await src.listEligible();
+    expect(eligible.map((t) => t.key).sort()).toEqual(["feature-x", "loose"]);
+    expect(eligible.find((t) => t.key === "feature-x")!.summary).toBe("Build feature X"); // first H1 of its md
+  });
+
+  it("seeds a directory ticket's title/type from README.md, else the first *.md", async () => {
+    const { src, folder } = build();
+    // README wins even though aaa.md sorts first.
+    mkdirSync(join(folder, "with-readme"));
+    writeFileSync(join(folder, "with-readme", "aaa.md"), "# Not this one");
+    writeFileSync(join(folder, "with-readme", "README.md"), "---\ntitle: From Readme\ntype: bug\n---\n# x");
+    // No README → first *.md alphabetically.
+    mkdirSync(join(folder, "no-readme"));
+    writeFileSync(join(folder, "no-readme", "zeta.md"), "# Zeta");
+    writeFileSync(join(folder, "no-readme", "alpha.md"), "# Alpha first");
+    const a = await src.describe("with-readme");
+    expect(a.summary).toBe("From Readme");
+    expect(a.type).toBe("bug");
+    const b = await src.describe("no-readme");
+    expect(b.summary).toBe("Alpha first");
+    expect(b.type).toBe("task"); // default
+  });
+
+  it("only checks the directory's TOP level — markdown nested deeper does not qualify it", async () => {
+    const { src, folder } = build();
+    mkdirSync(join(folder, "nested-only", "docs"), { recursive: true });
+    writeFileSync(join(folder, "nested-only", "docs", "spec.md"), "# Buried");
+    mkdirSync(join(folder, "empty-dir"));
+    writeFileSync(join(folder, "empty-dir", "notes.txt"), "no markdown here");
+    expect(await src.listEligible()).toEqual([]); // neither qualifies
+  });
+
+  it("a <key>.md file wins a key collision with a <key>/ directory", async () => {
+    const { src, folder } = build({ "dup.md": "# From the file" });
+    mkdirSync(join(folder, "dup"));
+    writeFileSync(join(folder, "dup", "spec.md"), "# From the dir");
+    const eligible = await src.listEligible();
+    expect(eligible.map((t) => t.key)).toEqual(["dup"]); // only one, and it's the file
+    expect(eligible[0]!.summary).toBe("From the file");
+    expect((await src.describe("dup")).summary).toBe("From the file");
+  });
+
+  it("materialize copies a whole directory item to task/ (idempotent, includes nested files)", async () => {
+    const { src, folder } = build();
+    mkdirSync(join(folder, "bundle", "assets"), { recursive: true });
+    writeFileSync(join(folder, "bundle", "README.md"), "# Bundle\n\nthe spec");
+    writeFileSync(join(folder, "bundle", "assets", "diagram.txt"), "shapes");
+    const mem = join(folder, ".mem");
+    mkdirSync(mem, { recursive: true });
+    await src.materialize("bundle", mem, () => {});
+    expect(existsSync(join(mem, "task.md"))).toBe(false); // a directory item does NOT use task.md
+    expect(readFileSync(join(mem, "task", "README.md"), "utf8")).toContain("the spec");
+    expect(readFileSync(join(mem, "task", "assets", "diagram.txt"), "utf8")).toBe("shapes"); // nested copied
+    // idempotent: a second call with a now-empty source does not clobber the copy
+    rmSync(join(folder, "bundle"), { recursive: true, force: true });
+    await src.materialize("bundle", mem, () => {});
+    expect(readFileSync(join(mem, "task", "README.md"), "utf8")).toContain("the spec");
   });
 
   it("health throws on a missing folder, passes on an existing one", async () => {

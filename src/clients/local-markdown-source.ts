@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { parse as parseYaml } from "yaml";
 import type { Store } from "../db/store.ts";
@@ -57,13 +57,21 @@ function deriveTicket(key: string, content: string): Ticket {
 }
 
 /**
- * A folder of `*.md` files as a work source. herdr-factory owns the status of record here — the
- * lifecycle (todo → in_development → in_review → merged|aborted) is tracked in the `work_items`
- * table, NOT in the files (which are never modified). A file's key is its filename without `.md`;
- * the live file is snapshotted to `task.md` at materialize time and not re-read afterwards.
+ * A folder of work items as a work source. Each top-level item is either a single `*.md` file OR
+ * a top-level directory that contains at least one top-level `*.md` (only that directory's own
+ * level is checked — markdown nested deeper does not qualify it). herdr-factory owns the status of
+ * record here — the lifecycle (todo → in_development → in_review → merged|aborted) is tracked in
+ * the `work_items` table, NOT in the source (which is never modified).
  *
- * Only top-level `*.md` files are scanned; dotfiles and `_`-prefixed files are skipped (so notes
- * / templates / `_drafts.md` don't get claimed as work).
+ * An item's key is its filename without `.md` (file) or its directory name (directory); a
+ * `<key>.md` file wins a collision with a `<key>/` directory. At materialize time a file is
+ * snapshotted to `task.md` and a directory is copied whole to `task/`, and not re-read afterwards.
+ * A directory's ticket title/type are seeded from its primary markdown (`README.md` if present,
+ * else the first `*.md` alphabetically).
+ *
+ * Only top-level entries are scanned; dot-prefixed names (hidden/system) and `__`-prefixed names
+ * are skipped — a `__` prefix marks work still being prepared (so `__drafts.md` / a `__wip/`
+ * directory don't get claimed until renamed).
  */
 export class LocalMarkdownSource implements WorkSource {
   private readonly folder: string;
@@ -77,8 +85,50 @@ export class LocalMarkdownSource implements WorkSource {
     this.name = name;
   }
 
-  private fileFor(key: string): string {
-    return join(this.folder, `${key}.md`);
+  /** Top-level `*.md` in a work directory whose contents seed the ticket: `README.md`
+   *  (case-insensitive) if present, else the first `*.md` alphabetically. Null when the directory
+   *  has no top-level markdown (so it does not qualify as a work item). */
+  private primaryMd(dir: string): string | null {
+    let ents;
+    try {
+      ents = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return null;
+    }
+    const mds = ents
+      .filter((d) => d.isFile() && d.name.toLowerCase().endsWith(".md"))
+      .map((d) => d.name)
+      .sort();
+    if (mds.length === 0) return null;
+    const readme = mds.find((n) => n.toLowerCase() === "readme.md");
+    return join(dir, readme ?? mds[0]!);
+  }
+
+  /** Resolve a key to its on-disk source: a top-level `<key>.md` file, or a top-level `<key>/`
+   *  directory holding at least one top-level `*.md`. Files win a name collision. The `missing`
+   *  path points at the expected `.md` (used for the materialize placeholder + warning). */
+  private resolve(key: string): { kind: "file" | "dir" | "missing"; path: string } {
+    const file = join(this.folder, `${key}.md`);
+    try {
+      if (statSync(file).isFile()) return { kind: "file", path: file };
+    } catch {
+      /* not a file — try a directory */
+    }
+    const dir = join(this.folder, key);
+    try {
+      if (statSync(dir).isDirectory() && this.primaryMd(dir)) return { kind: "dir", path: dir };
+    } catch {
+      /* not a directory either */
+    }
+    return { kind: "missing", path: file };
+  }
+
+  /** The markdown that seeds the ticket for a resolved item — the file itself, or the directory's
+   *  primary `*.md`. Throws on a missing/unreadable item. */
+  private readSpec(r: { kind: "file" | "dir" | "missing"; path: string }): string {
+    if (r.kind === "file") return readFileSync(r.path, "utf8");
+    if (r.kind === "dir") return readFileSync(this.primaryMd(r.path)!, "utf8");
+    throw new Error(`local_markdown: no source at ${r.path}`);
   }
 
   async listEligible(): Promise<Ticket[]> {
@@ -89,9 +139,20 @@ export class LocalMarkdownSource implements WorkSource {
     } catch {
       return [];
     }
+    // A `<key>.md` file always wins a key collision with a `<key>/` directory, so collect the
+    // file keys up front and let directories defer to them.
+    const fileKeys = new Set<string>();
+    for (const name of names) {
+      if (!name.endsWith(".md") || name.startsWith(".") || name.startsWith("__")) continue;
+      try {
+        if (statSync(join(this.folder, name)).isFile()) fileKeys.add(name.slice(0, -3));
+      } catch {
+        /* unreadable — ignore */
+      }
+    }
     const out: Ticket[] = [];
     for (const name of names.sort()) {
-      if (!name.endsWith(".md") || name.startsWith(".") || name.startsWith("_")) continue;
+      if (name.startsWith(".") || name.startsWith("__")) continue; // hidden, or `__`-prefixed = being prepared
       const full = join(this.folder, name);
       let st;
       try {
@@ -99,39 +160,48 @@ export class LocalMarkdownSource implements WorkSource {
       } catch {
         continue;
       }
-      if (!st.isFile()) continue;
-      const key = name.slice(0, -3); // strip ".md"
+      let key: string;
+      if (st.isFile() && name.endsWith(".md")) {
+        key = name.slice(0, -3); // strip ".md"
+      } else if (st.isDirectory()) {
+        key = name;
+        if (fileKeys.has(key)) continue; // a sibling <key>.md already owns this key
+        if (!this.primaryMd(full)) continue; // no top-level *.md → not a work item
+      } else {
+        continue; // a non-markdown file, or something exotic
+      }
       const status = this.store.getWorkItem(this.repo, this.name, key)?.status ?? "todo";
       if (status !== "todo") continue; // claimed earlier or terminal (merged/aborted)
       // Backstop: never list an item that already has an active run (covers the window between
       // claim and the in_development write, and any stale work_items row).
       if (this.store.activeRunForTicket(this.repo, this.name, key)) continue;
-      let content: string;
+      let spec: string; // the markdown whose contents seed this ticket
       try {
-        content = readFileSync(full, "utf8");
+        spec = st.isDirectory() ? readFileSync(this.primaryMd(full)!, "utf8") : readFileSync(full, "utf8");
       } catch {
         continue;
       }
-      out.push(deriveTicket(key, content));
+      out.push(deriveTicket(key, spec));
     }
     return out;
   }
 
   async describe(key: string): Promise<Ticket> {
-    const p = this.fileFor(key);
-    if (!existsSync(p)) throw new Error(`local_markdown: no file for "${key}" at ${p}`);
-    return deriveTicket(key, readFileSync(p, "utf8"));
+    const r = this.resolve(key);
+    if (r.kind === "missing") throw new Error(`local_markdown: no file or directory for "${key}" at ${r.path}`);
+    return deriveTicket(key, this.readSpec(r));
   }
 
-  /** Best-effort metadata for an item's work_items row (null fields when the file is gone). */
+  /** Best-effort metadata for an item's work_items row (null fields when the source is gone).
+   *  `path` is the `.md` file or the directory itself. */
   private metaFor(key: string): { title?: string | null; itemType?: string | null; path?: string | null } {
-    const p = this.fileFor(key);
-    if (!existsSync(p)) return { path: p };
+    const r = this.resolve(key);
+    if (r.kind === "missing") return { path: r.path };
     try {
-      const t = deriveTicket(key, readFileSync(p, "utf8"));
-      return { title: t.summary, itemType: t.type, path: p };
+      const t = deriveTicket(key, this.readSpec(r));
+      return { title: t.summary, itemType: t.type, path: r.path };
     } catch {
-      return { path: p };
+      return { path: r.path };
     }
   }
 
@@ -141,15 +211,24 @@ export class LocalMarkdownSource implements WorkSource {
   }
 
   async materialize(key: string, memDir: string, log: Logger): Promise<void> {
-    const dest = join(memDir, "task.md");
-    if (existsSync(dest)) return; // idempotent across claiming ticks
-    const src = this.fileFor(key);
-    if (!existsSync(src)) {
-      writeFileSync(dest, `# ${key}\n\n_(source markdown file ${src} was not found at materialize time)_\n`);
-      log("warn", `${key}: local_markdown source file missing at ${src}`);
+    const r = this.resolve(key);
+    // A directory item: copy the whole tree to task/ (so the agent sees every file, nested
+    // included). Idempotent on the task/ dir's existence across claiming ticks.
+    if (r.kind === "dir") {
+      const dest = join(memDir, "task");
+      if (existsSync(dest)) return;
+      cpSync(r.path, dest, { recursive: true });
       return;
     }
-    writeFileSync(dest, readFileSync(src, "utf8"));
+    // A single-file item (or a missing source): snapshot to task.md.
+    const dest = join(memDir, "task.md");
+    if (existsSync(dest)) return; // idempotent across claiming ticks
+    if (r.kind === "missing") {
+      writeFileSync(dest, `# ${key}\n\n_(source markdown for "${key}" was not found at materialize time)_\n`);
+      log("warn", `${key}: local_markdown source not found (looked for ${r.path})`);
+      return;
+    }
+    writeFileSync(dest, readFileSync(r.path, "utf8"));
   }
 
   async health(): Promise<void> {

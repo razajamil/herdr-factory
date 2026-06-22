@@ -209,12 +209,16 @@ reverse-engineered during the bash prototype.
   `merged`/`aborted` are **unmapped** (Jira's terminal state is owned by its GitHub integration),
   so `transition` short-circuits to a no-op **before any network call** and teardown stays
   Jira-silent. `materialize` writes `ticket.json` + attachments.
-- **`local-markdown-source.ts`** — a folder of `*.md` files (top-level only; dot/`_`-prefixed
-  skipped). herdr-factory owns the status of record in the `work_items` table (the files are never
-  modified). Key = filename stem; title/type from optional YAML front-matter, else the first H1 /
-  humanized filename and `"task"`. `listEligible` returns files whose `work_items.status` is
-  absent/`todo` AND have no active run (a backstop over the run-table dedup); `transition` upserts
-  `work_items.status`; `materialize` snapshots the file to `task.md`; `health` stats the folder.
+- **`local-markdown-source.ts`** — a folder of work items (top-level only; dot-prefixed and
+  `__`-prefixed names skipped — `__` marks work still being prepared). Each item is a single `*.md` file **or** a top-level subdirectory holding ≥1 top-level
+  `*.md` (only that level is checked; a `<key>.md` file wins a collision with a `<key>/` dir).
+  herdr-factory owns the status of record in the `work_items` table (the source is never modified).
+  Key = filename stem / dir name; title/type from optional YAML front-matter, else the first H1 /
+  humanized name and `"task"` (a directory seeds these from its primary md — `README.md` if present,
+  else the first `*.md`). `listEligible` returns items whose `work_items.status` is absent/`todo`
+  AND have no active run (a backstop over the run-table dedup); `transition` upserts
+  `work_items.status`; `materialize` snapshots a file to `task.md` or copies a directory whole to
+  `task/`; `health` stats the folder.
 - **`github.ts`** (`gh` via execFile) — `prForBranch(repo, branch)`,
   `reviewSignature(repo, n) → {unresolved, failing, sig}` (graphql review threads
   + `statusCheckRollup`).
@@ -470,9 +474,10 @@ step (`spawnStep`):
    the engine's built-in step prompt + the repo's `prompt_file` (if any) as additions; `replace`
    = the `prompt_file` verbatim. The built-in is resolved **per source type**:
    `src/prompts/<type>/<step>.md` if present, else the shared `src/prompts/<step>.md` (so
-   `local_markdown` gets its own `fix` prompt pointing at `task.md`, while review/pr share the
-   defaults). `renderStepPrompt` then substitutes tokens (`@@KEY@@`, `@@WORK_DOC@@` —
-   `ticket.json` for Jira, `task.md` for local_markdown — `@@HANDOFF_IN@@`, `@@PRIOR_PANE@@`,
+   `local_markdown` gets its own `fix` prompt pointing at `task.md` / `task/`, while review/pr share
+   the defaults). `renderStepPrompt` then substitutes tokens (`@@KEY@@`, `@@WORK_DOC@@` —
+   `ticket.json` for Jira; `task.md` (file) or `task/` (directory) for local_markdown, detected from
+   what `materialize` wrote into the worktree — `@@WORK_DOC_KIND@@`, `@@HANDOFF_IN@@`, `@@PRIOR_PANE@@`,
    `@@STEP_DONE_CMD@@` — which carries `--source` so the signal resolves unambiguously, …) into
    that resolved prompt, appends `guidelines-prompt.md`, and appends a standard footer that points
    the agent at its inputs and tells it to write its handoff note + signal `step-done`. The rendered prompt is written to

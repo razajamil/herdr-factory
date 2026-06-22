@@ -1,4 +1,4 @@
-import { mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Deps, SourceRuntime } from "./deps.ts";
@@ -90,7 +90,7 @@ export async function dispatchToLayout(
 
 /** Materialize the work item (its work doc + any media) into the worktree's .memory for the
  *  agents to read. Delegates to the source: Jira writes ticket.json + image/video attachments;
- *  local_markdown snapshots the file to task.md. Idempotent (the source guards against
+ *  local_markdown snapshots a file to task.md or copies a directory item whole to task/. Idempotent (the source guards against
  *  re-materializing) and best-effort (it logs rather than throwing), so it's safe to call on
  *  every claiming tick while we wait for the step's layout pane to come up. */
 export async function materializeWork(deps: Deps, run: Run, src: SourceRuntime): Promise<void> {
@@ -134,8 +134,20 @@ export function renderStepPrompt(deps: Deps, run: Run, src: SourceRuntime, step:
   // The step-done command carries --source so the signal resolves to the right run even when two
   // sources share a key (the worker only knows its key, via HERDR_FACTORY_TICKET).
   const stepDoneCmd = `${CLI_PATH} --repo ${deps.config.repoName} step-done ${run.ticketKey} ${step} --source ${src.name}`;
-  // Where the work item's spec lives — per source type (Jira → ticket.json; local_markdown → task.md).
-  const workDoc = src.type === "jira" ? `${MEMORY_DIR}/ticket.json` : `${MEMORY_DIR}/task.md`;
+  // Where the work item's spec lives + how to describe it. Jira → a single ticket.json.
+  // local_markdown is either a single file (snapshotted to task.md) or a whole directory (copied
+  // to task/); detect which from what materialize wrote into this worktree's .memory.
+  let workDoc: string;
+  let workDocKind: string;
+  if (src.type === "jira") {
+    workDoc = `${MEMORY_DIR}/ticket.json`;
+    workDocKind = "Jira ticket (JSON)";
+  } else {
+    const taskDir = join(worktree, MEMORY_DIR, "task");
+    const isDir = existsSync(taskDir) && statSync(taskDir).isDirectory();
+    workDoc = isDir ? `${MEMORY_DIR}/task/` : `${MEMORY_DIR}/task.md`;
+    workDocKind = isDir ? "directory of markdown files" : "markdown file";
+  }
   const sub: Record<string, string> = {
     "@@KEY@@": run.ticketKey,
     "@@REPO@@": deps.config.repoName,
@@ -146,6 +158,7 @@ export function renderStepPrompt(deps: Deps, run: Run, src: SourceRuntime, step:
     "@@STEP@@": step,
     "@@MEMORY_DIR@@": MEMORY_DIR,
     "@@WORK_DOC@@": workDoc,
+    "@@WORK_DOC_KIND@@": workDocKind,
     "@@EVIDENCE_DIR@@": `${MEMORY_DIR}/evidence`,
     "@@CLI@@": CLI_PATH,
     "@@HANDOFF_IN@@": prior ? `${MEMORY_DIR}/handoff-${prior.step}.md` : "(none — first step)",

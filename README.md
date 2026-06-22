@@ -72,8 +72,10 @@ In `repos/<name>/config.yml`, set:
   `priority` (lower = pulled first), its own `workspace_name` branch template (must include
   `{{ticket_id}}`), its own `agents.{fix,review,pr}` blocks, and a type-specific block:
   - `jira:` — `base_url` / `project` / `board` / `label` / the three `status` names
-  - `local_markdown:` — `folder` (a directory of `*.md` task briefs; each top-level file is one
-    work item, keyed by filename, with status tracked internally — the files are never modified)
+  - `local_markdown:` — `folder` (a directory of task briefs; each top-level item is either a
+    single `*.md` file *or* a top-level subdirectory containing at least one top-level `*.md`,
+    keyed by filename/dirname, with status tracked internally — the source is never modified). A
+    directory item is copied whole into the worktree so multi-file briefs (spec + assets) work.
 
 Each agent block has the agent's **`prompt_type`**, optionally a `prompt_file`, and optionally a
 `tab` / `pane`:
@@ -99,7 +101,8 @@ prompt the agent receives is never a surprise:
   full control.
 
 In both modes the `prompt_file` lives in the repo folder and supports tokens like `@@KEY@@`,
-`@@WORK_DOC@@` (the item's spec — `ticket.json` for Jira, `task.md` for local_markdown), and
+`@@WORK_DOC@@` (the item's spec — `ticket.json` for Jira; `task.md` or, for a directory item,
+`task/` for local_markdown), `@@WORK_DOC_KIND@@` (how to describe it in prose), and
 `@@STEP_DONE_CMD@@`. Optionally add repo-specific guidance to `guidelines-prompt.md` (appended to
 every agent prompt in either mode; delete it if unused). The `augment` built-in is resolved per
 source type (`src/prompts/<type>/<step>.md`, else the shared `src/prompts/<step>.md`).

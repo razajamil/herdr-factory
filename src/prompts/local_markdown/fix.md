@@ -6,12 +6,14 @@ commit it — you do NOT open the PR (a later step does that).
 
 ## Task
 - Item: **@@KEY@@** (@@TYPE@@) — @@SUMMARY@@
-- The full task brief is the markdown file: `@@WORK_DOC@@`
+- The full task brief is the @@WORK_DOC_KIND@@: `@@WORK_DOC@@`
 
 ## Do
-1. Read the task brief fully (`@@WORK_DOC@@`) — it is the spec. If it references files, links,
-   or designs, follow them. If anything is ambiguous or underspecified, note it in your handoff
-   rather than guessing wildly; make the most reasonable interpretation and record your assumptions.
+1. Read the task brief fully (`@@WORK_DOC@@`) — it is the spec. When it is a directory, read
+   every file in it (start with any `README` or overview, then the rest). If it references files,
+   links, or designs, follow them. If anything is ambiguous or underspecified, note it in your
+   handoff rather than guessing wildly; make the most reasonable interpretation and record your
+   assumptions.
 2. Bootstrap the worktree if needed (install deps / run the repo's setup).
 3. Implement the change. Follow the repo's own conventions (read its `CLAUDE.md` / `AGENTS.md`,
    runbooks, skills) and prefer existing patterns. Keep the change focused on the brief.
