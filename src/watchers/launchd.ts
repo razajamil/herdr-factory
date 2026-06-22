@@ -2,11 +2,11 @@ import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { run } from "./clients/exec.ts";
-import { listConfiguredRepos, serverLogsDir } from "./config.ts";
+import { run } from "../clients/exec.ts";
+import { listConfiguredRepos, serverLogsDir } from "../config.ts";
 
-const PKG_ROOT = fileURLToPath(new URL("..", import.meta.url));
-const CLI_ENTRY = join(PKG_ROOT, "src", "cli.ts");
+const PKG_ROOT = fileURLToPath(new URL("../../", import.meta.url));
+const CLI_ENTRY = join(PKG_ROOT, "src", "cli", "index.ts");
 
 // ONE repo-agnostic supervisor job for the whole machine — it runs `ensure-up`, which keeps the
 // single resident `serve` process (serving every configured repo) alive. This replaces the old

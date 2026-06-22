@@ -1,4 +1,5 @@
-import type { Database } from "better-sqlite3";
+import type { DatabaseSync } from "node:sqlite";
+import { tx } from "./tx.ts";
 
 const MIGRATIONS: { version: number; sql: string }[] = [
   {
@@ -102,7 +103,7 @@ const MIGRATIONS: { version: number; sql: string }[] = [
 ];
 
 /** Apply pending migrations in a transaction. Idempotent. */
-export function migrate(db: Database): void {
+export function migrate(db: DatabaseSync): void {
   db.exec("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL)");
   const row = db.prepare("SELECT MAX(version) AS v FROM schema_version").get() as
     | { v: number | null }
@@ -111,10 +112,9 @@ export function migrate(db: Database): void {
 
   for (const m of MIGRATIONS) {
     if (m.version <= current) continue;
-    const apply = db.transaction(() => {
+    tx(db, () => {
       db.exec(m.sql);
       db.prepare("INSERT INTO schema_version (version) VALUES (?)").run(m.version);
     });
-    apply();
   }
 }

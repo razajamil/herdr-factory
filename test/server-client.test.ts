@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createServer, type Server } from "node:http";
 import { serverInfoPath } from "../src/config.ts";
-import { NoServerError, pingHealth, readServerInfo, serverFetch, viaServerOrLocal } from "../src/server-client.ts";
+import { NoServerError, pingHealth, readServerInfo, serverFetch, viaServerOrLocal } from "../src/server/client.ts";
 
 let dir: string;
 let prev: string | undefined;

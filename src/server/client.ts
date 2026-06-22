@@ -1,5 +1,5 @@
 import { readFileSync } from "node:fs";
-import { serverInfoPath } from "./config.ts";
+import { serverInfoPath } from "../config.ts";
 
 /** What a running `serve` advertises in server.json. */
 export interface ServerInfo {

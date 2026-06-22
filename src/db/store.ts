@@ -1,6 +1,7 @@
-import type Database from "better-sqlite3";
+import type { DatabaseSync } from "node:sqlite";
 import type { Clock, EventType, Outcome, Run, RunPatch, RunStep, RunStepPatch, StepName, WorkItem, WorkState } from "../types.ts";
 import { systemClock } from "../types.ts";
+import { tx } from "./tx.ts";
 
 interface RunRow {
   id: number;
@@ -110,9 +111,9 @@ type Bind = string | number | null;
 
 /** Typed repository over the SQLite DB. All methods are synchronous. */
 export class Store {
-  private readonly db: Database.Database;
+  private readonly db: DatabaseSync;
   private readonly now: Clock;
-  constructor(db: Database.Database, now: Clock = systemClock) {
+  constructor(db: DatabaseSync, now: Clock = systemClock) {
     this.db = db;
     this.now = now;
   }
@@ -127,7 +128,7 @@ export class Store {
   activeRuns(repo: string): Run[] {
     const rows = this.db
       .prepare("SELECT * FROM runs WHERE repo = ? AND ended_at IS NULL ORDER BY created_at")
-      .all(repo) as RunRow[];
+      .all(repo) as unknown as RunRow[];
     return rows.map(toRun);
   }
 
@@ -145,7 +146,7 @@ export class Store {
   activeRunsForKey(repo: string, key: string): Run[] {
     const rows = this.db
       .prepare("SELECT * FROM runs WHERE repo = ? AND ticket_key = ? AND ended_at IS NULL ORDER BY id")
-      .all(repo, key) as RunRow[];
+      .all(repo, key) as unknown as RunRow[];
     return rows.map(toRun);
   }
 
@@ -228,7 +229,7 @@ export class Store {
   /** TTL lock; steals an expired holder. Atomic. */
   acquireLock(name: string, owner: string, ttlSec: number): boolean {
     const now = this.now();
-    const run = this.db.transaction((): boolean => {
+    return tx(this.db, (): boolean => {
       const row = this.db.prepare("SELECT expires_at FROM locks WHERE name = ?").get(name) as
         | { expires_at: number }
         | undefined;
@@ -241,7 +242,6 @@ export class Store {
         .run(name, owner, now, now + ttlSec);
       return true;
     });
-    return run();
   }
 
   releaseLock(name: string, owner: string): void {
@@ -265,7 +265,7 @@ export class Store {
     const sql = includeEnded
       ? "SELECT * FROM runs WHERE repo = ? ORDER BY created_at DESC LIMIT 100"
       : "SELECT * FROM runs WHERE repo = ? AND ended_at IS NULL ORDER BY created_at";
-    return (this.db.prepare(sql).all(repo) as RunRow[]).map(toRun);
+    return (this.db.prepare(sql).all(repo) as unknown as RunRow[]).map(toRun);
   }
 
   /** Events for a ticket's most recent run (the timeline). */
@@ -291,7 +291,7 @@ export class Store {
   }
 
   runStepsFor(runId: number): RunStep[] {
-    return (this.db.prepare("SELECT * FROM run_steps WHERE run_id = ? ORDER BY id").all(runId) as RunStepRow[]).map(
+    return (this.db.prepare("SELECT * FROM run_steps WHERE run_id = ? ORDER BY id").all(runId) as unknown as RunStepRow[]).map(
       toRunStep,
     );
   }
@@ -345,7 +345,7 @@ export class Store {
         : this.db
             .prepare("SELECT * FROM work_items WHERE repo = ? AND source = ? ORDER BY updated_at DESC")
             .all(repo, source)
-    ) as WorkItemRow[];
+    ) as unknown as WorkItemRow[];
     return rows.map(toWorkItem);
   }
 

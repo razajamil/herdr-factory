@@ -8,7 +8,7 @@
     "herdr-factory": "bin/herdr-factory"
   },
   "scripts": {
-    "cats": "node src/cli.ts",
+    "cats": "node src/cli/index.ts",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest"
@@ -17,13 +17,15 @@
     "node": ">=24"
   },
   "dependencies": {
-    "better-sqlite3": "^12.11.1",
+    "@hono/node-server": "^2.0.5",
+    "@hono/swagger-ui": "^0.6.1",
+    "@hono/zod-openapi": "^1.4.0",
     "commander": "^15.0.0",
+    "hono": "^4.12.26",
     "yaml": "^2.9.0",
     "zod": "^4.4.3"
   },
   "devDependencies": {
-    "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^25.9.3",
     "typescript": "^6.0.3",
     "vitest": "^4.1.9"

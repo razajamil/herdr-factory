@@ -1,11 +1,12 @@
 import { spawn } from "node:child_process";
 import { rmSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { serverInfoPath } from "./config.ts";
-import { pingHealth, readServerInfo } from "./server-client.ts";
-import { VERSION } from "./version.ts";
+import { serverInfoPath } from "../config.ts";
+import { pingHealth, readServerInfo } from "../server/client.ts";
+import { VERSION } from "../version.ts";
+import { autoUpdateEnabled, selfUpdate } from "./updater.ts";
 
-const CLI_ENTRY = fileURLToPath(new URL("cli.ts", import.meta.url));
+const CLI_ENTRY = fileURLToPath(new URL("../cli/index.ts", import.meta.url));
 
 export type Log = (level: "info" | "warn" | "error", msg: string) => void;
 
@@ -61,10 +62,27 @@ async function killServer(pid: number, port: number): Promise<void> {
  * Being a one-shot, this is itself immune to the resident-process wedging that motivated the
  * redesign — launchd just re-runs it on a schedule.
  */
-export async function ensureUp(opts: { force?: boolean }, log: Log): Promise<{ action: "noop" | "started" | "restarted" }> {
+export async function ensureUp(
+  opts: { force?: boolean; skipAutoUpdate?: boolean },
+  log: Log,
+): Promise<{ action: "noop" | "started" | "restarted" }> {
+  let force = opts.force ?? false;
+
+  // Auto-update (on by default; HERDR_FACTORY_AUTO_UPDATE=0 disables). A successful update changes
+  // the code on disk, so force a restart: VERSION is read at process start, so THIS process's
+  // VERSION is now stale — the freshly spawned serve recomputes it from the new git sha.
+  if (!opts.skipAutoUpdate && autoUpdateEnabled()) {
+    try {
+      const res = await selfUpdate(log);
+      if (res.updated) force = true;
+    } catch (e) {
+      log("warn", `self-update errored — ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+
   const info = readServerInfo();
 
-  if (info && !opts.force) {
+  if (info && !force) {
     if ((await pingHealth(info.port)) && info.version === VERSION) {
       log("info", `server healthy on :${info.port} (v${info.version})`);
       return { action: "noop" };

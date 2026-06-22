@@ -16,11 +16,15 @@ record lives in Jira) and `local_markdown` (lifecycle tracked internally by herd
 
 All of these must be on your `PATH`:
 
-- `node` ≥ 24 and `pnpm` — the CLI runs `src/*.ts` directly via Node's built-in TypeScript support.
-  [`mise`](https://mise.jdx.dev) is recommended: `mise.toml` pins node 24, and `bin/herdr-factory`
-  runs via `mise exec` so it always uses node 24 even when a worker agent invokes it from another
-  repo's worktree that activates a different node (`better-sqlite3` is a native module — the
-  runtime node ABI must match the one it was built against)
+- `node` ≥ 24 — the CLI runs `src/*.ts` directly via Node's built-in type-stripping and stores
+  state in the built-in `node:sqlite` (no native modules). `bin/herdr-factory` calls `node`
+  directly; pin Node 24 with any version manager (a `.node-version` file is included, read by
+  `nvm`/`fnm`/`asdf`/`mise`). A worker agent invokes the CLI from other repos' worktrees, so make
+  sure the `node` resolved there is ≥ 24 too — the launcher errors clearly otherwise.
+- a package manager to install the runtime deps (`commander`, `yaml`, `zod`, and `hono` + its
+  `node-server`/`zod-openapi`/`swagger-ui` adapters — all pure-JS): **`npm`** (bundled with Node)
+  is enough to run it; **`pnpm`** is used for local development (the committed lockfile is
+  `pnpm-lock.yaml`).
 - `herdr` — the worktree/workspace server ([herdr.dev](https://herdr.dev))
 - `claude` — the Claude Code CLI
 - `git`, `gh` (authenticated)
@@ -37,7 +41,7 @@ plugin is recommended for easier management of herdr layouts per workspace or re
 ```sh
 git clone <this> ~/dev/raza/herdr-factory
 cd ~/dev/raza/herdr-factory
-pnpm install                                                                  # install dependencies
+npm install --omit=dev                                                        # runtime deps only (dev: `pnpm install`)
 ln -s ~/dev/raza/herdr-factory/bin/herdr-factory ~/.local/bin/herdr-factory   # optional, for PATH
 ```
 
@@ -130,7 +134,7 @@ in a local_markdown source's folder — and the factory takes it from there.
 ```sh
 herdr-factory --repo <name> status      # see what's in flight (+ server/supervisor state)
 herdr-factory --repo <name> logs         # tail the repo's dispatcher log
-herdr-factory restart                    # graceful server restart after a `git pull`
+herdr-factory restart                    # force a restart now (a `git pull` auto-restarts within ~60s)
 herdr-factory reload                      # hot-reload config (e.g. max_active) without a restart
 ```
 
@@ -176,7 +180,7 @@ injected from config plus an optional per-repo guidance addendum.
 herdr-factory --repo <name> tick|status|eligible|runs [--all]|timeline <KEY>|logs [N]
 herdr-factory --repo <name> claim <KEY> [--source <name>]|teardown <KEY> [--source <name>]
 herdr-factory --repo <name> step-done <KEY> <fix|review|pr> [--source <name>]   # agent → dispatcher (event-nudge)
-herdr-factory serve|ensure-up [--restart]|restart|reload   # the server + its supervisor (no --repo)
+herdr-factory serve|ensure-up [--restart]|restart|reload|update   # the server + its supervisor (no --repo)
 herdr-factory install|uninstall|start|stop             # the one supervisor launchd job (no --repo)
 herdr-factory capture-lock acquire|release <owner>     # machine-global, no --repo
 herdr-factory doctor|help
@@ -187,6 +191,11 @@ in-process reconcile) and fall back to running in-process when it isn't. `eligib
 across all sources; `doctor` runs a per-source health check plus server liveness. `claim` takes
 `--source` (defaulted when there's a single source); `teardown`/`step-done` take `--source` to
 disambiguate a key active in more than one source.
+
+`serve` exposes a local HTTP API on `127.0.0.1:8765` (Hono) with the OpenAPI spec at `/doc` and
+Swagger UI at `/ui`. `update` pulls the latest code (hard reset to the branch's upstream) and
+restarts onto it; the supervisor also does this automatically every ~60s unless
+`HERDR_FACTORY_AUTO_UPDATE=0` is set.
 
 ## What's repo-specific (all in `repos/<name>/config.yml`)
 
@@ -202,8 +211,10 @@ Only the Jira **auth** (email + token, one Atlassian account) is global, in
 ## Layout
 
 ```
-bin/herdr-factory          CLI (selects a repo via --repo)
-src/{server,server-client,supervisor}.ts   resident serve + its HTTP client + the ensure-up supervisor
+bin/herdr-factory          CLI launcher → node src/cli/index.ts (guards Node ≥ 24)
+src/cli/                CLI: commander program (selects a repo via --repo)
+src/server/             resident serve (Hono + OpenAPI) · app · schemas · HTTP client
+src/watchers/           launchd job · ensure-up supervisor · self-updater
 src/core/*.ts           generic engine: reconcile · step · watch · branch · deps
 src/prompts/*.md        engine default step prompts (the base for prompt_type: augment)
 examples/example-repo/  config.yml + fix.md/review.md/pr.md + guidelines-prompt.md (copy to repos/<name>/)
@@ -213,15 +224,15 @@ examples/example-repo/  config.yml + fix.md/review.md/pr.md + guidelines-prompt.
 
 ## Security note
 
-Workers launch with `--dangerously-skip-permissions` so the loop runs unattended.
-Each worker is confined to its own throwaway worktree, but can run commands, push
-branches, and open PRs without prompting. Review `HERDR_FACTORY_CLAUDE_FLAGS` and
-tighten per repo if desired.
+Workers launch with `--dangerously-skip-permissions` (hardcoded as `CLAUDE_FLAGS` in
+`src/core/step.ts`) so the loop runs unattended. Each worker is confined to its own throwaway
+worktree, but can run commands, push branches, and open PRs without prompting. To tighten, change
+`CLAUDE_FLAGS` in `src/core/step.ts`.
 
 ## Platform
 
 macOS (launchd). Portability is now down to its smallest seam: the only OS-specific piece is the
-**scheduled `ensure-up`** — `src/launchd.ts` writes the launchd plist. To support Linux/Windows,
+**scheduled `ensure-up`** — `src/watchers/launchd.ts` writes the launchd plist. To support Linux/Windows,
 swap that one job for a systemd timer, cron entry, or Task Scheduler task that runs
 `herdr-factory ensure-up` on an interval; the resident `serve` + the whole engine are
 already platform-neutral Node. (herdr itself remains the broader portability question.)

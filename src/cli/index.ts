@@ -1,20 +1,21 @@
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { Command } from "commander";
-import { globalDbPath } from "./config.ts";
-import { openDb } from "./db/index.ts";
-import { Store } from "./db/store.ts";
-import { systemClock, type Run, type StepName } from "./types.ts";
-import type { Deps } from "./core/deps.ts";
-import { claimTicket, reconcileRepo, reconcileRun, teardownTicket, withTickLock } from "./core/reconcile.ts";
-import { run } from "./clients/exec.ts";
-import * as launchd from "./launchd.ts";
-import { buildDeps, today } from "./build-deps.ts";
-import { resolveActiveRun, resolveSourceName } from "./resolve.ts";
-import { serve } from "./server.ts";
-import { ensureUp, stopServer, type Log } from "./supervisor.ts";
-import { NoServerError, pingHealth, readServerInfo, serverFetch, viaServerOrLocal } from "./server-client.ts";
-import { VERSION } from "./version.ts";
+import { globalDbPath } from "../config.ts";
+import { openDb } from "../db/index.ts";
+import { Store } from "../db/store.ts";
+import { systemClock, type Run, type StepName } from "../types.ts";
+import type { Deps } from "../core/deps.ts";
+import { claimTicket, reconcileRepo, reconcileRun, teardownTicket, withTickLock } from "../core/reconcile.ts";
+import { run } from "../clients/exec.ts";
+import * as launchd from "../watchers/launchd.ts";
+import { buildDeps, today } from "../build-deps.ts";
+import { resolveActiveRun, resolveSourceName } from "../resolve.ts";
+import { serve } from "../server/serve.ts";
+import { ensureUp, stopServer, type Log } from "../watchers/supervisor.ts";
+import { selfUpdate } from "../watchers/updater.ts";
+import { NoServerError, pingHealth, readServerInfo, serverFetch, viaServerOrLocal } from "../server/client.ts";
+import { VERSION } from "../version.ts";
 
 function fail(e: unknown): never {
   console.error(e instanceof Error ? e.message : String(e));
@@ -316,6 +317,24 @@ program
   .action(async () => {
     try {
       const { action } = await ensureUp({ force: true }, consoleLog);
+      console.log(`restart: ${action}`);
+    } catch (e) {
+      fail(e);
+    }
+  });
+
+program
+  .command("update")
+  .description("pull the latest code (hard reset to upstream) and restart the server onto it")
+  .action(async () => {
+    try {
+      const res = await selfUpdate(consoleLog);
+      if (!res.updated) {
+        console.log(`no update: ${res.reason}`);
+        return;
+      }
+      console.log(`updated ${res.from?.slice(0, 12)} → ${res.to?.slice(0, 12)}; restarting server`);
+      const { action } = await ensureUp({ force: true, skipAutoUpdate: true }, consoleLog);
       console.log(`restart: ${action}`);
     } catch (e) {
       fail(e);

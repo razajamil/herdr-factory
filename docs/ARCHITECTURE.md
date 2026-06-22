@@ -50,17 +50,18 @@ This document is the canonical design of the TypeScript implementation
 |---|---|
 | Language / runtime | TypeScript on Node ≥24, run via **native type stripping** (no build step) |
 | CLI | **commander** |
-| State store | **better-sqlite3** (synchronous — ideal for a short-lived tick) |
+| State store | **node:sqlite** (`DatabaseSync` — Node built-in, synchronous; no native module) |
 | Config | **`yaml`** + **`zod`** (parse + validate → types) |
 | Subprocess (herdr/gh/git) | **`node:child_process`** `execFile` (arg arrays, no shell) |
-| Local API server | **`node:http`** (resident `serve`, 127.0.0.1) + native **`fetch`** clients |
+| Local API server | **Hono** on **`@hono/node-server`** (resident `serve`, 127.0.0.1); **`@hono/zod-openapi`** validates requests + generates the OpenAPI doc, **`@hono/swagger-ui`** at `/ui`; native **`fetch`** clients |
 | HTTP (Jira REST) | native **`fetch`** |
 | Tests | **vitest** (dev-only) |
 | External CLIs | **herdr**, **gh**, **git** |
 
-Runtime dep footprint: `commander`, `better-sqlite3`, `yaml`, `zod`. Everything
-else is Node built-ins or the external CLIs; the `.ts` sources run unbuilt via
-Node's native type stripping.
+Runtime dep footprint: `commander`, `yaml`, `zod`, `hono` + `@hono/node-server` +
+`@hono/zod-openapi` + `@hono/swagger-ui` (all pure-JS). SQLite is Node's built-in `node:sqlite` —
+no native module. Everything else is Node built-ins or the external CLIs; the `.ts` sources run
+unbuilt via Node's native type stripping.
 
 ---
 
@@ -68,10 +69,10 @@ Node's native type stripping.
 
 ```
   launchd · StartInterval ──► ensure-up ──spawns / health-checks──► serve.ts (resident daemon)
-  (one job: launchd.ts)                                               │  node:http API @127.0.0.1
+  (one job: launchd.ts)                                               │  Hono API @127.0.0.1
                                                                       │  + per-repo tick loops
-  herdr-factory <cmd> ──► cli.ts ──POST /repos/:repo/… (else in-process)─┤
-  (--repo · dispatch · --json)        via server-client.ts             │
+  herdr-factory <cmd> ──► cli/index.ts ──POST /repos/:repo/… (else in-process)─┤
+  (--repo · dispatch · --json)        via server/client.ts             │
                             serve + cli both build/inject Deps (build-deps.ts)
                                                                       ▼
         ┌──────────────── core/ (PURE, testable) ────────────────┐
@@ -89,7 +90,7 @@ Node's native type stripping.
 
 **Dependency rule:** `core` imports *interfaces*; `cli` **and** `server` construct the concrete
 implementations (via `build-deps.ts`) and inject them. The CLI routes mutating commands to a
-running `server` and falls back to the same in-process path when none is up (`server-client.ts`).
+running `server` and falls back to the same in-process path when none is up (`server/client.ts`).
 Tests substitute fakes + `:memory:` SQLite.
 
 ### Repo layout
@@ -97,25 +98,31 @@ Tests substitute fakes + `:memory:` SQLite.
 ```
 herdr-factory/
   package.json  tsconfig.json  README.md  docs/ARCHITECTURE.md
-  bin/herdr-factory          cwd-robust launcher → `mise exec -- node src/cli.ts` (mise.toml pins
-                          node 24; resolves its own dir through symlinks; symlinked into ~/.local/bin)
-  mise.toml                  pins node 24 for this package (runtime + native-module build ABI)
+  bin/herdr-factory          cwd-robust launcher → `node src/cli/index.ts` (resolves its own dir through
+                          symlinks; guards Node >= 24; symlinked into ~/.local/bin)
+  .node-version              pins node 24 for this package (read by nvm/fnm/asdf/mise)
   src/
-    cli.ts                commander program; routes via server (else in-process), dispatches
+    cli/index.ts          commander program; routes via server (else in-process), dispatches
     build-deps.ts         buildDeps(repo) — shared by the server + every command's local path
     resolve.ts            pure resolveSourceName / resolveActiveRun (throw, not exit; CLI+server)
     config.ts             env + repos/<name>/config.yml → zod → typed Config (work_sources[]);
                           listConfiguredRepos + server path/port helpers
     types.ts              shared domain types (incl. WorkState, WorkItem)
-    version.ts            VERSION (stamped into /health + server.json for restart-on-bump)
-    server.ts             resident `serve`: multi-repo tick loops + node:http API
-    server-client.ts      CLI side: readServerInfo / pingHealth / serverFetch / viaServerOrLocal
-    supervisor.ts         stateless `ensure-up` / `stopServer` (health-check + detached serve spawn)
-    db/{index,migrate,store}.ts
+    version.ts            VERSION = package version + git HEAD sha (a new commit changes it, so
+                          ensure-up restarts an outdated serve — stamped into /health + server.json)
+    server/
+      serve.ts            resident `serve`: multi-repo tick loops + binds Hono via @hono/node-server
+      app.ts              OpenAPIHono: routes → handlers, OpenAPI doc (/doc) + Swagger UI (/ui)
+      schemas.ts          zod request/response schemas + createRoute defs (validation + the doc)
+      client.ts           CLI side: readServerInfo / pingHealth / serverFetch / viaServerOrLocal
+    watchers/
+      launchd.ts          one supervisor job (com.herdr-factory.server) running `ensure-up`
+      supervisor.ts       stateless `ensure-up` / `stopServer` (health-check + detached serve spawn)
+      updater.ts          selfUpdate: git fetch + hard-reset to upstream (HERDR_FACTORY_AUTO_UPDATE)
+    db/{index,migrate,store,tx}.ts
     clients/{exec,herdr,jira,jira-source,local-markdown-source,github,git}.ts
     core/{deps,branch,step,watch,reconcile}.ts
     prompts/{fix,review,pr}.md + prompts/local_markdown/fix.md  (per-source-type built-ins)
-    launchd.ts            one supervisor job (com.herdr-factory.server) running `ensure-up`
   examples/example-repo/{config.yml, fix.md, review.md, pr.md, guidelines-prompt.md}
   test/                   vitest
 ```
@@ -227,12 +234,15 @@ reverse-engineered during the bash prototype.
 
 ---
 
-## 6. State — SQLite (better-sqlite3)
+## 6. State — SQLite (node:sqlite)
 
-One global DB `~/.local/state/herdr-factory/herdr-factory.db`. `db/index.ts` sets
-`PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;` then runs migrations
-(`schema_version` + ordered SQL). Per-repo ticks write concurrently to the one
-DB; WAL + busy_timeout + the per-repo single-instance lock keep that safe.
+One global DB `~/.local/state/herdr-factory/herdr-factory.db`, via Node's built-in `node:sqlite`
+(`DatabaseSync` — synchronous, no native module; still flagged *experimental*, which the pinned
+Node ≥24 keeps stable for us). `db/index.ts` sets `PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;`
+then runs migrations (`schema_version` + ordered SQL). `node:sqlite` has no `.transaction()` /
+`.pragma()` helper (unlike better-sqlite3), so a small `db/tx.ts` wraps `BEGIN IMMEDIATE`/`COMMIT`/
+`ROLLBACK` (used by migrations and `acquireLock`) and PRAGMAs run via `exec`. Per-repo ticks write
+concurrently to the one DB; WAL + busy_timeout + the per-repo single-instance lock keep that safe.
 
 ```sql
 CREATE TABLE repos(name TEXT PRIMARY KEY, repo_path TEXT, base_ref TEXT, github TEXT,
@@ -585,7 +595,7 @@ left as-is).
 - **Global secrets** stay the same: `JIRA_EMAIL` / `JIRA_API_TOKEN` (auth only; *where* a Jira
   source polls is its per-source `base_url`).
 - `config.ts` asserts `repo.path` is a **main checkout** (not a linked worktree), since herdr can't
-  create worktrees from one. The work-source *clients* are constructed in `cli.ts`'s `buildDeps`
+  create worktrees from one. The work-source *clients* are constructed in `build-deps.ts`'s `buildDeps`
   (the `local_markdown` client needs the `Store`); `config.ts` stays pure data + prompt resolution.
 
 Onboarding a repo is pure data: drop a `repos/<name>/` folder, define its herdr layout
@@ -605,9 +615,10 @@ herdr-factory --repo <name> claim <KEY> [--source <name>] | teardown <KEY> [--so
 herdr-factory --repo <name> step-done <KEY> <fix|review|pr> [--source <name>]  # agent → dispatcher (event-nudges)
 herdr-factory --repo <name> runs [--all] | timeline <KEY> | logs [N]   # read the DB / repo log
 # machine-wide (no --repo)
-herdr-factory serve                       # the resident daemon: tick every repo + HTTP API
-herdr-factory ensure-up [--restart]       # supervisor one-shot: (re)start serve if down/wedged/outdated
+herdr-factory serve                       # the resident daemon: tick every repo + Hono API (+ /doc, /ui)
+herdr-factory ensure-up [--restart]       # supervisor one-shot: auto-update + (re)start serve if down/wedged/outdated
 herdr-factory restart                     # graceful restart of the running server (pick up new code)
+herdr-factory update                      # pull latest (hard reset to upstream) + restart onto it
 herdr-factory reload                      # hot-reload config + re-discover repos (no restart)
 herdr-factory install | uninstall | start | stop   # the one supervisor launchd job
 herdr-factory capture-lock acquire|release <owner> # machine-global capture lock
@@ -648,15 +659,20 @@ discovers every configured repo (`listConfiguredRepos`), builds a `Deps` per rep
 per-repo tick loop (each at its own `tick_interval_seconds`, with an immediate first pass) — exactly
 what the old per-repo `watch` did, but collapsed into a single process plus a local HTTP surface.
 
-- **Transport.** `node:http` on `127.0.0.1:<port>` (`HERDR_FACTORY_PORT`, default `8765`) — TCP, not
-  a unix socket, so the future browser UI can reach it. On listen it writes
+- **Transport.** **Hono** on **`@hono/node-server`**, bound to `127.0.0.1:<port>` (`HERDR_FACTORY_PORT`,
+  default `8765`) — TCP, not a unix socket, so the future browser UI can reach it. Routes are defined
+  with **`@hono/zod-openapi`** (`createRoute` + zod schemas in `server/schemas.ts`), so every request
+  is validated and the same schemas generate the OpenAPI document. On listen it writes
   `~/.local/state/herdr-factory/server.json` (`{pid, port, version, startedAt}`); clients + the
   supervisor read it to find and health-check the server. The **bind itself is the single-instance
-  guard** — a second `serve` loses with `EADDRINUSE` and exits.
+  guard** — a second `serve` loses with `EADDRINUSE` (the server emits `error`) and exits.
 - **Routes.** `GET /health` · `POST /reload` (re-discover repos / reload config) · `POST /shutdown`
   (graceful drain) · `POST /repos/:repo/{tick,step-done,claim,teardown}` (the mutating CLI paths) ·
-  `GET /repos/:repo/{status,runs,eligible,timeline}` (reads for the web UI). Per-repo work logs to
-  each repo's own logger; server-lifecycle events log to stdout/err (captured by the supervisor).
+  `GET /repos/:repo/{status,runs,eligible,timeline}` (reads for the web UI) · `GET /doc` (the
+  generated OpenAPI 3.0 spec) · `GET /ui` (Swagger UI). Validation failures, unknown routes and
+  thrown errors are all normalised to `{ error }` (a `defaultHook` + `notFound`/`onError`) — the
+  shape `server/client.ts` parses. Per-repo work logs to each repo's own logger; server-lifecycle
+  events log to stdout/err (captured by the supervisor).
 - **Per-repo safety.** An in-flight flag stops a slow tick from stacking; `withTickLock` is the
   cross-process backstop (a stray CLI `tick` can't overlap either). Two repos tick concurrently
   (interleaved awaits) — fine: different repos, WAL DB, per-repo lock.
@@ -665,21 +681,33 @@ what the old per-repo `watch` did, but collapsed into a single process plus a lo
   exit 0.
 
 **Supervision is a stateless scheduled `ensure-up`.** One launchd job, `com.herdr-factory.server`,
-runs `herdr-factory ensure-up` on `StartInterval` (60s). `ensure-up` is a **one-shot**: hit
-`/health`; if healthy **and** the version matches → no-op; else kill any stale/wedged pid (graceful
-`POST /shutdown` first, then `SIGTERM`→`SIGKILL` to free the port) and spawn a detached `serve`.
+runs `herdr-factory ensure-up` on `StartInterval` (60s). `ensure-up` is a **one-shot**: optionally
+self-update (see *Updates* below), then hit `/health`; if healthy **and** the version matches → no-op;
+else kill any stale/wedged pid (graceful `POST /shutdown` first, then `SIGTERM`→`SIGKILL` to free the
+port) and spawn a detached `serve`.
 
-- `ProgramArguments = [node, "<abs>/src/cli.ts", "ensure-up"]`; `EnvironmentVariables` = captured
-  `PATH` + `HOME` (no experimental flags — native type stripping is on by default on Node ≥24, and
-  better-sqlite3 needs none). Secrets aren't in the plist; `serve` re-reads the env file per repo.
+- `ProgramArguments = [node, "<abs>/src/cli/index.ts", "ensure-up"]`; `EnvironmentVariables` = captured
+  `PATH` + `HOME` (no experimental flags needed — native type stripping and `node:sqlite` are both
+  usable without flags on Node ≥24). Secrets aren't in the plist; `serve` re-reads the env file per repo.
 - **Why a scheduled one-shot, not `KeepAlive` on `serve`.** A one-shot supervisor is itself immune
   to the per-user launchd interval-timer wedging that bit the old resident `watch` after sleep/wake
   (a missed beat is harmless — `serve` self-sustains between runs), it detects a **wedged-but-alive**
   server (which `KeepAlive` can't — it only reacts to process death), and "run a command on a
   schedule" is the portable seam for systemd timers / cron / Task Scheduler later. `install` also
   boots out any legacy per-repo `com.herdr-factory.<repo>` `watch` jobs so an upgrade is clean.
-- **Updates** are a graceful `herdr-factory restart` (= `ensure-up --restart`): drain the running
-  server, spawn fresh code — no launchd churn. `ensure-up` also auto-restarts on a version bump.
+- **Updates are fully unattended.** Each `ensure-up` tick first runs the **supervised updater**
+  (`watchers/updater.ts`, on by default — set `HERDR_FACTORY_AUTO_UPDATE=0` to disable): `git fetch`
+  + a **hard reset** to the current branch's upstream (`@{u}`), resolved against the package dir, plus
+  a `pnpm`/`npm install` if `package.json`/`pnpm-lock.yaml` changed (no native modules → no rebuild).
+  Best-effort: any git/network failure logs and is skipped, never breaking the tick. When the reset
+  lands new code, ensure-up **forces a restart** (the running process's `VERSION` was read at start, so
+  it can't rely on the version compare). Independently, `VERSION` = package version + git HEAD sha, so
+  *any* code change also trips the version-mismatch restart on the next tick. `herdr-factory restart`
+  (= `ensure-up --restart`) forces a restart now; `herdr-factory update` runs the updater + restart on
+  demand (and works even when auto-update is disabled). The hard reset discards local edits on the
+  daemon machine — by design (see §14). Note `HERDR_FACTORY_AUTO_UPDATE` only takes effect where
+  `ensure-up` actually runs — the launchd plist currently bakes only `PATH`/`HOME`, so disabling it
+  for the supervised path means adding the var to the plist (or just committing/pushing your code).
 
 ---
 
@@ -740,13 +768,18 @@ Hard-won from the bash prototype — encode as types/tests/asserts:
   no server up (`viaServerOrLocal` falls back to in-process), so a worker's `step-done` lands even
   mid-restart. Errors from a *reached* server propagate (they're not a `NoServerError` → no
   fallback); only unreachability falls back.
-- **Native-module ABI must match the runtime Node.** `better-sqlite3` is compiled for one Node ABI
-  (`NODE_MODULE_VERSION`, == the Node major). The CLI is invoked by worker agents **from another
-  repo's worktree**, which may have a different Node activated by mise — so `bin/herdr-factory`
-  runs via `mise exec -- node` against this package's pinned node (`mise.toml` → node 24), never a
-  bare `node` (a `cd` in the non-interactive launcher does NOT change the inherited PATH's Node).
-  The launchd supervisor + the `serve` it spawns are immune (the plist bakes `process.execPath`,
-  the node 24 that ran `install`, and `ensure-up` spawns `serve` with that same `process.execPath`).
+- **Runtime requires Node ≥ 24; no native modules.** The `.ts` sources run via native
+  type-stripping and state lives in the built-in `node:sqlite` — both need Node ≥ 24, and neither
+  is ABI-coupled (there is no compiled `.node` to match). The CLI is invoked by worker agents **from
+  another repo's worktree**, whose `node` on PATH may be older — so `bin/herdr-factory` runs `node`
+  directly and guards `node -v >= 24`, erroring clearly rather than failing cryptically on type
+  stripping. The launchd supervisor + the `serve` it spawns run under the `process.execPath` baked
+  into the plist at install time, so `install` must be run under a Node ≥ 24.
+- **Self-update + `VERSION` resolve against the package dir, never the caller's cwd.** A worker
+  invokes the CLI from another repo's worktree, so `version.ts` (git HEAD sha → `VERSION`) and
+  `watchers/updater.ts` (`git fetch` + hard reset to `@{u}`) both run git in the herdr-factory
+  package dir. A successful auto-update **forces** a restart — the running process's `VERSION` was
+  read at start, so the version compare alone wouldn't catch the freshly-reset code.
 
 ---
 
@@ -774,8 +807,18 @@ follows the active step*) and **multi-source work** (the `WorkSource` abstractio
 preserved byte-for-byte (see §14). The **most recent change** is the supervision rework ([§12](#12-server--supervision)):
 the per-repo `launchd` `watch` jobs are replaced by one resident `serve` (HTTP API + per-repo tick
 loops for all repos) kept alive by a stateless scheduled `ensure-up` supervisor, with the CLI
-routing through the server and falling back to in-process when it's down. Still early — watch live
-runs before trusting it fully unsupervised.
+routing through the server and falling back to in-process when it's down.
+
+**Since then** (a packaging + framework pass): the state store moved from `better-sqlite3` to Node's
+built-in **`node:sqlite`** (no native module → no ABI/`mise` coupling); the launcher runs **`node`
+directly** (mise dropped, a `.node-version` pin instead) and **`pnpm` is dev-only** (`npm install
+--omit=dev` to run); **`VERSION` is derived from the git HEAD sha** so any new commit auto-restarts
+`serve`; the source tree was split into **`cli/` · `server/` · `watchers/`**; the HTTP layer moved
+to **Hono** with **`@hono/zod-openapi`** request validation + a generated OpenAPI doc (`/doc`) and
+Swagger UI (`/ui`); and a **supervised auto-updater** (`watchers/updater.ts`) now `git fetch`es +
+hard-resets to upstream on each `ensure-up` tick (on by default, `HERDR_FACTORY_AUTO_UPDATE=0` to
+disable, plus a manual `herdr-factory update`). Still early — watch live runs before trusting it
+fully unsupervised.
 
 ---
 
@@ -789,6 +832,6 @@ joined to `run`.
 The `serve` JSON API ([§12](#12-server--supervision)) is now the foundation: the read endpoints
 already exist (`GET /repos/:repo/{status,runs,eligible,timeline}`, `GET /health`), so a browser UI
 is a client of the running server rather than a separate DB reader — this was the motivating reason
-to adopt the server model. A static SPA can be served from the same `node:http` process (it already
+to adopt the server model. A static SPA can be served from the same Hono server (it already
 binds TCP on localhost). Datasette pointed straight at the DB remains an option for an instant
 read-only view. Cross-repo aggregation is natural now that one server holds every repo.

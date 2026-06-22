@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import Database from "better-sqlite3";
+import { DatabaseSync } from "node:sqlite";
 import { openDb } from "../src/db/index.ts";
 import { migrate } from "../src/db/migrate.ts";
 import { Store } from "../src/db/store.ts";
@@ -142,7 +142,7 @@ describe("Store", () => {
   });
 
   it("migration v6 backfills pre-existing runs to 'jira' and adds work_items (idempotent)", () => {
-    const db = new Database(":memory:");
+    const db = new DatabaseSync(":memory:");
     // Simulate a pre-v6 DB: schema_version=5, a runs table WITHOUT work_source, one in-flight row.
     db.exec(`
       CREATE TABLE schema_version (version INTEGER NOT NULL);
