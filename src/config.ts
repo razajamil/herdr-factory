@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, statSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -256,6 +256,36 @@ export function assertMainCheckout(repoPath: string): void {
 /** Path to the one global DB (repo-agnostic commands like capture-lock need it). */
 export function globalDbPath(): string {
   return join(stateRoot(), "herdr-factory.db");
+}
+
+/** Every repo configured under `<configDir>/repos/<name>/config.yml`, sorted. The resident
+ *  server discovers all of them on startup; the per-repo launchd model needed none of this. */
+export function listConfiguredRepos(): string[] {
+  const dir = join(configDir(), "repos");
+  if (!existsSync(dir)) return [];
+  return readdirSync(dir, { withFileTypes: true })
+    .filter((d) => d.isDirectory() && existsSync(join(dir, d.name, "config.yml")))
+    .map((d) => d.name)
+    .sort();
+}
+
+/** Where the running `serve` process advertises itself: `{pid, port, version, startedAt}`.
+ *  Written on listen, removed on graceful shutdown. CLI clients + the supervisor read it to
+ *  find (and health-check) the server. */
+export function serverInfoPath(): string {
+  return join(stateRoot(), "server.json");
+}
+
+/** TCP port the server binds on 127.0.0.1 (override with HERDR_FACTORY_PORT). The bind itself
+ *  is the single-instance guard — a second `serve` fails with EADDRINUSE and exits. */
+export function serverPort(): number {
+  const p = Number(process.env.HERDR_FACTORY_PORT);
+  return Number.isInteger(p) && p > 0 ? p : 8765;
+}
+
+/** Server-wide (not per-repo) log dir — the supervisor's launchd stdout/err land here. */
+export function serverLogsDir(): string {
+  return join(stateRoot(), "logs");
 }
 
 export function loadSecrets(): Secrets {

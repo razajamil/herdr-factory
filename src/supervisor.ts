@@ -1,0 +1,96 @@
+import { spawn } from "node:child_process";
+import { rmSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { serverInfoPath } from "./config.ts";
+import { pingHealth, readServerInfo } from "./server-client.ts";
+import { VERSION } from "./version.ts";
+
+const CLI_ENTRY = fileURLToPath(new URL("cli.ts", import.meta.url));
+
+export type Log = (level: "info" | "warn" | "error", msg: string) => void;
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+const alive = (pid: number): boolean => {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false; // ESRCH (gone) or EPERM (not ours) — either way, not a process we manage
+  }
+};
+const signal = (pid: number, sig: NodeJS.Signals) => {
+  try {
+    process.kill(pid, sig);
+  } catch {
+    /* already gone */
+  }
+};
+
+/** Spawn a fully-detached `serve` that outlives this (one-shot) supervisor process. */
+function spawnServe(): void {
+  const child = spawn(process.execPath, [CLI_ENTRY, "serve"], { detached: true, stdio: "ignore" });
+  child.unref();
+}
+
+/** Gracefully ask a reachable server to shut down, then make sure its process is gone (so the
+ *  port is free for a restart). Clears server.json. Best-effort throughout. */
+async function killServer(pid: number, port: number): Promise<void> {
+  if (await pingHealth(port)) {
+    try {
+      await fetch(`http://127.0.0.1:${port}/shutdown`, { method: "POST", signal: AbortSignal.timeout(3000) });
+    } catch {
+      /* fall through to signals */
+    }
+  }
+  for (let i = 0; i < 15 && alive(pid); i++) {
+    signal(pid, "SIGTERM");
+    await sleep(200);
+  }
+  if (alive(pid)) signal(pid, "SIGKILL");
+  try {
+    rmSync(serverInfoPath());
+  } catch {
+    /* already removed by graceful shutdown */
+  }
+}
+
+/**
+ * The stateless supervisor tick. Ensure a healthy, current `serve` is running:
+ *  - healthy + same version → no-op (the common case);
+ *  - missing / unhealthy / wedged / outdated → (re)start it.
+ * Being a one-shot, this is itself immune to the resident-process wedging that motivated the
+ * redesign — launchd just re-runs it on a schedule.
+ */
+export async function ensureUp(opts: { force?: boolean }, log: Log): Promise<{ action: "noop" | "started" | "restarted" }> {
+  const info = readServerInfo();
+
+  if (info && !opts.force) {
+    if ((await pingHealth(info.port)) && info.version === VERSION) {
+      log("info", `server healthy on :${info.port} (v${info.version})`);
+      return { action: "noop" };
+    }
+    log("info", info.version !== VERSION ? `server v${info.version} != v${VERSION} — restarting` : "server not responding — restarting");
+  }
+
+  if (info) {
+    await killServer(info.pid, info.port);
+    spawnServe();
+    log("info", "restarted serve");
+    return { action: "restarted" };
+  }
+
+  spawnServe();
+  log("info", "started serve");
+  return { action: "started" };
+}
+
+/** Stop the running server (for `uninstall`/`stop`). No-op if none is running. */
+export async function stopServer(log: Log): Promise<void> {
+  const info = readServerInfo();
+  if (!info) {
+    log("info", "no server running");
+    return;
+  }
+  await killServer(info.pid, info.port);
+  log("info", "server stopped");
+}

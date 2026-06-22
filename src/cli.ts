@@ -1,108 +1,34 @@
-import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
-import { rm } from "node:fs/promises";
+import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { Command } from "commander";
-import { globalDbPath, loadConfig, type Config } from "./config.ts";
+import { globalDbPath } from "./config.ts";
 import { openDb } from "./db/index.ts";
 import { Store } from "./db/store.ts";
 import { systemClock, type Run, type StepName } from "./types.ts";
-import { HerdrClient } from "./clients/herdr.ts";
-import { JiraSource } from "./clients/jira-source.ts";
-import { LocalMarkdownSource } from "./clients/local-markdown-source.ts";
-import { GitHubClient } from "./clients/github.ts";
-import { GitClient, parseGhRepo } from "./clients/git.ts";
-import type { Deps, Logger, SourceRuntime } from "./core/deps.ts";
+import type { Deps } from "./core/deps.ts";
 import { claimTicket, reconcileRepo, reconcileRun, teardownTicket, withTickLock } from "./core/reconcile.ts";
 import { run } from "./clients/exec.ts";
 import * as launchd from "./launchd.ts";
+import { buildDeps, today } from "./build-deps.ts";
+import { resolveActiveRun, resolveSourceName } from "./resolve.ts";
+import { serve } from "./server.ts";
+import { ensureUp, stopServer, type Log } from "./supervisor.ts";
+import { NoServerError, pingHealth, readServerInfo, serverFetch, viaServerOrLocal } from "./server-client.ts";
+import { VERSION } from "./version.ts";
 
 function fail(e: unknown): never {
   console.error(e instanceof Error ? e.message : String(e));
   process.exit(1);
 }
 
-function today(): string {
-  return new Date().toISOString().slice(0, 10);
-}
-
-function makeLogger(config: Config): Logger {
-  mkdirSync(config.paths.logsDir, { recursive: true });
-  return (level, msg) => {
-    const line = `${new Date().toISOString()} [${level.toUpperCase()}] ${msg}\n`;
-    process.stderr.write(line);
-    try {
-      appendFileSync(join(config.paths.logsDir, `${today()}.log`), line);
-    } catch {
-      /* logging to file is best-effort */
-    }
-  };
-}
-
-async function buildDeps(repoName: string): Promise<Deps> {
-  const { config, secrets } = loadConfig(repoName);
-  mkdirSync(config.paths.stateDir, { recursive: true });
-  const store = new Store(openDb(config.paths.dbPath), systemClock);
-  const git = new GitClient();
-  const ghRepo = config.repo.github ?? parseGhRepo(await git.originUrl(config.repo.path)) ?? "";
-  // config.sources is already priority-ordered; build a live client per source.
-  const sources: SourceRuntime[] = config.sources.map((s) => ({
-    name: s.name,
-    type: s.type,
-    priority: s.priority,
-    workspaceName: s.workspaceName,
-    agents: s.agents,
-    client:
-      s.type === "jira"
-        ? new JiraSource(s.jira!, secrets.jiraEmail, secrets.jiraApiToken)
-        : new LocalMarkdownSource(s.localMarkdown!.folder, store, repoName, s.name),
-  }));
-  const byName = new Map(sources.map((s) => [s.name, s]));
-  return {
-    config,
-    secrets,
-    store,
-    ghRepo,
-    herdr: new HerdrClient(process.env.HERDR_BIN_PATH ?? "herdr"),
-    sources,
-    resolveSource: (name) => (name == null ? undefined : byName.get(name)),
-    github: new GitHubClient(),
-    git,
-    log: makeLogger(config),
-    now: systemClock,
-    sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
-    rmrf: (p) => rm(p, { recursive: true, force: true }),
-  };
-}
-
-/** Resolve the source name for a manual command: the --source flag if given (validated), else
- *  the sole source, else fail asking which. */
-function resolveSourceName(deps: Deps, optSource: string | undefined): string {
-  if (optSource) {
-    if (!deps.sources.some((s) => s.name === optSource)) {
-      fail(`unknown source "${optSource}"; configured: ${deps.sources.map((s) => s.name).join(", ")}`);
-    }
-    return optSource;
-  }
-  if (deps.sources.length === 1) return deps.sources[0]!.name;
-  fail(`multiple sources configured — pass --source <name> (one of: ${deps.sources.map((s) => s.name).join(", ")})`);
-}
-
-/** Resolve a single active run by key for a manual mutation, erroring on cross-source ambiguity. */
-function resolveActiveRun(deps: Deps, key: string, optSource: string | undefined): Run | undefined {
-  const repo = deps.config.repoName;
-  if (optSource) return deps.store.activeRunForTicket(repo, optSource, key);
-  const runs = deps.store.activeRunsForKey(repo, key);
-  if (runs.length > 1) {
-    fail(`${key}: active in multiple sources (${runs.map((r) => r.workSource).join(", ")}) — pass --source <name>`);
-  }
-  return runs[0];
-}
+/** A console logger for the repo-agnostic supervisor commands (serve/ensure-up/install/…). */
+const consoleLog: Log = (level, msg) => console.log(`[${level}] ${msg}`);
 
 const program = new Command();
 program
   .name("herdr-factory")
   .description("Autonomous work→PR factory — runs Claude worker agents across repos on herdr worktrees.")
-  .version("0.1.0")
+  .version(VERSION)
   .option("--repo <name>", "target repo (its ~/.config/herdr-factory/repos/<name>/)");
 
 function requireRepo(): string {
@@ -113,12 +39,18 @@ function requireRepo(): string {
 
 program
   .command("tick")
-  .description("run one reconcile pass (handy for manual/one-shot runs)")
+  .description("run one reconcile pass (routes through the server if up, else runs in-process)")
   .action(async () => {
     try {
-      const deps = await buildDeps(requireRepo());
-      const ran = await withTickLock(deps, () => reconcileRepo(deps));
-      if (!ran) deps.log("info", "another tick is already running — skipping");
+      const repo = requireRepo();
+      const { viaServer, data } = await viaServerOrLocal({ method: "POST", path: `/repos/${encodeURIComponent(repo)}/tick` }, async () => {
+        const deps = await buildDeps(repo);
+        const ran = await withTickLock(deps, () => reconcileRepo(deps));
+        if (!ran) deps.log("info", "another tick is already running — skipping");
+        return { ran };
+      });
+      const ran = (data as { ran?: boolean }).ran;
+      console.log(`tick: ${ran === false ? "another tick already running" : "ran"} (${viaServer ? "via server" : "in-process"})`);
     } catch (e) {
       fail(e);
     }
@@ -126,7 +58,7 @@ program
 
 program
   .command("watch")
-  .description("resident daemon: reconcile in a loop every tick_interval_seconds (what launchd keeps alive)")
+  .description("[legacy/dev] single-repo resident loop (the server now does this for all repos)")
   .action(async () => {
     let deps: Deps;
     try {
@@ -163,7 +95,7 @@ program
 
 program
   .command("status")
-  .description("show active tickets + launchd state for the repo")
+  .description("show active tickets + server/supervisor state for the repo")
   .action(async () => {
     try {
       const deps = await buildDeps(requireRepo());
@@ -195,7 +127,12 @@ program
         for (const r of finished) console.log(fmt(r, r.outcome ?? "—"));
       }
       console.log("");
-      console.log(`launchd: ${(await launchd.isLoaded(c.repoName)) ? "loaded" : "not loaded"}`);
+      const info = readServerInfo();
+      const healthy = info ? await pingHealth(info.port) : false;
+      console.log(
+        `server: ${healthy ? `running (pid ${info!.pid}, port ${info!.port}, v${info!.version})` : info ? "advertised but not responding" : "not running"}`,
+      );
+      console.log(`supervisor: ${(await launchd.isLoaded()) ? "loaded" : "not loaded"}`);
     } catch (e) {
       fail(e);
     }
@@ -227,8 +164,13 @@ program
   .option("--source <name>", "which work source the key belongs to (required if >1 source)")
   .action(async (key: string, opts: { source?: string }) => {
     try {
-      const deps = await buildDeps(requireRepo());
-      await claimTicket(deps, resolveSourceName(deps, opts.source), key);
+      const repo = requireRepo();
+      await viaServerOrLocal({ method: "POST", path: `/repos/${encodeURIComponent(repo)}/claim`, body: { key, source: opts.source } }, async () => {
+        const deps = await buildDeps(repo);
+        await claimTicket(deps, resolveSourceName(deps, opts.source), key);
+        return { ok: true };
+      });
+      console.log(`${key}: claimed`);
     } catch (e) {
       fail(e);
     }
@@ -240,7 +182,12 @@ program
   .option("--source <name>", "disambiguate when the key is active in more than one source")
   .action(async (key: string, opts: { source?: string }) => {
     try {
-      await teardownTicket(await buildDeps(requireRepo()), key, opts.source);
+      const repo = requireRepo();
+      await viaServerOrLocal({ method: "POST", path: `/repos/${encodeURIComponent(repo)}/teardown`, body: { key, source: opts.source } }, async () => {
+        await teardownTicket(await buildDeps(repo), key, opts.source);
+        return { ok: true };
+      });
+      console.log(`${key}: torn down`);
     } catch (e) {
       fail(e);
     }
@@ -248,24 +195,32 @@ program
 
 program
   .command("step-done <key> <step>")
-  .description("a pipeline agent signals it finished its step (fix|review|pr)")
+  .description("a pipeline agent signals it finished its step (fix|review|pr) — event-nudges the dispatcher")
   .option("--source <name>", "the work source the run belongs to (passed by the agent)")
   .action(async (key: string, step: string, opts: { source?: string }) => {
     try {
       if (!["fix", "review", "pr"].includes(step)) fail(`step-done: step must be fix|review|pr (got "${step}")`);
-      const deps = await buildDeps(requireRepo());
-      const run = resolveActiveRun(deps, key, opts.source);
-      if (!run) {
-        deps.log("warn", `${key}: no active run to mark step-done`);
-        return;
-      }
-      deps.store.markStepDone(run.id, step as StepName);
-      deps.store.recordEvent({ runId: run.id, repo: deps.config.repoName, ticketKey: key, type: "step_done", detail: { step } });
-      deps.log("info", `${key}: step-done ${step} recorded`);
-      // Event nudge: advance the run immediately if no tick is mid-flight; otherwise the
-      // in-flight/next tick picks up the done flag. The tick is the backstop.
-      const ran = await withTickLock(deps, () => reconcileRun(deps, deps.store.getRun(run.id)!));
-      if (!ran) deps.log("info", `${key}: tick busy — next tick will advance the pipeline`);
+      const repo = requireRepo();
+      // Route through the server (warm reconcile in ~ms) with a direct in-process fallback so the
+      // nudge still lands while the server is restarting — the next tick is the backstop either way.
+      const { data } = await viaServerOrLocal(
+        { method: "POST", path: `/repos/${encodeURIComponent(repo)}/step-done`, body: { key, step, source: opts.source } },
+        async () => {
+          const deps = await buildDeps(repo);
+          const run = resolveActiveRun(deps, key, opts.source);
+          if (!run) {
+            deps.log("warn", `${key}: no active run to mark step-done`);
+            return { ok: false };
+          }
+          deps.store.markStepDone(run.id, step as StepName);
+          deps.store.recordEvent({ runId: run.id, repo: deps.config.repoName, ticketKey: key, type: "step_done", detail: { step } });
+          deps.log("info", `${key}: step-done ${step} recorded`);
+          const advanced = await withTickLock(deps, () => reconcileRun(deps, deps.store.getRun(run.id)!));
+          if (!advanced) deps.log("info", `${key}: tick busy — next tick will advance the pipeline`);
+          return { ok: true, advanced };
+        },
+      );
+      if ((data as { ok?: boolean }).ok === false) console.log(`${key}: no active run to mark step-done`);
     } catch (e) {
       fail(e);
     }
@@ -332,13 +287,66 @@ program
   });
 
 program
-  .command("install")
-  .description("install the repo's launchd job")
+  .command("serve")
+  .description("run the resident server: tick every configured repo + expose the HTTP API (kept alive by the supervisor)")
   .action(async () => {
     try {
-      const deps = await buildDeps(requireRepo());
-      await launchd.install(deps.config);
-      console.log(`installed + loaded ${launchd.label(deps.config.repoName)} (resident watch, reconciles every ${deps.config.limits.tickIntervalSeconds}s)`);
+      await serve();
+    } catch (e) {
+      fail(e);
+    }
+  });
+
+program
+  .command("ensure-up")
+  .description("[supervisor] one-shot: (re)start the server if it's down/wedged/outdated, then exit (what launchd schedules)")
+  .option("--restart", "force a graceful restart even if the server is healthy")
+  .action(async (opts: { restart?: boolean }) => {
+    try {
+      const { action } = await ensureUp({ force: opts.restart }, consoleLog);
+      console.log(`ensure-up: ${action}`);
+    } catch (e) {
+      fail(e);
+    }
+  });
+
+program
+  .command("restart")
+  .description("gracefully restart the running server (picks up new code after a pull)")
+  .action(async () => {
+    try {
+      const { action } = await ensureUp({ force: true }, consoleLog);
+      console.log(`restart: ${action}`);
+    } catch (e) {
+      fail(e);
+    }
+  });
+
+program
+  .command("reload")
+  .description("hot-reload config: the running server re-reads every repo's config + re-discovers repos (no restart)")
+  .action(async () => {
+    try {
+      const data = await serverFetch("POST", "/reload");
+      const repos = (data as { repos?: string[] }).repos ?? [];
+      console.log(`reloaded — serving: ${repos.join(", ") || "(no repos)"}`);
+    } catch (e) {
+      if (e instanceof NoServerError) {
+        console.log("no server running — config is read fresh on the next `serve` start (try `herdr-factory start`)");
+        return;
+      }
+      fail(e);
+    }
+  });
+
+program
+  .command("install")
+  .description("install the machine-wide supervisor (one launchd job that keeps the server up for all repos)")
+  .action(async () => {
+    try {
+      await launchd.install();
+      await ensureUp({}, consoleLog);
+      console.log(`installed + loaded ${launchd.label()} — scheduled ensure-up keeps the server serving all configured repos`);
     } catch (e) {
       fail(e);
     }
@@ -346,12 +354,12 @@ program
 
 program
   .command("uninstall")
-  .description("remove the repo's launchd job")
+  .description("remove the supervisor job and stop the server (in-flight workers untouched)")
   .action(async () => {
     try {
-      const repo = requireRepo();
-      await launchd.uninstall(repo);
-      console.log(`uninstalled ${launchd.label(repo)} (in-flight workers untouched)`);
+      await launchd.uninstall();
+      await stopServer(consoleLog);
+      console.log(`uninstalled ${launchd.label()}`);
     } catch (e) {
       fail(e);
     }
@@ -359,12 +367,12 @@ program
 
 program
   .command("start")
-  .description("load the repo's launchd job")
+  .description("load the supervisor job (and bring the server up)")
   .action(async () => {
     try {
-      const deps = await buildDeps(requireRepo());
-      await launchd.start(deps.config);
-      console.log(`started ${launchd.label(deps.config.repoName)}`);
+      await launchd.start();
+      await ensureUp({}, consoleLog);
+      console.log(`started ${launchd.label()}`);
     } catch (e) {
       fail(e);
     }
@@ -372,12 +380,12 @@ program
 
 program
   .command("stop")
-  .description("unload the repo's launchd job (workers keep running)")
+  .description("unload the supervisor job and stop the server (workers keep running)")
   .action(async () => {
     try {
-      const repo = requireRepo();
-      await launchd.stop(repo);
-      console.log(`stopped ${launchd.label(repo)}`);
+      await launchd.stop();
+      await stopServer(consoleLog);
+      console.log(`stopped ${launchd.label()}`);
     } catch (e) {
       fail(e);
     }
@@ -426,6 +434,8 @@ program
       await check("git origin resolved", async () => {
         if (!deps.ghRepo) throw new Error("no origin");
       });
+      const info = readServerInfo();
+      console.log(`server: ${info && (await pingHealth(info.port)) ? `running on :${info.port} (v${info.version})` : "not running"}`);
       console.log(`db: ${deps.config.paths.dbPath}`);
     } catch (e) {
       fail(e);

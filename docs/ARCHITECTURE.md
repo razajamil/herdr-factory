@@ -2,10 +2,12 @@
 
 Autonomous work → PR factory that runs Claude worker agents across one or
 more repos, on top of [herdr](https://herdr.dev) worktrees. A single idempotent
-reconciler (`reconcileRepo`, looped by the resident `watch` daemon under `launchd`),
-pulls eligible work from one or more **work sources** (a Jira board, a folder of
-markdown briefs, …) in priority order, spins up one herdr worktree + Claude worker
-per item, watches the PR, and tears the worktree down on merge/close.
+reconciler (`reconcileRepo`, looped by the resident **`serve`** daemon — one process
+that ticks every configured repo and exposes a local HTTP API), pulls eligible work
+from one or more **work sources** (a Jira board, a folder of markdown briefs, …) in
+priority order, spins up one herdr worktree + Claude worker per item, watches the PR,
+and tears the worktree down on merge/close. The server is kept alive by a **stateless
+`ensure-up` supervisor** run on a schedule (one launchd job) — see [§12](#12-server--supervision).
 
 **Work sources** are the pluggable front of the engine. Each repo configures an ordered,
 priority-ranked list of them (`work_sources`); two types ship today — `jira` (poll a board;
@@ -35,7 +37,10 @@ This document is the canonical design of the TypeScript implementation
 4. **Repo-specifics are decoupled into per-repo config**, not code. The engine
    is generic; onboarding a repo is pure data.
 5. **Stop/restart safe.** State is on disk (SQLite); every action is idempotent;
-   `launchctl bootout` never kills in-flight workers (they live in herdr).
+   stopping the server never kills in-flight workers (they live in herdr). The DB —
+   not the server — is the source of truth, so **the server is a coordinator, not a
+   single point of failure**: every CLI command runs in-process when no server is up
+   (see [§12](#12-server--supervision)), so a worker's `step-done` lands even mid-restart.
 
 ---
 
@@ -48,6 +53,7 @@ This document is the canonical design of the TypeScript implementation
 | State store | **better-sqlite3** (synchronous — ideal for a short-lived tick) |
 | Config | **`yaml`** + **`zod`** (parse + validate → types) |
 | Subprocess (herdr/gh/git) | **`node:child_process`** `execFile` (arg arrays, no shell) |
+| Local API server | **`node:http`** (resident `serve`, 127.0.0.1) + native **`fetch`** clients |
 | HTTP (Jira REST) | native **`fetch`** |
 | Tests | **vitest** (dev-only) |
 | External CLIs | **herdr**, **gh**, **git** |
@@ -90,14 +96,21 @@ herdr-factory/
                           node 24; resolves its own dir through symlinks; symlinked into ~/.local/bin)
   mise.toml                  pins node 24 for this package (runtime + native-module build ABI)
   src/
-    cli.ts                commander program; builds deps (incl. work-source clients), dispatches
-    config.ts             env + repos/<name>/config.yml → zod → typed Config (work_sources[])
+    cli.ts                commander program; routes via server (else in-process), dispatches
+    build-deps.ts         buildDeps(repo) — shared by the server + every command's local path
+    resolve.ts            pure resolveSourceName / resolveActiveRun (throw, not exit; CLI+server)
+    config.ts             env + repos/<name>/config.yml → zod → typed Config (work_sources[]);
+                          listConfiguredRepos + server path/port helpers
     types.ts              shared domain types (incl. WorkState, WorkItem)
+    version.ts            VERSION (stamped into /health + server.json for restart-on-bump)
+    server.ts             resident `serve`: multi-repo tick loops + node:http API
+    server-client.ts      CLI side: readServerInfo / pingHealth / serverFetch / viaServerOrLocal
+    supervisor.ts         stateless `ensure-up` / `stopServer` (health-check + detached serve spawn)
     db/{index,migrate,store}.ts
     clients/{exec,herdr,jira,jira-source,local-markdown-source,github,git}.ts
     core/{deps,branch,step,watch,reconcile}.ts
     prompts/{fix,review,pr}.md + prompts/local_markdown/fix.md  (per-source-type built-ins)
-    launchd.ts
+    launchd.ts            one supervisor job (com.herdr-factory.server) running `ensure-up`
   examples/example-repo/{config.yml, fix.md, review.md, pr.md, guidelines-prompt.md}
   test/                   vitest
 ```
@@ -573,45 +586,87 @@ layout (workspace-manager plugin), `herdr-factory --repo <name> install`.
 ## 11. CLI surface (commander)
 
 ```
+# repo-scoped
 herdr-factory --repo <name> tick | status | eligible
 herdr-factory --repo <name> claim <KEY> [--source <name>] | teardown <KEY> [--source <name>]
 herdr-factory --repo <name> step-done <KEY> <fix|review|pr> [--source <name>]  # agent → dispatcher (event-nudges)
-herdr-factory --repo <name> install | uninstall | start | stop | logs [N]
-herdr-factory --repo <name> runs [--all] | timeline <KEY>   # read the DB
-herdr-factory capture-lock acquire|release <owner>     # machine-global, no --repo
-herdr-factory doctor                                   # herdr / gh / claude / per-source health / db
+herdr-factory --repo <name> runs [--all] | timeline <KEY> | logs [N]   # read the DB / repo log
+# machine-wide (no --repo)
+herdr-factory serve                       # the resident daemon: tick every repo + HTTP API
+herdr-factory ensure-up [--restart]       # supervisor one-shot: (re)start serve if down/wedged/outdated
+herdr-factory restart                     # graceful restart of the running server (pick up new code)
+herdr-factory reload                      # hot-reload config + re-discover repos (no restart)
+herdr-factory install | uninstall | start | stop   # the one supervisor launchd job
+herdr-factory capture-lock acquire|release <owner> # machine-global capture lock
+herdr-factory doctor                      # herdr / gh / claude / per-source health / server / db
 herdr-factory help
 ```
 
-`eligible` lists todo items **across all sources** (each annotated with its `source`). `doctor`
-runs a **per-source** `health()` check (Jira auth/board; local_markdown folder exists). `claim`
-takes `--source` (defaulted when there's a single source, required when >1); `teardown`/`step-done`
-resolve the run by key and take `--source` to disambiguate when a key is active in more than one
-source (the agent's rendered `step-done` always carries `--source`). `status` is a dashboard, not
-just a count: a header listing the configured **sources** (name/type/priority), then an **ACTIVE**
-section (each run's `work_source` + ledger phase + **live** herdr agent status + PR + summary) and
-a **FINISHED** section (outcome, newest first), under a `Runs: N running (cap M) · K finished`
-line. `runs`/`timeline` read the same DB.
+**Server routing.** The mutating + nudge commands (`tick`, `step-done`, `claim`, `teardown`) route
+through the running server (`POST /repos/:repo/…`) when it's up — a warm, in-process reconcile in
+~ms — and **fall back to direct in-process execution** when it isn't (`viaServerOrLocal`). Because
+the DB is the source of truth and the tick lock coordinates any actor, the fallback is fully
+correct: a worker's `step-done` lands even while the server is restarting, and the next tick is the
+backstop. **Read** commands (`status`/`runs`/`eligible`/`timeline`) stay direct-DB (always correct,
+no server needed); the server exposes the same reads as JSON (`GET /repos/:repo/…`) for the future
+web UI ([§16](#16-web-ui-future)).
 
-Each command builds `Deps` (open DB, construct clients from config) and calls
-core. `--repo` is a global option; repo-scoped commands assert it.
+`eligible` lists todo items **across all sources** (each annotated with its `source`). `doctor`
+runs a **per-source** `health()` check (Jira auth/board; local_markdown folder exists) plus a
+server-liveness line. `claim` takes `--source` (defaulted when there's a single source, required
+when >1); `teardown`/`step-done` resolve the run by key and take `--source` to disambiguate when a
+key is active in more than one source (the agent's rendered `step-done` always carries `--source`).
+`status` is a dashboard: a header listing the configured **sources** (name/type/priority), then an
+**ACTIVE** section (each run's `work_source` + ledger phase + **live** herdr agent status + PR +
+summary) and a **FINISHED** section (outcome, newest first), under a `Runs: N running (cap M) · K
+finished` line, ending with the **server** + **supervisor** state.
+
+`--repo` is a global option; repo-scoped commands assert it. The supervisor commands
+(`serve`/`ensure-up`/`restart`/`install`/…) are repo-agnostic — the server discovers every repo
+under `~/.config/herdr-factory/repos/`. The shared `buildDeps(repo)` (open DB, construct clients
+from config) backs both the server and every command's local path.
 
 ---
 
-## 12. launchd
+## 12. Server & supervision
 
-One job per repo, `com.herdr-factory.<repo>`. `launchd.ts` generates the plist and
-drives `launchctl bootstrap/bootout`.
+The work lives in **one resident `serve` process** for the whole machine (not one per repo). It
+discovers every configured repo (`listConfiguredRepos`), builds a `Deps` per repo, and runs a
+per-repo tick loop (each at its own `tick_interval_seconds`, with an immediate first pass) — exactly
+what the old per-repo `watch` did, but collapsed into a single process plus a local HTTP surface.
 
-- `ProgramArguments = [node, "<abs>/src/cli.ts", "--repo", "<name>", "watch"]` — a
-  resident loop that reconciles every `tick_interval_seconds` itself.
-- `EnvironmentVariables`: captured `PATH` + `HOME` (no experimental flags —
-  native type stripping is on by default on Node ≥24, and better-sqlite3 needs
-  none). Secrets are **not** in the plist; `watch` re-reads the env file at start.
-- `KeepAlive` + `ThrottleInterval` (not `StartInterval`): launchd restarts the daemon if it
-  dies, and the internal loop owns the cadence — this avoids the per-user launchd
-  interval-timer wedging that `StartInterval` is prone to after sleep/wake. Per-repo
-  stdout/err logs. The cross-process tick lock still guards against any overlapping pass.
+- **Transport.** `node:http` on `127.0.0.1:<port>` (`HERDR_FACTORY_PORT`, default `8765`) — TCP, not
+  a unix socket, so the future browser UI can reach it. On listen it writes
+  `~/.local/state/herdr-factory/server.json` (`{pid, port, version, startedAt}`); clients + the
+  supervisor read it to find and health-check the server. The **bind itself is the single-instance
+  guard** — a second `serve` loses with `EADDRINUSE` and exits.
+- **Routes.** `GET /health` · `POST /reload` (re-discover repos / reload config) · `POST /shutdown`
+  (graceful drain) · `POST /repos/:repo/{tick,step-done,claim,teardown}` (the mutating CLI paths) ·
+  `GET /repos/:repo/{status,runs,eligible,timeline}` (reads for the web UI). Per-repo work logs to
+  each repo's own logger; server-lifecycle events log to stdout/err (captured by the supervisor).
+- **Per-repo safety.** An in-flight flag stops a slow tick from stacking; `withTickLock` is the
+  cross-process backstop (a stray CLI `tick` can't overlap either). Two repos tick concurrently
+  (interleaved awaits) — fine: different repos, WAL DB, per-repo lock.
+- **Graceful shutdown** (SIGTERM/SIGINT/`POST /shutdown`): stop accepting, clear timers, let any
+  in-flight tick finish (idempotent + on-disk, so a hard kill is safe too), remove `server.json`,
+  exit 0.
+
+**Supervision is a stateless scheduled `ensure-up`.** One launchd job, `com.herdr-factory.server`,
+runs `herdr-factory ensure-up` on `StartInterval` (60s). `ensure-up` is a **one-shot**: hit
+`/health`; if healthy **and** the version matches → no-op; else kill any stale/wedged pid (graceful
+`POST /shutdown` first, then `SIGTERM`→`SIGKILL` to free the port) and spawn a detached `serve`.
+
+- `ProgramArguments = [node, "<abs>/src/cli.ts", "ensure-up"]`; `EnvironmentVariables` = captured
+  `PATH` + `HOME` (no experimental flags — native type stripping is on by default on Node ≥24, and
+  better-sqlite3 needs none). Secrets aren't in the plist; `serve` re-reads the env file per repo.
+- **Why a scheduled one-shot, not `KeepAlive` on `serve`.** A one-shot supervisor is itself immune
+  to the per-user launchd interval-timer wedging that bit the old resident `watch` after sleep/wake
+  (a missed beat is harmless — `serve` self-sustains between runs), it detects a **wedged-but-alive**
+  server (which `KeepAlive` can't — it only reacts to process death), and "run a command on a
+  schedule" is the portable seam for systemd timers / cron / Task Scheduler later. `install` also
+  boots out any legacy per-repo `com.herdr-factory.<repo>` `watch` jobs so an upgrade is clean.
+- **Updates** are a graceful `herdr-factory restart` (= `ensure-up --restart`): drain the running
+  server, spawn fresh code — no launchd churn. `ensure-up` also auto-restarts on a version bump.
 
 ---
 
@@ -661,13 +716,20 @@ Hard-won from the bash prototype — encode as types/tests/asserts:
 - **focus follows the active step only within the focused worktree** — never steals focus
   across worktrees; a transition in an unfocused worktree is deferred via `run.focus_pending`
   and applied when the user navigates back (herdr has no focus event → polled when pending).
-- single-instance per-repo tick lock; WAL + `busy_timeout` for the shared DB.
+- single-instance per-repo tick lock; WAL + `busy_timeout` for the shared DB. The resident server
+  adds an in-process per-repo in-flight flag on top of the lock; the **port bind** is the server's
+  own single-instance guard.
+- **The server is never the source of truth.** The DB is. Every CLI command must run correctly with
+  no server up (`viaServerOrLocal` falls back to in-process), so a worker's `step-done` lands even
+  mid-restart. Errors from a *reached* server propagate (they're not a `NoServerError` → no
+  fallback); only unreachability falls back.
 - **Native-module ABI must match the runtime Node.** `better-sqlite3` is compiled for one Node ABI
   (`NODE_MODULE_VERSION`, == the Node major). The CLI is invoked by worker agents **from another
   repo's worktree**, which may have a different Node activated by mise — so `bin/herdr-factory`
   runs via `mise exec -- node` against this package's pinned node (`mise.toml` → node 24), never a
   bare `node` (a `cd` in the non-interactive launcher does NOT change the inherited PATH's Node).
-  The launchd daemon is immune (its plist bakes `process.execPath`, the node 24 that ran `install`).
+  The launchd supervisor + the `serve` it spawns are immune (the plist bakes `process.execPath`,
+  the node 24 that ran `install`, and `ensure-up` spawns `serve` with that same `process.execPath`).
 
 ---
 
@@ -689,12 +751,14 @@ risk: build, validate read-only, do one guarded single-ticket run, then install.
 **Status:** M0–M6 complete. The §7/§8 multi-agent pipeline (fix → review → pr agents,
 handoff docs, on-demand session query, hybrid tick+event) is **implemented, unit-tested, and
 validated live end-to-end** on a real ticket (RWR-17269 → merged PR; `fix`=claude,
-`review`/`pr`=opencode — confirming agent-agnostic dispatch). It is installed and running
-under `launchd` (`com.herdr-factory.<repo>`). Step-focus following (§7, *Focus follows the
-active step*) and then **multi-source work** (the `WorkSource` abstraction + the `local_markdown`
-source + per-source `agents`/`workspace_name`, this section) are the most recent additions; the
-Jira path is preserved byte-for-byte (see §14). Still early — watch live runs before trusting it
-fully unsupervised.
+`review`/`pr`=opencode — confirming agent-agnostic dispatch). Step-focus following (§7, *Focus
+follows the active step*) and **multi-source work** (the `WorkSource` abstraction + the
+`local_markdown` source + per-source `agents`/`workspace_name`) landed next; the Jira path is
+preserved byte-for-byte (see §14). The **most recent change** is the supervision rework ([§12](#12-server--supervision)):
+the per-repo `launchd` `watch` jobs are replaced by one resident `serve` (HTTP API + per-repo tick
+loops for all repos) kept alive by a stateless scheduled `ensure-up` supervisor, with the CLI
+routing through the server and falling back to in-process when it's down. Still early — watch live
+runs before trusting it fully unsupervised.
 
 ---
 
@@ -703,6 +767,11 @@ fully unsupervised.
 The SQLite schema is the contract; a future UI is a *reader*. Active dashboard =
 `runs WHERE ended_at IS NULL`; history + metrics (time-to-PR, success rate,
 time-in-review) derive from `runs` + `events`; per-ticket timeline = `events`
-joined to `run`. Options: point **Datasette** at the DB for an instant read-only
-view; later a `herdr-factory serve` JSON API or a Next.js app reading via
-better-sqlite3.
+joined to `run`.
+
+The `serve` JSON API ([§12](#12-server--supervision)) is now the foundation: the read endpoints
+already exist (`GET /repos/:repo/{status,runs,eligible,timeline}`, `GET /health`), so a browser UI
+is a client of the running server rather than a separate DB reader — this was the motivating reason
+to adopt the server model. A static SPA can be served from the same `node:http` process (it already
+binds TCP on localhost). Datasette pointed straight at the DB remains an option for an instant
+read-only view. Cross-repo aggregation is natural now that one server holds every repo.

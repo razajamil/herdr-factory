@@ -114,17 +114,20 @@ makes this layout reusable per repo.
 ### 5. Install and start
 
 ```sh
-herdr-factory --repo <name> install
+herdr-factory install      # one machine-wide job — no --repo (it serves every configured repo)
 ```
 
-This registers the `launchd` job — a resident `watch` daemon that reconciles every 60s and
-that launchd restarts if it ever dies. Feed it work via any configured source — label a Jira
-ticket with your configured `label` and move it to the `todo` status, or drop a `*.md` brief in
-a local_markdown source's folder — and the factory takes it from there.
+This registers a single `launchd` supervisor job that runs `ensure-up` on a schedule. `ensure-up`
+keeps the resident **`serve`** daemon alive — one process that ticks every configured repo every
+`tick_interval_seconds` and exposes a local HTTP API. Feed it work via any configured source — label
+a Jira ticket with your configured `label` and move it to the `todo` status, or drop a `*.md` brief
+in a local_markdown source's folder — and the factory takes it from there.
 
 ```sh
-herdr-factory --repo <name> status      # see what's in flight
-herdr-factory --repo <name> logs         # tail the dispatcher
+herdr-factory --repo <name> status      # see what's in flight (+ server/supervisor state)
+herdr-factory --repo <name> logs         # tail the repo's dispatcher log
+herdr-factory restart                    # graceful server restart after a `git pull`
+herdr-factory reload                      # hot-reload config (e.g. max_active) without a restart
 ```
 
 ---
@@ -134,7 +137,10 @@ herdr-factory --repo <name> logs         # tail the dispatcher
 ## How it works
 
 ```
-launchd ─keepalive─> herdr-factory --repo <name> watch   (resident reconciler, loops every 60s)
+launchd ─StartInterval─> herdr-factory ensure-up   (stateless one-shot: keeps `serve` up)
+                                  │ (re)starts if down/wedged/outdated
+                                  ▼
+        herdr-factory serve   (one resident process, ticks EVERY repo + HTTP API on 127.0.0.1)
         │ Phase A: advance each active ticket   │ Phase B: claim new work up to cap
         ▼
   To Do ─claim─> In Progress ─PR+automated round─> In Review ─merged/closed─> teardown
@@ -143,17 +149,18 @@ launchd ─keepalive─> herdr-factory --repo <name> watch   (resident reconcile
                    10-min CI/bot round → done)      worker on new comments
 ```
 
-A single idempotent reconciler (`tick`), driven by `launchd`, finds eligible Jira
-tickets, spins up one herdr worktree + Claude worker per ticket, watches the
-resulting PR, and tears the worktree down on merge/close. **All polling is plain
-shell — no LLM tokens are spent finding or watching work.** Claude agents run
-only for the two jobs that need reasoning: writing the fix+PR, and addressing
-review comments. The dispatcher is generic; everything repo-specific lives in
-per-repo config, so the same engine drives many repos.
+A single idempotent reconciler (`reconcileRepo`), looped by the resident `serve` daemon, finds
+eligible work, spins up one herdr worktree + Claude worker per item, watches the resulting PR, and
+tears the worktree down on merge/close. **All polling is plain shell — no LLM tokens are spent
+finding or watching work.** Claude agents run only for the jobs that need reasoning: the
+fix → review → PR pipeline, and addressing review comments. The dispatcher is generic; everything
+repo-specific lives in per-repo config, so the same engine drives many repos.
 
-State is on disk (an atomic ledger, one JSON per ticket), so a tick can be killed
-at any point and the next one resumes. `launchctl bootout` never kills in-flight
-workers (they live in the herdr server); `bootstrap` resumes from the ledger.
+State is on disk (SQLite), so a tick can be killed at any point and the next one resumes. The DB —
+not the server — is the source of truth: **every command runs in-process when no server is up**, so
+a worker's `step-done` lands even while the server is restarting. Stopping the server never kills
+in-flight workers (they live in the herdr server). The supervisor is a stateless scheduled one-shot,
+so it's immune to the resident-daemon wedging that a `KeepAlive` loop is prone to after sleep/wake.
 
 The worker runs *inside* the target repo's worktree, so it picks up that repo's
 `CLAUDE.md`/skills natively — the brief stays generic, with only a few commands
@@ -162,17 +169,20 @@ injected from config plus an optional per-repo guidance addendum.
 ## Commands
 
 ```
-herdr-factory --repo <name> tick|status|eligible|logs [N]
+herdr-factory --repo <name> tick|status|eligible|runs [--all]|timeline <KEY>|logs [N]
 herdr-factory --repo <name> claim <KEY> [--source <name>]|teardown <KEY> [--source <name>]
-herdr-factory --repo <name> install|uninstall|start|stop
 herdr-factory --repo <name> step-done <KEY> <fix|review|pr> [--source <name>]   # agent → dispatcher (event-nudge)
+herdr-factory serve|ensure-up [--restart]|restart|reload   # the server + its supervisor (no --repo)
+herdr-factory install|uninstall|start|stop             # the one supervisor launchd job (no --repo)
 herdr-factory capture-lock acquire|release <owner>     # machine-global, no --repo
-herdr-factory help
+herdr-factory doctor|help
 ```
 
-`eligible` lists todo items across all sources; `doctor` runs a per-source health check. `claim`
-takes `--source` (defaulted when there's a single source); `teardown`/`step-done` take `--source`
-to disambiguate a key active in more than one source.
+`tick`/`step-done`/`claim`/`teardown` route through the running server when it's up (warm,
+in-process reconcile) and fall back to running in-process when it isn't. `eligible` lists todo items
+across all sources; `doctor` runs a per-source health check plus server liveness. `claim` takes
+`--source` (defaulted when there's a single source); `teardown`/`step-done` take `--source` to
+disambiguate a key active in more than one source.
 
 ## What's repo-specific (all in `repos/<name>/config.yml`)
 
@@ -189,11 +199,12 @@ Only the Jira **auth** (email + token, one Atlassian account) is global, in
 
 ```
 bin/herdr-factory          CLI (selects a repo via --repo)
+src/{server,server-client,supervisor}.ts   resident serve + its HTTP client + the ensure-up supervisor
 src/core/*.ts           generic engine: reconcile · step · watch · branch · deps
 src/prompts/*.md        engine default step prompts (the base for prompt_type: augment)
 examples/example-repo/  config.yml + fix.md/review.md/pr.md + guidelines-prompt.md (copy to repos/<name>/)
 ~/.config/herdr-factory/   env (secrets) + repos/<name>/{config.yml, guidelines-prompt.md}
-~/.local/state/herdr-factory/<repo>/   tickets, locks, logs   (+ _shared/locks for the global capture lock)
+~/.local/state/herdr-factory/   herdr-factory.db · server.json · logs/ (supervisor) · <repo>/logs/
 ```
 
 ## Security note
@@ -205,5 +216,8 @@ tighten per repo if desired.
 
 ## Platform
 
-macOS (launchd). The engine is portable shell; only `install-launchd.sh` is
-mac-specific — swap it for a systemd unit or cron entry on Linux.
+macOS (launchd). Portability is now down to its smallest seam: the only OS-specific piece is the
+**scheduled `ensure-up`** — `src/launchd.ts` writes the launchd plist. To support Linux/Windows,
+swap that one job for a systemd timer, cron entry, or Task Scheduler task that runs
+`herdr-factory ensure-up` on an interval; the resident `serve` + the whole engine are
+already platform-neutral Node. (herdr itself remains the broader portability question.)
