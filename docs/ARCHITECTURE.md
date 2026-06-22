@@ -67,12 +67,15 @@ Node's native type stripping.
 ## 3. Layered architecture
 
 ```
-                 ┌───────────────────────── cli.ts (commander) ──────────────┐
-                 │  --repo selector · command dispatch · --json output         │
-                 └───────────────┬───────────────────────────┬───────────────┘
-                                 ▼                           ▼
-        ┌──────────────── core/ (PURE, testable) ────────────────┐     launchd.ts
-        │  reconcile · watch · step · branch · phases              │  (plist + ctl)
+  launchd · StartInterval ──► ensure-up ──spawns / health-checks──► serve.ts (resident daemon)
+  (one job: launchd.ts)                                               │  node:http API @127.0.0.1
+                                                                      │  + per-repo tick loops
+  herdr-factory <cmd> ──► cli.ts ──POST /repos/:repo/… (else in-process)─┤
+  (--repo · dispatch · --json)        via server-client.ts             │
+                            serve + cli both build/inject Deps (build-deps.ts)
+                                                                      ▼
+        ┌──────────────── core/ (PURE, testable) ────────────────┐
+        │  reconcile · watch · step · branch · phases              │
         │  depends only on interfaces ↓↓↓                          │
         └───────┬───────────────────────────────┬─────────────────┘
                 ▼                                 ▼
@@ -84,8 +87,10 @@ Node's native type stripping.
                                        herdr · gh · git · fetch(Jira REST)
 ```
 
-**Dependency rule:** `core` imports *interfaces*; `cli` constructs the concrete
-implementations and injects them. Tests substitute fakes + `:memory:` SQLite.
+**Dependency rule:** `core` imports *interfaces*; `cli` **and** `server` construct the concrete
+implementations (via `build-deps.ts`) and inject them. The CLI routes mutating commands to a
+running `server` and falls back to the same in-process path when none is up (`server-client.ts`).
+Tests substitute fakes + `:memory:` SQLite.
 
 ### Repo layout
 
@@ -578,8 +583,11 @@ left as-is).
   create worktrees from one. The work-source *clients* are constructed in `cli.ts`'s `buildDeps`
   (the `local_markdown` client needs the `Store`); `config.ts` stays pure data + prompt resolution.
 
-Onboarding a repo is pure data: drop a `repos/<name>/` folder, define its herdr
-layout (workspace-manager plugin), `herdr-factory --repo <name> install`.
+Onboarding a repo is pure data: drop a `repos/<name>/` folder, define its herdr layout
+(workspace-manager plugin), and `herdr-factory reload` so the running server discovers it (or
+`restart`). There is **no per-repo install** — the supervisor + `serve` are machine-wide and
+serve every repo under `repos/` (`listConfiguredRepos`); the one-time `herdr-factory install`
+sets up the supervisor itself, not a repo.
 
 ---
 
@@ -676,7 +684,11 @@ vitest. Store tested against `:memory:` SQLite (run lifecycle, active counting,
 lock TTL). `core/reconcile` tested with fake clients + in-memory store + an
 injected `now()` → deterministic phase-machine assertions. Every bug from the
 bash prototype is encoded as a regression test (see §14). Clients get thin
-contract tests; a live read-only smoke via `doctor`/`eligible`.
+contract tests; a live read-only smoke via `doctor`/`eligible`. The server client +
+fallback are unit-tested (`test/server-client.test.ts`): `readServerInfo`, `pingHealth`,
+and `viaServerOrLocal` against an ephemeral `node:http` server — asserting it uses the
+server when reachable, falls back to in-process on `NoServerError`, and propagates a
+reached-server error rather than masking it with a fallback.
 
 ---
 

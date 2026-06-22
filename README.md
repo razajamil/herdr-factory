@@ -23,10 +23,11 @@ All of these must be on your `PATH`:
   runtime node ABI must match the one it was built against)
 - `herdr` — the worktree/workspace server ([herdr.dev](https://herdr.dev))
 - `claude` — the Claude Code CLI
-- `git`, `gh` (authenticated), `curl`
-- `jq`
-- `yq` — mikefarah v4 (reads `config.yml`)
+- `git`, `gh` (authenticated)
 - A Jira account with an API token, and `launchd` (macOS — see [Platform](#platform) for Linux)
+
+(The TypeScript engine parses `config.yml` with the `yaml` package and talks HTTP via native
+`fetch` — no `jq`/`yq`/`curl` needed; those were bash-prototype dependencies.)
 
 The [herdr-plugin-workspace-manager](https://github.com/razajamil/herdr-plugin-workspace-manager)
 plugin is recommended for easier management of herdr layouts per workspace or repo.
@@ -145,7 +146,7 @@ launchd ─StartInterval─> herdr-factory ensure-up   (stateless one-shot: keep
         ▼
   To Do ─claim─> In Progress ─PR+automated round─> In Review ─merged/closed─> teardown
    (label)        worktree + "cat" worker          script transitions;        rm worktree,
-                  (fix → quality → PR →             7h watch wakes the         branch, archive
+                  (fix → review → PR →              7h watch wakes the         branch, archive
                    10-min CI/bot round → done)      worker on new comments
 ```
 
