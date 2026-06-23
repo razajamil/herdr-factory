@@ -210,11 +210,14 @@ export interface Loaded {
   secrets: Secrets;
 }
 
+// `?.trim() ||` (not `??`): treat an empty/whitespace override as unset, so a stray
+// `HERDR_FACTORY_STATE_ROOT=` doesn't collapse every state path to a relative "" root (and stays
+// consistent with bin/herdr-factory's `${VAR:-default}`, which also falls back on empty).
 function configDir(): string {
-  return process.env.HERDR_FACTORY_CONFIG_DIR ?? join(homedir(), ".config", "herdr-factory");
+  return process.env.HERDR_FACTORY_CONFIG_DIR?.trim() || join(homedir(), ".config", "herdr-factory");
 }
 function stateRoot(): string {
-  return process.env.HERDR_FACTORY_STATE_ROOT ?? join(homedir(), ".local", "state", "herdr-factory");
+  return process.env.HERDR_FACTORY_STATE_ROOT?.trim() || join(homedir(), ".local", "state", "herdr-factory");
 }
 
 /** Expand a leading `~`/`~/` and any `$HOME`/`${HOME}` to the home directory. Absolute paths and
@@ -256,6 +259,15 @@ export function assertMainCheckout(repoPath: string): void {
 /** Path to the one global DB (repo-agnostic commands like capture-lock need it). */
 export function globalDbPath(): string {
   return join(stateRoot(), "herdr-factory.db");
+}
+
+/** Machine-global file recording an absolute path to a verified Node >=24 binary. The CLI
+ *  self-bakes `process.execPath` here on every run (it only ever runs under >=24); the
+ *  `bin/herdr-factory` launcher falls back to it when the caller's active node is older — so the
+ *  CLI always runs on its own Node 24 regardless of the caller's cwd, with no version-manager
+ *  dependency at runtime. */
+export function nodePathFile(): string {
+  return join(stateRoot(), "node-path");
 }
 
 /** Every repo configured under `<configDir>/repos/<name>/config.yml`, sorted. The resident

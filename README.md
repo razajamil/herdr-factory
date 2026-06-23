@@ -19,8 +19,10 @@ All of these must be on your `PATH`:
 - `node` ≥ 24 — the CLI runs `src/*.ts` directly via Node's built-in type-stripping and stores
   state in the built-in `node:sqlite` (no native modules). `bin/herdr-factory` calls `node`
   directly; pin Node 24 with any version manager (a `.node-version` file is included, read by
-  `nvm`/`fnm`/`asdf`/`mise`). A worker agent invokes the CLI from other repos' worktrees, so make
-  sure the `node` resolved there is ≥ 24 too — the launcher errors clearly otherwise.
+  `nvm`/`fnm`/`asdf`/`mise`). A worker agent invokes the CLI from other repos' worktrees that may
+  activate an older node, so the launcher uses the active `node` when it's ≥ 24, else re-execs with
+  the Node 24 path the CLI baked on a prior run (`<state>/node-path`); run any command once under
+  Node 24 (e.g. `install`) to seed that, after which it works from any directory.
 - a package manager to install the runtime deps (`commander`, `yaml`, `zod`, and `hono` + its
   `node-server`/`zod-openapi`/`swagger-ui` adapters — all pure-JS): **`npm`** (bundled with Node)
   is enough to run it; **`pnpm`** is used for local development (the committed lockfile is

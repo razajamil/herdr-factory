@@ -99,7 +99,7 @@ Tests substitute fakes + `:memory:` SQLite.
 herdr-factory/
   package.json  tsconfig.json  README.md  docs/ARCHITECTURE.md
   bin/herdr-factory          cwd-robust launcher → `node src/cli/index.ts` (resolves its own dir through
-                          symlinks; guards Node >= 24; symlinked into ~/.local/bin)
+                          symlinks; runs Node >= 24 — active, else the baked node-path; symlinked into ~/.local/bin)
   .node-version              pins node 24 for this package (read by nvm/fnm/asdf/mise)
   src/
     cli/index.ts          commander program; routes via server (else in-process), dispatches
@@ -771,9 +771,11 @@ Hard-won from the bash prototype — encode as types/tests/asserts:
 - **Runtime requires Node ≥ 24; no native modules.** The `.ts` sources run via native
   type-stripping and state lives in the built-in `node:sqlite` — both need Node ≥ 24, and neither
   is ABI-coupled (there is no compiled `.node` to match). The CLI is invoked by worker agents **from
-  another repo's worktree**, whose `node` on PATH may be older — so `bin/herdr-factory` runs `node`
-  directly and guards `node -v >= 24`, erroring clearly rather than failing cryptically on type
-  stripping. The launchd supervisor + the `serve` it spawns run under the `process.execPath` baked
+  another repo's worktree**, whose `node` on PATH may be older — so `bin/herdr-factory` uses the
+  active `node` when it's ≥ 24, else re-execs with the Node 24 path the CLI self-bakes
+  (`process.execPath` → `<state>/node-path`, `config.nodePathFile`) on every ≥ 24 run; it errors
+  with guidance only if neither is available (so the first run / `install` must be under Node ≥ 24
+  to seed it). The launchd supervisor + the `serve` it spawns run under the `process.execPath` baked
   into the plist at install time, so `install` must be run under a Node ≥ 24.
 - **Self-update + `VERSION` resolve against the package dir, never the caller's cwd.** A worker
   invokes the CLI from another repo's worktree, so `version.ts` (git HEAD sha → `VERSION`) and

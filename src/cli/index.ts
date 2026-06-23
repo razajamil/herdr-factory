@@ -1,7 +1,7 @@
-import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { Command } from "commander";
-import { globalDbPath } from "../config.ts";
+import { globalDbPath, nodePathFile } from "../config.ts";
 import { openDb } from "../db/index.ts";
 import { Store } from "../db/store.ts";
 import { systemClock, type Run, type StepName } from "../types.ts";
@@ -21,6 +21,27 @@ function fail(e: unknown): never {
   console.error(e instanceof Error ? e.message : String(e));
   process.exit(1);
 }
+
+/** Record this node binary so `bin/herdr-factory` can re-exec with a known Node >=24 from any cwd
+ *  (see config.nodePathFile). Best-effort + guarded to >=24 so we never bake an unusable path (the
+ *  CLI effectively only ever runs under >=24 anyway — type-stripping + node:sqlite require it).
+ *  Runs on every invocation, so it self-heals as the pinned node is upgraded. */
+function bakeNodePath(): void {
+  try {
+    if (Number(process.versions.node.split(".")[0]) < 24) return;
+    const file = nodePathFile();
+    if (existsSync(file) && readFileSync(file, "utf8") === process.execPath) return;
+    mkdirSync(dirname(file), { recursive: true });
+    // Atomic publish (write sibling temp, then rename) so a concurrent launcher `cat` never reads a
+    // torn/empty file — writeFileSync truncates first, and multiple workers can bake at once.
+    const tmp = `${file}.${process.pid}`;
+    writeFileSync(tmp, process.execPath);
+    renameSync(tmp, file);
+  } catch {
+    /* best-effort: a read-only / uncreatable state dir must never break the CLI */
+  }
+}
+bakeNodePath();
 
 /** A console logger for the repo-agnostic supervisor commands (serve/ensure-up/install/…). */
 const consoleLog: Log = (level, msg) => console.log(`[${level}] ${msg}`);
