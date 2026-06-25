@@ -29,7 +29,7 @@ work_sources:
     jira:
       base_url: https://your-org.atlassian.net # the Atlassian site (auth — email+token — lives in this repo's env file)
       project: PROJ
-      board: 123
+      board: "123"
       label: agent
       status:
         todo: To Do
@@ -77,8 +77,22 @@ belt:
     priority: 2
     workspace_name: "research/{{work_id}}-{{work_slug}}"
     steps:
-      - { name: research, tab: research, pane: agent, prompt_file: prompts/work_generation/research.md, prompt_file_source: config }
-      - { name: propose, prompt_file: prompts/work_generation/propose.md, prompt_file_source: config }
-      - { name: create_jira_ticket, prompt_file: prompts/work_generation/create-jira-ticket.md, prompt_file_source: config }
+      - {
+          name: research,
+          tab: research,
+          pane: agent,
+          prompt_file: prompts/work_generation/research.md,
+          prompt_file_source: config,
+        }
+      - {
+          name: propose,
+          prompt_file: prompts/work_generation/propose.md,
+          prompt_file_source: config,
+        }
+      - {
+          name: create_jira_ticket,
+          prompt_file: prompts/work_generation/create-jira-ticket.md,
+          prompt_file_source: config,
+        }
 
 # guidelines-prompt.md in this folder (if present) is appended to EVERY step prompt of EVERY belt.
