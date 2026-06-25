@@ -1,5 +1,32 @@
 # herdr-factory — Architecture
 
+> **⚠️ Belt redesign (current model — read this first).** The pipeline is no longer a fixed
+> per-source `fix → review → pr`. Config now has two top-level lists: **`work_sources`** (backends:
+> *where* work is pulled — `jira` / `local_markdown`, with no pipeline) and **`belt`** (*what* to do
+> with it). A **belt** pairs a source with an ordered pipeline and has a `belt_type`:
+> - **`work_to_pull_request`** — the engine-owned `fix → review → pr` flow + the PR-watch/merge
+>   lifecycle (`reviewing` phase, resolver). This is exactly the pipeline the sections below
+>   describe; it now lives on a belt and is gated by belt selection.
+> - **`custom`** — user-defined ordered `steps[]`, each with its own `prompt_file`, fully
+>   agent-driven: the run ends when the **last** step signals `step-done` (no PR, no `reviewing`).
+>
+> The `agents.{fix,review,pr}` block + `workspace_name` + `priority` moved **off the source and
+> onto the belt**. Belt selection is programmatic: at claim time belts are walked in `priority`
+> order and the first whose `match` predicate (a `.ts` default export `(ctx)=>boolean`) accepts an
+> item claims it (first match wins; no `match` ⇒ accept all). A run records its `belt` + active
+> `step` columns. Phases collapsed to `claiming | running | reviewing | tearing_down | done |
+> attention` (the active step is on `run.step`); `StepName` is now `string`; `prompt_type` is gone.
+> Prompt model: a `work_to_pull_request` step uses the engine-shipped prompt, optionally **augmented**
+> by an `agents.<step>.prompt_file`; a `custom` step's body is its (required) `prompt_file`. Each
+> `prompt_file` has a `prompt_file_source` — `config` (the repo's config folder, read at load) or
+> `repo` (the target repo checkout, read from the run's worktree at render time) — and every step
+> gets an injected handover scaffold. Outcomes gained `completed` and WorkState
+> gained `done` for custom-belt terminals. Migration v7 adds `runs.belt`/`runs.step` and widens the
+> `work_items.status` CHECK. **Where the prose below says "per source pipeline / `agents` /
+> `prompt_type` / fix→review→pr is universal," read it as the `work_to_pull_request` belt** — the
+> mechanics (worktree, per-step gate, handoff, PR watch) are unchanged; only their configuration
+> home and selection moved. The README reflects the new model end-to-end.
+
 Autonomous work → PR factory that runs Claude worker agents across one or
 more repos, on top of [herdr](https://herdr.dev) worktrees. A single idempotent
 reconciler (`reconcileRepo`, looped by the resident **`serve`** daemon — one process
@@ -559,10 +586,10 @@ left as-is).
 
 ## 10. Config
 
-- **Global secrets** — `~/.config/herdr-factory/env` (chmod 600):
-  `JIRA_EMAIL`, `JIRA_API_TOKEN` — Jira **auth** only (one Atlassian account; an API token
-  authenticates against any site that account can reach). *Where* work is polled from (the
-  Atlassian site `base_url`) is per-repo config, not a global secret.
+- **Per-repo secrets** — `repos/<name>/env` (chmod 600): `JIRA_EMAIL`, `JIRA_API_TOKEN` — Jira
+  **auth** only. Secrets are strictly per-repo; there is no shared/global secrets file. *Where*
+  work is polled from (the Atlassian site `base_url`) is per-repo config, not a secret.
+  (`loadSecrets(repoDir)` reads only `<repoDir>/env`.)
 - **Per-repo** — `~/.config/herdr-factory/repos/<name>/`:
   - `config.yml` — parsed with `yaml`, validated with `zod` → typed `Config`:
     - `repo` — `path` / `base_ref` / `github` (repo-global). `path` (and any source path) supports
@@ -579,9 +606,9 @@ left as-is).
         v6-backfilled in-flight runs resolve.
       - `priority` — optional, default `100`; **lower = pulled first**; ties break by list order.
       - `workspace_name` — **per source** now. Branch-name template (worktree + workspace derive
-        from it). Vars: `{{ticket_id}}` `{{ticket_short_slug}}` (≤20) `{{ticket_slug}}` (≤50)
-        `{{ticket_type}}` `{{ticket_prefix}}` (`fix`/`chore`/`feature`). zod requires `{{ticket_id}}`.
-        Default `{{ticket_prefix}}/{{ticket_id}}-{{ticket_slug}}`. (Keys should be unique across
+        from it). Vars: `{{work_id}}` `{{work_slug}}` (≤20) `{{work_full_slug}}` (≤50)
+        `{{work_type}}` `{{semantic_work_prefix}}` (`fix`/`chore`/`feature`). zod requires `{{work_id}}`.
+        Default `{{semantic_work_prefix}}/{{work_id}}-{{work_full_slug}}`. (Keys should be unique across
         sources, and per-source templates should differ, so two sources can't collide on a branch.)
       - `agents` — **per source**, required, one block each for `fix`/`review`/`pr`: `tab`/`pane`
         (optional, both-or-neither) + `prompt_type` (required, no default: `augment` | `replace`)

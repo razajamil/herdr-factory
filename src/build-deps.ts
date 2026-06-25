@@ -1,16 +1,31 @@
 import { appendFileSync, mkdirSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { loadConfig, type Config } from "./config.ts";
 import { openDb } from "./db/index.ts";
 import { Store } from "./db/store.ts";
 import { systemClock } from "./types.ts";
+import type { BeltMatch } from "./types.ts";
 import { HerdrClient } from "./clients/herdr.ts";
 import { JiraSource } from "./clients/jira-source.ts";
 import { LocalMarkdownSource } from "./clients/local-markdown-source.ts";
 import { GitHubClient } from "./clients/github.ts";
 import { GitClient, parseGhRepo } from "./clients/git.ts";
-import type { Deps, Logger, SourceRuntime } from "./core/deps.ts";
+import type { BeltRuntime, Deps, Logger, SourceRuntime } from "./core/deps.ts";
+
+/** Load a belt's `match` predicate from its resolved `.ts` module (default export). Node strips
+ *  types on import, so the module runs as-is with no build step. Throws if the default export
+ *  isn't a function — a misconfigured predicate should fail loudly at startup, not silently match
+ *  nothing. Returns undefined when the belt has no match file (⇒ it accepts anything). */
+async function loadMatch(matchFile: string | undefined): Promise<BeltMatch | undefined> {
+  if (!matchFile) return undefined;
+  const mod = (await import(pathToFileURL(matchFile).href)) as { default?: unknown };
+  if (typeof mod.default !== "function") {
+    throw new Error(`belt match file ${matchFile} must \`export default\` a function (got ${typeof mod.default})`);
+  }
+  return mod.default as BeltMatch;
+}
 
 export function today(): string {
   return new Date().toISOString().slice(0, 10);
@@ -38,19 +53,21 @@ export async function buildDeps(repoName: string): Promise<Deps> {
   const store = new Store(openDb(config.paths.dbPath), systemClock);
   const git = new GitClient();
   const ghRepo = config.repo.github ?? parseGhRepo(await git.originUrl(config.repo.path)) ?? "";
-  // config.sources is already priority-ordered; build a live client per source.
+  // Build a live client per work source (backends only — the pipeline lives on belts).
   const sources: SourceRuntime[] = config.sources.map((s) => ({
     name: s.name,
     type: s.type,
-    priority: s.priority,
-    workspaceName: s.workspaceName,
-    agents: s.agents,
     client:
       s.type === "jira"
         ? new JiraSource(s.jira!, secrets.jiraEmail, secrets.jiraApiToken)
         : new LocalMarkdownSource(s.localMarkdown!.folder, store, repoName, s.name),
   }));
-  const byName = new Map(sources.map((s) => [s.name, s]));
+  const sourceByName = new Map(sources.map((s) => [s.name, s]));
+  // config.belts is already priority-ordered; load each belt's match predicate (if any).
+  const belts: BeltRuntime[] = await Promise.all(
+    config.belts.map(async (b) => ({ ...b, match: await loadMatch(b.matchFile) })),
+  );
+  const beltByName = new Map(belts.map((b) => [b.name, b]));
   return {
     config,
     secrets,
@@ -58,7 +75,9 @@ export async function buildDeps(repoName: string): Promise<Deps> {
     ghRepo,
     herdr: new HerdrClient(process.env.HERDR_BIN_PATH ?? "herdr"),
     sources,
-    resolveSource: (name) => (name == null ? undefined : byName.get(name)),
+    resolveSource: (name) => (name == null ? undefined : sourceByName.get(name)),
+    belts,
+    resolveBelt: (name) => (name == null ? undefined : beltByName.get(name)),
     github: new GitHubClient(),
     git,
     log: makeLogger(config),

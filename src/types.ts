@@ -1,35 +1,43 @@
 // Shared domain types.
 
+/**
+ * A run's lifecycle position — belt-agnostic now. `running` means a belt step's agent is active
+ * (which step is on `run.step`); the old per-step phases (fixing/auto_review/pr_round) collapsed
+ * into it once steps became belt-defined. `reviewing` (the token-free PR watch + resolver) is
+ * entered only by `work_to_pull_request` belts after their PR step; `custom` belts never reach it.
+ */
 export type Phase =
   | "claiming"
-  | "fixing" // fix agent
-  | "auto_review" // review agent
-  | "pr_round" // pr agent: opens the PR + drives the CI/bot round
-  | "reviewing" // human-review watch + resolver
+  | "running" // a belt step's agent is active (run.step says which)
+  | "reviewing" // work_to_pull_request only: human-review watch + resolver
   | "tearing_down"
   | "done"
   | "attention";
 
-/** The pipeline step a phase runs. */
-export type StepName = "fix" | "review" | "pr";
+/** A belt step's name. Fixed (fix|review|pr) for work_to_pull_request, user-defined for custom —
+ *  so it's just a string; the configured belt is the source of truth for which names are valid. */
+export type StepName = string;
 
-export type Outcome = "merged" | "closed" | "abandoned" | "timeout";
+// merged|closed come from a PR; completed is a non-PR belt's success (last step signalled done);
+// abandoned|timeout are failures.
+export type Outcome = "merged" | "closed" | "abandoned" | "timeout" | "completed";
 
 /**
  * The canonical work lifecycle, source-agnostic. Each work source maps these onto its own
- * backend: Jira maps todo/in_development/in_review onto configured Jira statuses (merged/aborted
- * are deliberately UNMAPPED — Jira's terminal state is owned by its GitHub integration, so a
- * transition to them is a no-op with no network call); local_markdown maps all five onto rows
- * in the `work_items` table (todo → in_development → in_review → merged|aborted, both terminal).
+ * backend: Jira maps todo/in_development/in_review onto configured Jira statuses (merged/aborted/
+ * done are deliberately UNMAPPED — Jira's terminal state is owned by its GitHub integration, so a
+ * transition to them is a no-op with no network call); local_markdown maps all of them onto rows
+ * in the `work_items` table. `done` is the terminal state for a custom (non-PR) belt's success.
  */
-export type WorkState = "todo" | "in_development" | "in_review" | "merged" | "aborted";
+export type WorkState = "todo" | "in_development" | "in_review" | "merged" | "aborted" | "done";
 
 /** Map a run Outcome to the terminal WorkState written back at teardown. */
-export function outcomeToWorkState(outcome: Outcome): "merged" | "aborted" {
-  // merged is the only success; everything else (PR closed, abandoned, watch timeout) is aborted.
+export function outcomeToWorkState(outcome: Outcome): "merged" | "aborted" | "done" {
   switch (outcome) {
     case "merged":
-      return "merged";
+      return "merged"; // PR merged
+    case "completed":
+      return "done"; // custom belt finished its last step
     case "closed":
     case "abandoned":
     case "timeout":
@@ -56,16 +64,18 @@ export type EventType =
   | "attention"
   | "error";
 
-/** A single attempt at delivering one Jira ticket as a PR. */
+/** A single attempt at running one work item through a belt. */
 export interface Run {
   id: number;
   repo: string;
   workSource: string | null; // which configured work source this run was claimed from
+  belt: string | null; // which belt is processing it (its step sequence + lifecycle)
   ticketKey: string;
   summary: string | null;
   issueType: string | null;
   branch: string | null;
   phase: Phase;
+  step: string | null; // the active belt step when phase === "running"
   workspaceId: string | null;
   paneId: string | null;
   worktreePath: string | null;
@@ -85,6 +95,7 @@ export type RunPatch = Partial<
   Pick<
     Run,
     | "phase"
+    | "step"
     | "branch"
     | "summary"
     | "issueType"
@@ -133,6 +144,9 @@ export interface WorkItem {
   createdAt: number;
   updatedAt: number;
 }
+
+/** The kind of backend a work source polls. */
+export type SourceType = "jira" | "local_markdown";
 
 /** epoch-seconds clock, injected for testability. */
 export type Clock = () => number;
@@ -201,4 +215,59 @@ export interface ReviewSig {
   unresolved: number;
   failing: number;
   sig: string;
+}
+
+// --- belt routing (the `match` predicate) -----------------------------------
+// A belt may carry a `match` predicate (a `.ts` module's default export). At claim time the
+// reconciler walks belts in priority order and the FIRST belt whose predicate returns true claims
+// the item (a belt with no predicate accepts anything from its source). The predicate receives the
+// item's metadata + its source — enough to route on without claiming first. These types are
+// exported so a user's `match.ts` can import them: `import type { BeltMatch } from ".../types.ts"`.
+
+/** The source a candidate item came from. */
+export interface MatchSource {
+  name: string;
+  type: SourceType;
+}
+
+/** A Jira candidate (sourceType "jira") exposed to a belt's match predicate. `fields` is the raw
+ *  Jira issue.fields object (summary/status/issuetype/labels/…) for arbitrary routing. */
+export interface JiraMatchItem {
+  sourceType: "jira";
+  key: string;
+  summary: string;
+  type: string; // issue type name, e.g. "Bug"
+  status: string; // current Jira status name
+  labels: string[];
+  fields: Record<string, unknown>;
+}
+
+/** A local_markdown candidate (sourceType "local_markdown") exposed to a belt's match predicate. */
+export interface LocalMarkdownMatchItem {
+  sourceType: "local_markdown";
+  key: string;
+  summary: string;
+  type: string;
+  path: string; // the .md file or directory backing this item
+  filename: string; // basename of `path`
+  frontMatter: Record<string, unknown>; // parsed YAML front-matter ({} when none)
+  body: string; // the markdown body (front-matter stripped)
+}
+
+/** A candidate work item: the rich, source-tagged metadata a source surfaces from `listEligible`.
+ *  Belts route on it (as `ctx.item`), and the lean Ticket (key/summary/type) used for claim +
+ *  branch naming is derived from it via `ticketOf` — so key/summary/type live in exactly one place. */
+export type MatchItem = JiraMatchItem | LocalMarkdownMatchItem;
+
+export interface MatchContext {
+  item: MatchItem;
+  source: MatchSource;
+}
+
+/** The shape of a belt's `match.ts` default export. May be sync or async. */
+export type BeltMatch = (ctx: MatchContext) => boolean | Promise<boolean>;
+
+/** The lean Ticket every candidate carries (key/summary/type) — for claim + branch naming. */
+export function ticketOf(item: MatchItem): Ticket {
+  return { key: item.key, summary: item.summary, type: item.type };
 }

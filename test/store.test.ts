@@ -14,7 +14,7 @@ function makeStore(start = 1000) {
 describe("Store", () => {
   it("creates a run in claiming and counts it active", () => {
     const { store } = makeStore();
-    const run = store.createRun({ repo: "r", workSource: "jira", ticketKey: "K-1", summary: "s", issueType: "Bug", branch: "fix/K-1-s" });
+    const run = store.createRun({ repo: "r", workSource: "jira", belt: "ship", ticketKey: "K-1", summary: "s", issueType: "Bug", branch: "fix/K-1-s" });
     expect(run.phase).toBe("claiming");
     expect(store.countActive("r")).toBe(1);
     expect(store.activeRunForTicket("r", "jira", "K-1")?.id).toBe(run.id);
@@ -22,11 +22,12 @@ describe("Store", () => {
 
   it("updates fields and bumps updated_at", () => {
     const { store, tick } = makeStore(1000);
-    const run = store.createRun({ repo: "r", workSource: "jira", ticketKey: "K-2" });
+    const run = store.createRun({ repo: "r", workSource: "jira", belt: "ship", ticketKey: "K-2" });
     tick(5);
-    store.updateRun(run.id, { phase: "fixing", prNumber: 42, workspaceId: "w1" });
+    store.updateRun(run.id, { phase: "running", step: "fix", prNumber: 42, workspaceId: "w1" });
     const got = store.getRun(run.id)!;
-    expect(got.phase).toBe("fixing");
+    expect(got.phase).toBe("running");
+    expect(got.step).toBe("fix");
     expect(got.prNumber).toBe(42);
     expect(got.workspaceId).toBe("w1");
     expect(got.updatedAt).toBe(1005);
@@ -34,7 +35,7 @@ describe("Store", () => {
 
   it("run_steps: upsert inserts then patches, markStepDone, per-run listing", () => {
     const { store } = makeStore();
-    const run = store.createRun({ repo: "r", workSource: "jira", ticketKey: "K-R" });
+    const run = store.createRun({ repo: "r", workSource: "jira", belt: "ship", ticketKey: "K-R" });
     expect(store.getRunStep(run.id, "fix")).toBeUndefined();
 
     // first upsert inserts the row + applies the patch
@@ -62,7 +63,7 @@ describe("Store", () => {
 
   it("ends a run -> not active, has outcome + ended_at", () => {
     const { store } = makeStore();
-    const run = store.createRun({ repo: "r", workSource: "jira", ticketKey: "K-3" });
+    const run = store.createRun({ repo: "r", workSource: "jira", belt: "ship", ticketKey: "K-3" });
     store.endRun(run.id, "merged");
     expect(store.countActive("r")).toBe(0);
     const got = store.getRun(run.id)!;
@@ -73,9 +74,9 @@ describe("Store", () => {
 
   it("supports multiple attempts per ticket and keeps history", () => {
     const { store, db } = makeStore();
-    const a = store.createRun({ repo: "r", workSource: "jira", ticketKey: "K-4" });
+    const a = store.createRun({ repo: "r", workSource: "jira", belt: "ship", ticketKey: "K-4" });
     store.endRun(a.id, "closed");
-    const b = store.createRun({ repo: "r", workSource: "jira", ticketKey: "K-4" }); // re-claim after a failed attempt
+    const b = store.createRun({ repo: "r", workSource: "jira", belt: "ship", ticketKey: "K-4" }); // re-claim after a failed attempt
     expect(store.countActive("r")).toBe(1);
     expect(store.activeRunForTicket("r", "jira", "K-4")?.id).toBe(b.id);
     const { n } = db.prepare("SELECT COUNT(*) AS n FROM runs WHERE ticket_key = 'K-4'").get() as { n: number };
@@ -84,7 +85,7 @@ describe("Store", () => {
 
   it("records events with JSON detail", () => {
     const { store, db } = makeStore();
-    const run = store.createRun({ repo: "r", workSource: "jira", ticketKey: "K-5" });
+    const run = store.createRun({ repo: "r", workSource: "jira", belt: "ship", ticketKey: "K-5" });
     store.recordEvent({ runId: run.id, repo: "r", ticketKey: "K-5", type: "claimed" });
     store.recordEvent({ runId: run.id, repo: "r", ticketKey: "K-5", type: "pr_opened", detail: { number: 7 } });
     const evs = db.prepare("SELECT type, detail FROM events WHERE run_id = ? ORDER BY id").all(run.id) as {
@@ -97,8 +98,8 @@ describe("Store", () => {
 
   it("scopes activeRunForTicket by source — same key in two sources is two runs", () => {
     const { store } = makeStore();
-    const j = store.createRun({ repo: "r", workSource: "jira", ticketKey: "DUP-1", branch: "fix/DUP-1" });
-    const m = store.createRun({ repo: "r", workSource: "local_markdown", ticketKey: "DUP-1", branch: "feature/DUP-1" });
+    const j = store.createRun({ repo: "r", workSource: "jira", belt: "ship", ticketKey: "DUP-1", branch: "fix/DUP-1" });
+    const m = store.createRun({ repo: "r", workSource: "local_markdown", belt: "gen", ticketKey: "DUP-1", branch: "feature/DUP-1" });
     expect(store.countActive("r")).toBe(2);
     expect(store.activeRunForTicket("r", "jira", "DUP-1")?.id).toBe(j.id);
     expect(store.activeRunForTicket("r", "local_markdown", "DUP-1")?.id).toBe(m.id);
@@ -106,10 +107,22 @@ describe("Store", () => {
     expect(store.activeRunsForKey("r", "DUP-1").map((x) => x.workSource).sort()).toEqual(["jira", "local_markdown"]);
   });
 
-  it("records the work_source on each run", () => {
+  it("records the work_source + belt on each run, and the active step", () => {
     const { store } = makeStore();
-    const run = store.createRun({ repo: "r", workSource: "local_markdown", ticketKey: "M-1" });
+    const run = store.createRun({ repo: "r", workSource: "local_markdown", belt: "gen", ticketKey: "M-1" });
     expect(store.getRun(run.id)!.workSource).toBe("local_markdown");
+    expect(store.getRun(run.id)!.belt).toBe("gen");
+    expect(store.getRun(run.id)!.step).toBeNull();
+    store.updateRun(run.id, { phase: "running", step: "research" });
+    expect(store.getRun(run.id)!.step).toBe("research");
+  });
+
+  it("work_items accepts the custom-belt terminal state 'done' (migration v7)", () => {
+    const { store } = makeStore();
+    expect(store.setWorkItemStatus("r", "lm", "idea-1", "done")).toBe(true);
+    expect(store.getWorkItem("r", "lm", "idea-1")!.status).toBe("done");
+    // a 'done' item is terminal — listing by 'todo' must not surface it
+    expect(store.listWorkItems("r", "lm", "todo").map((x) => x.key)).not.toContain("idea-1");
   });
 
   it("work_items: upsert status is idempotent, tolerant of any→any, and merges metadata", () => {

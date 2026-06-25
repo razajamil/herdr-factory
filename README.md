@@ -3,12 +3,20 @@
 Autonomous work → PR **factory** that runs Claude worker agents across one
 or more repos, on top of [herdr](https://herdr.dev) worktrees.
 
-Point it at one or more **work sources** — a Jira board, a folder of markdown task
-briefs — and walk away: the factory claims an item, spins up a herdr worktree, runs
-Claude through fix → review → PR, watches the PR, and tears the worktree down on merge.
-Sources are pulled in priority order under one global concurrency cap; each source has its
-own branch template and pipeline agents. Two source types ship today: `jira` (status of
-record lives in Jira) and `local_markdown` (lifecycle tracked internally by herdr-factory).
+Point it at one or more **work sources** — a Jira board, a folder of markdown task briefs — and
+define one or more **belts** that say what to *do* with the work, then walk away: the factory
+claims an item, spins up a herdr worktree, and runs it through the belt's pipeline of agent steps.
+A **belt** pairs a source with an ordered list of steps. Two belt types ship today:
+
+- **`work_to_pull_request`** — the classic fix → review → pr flow. The engine owns the steps,
+  rides the PR through CI + human review to merge, and tears the worktree down. "Walk away."
+- **`custom`** — your own ordered, agent-driven steps (e.g. research → propose →
+  create_jira_ticket). Each step owns its prompt; the run ends when the last step signals done.
+
+Belts are walked in priority order under one global concurrency cap, and each belt can carry a
+programmatic `match` predicate so several belts can share one source (first match wins). Two
+source types ship: `jira` (status of record lives in Jira) and `local_markdown` (lifecycle
+tracked internally by herdr-factory).
 
 ## Quick start
 
@@ -49,16 +57,16 @@ ln -s ~/dev/raza/herdr-factory/bin/herdr-factory ~/.local/bin/herdr-factory   # 
 
 ### 2. Add your Jira credentials
 
-Create `~/.config/herdr-factory/env` (chmod 600) — these are global, shared by every repo:
+Credentials are **per-repo** — create `repos/<name>/env` (chmod 600):
 
 ```sh
 JIRA_EMAIL=you@org.com
 JIRA_API_TOKEN=...        # id.atlassian.com → Security → API tokens
 ```
 
-These are just the Jira **auth** (one Atlassian account — an API token authenticates against
-any site that account can reach). *Where* each repo polls work from — the Atlassian site
-(`base_url`), project, board, label, statuses — is per-repo, set in its `config.yml` (next).
+These are just the Jira **auth**, and they live **only** in `repos/<name>/env` — there is no shared
+global secrets file. *Where* each repo polls work from — the Atlassian site (`base_url`), project,
+board, label, statuses — is per-repo, set in its `config.yml` (next).
 
 ### 3. Configure a repo
 
@@ -72,54 +80,81 @@ In `repos/<name>/config.yml`, set:
 
 - `repo.path` / `repo.base_ref` — the main checkout and the branch worktrees fork from
   (repo-global; `~` / `$HOME` are expanded)
-- `limits` — repo-global tuning, incl. `max_active` (the global concurrency cap across sources)
-- `work_sources` — an ordered, **priority-ranked** list (≥1). Each entry has a `type`
-  (`jira` | `local_markdown`), an optional `name` (default = type, unique per repo) and
-  `priority` (lower = pulled first), its own `workspace_name` branch template (must include
-  `{{ticket_id}}`), its own `agents.{fix,review,pr}` blocks, and a type-specific block:
+- `limits` — repo-global tuning, incl. `max_active` (the global concurrency cap across belts)
+- `work_sources` — backends (≥1): **where** work is pulled from. Each has a `type`
+  (`jira` | `local_markdown`), an optional `name` (default = type, unique per repo), and a
+  type-specific block. No pipeline lives here anymore — that's a belt.
   - `jira:` — `base_url` / `project` / `board` / `label` / the three `status` names
   - `local_markdown:` — `folder` (a directory of task briefs; each top-level item is either a
     single `*.md` file *or* a top-level subdirectory containing at least one top-level `*.md`,
     keyed by filename/dirname, with status tracked internally — the source is never modified). A
     directory item is copied whole into the worktree so multi-file briefs (spec + assets) work.
+- `belt` — pipelines (≥1): **what** to do with the work. Each belt has a `name`, a `belt_type`, a
+  `source` (referencing a `work_sources` name), a `priority` (lower = matched first), its own
+  `workspace_name` branch template (must include `{{work_id}}`; other vars: `{{work_slug}}` (≤20),
+  `{{work_full_slug}}` (≤50), `{{work_type}}`, `{{semantic_work_prefix}}` = fix/chore/feature), and
+  an optional `match`.
 
-Each agent block has the agent's **`prompt_type`**, optionally a `prompt_file`, and optionally a
-`tab` / `pane`:
+**Belt selection.** At claim time belts are walked in `priority` order; the first belt whose
+`match` predicate accepts an item claims it (**first match wins**). `match` is a path (relative to
+the repo folder) to a `.ts` module whose `export default` is `(ctx) => boolean` (sync or async),
+where `ctx = { item, source }`. A belt with no `match` accepts anything from its source. This is
+how several belts can share one source (e.g. route Jira bugs to one belt, stories to another).
 
-Each agent can target a herdr layout **`tab` / `pane`** (set both, or neither):
+**Belt types.**
 
-- **With `tab` / `pane`** — the dispatcher waits for your layout to bring that pane up with
-  an idle agent, then sends the step's prompt there. It never spawns its own pane for that
-  step; if the pane never appears within `limits.layout_wait_seconds` (default 600), the
-  ticket is flagged for **attention**. Use this when an external setup (e.g. the
-  workspace-manager plugin) auto-spawns your tabs/panes/dev-servers/agents per worktree.
+- **`work_to_pull_request`** — the classic fix → review → pr flow. The engine owns the three steps
+  *and* ships their prompts and rides the PR through CI + human review to merge ("walk away"). Its
+  `agents.{fix,review,pr}` block picks each step's layout pane (see below) and may OPTIONALLY add a
+  `prompt_file` (+ a required `prompt_file_source`) that **augments** that step's engine prompt with
+  repo-specific instructions. (`guidelines-prompt.md` still augments every step, and the worker
+  reads the repo's own `CLAUDE.md`/skills natively.)
+- **`custom`** — your own ordered `steps[]`, fully agent-driven. Each step has a `name` (a
+  lowercase slug), a **required** `prompt_file` + `prompt_file_source` (the whole step body), an
+  optional layout `tab`/`pane`, and optional `budget_seconds` / `heartbeat` (commit-stall detection,
+  off by default). The run ends when the **last** step signals step-done — no PR, no review watch.
+
+**Layout `tab` / `pane`** (set both, or neither — applies to a w2pr agent or a custom step):
+
+- **With `tab` / `pane`** — the dispatcher waits for your layout to bring that pane up with an idle
+  agent, then sends the step's prompt there. It never spawns its own pane for that step; if the
+  pane never appears within `limits.layout_wait_seconds` (default 600), the item is flagged for
+  **attention**. Use this when an external setup (e.g. the workspace-manager plugin) auto-spawns
+  your tabs/panes/dev-servers/agents per worktree.
 - **Without `tab` / `pane`** — herdr-factory spawns its own dedicated agent pane for the step.
 
-Every agent also needs a **`prompt_type`** — it's required, with no silent default, so the
-prompt the agent receives is never a surprise:
+**Prompts.** A step's `prompt_file` is the step body (custom) or an augmenting addendum to the
+engine prompt (w2pr). `prompt_file_source` says where it's read from: **`config`** = relative to
+this repo's config folder (`repos/<name>/`, read at config-load); **`repo`** = relative to the
+target repo checkout, read from the run's **worktree at render time** — so the prompt can live
+version-controlled in the codebase (a missing one surfaces when the step is dispatched). The engine
+always prepends a small **handover scaffold** (you're step X of belt Y; the belt runs A → B → C;
+the prior step's handoff is at `…`; when done, write your handoff and run step-done). Prompt files
+support tokens like `@@KEY@@`, `@@BELT@@`, `@@STEPS@@`, `@@WORK_DOC@@` (the item's spec —
+`ticket.json` for Jira; `task.md` or, for a directory item, `task/` for local_markdown),
+`@@WORK_DOC_KIND@@`, `@@HANDOFF_IN@@`, and `@@STEP_DONE_CMD@@`. `guidelines-prompt.md` (if present)
+is appended to *every* step of *every* belt; delete it if unused. The `work_to_pull_request`
+built-ins live in `src/prompts/` (per source type under `src/prompts/<type>/`).
 
-- **`augment`** *(recommended — start here)* — the engine ships a sensible built-in prompt
-  for the step, and your `prompt_file` (optional in this mode) is appended to it as extra,
-  repo-specific instructions. Begin with `augment` while you get a feel for how the agents
-  behave; you only need to write down the repo-specific extras, not a whole prompt.
-- **`replace`** — your `prompt_file` (required in this mode) is sent to the agent verbatim,
-  so you own the entire prompt. Switch to `replace` once you understand the system and want
-  full control.
-
-In both modes the `prompt_file` lives in the repo folder and supports tokens like `@@KEY@@`,
-`@@WORK_DOC@@` (the item's spec — `ticket.json` for Jira; `task.md` or, for a directory item,
-`task/` for local_markdown), `@@WORK_DOC_KIND@@` (how to describe it in prose), and
-`@@STEP_DONE_CMD@@`. Optionally add repo-specific guidance to `guidelines-prompt.md` (appended to
-every agent prompt in either mode; delete it if unused). The `augment` built-in is resolved per
-source type (`src/prompts/<type>/<step>.md`, else the shared `src/prompts/<step>.md`).
+**Editor support.** Each `config.yml`'s first line is a modeline —
+`# yaml-language-server: $schema=../../config.schema.json` — so the YAML language server gives
+autocomplete + inline validation (required fields, enums, and **unknown-key** errors that catch the
+classic `agents`-on-a-`custom`-belt mixup). The relative `../../` resolves to `<configDir>/`
+for a deployed `repos/<name>/config.yml`, where **`herdr-factory install` writes the schema**
+(regenerate after upgrading with `herdr-factory schema`); and to the **repo root** for the in-repo
+`examples/example-repo/config.yml`, where a committed `config.schema.json` lives (regenerate with
+`npm run schema`; a test guards it against drift). It's derived from the engine's own zod schema
+(no drift) and is *structural* — the cross-field rules (belt `source` refs, unique names, layout
+both-or-neither, `workspace_name` must contain `{{work_id}}`, file existence) are still validated at
+load with readable errors.
 
 ### 4. Define the herdr layout
 
-Lay out one tab/pane per agent that starts `claude`, matching `agents.fix.tab`/`.pane`,
-`agents.review.*`, and `agents.pr.*`. The dispatcher sends each step's prompt into its
-pane; if a pane is absent it falls back to opening its own. The
-[workspace-manager plugin](https://github.com/razajamil/herdr-plugin-workspace-manager)
-makes this layout reusable per repo.
+Lay out one tab/pane per belt step that starts `claude`, matching each step's `tab`/`pane`. The
+dispatcher sends each step's prompt into its pane; if a pane is absent it falls back to opening its
+own. The [workspace-manager plugin](https://github.com/razajamil/herdr-plugin-workspace-manager)
+makes this layout reusable per repo — and since each belt names its worktrees distinctively
+(`workspace_name`), your layout can key off the worktree name to provision the right panes.
 
 ### 5. Install and start
 
@@ -151,19 +186,20 @@ launchd ─StartInterval─> herdr-factory ensure-up   (stateless one-shot: keep
                                   │ (re)starts if down/wedged/outdated
                                   ▼
         herdr-factory serve   (one resident process, ticks EVERY repo + HTTP API on 127.0.0.1)
-        │ Phase A: advance each active ticket   │ Phase B: claim new work up to cap
+        │ Phase A: advance each active run       │ Phase B: claim new work (belt match) up to cap
         ▼
-  To Do ─claim─> In Progress ─PR+automated round─> In Review ─merged/closed─> teardown
-   (label)        worktree + "cat" worker          script transitions;        rm worktree,
-                  (fix → review → PR →              7h watch wakes the         branch, archive
-                   10-min CI/bot round → done)      worker on new comments
+  todo ─claim(belt)─> running step₁ → … → stepₙ ─┬─ work_to_pull_request: → reviewing ─merged─> teardown
+   (eligible)         worktree + one agent per     │  (PR + CI/bot round; 7h watch wakes the worker)
+                      step (handoff between them)  └─ custom: last step step-done ───────────> teardown
 ```
 
 A single idempotent reconciler (`reconcileRepo`), looped by the resident `serve` daemon, finds
-eligible work, spins up one herdr worktree + Claude worker per item, watches the resulting PR, and
-tears the worktree down on merge/close. **All polling is plain shell — no LLM tokens are spent
-finding or watching work.** Claude agents run only for the jobs that need reasoning: the
-fix → review → PR pipeline, and addressing review comments. The dispatcher is generic; everything
+eligible work, picks a belt (priority order, first `match` wins), spins up one herdr worktree, and
+runs one Claude agent per belt step, handing off between them. A `work_to_pull_request` belt then
+watches its PR through to merge and tears the worktree down; a `custom` belt finishes when its last
+step signals done. **All polling is plain shell — no LLM tokens are spent finding or watching
+work.** Claude agents run only for the jobs that need reasoning: the belt's steps, and (for
+`work_to_pull_request`) addressing review comments. The dispatcher is generic; everything
 repo-specific lives in per-repo config, so the same engine drives many repos.
 
 State is on disk (SQLite), so a tick can be killed at any point and the next one resumes. The DB —
@@ -180,10 +216,11 @@ injected from config plus an optional per-repo guidance addendum.
 
 ```
 herdr-factory --repo <name> tick|status|eligible|runs [--all]|timeline <KEY>|logs [N]
-herdr-factory --repo <name> claim <KEY> [--source <name>]|teardown <KEY> [--source <name>]
-herdr-factory --repo <name> step-done <KEY> <fix|review|pr> [--source <name>]   # agent → dispatcher (event-nudge)
+herdr-factory --repo <name> claim <KEY> [--belt <name>]|teardown <KEY> [--source <name>]
+herdr-factory --repo <name> step-done <KEY> <step> [--source <name>]   # agent → dispatcher (event-nudge)
 herdr-factory serve|ensure-up [--restart]|restart|reload|update   # the server + its supervisor (no --repo)
 herdr-factory install|uninstall|start|stop             # the one supervisor launchd job (no --repo)
+herdr-factory schema [--stdout]                        # write the config.yml JSON Schema for editors (no --repo)
 herdr-factory capture-lock acquire|release <owner>     # machine-global, no --repo
 herdr-factory doctor|help
 ```
@@ -191,8 +228,9 @@ herdr-factory doctor|help
 `tick`/`step-done`/`claim`/`teardown` route through the running server when it's up (warm,
 in-process reconcile) and fall back to running in-process when it isn't. `eligible` lists todo items
 across all sources; `doctor` runs a per-source health check plus server liveness. `claim` takes
-`--source` (defaulted when there's a single source); `teardown`/`step-done` take `--source` to
-disambiguate a key active in more than one source.
+`--belt` (which belt to run the item on; defaulted when there's a single belt); `step-done` takes
+the belt step name and `--source` to disambiguate; `teardown` takes `--source` to disambiguate a
+key active in more than one source.
 
 `serve` exposes a local HTTP API on `127.0.0.1:8765` (Hono) with the OpenAPI spec at `/doc` and
 Swagger UI at `/ui`. `update` pulls the latest code (hard reset to the branch's upstream) and
@@ -201,14 +239,15 @@ restarts onto it; the supervisor also does this automatically every ~60s unless
 
 ## What's repo-specific (all in `repos/<name>/config.yml`)
 
-repo checkout + base branch (repo-global) · `limits` incl. the global `max_active` cap ·
-the `work_sources` list — each with its own `workspace_name` branch template, `agents.{fix,review,pr}`
-blocks (each tab/pane + `prompt_type` + optional prompt_file), and type block (`jira`
-base_url/project/board/label/3 statuses, or `local_markdown` folder) — plus the folder's agent
-prompt files and optional `guidelines-prompt.md`. The engine's built-in step prompts (used by
-`prompt_type: augment`) live in `src/prompts/` (per source type under `src/prompts/<type>/`).
-Only the Jira **auth** (email + token, one Atlassian account) is global, in
-`~/.config/herdr-factory/env`.
+repo checkout + base branch (repo-global) · `limits` incl. the global `max_active` cap · the
+`work_sources` list (backends: `jira` base_url/project/board/label/3 statuses, or `local_markdown`
+folder) · the `belt` list — each with a `belt_type`, a `source` ref, `priority`, `workspace_name`
+branch template, optional `match` predicate (a `.ts` file in the folder), and either an
+`agents.{fix,review,pr}` layout block (`work_to_pull_request`) or an ordered `steps[]` with their
+`prompt_file`s (`custom`) — plus those custom step prompt files, any `match` `.ts` files, and an
+optional `guidelines-prompt.md`. The engine's built-in `work_to_pull_request` prompts live in
+`src/prompts/` (per source type under `src/prompts/<type>/`). The Jira **auth** (email + token) is
+**per-repo only**, in `repos/<name>/env`.
 
 ## Layout
 
@@ -218,9 +257,9 @@ src/cli/                CLI: commander program (selects a repo via --repo)
 src/server/             resident serve (Hono + OpenAPI) · app · schemas · HTTP client
 src/watchers/           launchd job · ensure-up supervisor · self-updater
 src/core/*.ts           generic engine: reconcile · step · watch · branch · deps
-src/prompts/*.md        engine default step prompts (the base for prompt_type: augment)
-examples/example-repo/  config.yml + fix.md/review.md/pr.md + guidelines-prompt.md (copy to repos/<name>/)
-~/.config/herdr-factory/   env (secrets) + repos/<name>/{config.yml, guidelines-prompt.md}
+src/prompts/*.md        built-in work_to_pull_request step prompts (per type under <type>/)
+examples/example-repo/  config.yml + custom step prompts + match-bugs.ts + guidelines-prompt.md (copy to repos/<name>/)
+~/.config/herdr-factory/   config.schema.json (editor schema) + repos/<name>/{config.yml, env (per-repo Jira secrets), guidelines-prompt.md}
 ~/.local/state/herdr-factory/   herdr-factory.db · server.json · logs/ (supervisor) · <repo>/logs/
 ```
 

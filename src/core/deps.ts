@@ -1,6 +1,17 @@
-import type { AgentCfg, Config, Secrets, SourceType } from "../config.ts";
+import type { BeltConfig, Config, Secrets } from "../config.ts";
 import type { Store } from "../db/store.ts";
-import type { Agent, FocusedPane, PrInfo, ReviewSig, Ticket, WorkState, WorktreeResult } from "../types.ts";
+import type {
+  Agent,
+  BeltMatch,
+  FocusedPane,
+  MatchItem,
+  PrInfo,
+  ReviewSig,
+  SourceType,
+  Ticket,
+  WorkState,
+  WorktreeResult,
+} from "../types.ts";
 
 // Interfaces the core depends on (concrete clients satisfy them structurally;
 // tests provide fakes). Keeping these here is what makes the reconciler testable.
@@ -31,9 +42,11 @@ export interface HerdrApi {
  * backend. Construction (and any backend config / Store handle) lives in the concrete clients.
  */
 export interface WorkSource {
-  /** Eligible (todo) items in the order they should be claimed. Must NOT throw on a transient
-   *  backend hiccup beyond what the caller try/catches per source; returns [] when there's none. */
-  listEligible(): Promise<Ticket[]>;
+  /** Eligible (todo) items in the order they should be claimed — the rich, source-tagged metadata
+   *  belts route on (and from which the reconciler derives each item's Ticket via `ticketOf`). Must
+   *  NOT throw on a transient backend hiccup beyond what the caller try/catches per source; returns
+   *  [] when there's none. */
+  listEligible(): Promise<MatchItem[]>;
   /** Metadata for one item by key (for the manual `claim` path). Throws if the item is unknown. */
   describe(key: string): Promise<Ticket>;
   /** Move an item to a canonical lifecycle state. Returns false (no-op) if already there or the
@@ -46,15 +59,19 @@ export interface WorkSource {
   health(): Promise<void>;
 }
 
-/** A configured source's identity + per-source layout/agents + its live client. Resolved once
- *  per run from `run.workSource` and threaded through the reconciler. */
+/** A configured source's identity + its live client. Resolved from `run.workSource` (or a belt's
+ *  `source`) and threaded through the reconciler for materialize / lifecycle transitions. */
 export interface SourceRuntime {
   name: string;
   type: SourceType;
-  priority: number;
-  workspaceName?: string;
-  agents: { fix: AgentCfg; review: AgentCfg; pr: AgentCfg };
   client: WorkSource;
+}
+
+/** A configured belt's resolved config + its loaded `match` predicate (undefined = accept all from
+ *  its source). This is the unit the reconciler drives: its ordered `steps`, and `watchPr` (true ⇒
+ *  run the token-free PR-watch after the last step). Resolved per run from `run.belt`. */
+export interface BeltRuntime extends BeltConfig {
+  match?: BeltMatch;
 }
 
 export interface GitHubApi {
@@ -78,8 +95,10 @@ export interface Deps {
   store: Store;
   ghRepo: string; // resolved owner/name
   herdr: HerdrApi;
-  sources: SourceRuntime[]; // configured work sources, ordered by priority (asc)
+  sources: SourceRuntime[]; // configured work sources
   resolveSource(name: string | null): SourceRuntime | undefined; // by run.workSource; total
+  belts: BeltRuntime[]; // configured belts, ordered by priority (asc)
+  resolveBelt(name: string | null): BeltRuntime | undefined; // by run.belt; total
   github: GitHubApi;
   git: GitApi;
   log: Logger;

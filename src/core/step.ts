@@ -1,44 +1,37 @@
-import { existsSync, mkdirSync, statSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import type { Deps, SourceRuntime } from "./deps.ts";
-import type { Phase, Run, RunStep, StepName } from "../types.ts";
+import type { StepConfig } from "../config.ts";
+import type { BeltRuntime, Deps, SourceRuntime } from "./deps.ts";
+import type { Run, RunStep } from "../types.ts";
 
 export const CLAUDE_FLAGS = ["--dangerously-skip-permissions"];
 export const CLI_PATH = fileURLToPath(new URL("../../bin/herdr-factory", import.meta.url));
 const MEMORY_DIR = ".memory/herdr-factory";
 
-/** One pipeline step: which phase runs it, which phase follows, and whether the
- *  commit-HEAD stall heartbeat applies (review may legitimately make no commits). */
-export interface StepDescriptor {
-  name: StepName;
-  phase: Phase;
-  heartbeat: boolean; // commit-HEAD stall heartbeat applies? (review may legitimately make no commits)
-}
+// --- belt step sequencing (belt.steps is the ordered source of truth) -------
 
-/** The pipeline order — the single source of truth for step sequencing (order = array index). */
-export const STEPS: StepDescriptor[] = [
-  { name: "fix", phase: "fixing", heartbeat: true },
-  { name: "review", phase: "auto_review", heartbeat: false },
-  { name: "pr", phase: "pr_round", heartbeat: true },
-];
+export const stepByName = (belt: BeltRuntime, name: string | null): StepConfig | undefined =>
+  name == null ? undefined : belt.steps.find((s) => s.name === name);
 
-export const stepForPhase = (phase: Phase): StepDescriptor | undefined => STEPS.find((s) => s.phase === phase);
+/** The belt's first step (every belt has ≥1 — enforced by config). */
+export const firstStep = (belt: BeltRuntime): StepConfig => belt.steps[0]!;
 
-const indexOfStep = (step: StepName): number => STEPS.findIndex((s) => s.name === step);
+const indexOfStep = (belt: BeltRuntime, name: string): number => belt.steps.findIndex((s) => s.name === name);
 
-export const priorStepName = (step: StepName): StepName | undefined => {
-  const i = indexOfStep(step);
-  return i > 0 ? STEPS[i - 1]!.name : undefined;
+/** The step before `name` in this belt, or undefined if it's the first. */
+export const priorStep = (belt: BeltRuntime, name: string): StepConfig | undefined => {
+  const i = indexOfStep(belt, name);
+  return i > 0 ? belt.steps[i - 1] : undefined;
 };
 
-/** Descriptor of the step after `step`, or undefined if it's the last (→ human reviewing). */
-export const nextStep = (step: StepName): StepDescriptor | undefined => {
-  const i = indexOfStep(step);
-  return i >= 0 && i < STEPS.length - 1 ? STEPS[i + 1] : undefined;
+/** The step after `name`, or undefined if it's the belt's last step (→ reviewing/teardown). */
+export const nextStep = (belt: BeltRuntime, name: string): StepConfig | undefined => {
+  const i = indexOfStep(belt, name);
+  return i >= 0 && i < belt.steps.length - 1 ? belt.steps[i + 1] : undefined;
 };
 
-const dispatchPrompt = (step: StepName): string =>
+const dispatchPrompt = (step: string): string =>
   `Read ${MEMORY_DIR}/prompt-${step}.md in this worktree and follow it exactly. This is an autonomous task — do not pause to ask for confirmation.`;
 
 /** Result of one dispatch attempt: the agent got the prompt (`ready` + its pane), or the
@@ -105,35 +98,73 @@ export async function materializeWork(deps: Deps, run: Run, src: SourceRuntime):
   }
 }
 
-/** Standard footer appended to every step prompt: where its inputs are, and the
- *  mandatory finish protocol (write a handoff note, then signal step-done). */
-function footer(step: StepName, prior: RunStep | null, stepDoneCmd: string): string {
+/** The handover scaffold appended to EVERY step prompt (work_to_pull_request + custom alike): which
+ *  belt/step this is and the full step sequence, how to read the prior step's handoff + query its
+ *  agent, and the mandatory finish protocol (write a handoff note, then signal step-done). This is
+ *  the "you're working in herdr, here are the other agents in this belt" wiring — the only thing the
+ *  engine injects on top of the step's own prompt body. */
+function scaffold(belt: BeltRuntime, step: StepConfig, prior: RunStep | null, stepDoneCmd: string): string {
+  const seq = belt.steps.map((s) => (s.name === step.name ? `**${s.name}** (you)` : s.name)).join(" → ");
   const inputs = prior
-    ? `\n\n## Inputs from the previous step (${prior.step})\n` +
-      `- Read the handoff note first: \`${MEMORY_DIR}/handoff-${prior.step}.md\`.\n` +
-      `- The previous agent ran in herdr pane \`${prior.paneId}\` (claude session \`${prior.sessionId ?? "?"}\`). ` +
+    ? `\n\n## Input from the previous step (${prior.step})\n` +
+      `- Read its handoff note first: \`${MEMORY_DIR}/handoff-${prior.step}.md\`.\n` +
+      `- That agent ran in herdr pane \`${prior.paneId}\` (claude session \`${prior.sessionId ?? "?"}\`). ` +
       `If the handoff note isn't enough, query it on demand: \`herdr agent read ${prior.paneId} --source recent\`, ` +
       `read its session transcript, or ask it directly with \`herdr agent send ${prior.paneId} "<question>"\`.\n`
-    : "\n\n## Inputs\nThis is the first step — start from the ticket.\n";
+    : "\n\n## Input\nThis is the first step of the belt — start from the work item.\n";
   return (
+    `\n\n## You are an agent in a herdr-factory belt\n` +
+    `You are the **${step.name}** step of the **${belt.name}** belt. The belt runs these steps in order: ${seq}. ` +
+    `Each step is a separate agent in its own herdr pane; you hand work forward via a handoff note (and can query earlier agents directly).\n` +
     inputs +
     `\n## Finishing this step (required)\n` +
-    `1. Write your handoff note to \`${MEMORY_DIR}/handoff-${step}.md\` — what you did, key decisions and why, ` +
+    `1. Write your handoff note to \`${MEMORY_DIR}/handoff-${step.name}.md\` — what you did, key decisions and why, ` +
     `anything uncertain, and what the next step should verify.\n` +
-    `2. Then run \`${stepDoneCmd}\` and stop. Do NOT change the work item's status — the ` +
-    `dispatcher owns all status transitions.\n`
+    `2. Then run \`${stepDoneCmd}\` and stop. Do NOT change the work item's status — the dispatcher owns all status transitions.\n`
   );
 }
 
-/** Render a step's prompt (config prompt_file contents + tokens + guidance + footer) and
- *  write it into the worktree's .memory for the agent to read. Function replacers avoid
- *  `$`-pattern interpretation. */
-export function renderStepPrompt(deps: Deps, run: Run, src: SourceRuntime, step: StepName, prior: RunStep | null): void {
+/** Assemble a step's prompt body at render time (before tokens/scaffold): the engine base
+ *  (work_to_pull_request steps) plus, if the step configures a `promptFile`, the user prompt read
+ *  from `config` (the repo's config folder) or `repo` (the run's worktree). For a w2pr step the
+ *  user prompt AUGMENTS the engine base; for a custom step (no base) it IS the whole body. */
+function stepBody(deps: Deps, run: Run, step: StepConfig): string {
+  let userPrompt = "";
+  if (step.promptFile) {
+    if (step.promptFileSource === "repo" && !run.worktreePath) {
+      throw new Error(`${run.ticketKey}: ${step.name} has a repo-sourced prompt_file but no worktree yet`);
+    }
+    const root = step.promptFileSource === "repo" ? run.worktreePath! : deps.config.paths.repoDir;
+    const path = isAbsolute(step.promptFile) ? step.promptFile : join(root, step.promptFile);
+    try {
+      userPrompt = readFileSync(path, "utf8");
+    } catch {
+      throw new Error(`${run.ticketKey}: ${step.name} prompt_file not found (${step.promptFileSource}): ${path}`);
+    }
+  }
+  if (step.enginePrompt === undefined) return userPrompt; // custom: the user prompt is the body
+  // work_to_pull_request: the engine base, augmented by the optional user prompt.
+  return userPrompt.trim()
+    ? `${step.enginePrompt.trimEnd()}\n\n## Additional repo-specific instructions for this step\n\n${userPrompt.trim()}\n`
+    : step.enginePrompt;
+}
+
+/** Render a step's prompt (its assembled body + tokens + guidance + handover scaffold) and write it
+ *  into the worktree's .memory for the agent to read. Function replacers avoid `$`-pattern
+ *  interpretation. */
+export function renderStepPrompt(
+  deps: Deps,
+  run: Run,
+  belt: BeltRuntime,
+  src: SourceRuntime,
+  step: StepConfig,
+  prior: RunStep | null,
+): void {
   const worktree = run.worktreePath;
   if (!worktree) throw new Error(`${run.ticketKey}: no worktree path`);
   // The step-done command carries --source so the signal resolves to the right run even when two
   // sources share a key (the worker only knows its key, via HERDR_FACTORY_TICKET).
-  const stepDoneCmd = `${CLI_PATH} --repo ${deps.config.repoName} step-done ${run.ticketKey} ${step} --source ${src.name}`;
+  const stepDoneCmd = `${CLI_PATH} --repo ${deps.config.repoName} step-done ${run.ticketKey} ${step.name} --source ${src.name}`;
   // Where the work item's spec lives + how to describe it. Jira → a single ticket.json.
   // local_markdown is either a single file (snapshotted to task.md) or a whole directory (copied
   // to task/); detect which from what materialize wrote into this worktree's .memory.
@@ -151,82 +182,91 @@ export function renderStepPrompt(deps: Deps, run: Run, src: SourceRuntime, step:
   const sub: Record<string, string> = {
     "@@KEY@@": run.ticketKey,
     "@@REPO@@": deps.config.repoName,
+    "@@BELT@@": belt.name,
+    "@@STEPS@@": belt.steps.map((s) => s.name).join(" → "),
     "@@TYPE@@": run.issueType ?? "",
     "@@SUMMARY@@": run.summary ?? "",
     "@@BRANCH@@": run.branch ?? "",
     "@@WORKTREE@@": worktree,
-    "@@STEP@@": step,
+    "@@STEP@@": step.name,
     "@@MEMORY_DIR@@": MEMORY_DIR,
     "@@WORK_DOC@@": workDoc,
     "@@WORK_DOC_KIND@@": workDocKind,
     "@@EVIDENCE_DIR@@": `${MEMORY_DIR}/evidence`,
     "@@CLI@@": CLI_PATH,
     "@@HANDOFF_IN@@": prior ? `${MEMORY_DIR}/handoff-${prior.step}.md` : "(none — first step)",
-    "@@HANDOFF_OUT@@": `${MEMORY_DIR}/handoff-${step}.md`,
+    "@@HANDOFF_OUT@@": `${MEMORY_DIR}/handoff-${step.name}.md`,
     "@@PRIOR_PANE@@": prior?.paneId ?? "(none)",
     "@@PRIOR_SESSION@@": prior?.sessionId ?? "(none)",
     "@@STEP_DONE_CMD@@": stepDoneCmd,
   };
-  let out = src.agents[step].prompt;
+  let out = stepBody(deps, run, step);
   for (const [token, value] of Object.entries(sub)) out = out.replaceAll(token, () => value);
   if (deps.config.guidance) out += `\n\n## Repo-specific guidance\n\n${deps.config.guidance}\n`;
-  out += footer(step, prior, stepDoneCmd);
+  out += scaffold(belt, step, prior, stepDoneCmd);
   const mem = join(worktree, MEMORY_DIR);
   mkdirSync(mem, { recursive: true });
-  writeFileSync(join(mem, `prompt-${step}.md`), out);
+  writeFileSync(join(mem, `prompt-${step.name}.md`), out);
 }
 
 /**
- * Spawn (or hand off to) the agent for `step`. Renders + writes its prompt (wiring in the
+ * Spawn (or hand off to) the agent for `stepName`. Renders + writes its prompt (wiring in the
  * prior step's handoff + pane/session for on-demand query), then dispatches:
  *   - `ready`  → records the pane on the run_step and as the run's latest pane, flags focus.
  *   - `waiting`→ the configured layout pane isn't up yet; nothing is recorded. The run_step's
  *     `started_at` (stamped on first touch below) times the bounded wait; the caller decides
  *     whether to retry next tick or escalate to attention.
  */
-export async function spawnStep(deps: Deps, run: Run, src: SourceRuntime, step: StepName): Promise<DispatchResult> {
+export async function spawnStep(
+  deps: Deps,
+  run: Run,
+  belt: BeltRuntime,
+  src: SourceRuntime,
+  stepName: string,
+): Promise<DispatchResult> {
   const workspaceId = run.workspaceId;
   const worktree = run.worktreePath;
   if (!workspaceId || !worktree) throw new Error(`${run.ticketKey}: missing workspace/worktree`);
-  const cfg = src.agents[step];
+  const step = stepByName(belt, stepName);
+  if (!step) throw new Error(`${run.ticketKey}: belt "${belt.name}" has no step "${stepName}"`);
 
   // Capture the prior step's session id at handoff time (herdr only knows it once the
   // prior agent has reported in) so this step's prompt can point at it.
-  const prevName = priorStepName(step);
-  let prior = prevName ? (deps.store.getRunStep(run.id, prevName) ?? null) : null;
+  const prev = priorStep(belt, stepName);
+  let prior = prev ? (deps.store.getRunStep(run.id, prev.name) ?? null) : null;
   if (prior && !prior.sessionId && prior.paneId) {
     const sid = await deps.herdr.agentSessionId(prior.paneId);
-    if (sid) prior = deps.store.upsertRunStep(run.id, prevName!, { sessionId: sid });
+    if (sid) prior = deps.store.upsertRunStep(run.id, prev!.name, { sessionId: sid });
   }
 
-  renderStepPrompt(deps, run, src, step, prior);
+  renderStepPrompt(deps, run, belt, src, step, prior);
 
   // Ensure the step row exists so its started_at clock runs from the first attempt — this is
   // what bounds the layout wait across ticks. (started_at is set to now() on first insert and
   // only reset below once we actually dispatch.)
-  deps.store.upsertRunStep(run.id, step);
+  deps.store.upsertRunStep(run.id, stepName);
 
   const result = await dispatchToLayout(deps, {
     workspaceId,
     worktree,
-    tab: cfg.tab,
-    pane: cfg.pane,
-    prompt: dispatchPrompt(step),
-    paneName: `${step}:${run.ticketKey}`,
+    tab: step.tab,
+    pane: step.pane,
+    prompt: dispatchPrompt(stepName),
+    paneName: `${stepName}:${run.ticketKey}`,
     ticketKey: run.ticketKey,
   });
   if (result.status === "waiting") return result; // still waiting on the user's layout pane
 
   // Dispatched. Reset started_at so the per-step budget is measured from now (per attempt,
   // not cumulatively across crash-recovery re-spawns or the preceding layout wait).
-  deps.store.upsertRunStep(run.id, step, { paneId: result.paneId, startedAt: deps.now() });
+  deps.store.upsertRunStep(run.id, stepName, { paneId: result.paneId, startedAt: deps.now() });
   deps.store.updateRun(run.id, { paneId: result.paneId }); // latest active pane (reviewing/resolver reuse it)
   deps.store.recordEvent({
     runId: run.id,
     repo: deps.config.repoName,
     ticketKey: run.ticketKey,
     type: "step_spawned",
-    detail: { step, paneId: result.paneId },
+    detail: { step: stepName, paneId: result.paneId },
   });
   // Mark that the active step changed. The actual focus shift is deferred to
   // applyPendingFocus, which brings this pane to the front only when the user is already

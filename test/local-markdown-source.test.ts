@@ -37,6 +37,17 @@ describe("LocalMarkdownSource", () => {
     expect(eligible.find((t) => t.key === "task-b")!.summary).toBe("task b"); // no H1 → humanized filename
   });
 
+  it("exposes the local_markdown match context (path/filename/front-matter/body) for belt routing", async () => {
+    const { src, folder } = build({ "idea-1.md": "---\ntype: research\n---\n# Idea\n\nthe body" });
+    const item = (await src.listEligible()).find((t) => t.key === "idea-1")!;
+    expect(item.sourceType).toBe("local_markdown");
+    if (item.sourceType !== "local_markdown") throw new Error("unreachable");
+    expect(item.filename).toBe("idea-1.md");
+    expect(item.path).toBe(join(folder, "idea-1.md"));
+    expect(item.frontMatter).toEqual({ type: "research" });
+    expect(item.body).toContain("the body");
+  });
+
   it("ignores a __-prefixed top-level directory (work still being prepared)", async () => {
     const { src, folder } = build();
     mkdirSync(join(folder, "__wip"));
@@ -86,7 +97,7 @@ describe("LocalMarkdownSource", () => {
   it("backstop: excludes a file that already has an active run (claim→in_development gap)", async () => {
     const { src, store } = build({ "task-a.md": "# A" });
     // run exists but the work_items row hasn't been written yet (still 'todo' by default)
-    store.createRun({ repo: "r", workSource: "lm", ticketKey: "task-a", branch: "feature/task-a" });
+    store.createRun({ repo: "r", workSource: "lm", belt: "gen", ticketKey: "task-a", branch: "feature/task-a" });
     expect(await src.listEligible()).toEqual([]); // not re-listed despite todo status
   });
 

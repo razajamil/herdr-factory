@@ -17,7 +17,7 @@ export function slugify(s: string, max: number): string {
 }
 
 /** Default workspace_name — reproduces the historical fix|chore|feature/KEY-slug naming. */
-export const DEFAULT_WORKSPACE_NAME = "{{ticket_prefix}}/{{ticket_id}}-{{ticket_slug}}";
+export const DEFAULT_WORKSPACE_NAME = "{{semantic_work_prefix}}/{{work_id}}-{{work_full_slug}}";
 
 export interface TicketVars {
   key: string;
@@ -25,14 +25,15 @@ export interface TicketVars {
   summary: string;
 }
 
-/** Variables a `workspace_name` template can interpolate. */
+/** Variables a `workspace_name` template can interpolate. (Generic across work sources — a "work
+ *  item" may be a Jira ticket, a markdown brief, …) */
 export function ticketVars(t: TicketVars): Record<string, string> {
   return {
-    ticket_id: t.key, // e.g. RWR-17202 (case preserved)
-    ticket_type: t.type.toLowerCase(), // e.g. bug, story
-    ticket_prefix: prefixForType(t.type), // fix | chore | feature
-    ticket_slug: slugify(t.summary, 50) || "work", // full title slug
-    ticket_short_slug: slugify(t.summary, 20) || "work", // title slug capped at 20
+    work_id: t.key, // e.g. RWR-17202 (case preserved)
+    work_type: t.type.toLowerCase(), // e.g. bug, story
+    semantic_work_prefix: prefixForType(t.type), // fix | chore | feature
+    work_full_slug: slugify(t.summary, 50) || "work", // full title slug (<=50)
+    work_slug: slugify(t.summary, 20) || "work", // title slug capped at 20
   };
 }
 

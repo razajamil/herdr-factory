@@ -11,7 +11,8 @@
     "cats": "node src/cli/index.ts",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "schema": "node src/cli/index.ts schema --stdout > config.schema.json"
   },
   "engines": {
     "node": ">=24"

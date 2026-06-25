@@ -7,11 +7,13 @@ interface RunRow {
   id: number;
   repo: string;
   work_source: string | null;
+  belt: string | null;
   ticket_key: string;
   summary: string | null;
   issue_type: string | null;
   branch: string | null;
   phase: string;
+  step: string | null;
   workspace_id: string | null;
   pane_id: string | null;
   worktree_path: string | null;
@@ -31,11 +33,13 @@ function toRun(r: RunRow): Run {
     id: r.id,
     repo: r.repo,
     workSource: r.work_source,
+    belt: r.belt,
     ticketKey: r.ticket_key,
     summary: r.summary,
     issueType: r.issue_type,
     branch: r.branch,
     phase: r.phase as Run["phase"],
+    step: r.step,
     workspaceId: r.workspace_id,
     paneId: r.pane_id,
     worktreePath: r.worktree_path,
@@ -158,6 +162,7 @@ export class Store {
   createRun(input: {
     repo: string;
     workSource: string;
+    belt: string;
     ticketKey: string;
     summary?: string | null;
     issueType?: string | null;
@@ -166,10 +171,10 @@ export class Store {
     const t = this.now();
     const info = this.db
       .prepare(
-        `INSERT INTO runs (repo, work_source, ticket_key, summary, issue_type, branch, phase, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, 'claiming', ?, ?)`,
+        `INSERT INTO runs (repo, work_source, belt, ticket_key, summary, issue_type, branch, phase, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'claiming', ?, ?)`,
       )
-      .run(input.repo, input.workSource, input.ticketKey, input.summary ?? null, input.issueType ?? null, input.branch ?? null, t, t);
+      .run(input.repo, input.workSource, input.belt, input.ticketKey, input.summary ?? null, input.issueType ?? null, input.branch ?? null, t, t);
     const run = this.getRun(Number(info.lastInsertRowid));
     if (!run) throw new Error("createRun: row vanished after insert");
     return run;
@@ -183,6 +188,7 @@ export class Store {
       vals.push(v);
     };
     if (patch.phase !== undefined) set("phase", patch.phase);
+    if (patch.step !== undefined) set("step", patch.step);
     if (patch.branch !== undefined) set("branch", patch.branch);
     if (patch.summary !== undefined) set("summary", patch.summary);
     if (patch.issueType !== undefined) set("issue_type", patch.issueType);
@@ -281,7 +287,7 @@ export class Store {
     }[];
   }
 
-  // --- run steps (one row per pipeline agent: fix / review / pr) --------------
+  // --- run steps (one row per belt step the run has reached) ------------------
 
   getRunStep(runId: number, step: StepName): RunStep | undefined {
     const row = this.db

@@ -1,8 +1,9 @@
 import { describe, it, expect, afterEach } from "vitest";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir, homedir } from "node:os";
 import { join } from "node:path";
-import { loadConfig, assertMainCheckout, expandHome } from "../src/config.ts";
+import { fileURLToPath } from "node:url";
+import { loadConfig, assertMainCheckout, expandHome, configJsonSchema } from "../src/config.ts";
 
 const cleanups: (() => void)[] = [];
 afterEach(() => {
@@ -12,22 +13,27 @@ afterEach(() => {
   delete process.env.HERDR_FACTORY_STATE_ROOT;
 });
 
-// A standard jira work source (one list item under `work_sources`). prompt_type: replace so each
-// agent's prompt is exactly its file contents.
-const JIRA_SOURCE = `  - type: jira
-    jira:
-      base_url: https://x.atlassian.net
-      project: RWR
-      board: 254
+// Reusable config fragments (already list-item indented).
+const JIRA_SRC = `  - type: jira
+    jira: { base_url: https://x.atlassian.net, project: RWR, board: 254 }
+`;
+const LM_SRC = `  - type: local_markdown
+    name: ideas
+    local_markdown: { folder: ~/work }
+`;
+// A work_to_pull_request belt: layout-only agents (the engine ships the prompts).
+const SHIP_BELT = `  - name: ship
+    belt_type: work_to_pull_request
+    source: jira
     agents:
-      fix:    { tab: fix,    pane: agent, prompt_type: replace, prompt_file: fix.md }
-      review: { tab: review, pane: agent, prompt_type: replace, prompt_file: review.md }
-      pr:     { tab: pr,     pane: agent, prompt_type: replace, prompt_file: pr.md }
+      fix:    { tab: fix,    pane: agent }
+      review: { tab: review, pane: agent }
+      pr:     { tab: pr,     pane: agent }
 `;
 
-/** Assemble a full config.yml from a `work_sources` body (already list-item indented). */
-function cfg(workSources: string, head = "repo:\n  path: __REPO__\n"): string {
-  return `${head}work_sources:\n${workSources}`;
+/** Assemble a full config.yml from a `work_sources` body + a `belt` body (both list-item indented). */
+function cfg(workSources: string, belts: string, head = "repo:\n  path: __REPO__\n"): string {
+  return `${head}work_sources:\n${workSources}belt:\n${belts}`;
 }
 
 function setup(yml: string, opts?: { guidance?: string; prompts?: Record<string, string> }) {
@@ -39,17 +45,16 @@ function setup(yml: string, opts?: { guidance?: string; prompts?: Record<string,
   mkdirSync(repoDir, { recursive: true });
   writeFileSync(join(repoDir, "config.yml"), yml.replaceAll("__REPO__", repoPath));
   if (opts?.guidance) writeFileSync(join(repoDir, "guidelines-prompt.md"), opts.guidance);
-  const prompts = opts?.prompts ?? { "fix.md": "FIX prompt\n", "review.md": "REVIEW prompt\n", "pr.md": "PR prompt\n" };
-  for (const [name, body] of Object.entries(prompts)) writeFileSync(join(repoDir, name), body);
-  // Auth (email + token) is the only global secret now; base_url is per-source config.
-  writeFileSync(join(base, "cfg", "env"), "JIRA_EMAIL=me@x.com\nJIRA_API_TOKEN=tok\n");
+  for (const [name, body] of Object.entries(opts?.prompts ?? {})) writeFileSync(join(repoDir, name), body);
+  // Jira auth (email + token) is strictly per-repo, in repos/<name>/env.
+  writeFileSync(join(repoDir, "env"), "JIRA_EMAIL=me@x.com\nJIRA_API_TOKEN=tok\n");
   process.env.HERDR_FACTORY_CONFIG_DIR = join(base, "cfg");
   process.env.HERDR_FACTORY_STATE_ROOT = join(base, "state");
-  return { repoPath };
+  return { repoPath, repoDir };
 }
 
-describe("loadConfig — work sources", () => {
-  it("maps a jira source + applies defaults + strips trailing slash on its base url", () => {
+describe("loadConfig — work sources + belts", () => {
+  it("maps a jira source + a work_to_pull_request belt + applies defaults + strips trailing slash", () => {
     const { repoPath } = setup(
       cfg(`  - type: jira
     jira:
@@ -60,11 +65,7 @@ describe("loadConfig — work sources", () => {
         todo: To Do
         in_development: In development
         review: Ready for Code Review
-    agents:
-      fix:    { tab: fix,    pane: agent, prompt_type: replace, prompt_file: fix.md }
-      review: { tab: review, pane: agent, prompt_type: replace, prompt_file: review.md }
-      pr:     { tab: pr,     pane: agent, prompt_type: replace, prompt_file: pr.md }
-`),
+`, SHIP_BELT),
       { guidance: "- use the X skill" },
     );
     const { config, secrets } = loadConfig("demo");
@@ -73,7 +74,6 @@ describe("loadConfig — work sources", () => {
     const s = config.sources[0]!;
     expect(s.name).toBe("jira"); // default name = type
     expect(s.type).toBe("jira");
-    expect(s.priority).toBe(100); // default
     expect(s.jira!.baseUrl).toBe("https://x.atlassian.net"); // trailing slash stripped
     expect(s.jira!.project).toBe("RWR");
     expect(s.jira!.board).toBe("254"); // coerced number → string
@@ -81,191 +81,299 @@ describe("loadConfig — work sources", () => {
     expect(s.jira!.statusInDev).toBe("In development");
     expect(config.limits.stallSeconds).toBe(2700); // default
     expect(config.limits.maxActive).toBe(3); // default
+    expect(config.limits.stepBudgetSeconds).toBe(3600); // default
     expect(config.guidance).toContain("use the X skill");
     expect(secrets.jiraEmail).toBe("me@x.com"); // auth still global
     expect(config.paths.dbPath).toContain("herdr-factory.db");
+
+    const belt = config.belts[0]!;
+    expect(belt.name).toBe("ship");
+    expect(belt.beltType).toBe("work_to_pull_request");
+    expect(belt.source).toBe("jira");
+    expect(belt.priority).toBe(100); // default
+    expect(belt.watchPr).toBe(true);
   });
 
-  it("maps the three agent blocks per source + reads each prompt_file's contents", () => {
-    setup(cfg(JIRA_SOURCE), {
-      prompts: { "fix.md": "do the fix\n", "review.md": "review it\n", "pr.md": "open the PR\n" },
-    });
-    const a = loadConfig("demo").config.sources[0]!.agents;
-    expect(a.fix.tab).toBe("fix");
-    expect(a.fix.pane).toBe("agent");
-    expect(a.fix.promptType).toBe("replace");
-    expect(a.fix.promptFile).toMatch(/fix\.md$/);
-    expect(a.fix.prompt).toBe("do the fix\n"); // replace → verbatim file contents
-    expect(a.review.prompt).toBe("review it\n");
-    expect(a.pr.prompt).toBe("open the PR\n");
+  it("loads Jira secrets strictly from the per-repo env (a shared global env is ignored)", () => {
+    setup(cfg(JIRA_SRC, SHIP_BELT), { prompts: {} }); // setup writes repos/demo/env: me@x.com / tok
+    // A global <configDir>/env must NOT be consulted — secrets are per-repo only.
+    writeFileSync(join(process.env.HERDR_FACTORY_CONFIG_DIR!, "env"), "JIRA_EMAIL=global@x.com\nJIRA_API_TOKEN=global-tok\n");
+    const { secrets } = loadConfig("demo");
+    expect(secrets.jiraEmail).toBe("me@x.com"); // per-repo, not the global
+    expect(secrets.jiraApiToken).toBe("tok");
   });
 
-  it("augment mode: engine default prompt + the prompt_file as additions", () => {
+  it("resolves a work_to_pull_request belt's three engine steps (shipped prompts, budgets, opensPr)", () => {
+    setup(cfg(JIRA_SRC, SHIP_BELT), { prompts: {} });
+    const steps = loadConfig("demo").config.belts[0]!.steps;
+    expect(steps.map((s) => s.name)).toEqual(["fix", "review", "pr"]);
+    const [fix, review, pr] = steps;
+    expect(fix!.tab).toBe("fix");
+    expect(fix!.pane).toBe("agent");
+    expect(fix!.enginePrompt).toContain("Fix agent"); // shipped engine prompt (src/prompts/fix.md)
+    expect(fix!.heartbeat).toBe(true);
+    expect(fix!.opensPr).toBe(false);
+    expect(fix!.budgetSeconds).toBe(5400); // develop_budget_seconds
+    expect(review!.enginePrompt).toContain("fresh-eyes");
+    expect(review!.heartbeat).toBe(false);
+    expect(review!.budgetSeconds).toBe(1800);
+    expect(pr!.enginePrompt).toContain("PR agent");
+    expect(pr!.opensPr).toBe(true); // only the pr step watches GitHub
+    expect(pr!.budgetSeconds).toBe(3600);
+  });
+
+  it("a work_to_pull_request belt on a local_markdown source uses the per-type built-in fix prompt", () => {
     setup(
-      cfg(`  - type: jira
-    jira: { base_url: https://x.atlassian.net, project: RWR, board: 254 }
+      cfg(LM_SRC, `  - name: lm-ship
+    belt_type: work_to_pull_request
+    source: ideas
     agents:
-      fix:    { tab: fix,    pane: agent, prompt_type: augment, prompt_file: fix.md }
-      review: { tab: review, pane: agent, prompt_type: replace, prompt_file: review.md }
-      pr:     { tab: pr,     pane: agent, prompt_type: replace, prompt_file: pr.md }
-`),
-      { prompts: { "fix.md": "EXTRA: run the linter\n", "review.md": "r\n", "pr.md": "p\n" } },
-    );
-    const fix = loadConfig("demo").config.sources[0]!.agents.fix;
-    expect(fix.promptType).toBe("augment");
-    expect(fix.prompt).toContain("Fix agent"); // engine default heading (prompts/fix.md)
-    expect(fix.prompt).toContain("Additional repo-specific instructions");
-    expect(fix.prompt).toContain("EXTRA: run the linter");
-  });
-
-  it("local_markdown augment fix uses the per-type built-in prompt (prompts/local_markdown/fix.md)", () => {
-    setup(
-      cfg(`  - type: local_markdown
-    local_markdown: { folder: ~/work }
-    agents:
-      fix:    { prompt_type: augment }
-      review: { prompt_type: augment }
-      pr:     { prompt_type: augment }
+      fix:    { tab: fix,    pane: agent }
+      review: { tab: review, pane: agent }
+      pr:     { tab: pr,     pane: agent }
 `),
       { prompts: {} },
     );
-    const s = loadConfig("demo").config.sources[0]!;
-    expect(s.type).toBe("local_markdown");
-    expect(s.localMarkdown!.folder).toBe(join(homedir(), "work"));
+    const { config } = loadConfig("demo");
+    expect(config.sources[0]!.type).toBe("local_markdown");
+    expect(config.sources[0]!.localMarkdown!.folder).toBe(join(homedir(), "work"));
+    const fix = config.belts[0]!.steps.find((s) => s.name === "fix")!;
     // the local_markdown fix prompt references the markdown task doc, not Jira
-    expect(s.agents.fix.prompt).toContain("@@WORK_DOC@@");
-    expect(s.agents.fix.prompt).not.toContain("Jira");
-    // review/pr have no per-type override → fall back to the shared engine prompt
-    expect(s.agents.review.prompt).toContain("fresh-eyes");
+    expect(fix.enginePrompt).toContain("@@WORK_DOC@@");
+    expect(fix.enginePrompt).not.toContain("Jira");
+    // review/pr have no per-type override → shared engine prompt
+    expect(config.belts[0]!.steps.find((s) => s.name === "review")!.enginePrompt).toContain("fresh-eyes");
   });
 
-  it("supports multiple sources, sorted by priority (ties keep config order)", () => {
+  it("resolves a custom belt's user-defined steps (prompt_file body, budget, heartbeat, no PR)", () => {
     setup(
-      cfg(`  - type: local_markdown
-    name: docs
-    priority: 5
-    local_markdown: { folder: ~/work }
-    agents:
-      fix:    { prompt_type: augment }
-      review: { prompt_type: augment }
-      pr:     { prompt_type: augment }
-  - type: jira
-    priority: 1
-    jira: { base_url: https://x.atlassian.net, project: RWR, board: 254 }
-    agents:
-      fix:    { prompt_type: augment }
-      review: { prompt_type: augment }
-      pr:     { prompt_type: augment }
+      cfg(LM_SRC, `  - name: work_generation
+    belt_type: custom
+    source: ideas
+    workspace_name: "research/{{work_id}}-{{work_slug}}"
+    steps:
+      - { name: research, tab: research, pane: agent, prompt_file: research.md, prompt_file_source: config }
+      - { name: create_jira_ticket, prompt_file: create.md, prompt_file_source: repo, budget_seconds: 1200, heartbeat: true }
+`),
+      { prompts: { "research.md": "Do the research\n" } },
+    );
+    const belt = loadConfig("demo").config.belts[0]!;
+    expect(belt.beltType).toBe("custom");
+    expect(belt.watchPr).toBe(false);
+    expect(belt.workspaceName).toBe("research/{{work_id}}-{{work_slug}}");
+    expect(belt.steps.map((s) => s.name)).toEqual(["research", "create_jira_ticket"]);
+    const [research, create] = belt.steps;
+    // The body is read at RENDER time now — config carries the file reference + source, not the text.
+    expect(research!.promptFile).toBe("research.md");
+    expect(research!.promptFileSource).toBe("config");
+    expect(research!.enginePrompt).toBeUndefined(); // custom belts have no engine base
+    expect(research!.tab).toBe("research");
+    expect(research!.budgetSeconds).toBe(3600); // default step_budget_seconds
+    expect(research!.heartbeat).toBe(false); // default off for custom
+    expect(research!.opensPr).toBe(false);
+    expect(create!.promptFile).toBe("create.md");
+    expect(create!.promptFileSource).toBe("repo"); // repo-sourced: not existence-checked at load
+    expect(create!.budgetSeconds).toBe(1200); // per-step override
+    expect(create!.heartbeat).toBe(true);
+    expect(create!.tab).toBeUndefined(); // no layout → spawns its own pane
+  });
+
+  it("loads a belt's match file path (existence verified, fn loaded later in buildDeps)", () => {
+    const { repoDir } = setup(
+      cfg(JIRA_SRC, `  - name: ship
+    belt_type: work_to_pull_request
+    source: jira
+    match: match.ts
+    agents: { fix: { tab: fix, pane: agent }, review: { tab: review, pane: agent }, pr: { tab: pr, pane: agent } }
+`),
+      { prompts: { "match.ts": "export default () => true;\n" } },
+    );
+    expect(loadConfig("demo").config.belts[0]!.matchFile).toBe(join(repoDir, "match.ts"));
+  });
+
+  it("throws when a belt's match file is missing on disk", () => {
+    setup(
+      cfg(JIRA_SRC, `  - name: ship
+    belt_type: work_to_pull_request
+    source: jira
+    match: nope.ts
+    agents: { fix: { tab: fix, pane: agent }, review: { tab: review, pane: agent }, pr: { tab: pr, pane: agent } }
 `),
       { prompts: {} },
     );
-    const sources = loadConfig("demo").config.sources;
-    expect(sources.map((s) => s.name)).toEqual(["jira", "docs"]); // priority 1 before 5
-    expect(sources[0]!.priority).toBe(1);
+    expect(() => loadConfig("demo")).toThrow(/match not found/);
+  });
+
+  it("sorts belts by priority (ties keep config order)", () => {
+    setup(
+      cfg(`${JIRA_SRC}${LM_SRC}`, `  - name: low
+    belt_type: work_to_pull_request
+    source: ideas
+    priority: 5
+    agents: { fix: { tab: fix, pane: agent }, review: { tab: review, pane: agent }, pr: { tab: pr, pane: agent } }
+  - name: high
+    belt_type: work_to_pull_request
+    source: jira
+    priority: 1
+    agents: { fix: { tab: fix, pane: agent }, review: { tab: review, pane: agent }, pr: { tab: pr, pane: agent } }
+`),
+      { prompts: {} },
+    );
+    const belts = loadConfig("demo").config.belts;
+    expect(belts.map((b) => b.name)).toEqual(["high", "low"]); // priority 1 before 5
+    expect(belts[0]!.priority).toBe(1);
   });
 
   it("rejects duplicate (resolved) source names — two unnamed jira sources collide on 'jira'", () => {
     setup(
       cfg(`  - type: jira
     jira: { base_url: https://x.atlassian.net, project: A, board: 1 }
-    agents: { fix: { prompt_type: augment }, review: { prompt_type: augment }, pr: { prompt_type: augment } }
   - type: jira
     jira: { base_url: https://y.atlassian.net, project: B, board: 2 }
-    agents: { fix: { prompt_type: augment }, review: { prompt_type: augment }, pr: { prompt_type: augment } }
-`),
+`, SHIP_BELT),
       { prompts: {} },
     );
     expect(() => loadConfig("demo")).toThrow(/duplicate work source name/);
   });
 
-  it("allows two jira sources with explicit unique names", () => {
-    setup(
-      cfg(`  - type: jira
-    name: alpha
-    jira: { base_url: https://x.atlassian.net, project: A, board: 1 }
-    agents: { fix: { prompt_type: augment }, review: { prompt_type: augment }, pr: { prompt_type: augment } }
-  - type: jira
-    name: beta
-    jira: { base_url: https://y.atlassian.net, project: B, board: 2 }
-    agents: { fix: { prompt_type: augment }, review: { prompt_type: augment }, pr: { prompt_type: augment } }
-`),
-      { prompts: {} },
-    );
-    expect(loadConfig("demo").config.sources.map((s) => s.name)).toEqual(["alpha", "beta"]);
-  });
-
-  it("rejects a blank source name (can't bypass the type-default / uniqueness)", () => {
+  it("rejects a blank source name", () => {
     setup(
       cfg(`  - type: jira
     name: ""
     jira: { base_url: https://x.atlassian.net, project: RWR, board: 254 }
-    agents: { fix: { prompt_type: augment }, review: { prompt_type: augment }, pr: { prompt_type: augment } }
+`, SHIP_BELT),
+      { prompts: {} },
+    );
+    expect(() => loadConfig("demo")).toThrow();
+  });
+
+  it("rejects a belt referencing an unknown work source", () => {
+    setup(
+      cfg(JIRA_SRC, `  - name: ship
+    belt_type: work_to_pull_request
+    source: nonexistent
+    agents: { fix: { tab: fix, pane: agent }, review: { tab: review, pane: agent }, pr: { tab: pr, pane: agent } }
+`),
+      { prompts: {} },
+    );
+    expect(() => loadConfig("demo")).toThrow(/unknown work source/);
+  });
+
+  it("rejects duplicate belt names", () => {
+    setup(
+      cfg(JIRA_SRC, `  - name: dup
+    belt_type: work_to_pull_request
+    source: jira
+    agents: { fix: { tab: fix, pane: agent }, review: { tab: review, pane: agent }, pr: { tab: pr, pane: agent } }
+  - name: dup
+    belt_type: work_to_pull_request
+    source: jira
+    agents: { fix: { tab: fix, pane: agent }, review: { tab: review, pane: agent }, pr: { tab: pr, pane: agent } }
+`),
+      { prompts: {} },
+    );
+    expect(() => loadConfig("demo")).toThrow(/duplicate belt name/);
+  });
+
+  it("rejects a custom belt with duplicate step names", () => {
+    setup(
+      cfg(LM_SRC, `  - name: gen
+    belt_type: custom
+    source: ideas
+    steps:
+      - { name: research, prompt_file: a.md, prompt_file_source: config }
+      - { name: research, prompt_file: b.md, prompt_file_source: config }
+`),
+      { prompts: { "a.md": "a\n", "b.md": "b\n" } },
+    );
+    expect(() => loadConfig("demo")).toThrow(/duplicate step name/);
+  });
+
+  it("rejects a custom belt step with an invalid (non-slug) name", () => {
+    setup(
+      cfg(LM_SRC, `  - name: gen
+    belt_type: custom
+    source: ideas
+    steps:
+      - { name: "Bad Name", prompt_file: a.md, prompt_file_source: config }
+`),
+      { prompts: { "a.md": "a\n" } },
+    );
+    expect(() => loadConfig("demo")).toThrow();
+  });
+
+  it("throws when a custom belt step's prompt_file is missing on disk", () => {
+    setup(
+      cfg(LM_SRC, `  - name: gen
+    belt_type: custom
+    source: ideas
+    steps:
+      - { name: research, prompt_file: missing.md, prompt_file_source: config }
+`),
+      { prompts: {} },
+    );
+    expect(() => loadConfig("demo")).toThrow(/prompt_file.*not found/);
+  });
+
+  it("rejects a custom belt with no steps", () => {
+    setup(
+      cfg(LM_SRC, `  - name: gen
+    belt_type: custom
+    source: ideas
+    steps: []
 `),
       { prompts: {} },
     );
     expect(() => loadConfig("demo")).toThrow();
   });
 
-  it("rejects an agent missing prompt_type (no silent default)", () => {
+  it("rejects a custom belt that carries an agents block (strict — the w2pr/custom mixup)", () => {
     setup(
-      cfg(`  - type: jira
-    jira: { base_url: https://x.atlassian.net, project: RWR, board: 254 }
-    agents:
-      fix:    { tab: fix, pane: agent, prompt_file: fix.md }
-      review: { tab: review, pane: agent, prompt_type: replace, prompt_file: review.md }
-      pr:     { tab: pr, pane: agent, prompt_type: replace, prompt_file: pr.md }
+      cfg(LM_SRC, `  - name: gen
+    belt_type: custom
+    source: ideas
+    steps:
+      - { name: research, prompt_file: r.md, prompt_file_source: config }
+    agents: { fix: { tab: fix, pane: agent }, review: { tab: review, pane: agent }, pr: { tab: pr, pane: agent } }
 `),
+      { prompts: { "r.md": "r\n" } },
+    );
+    expect(() => loadConfig("demo")).toThrow(/Unrecognized key|agents/i);
+  });
+
+  it("rejects a work_to_pull_request belt that carries a steps array (strict)", () => {
+    setup(
+      cfg(JIRA_SRC, `  - name: ship
+    belt_type: work_to_pull_request
+    source: jira
+    agents: { fix: { tab: fix, pane: agent }, review: { tab: review, pane: agent }, pr: { tab: pr, pane: agent } }
+    steps: []
+`),
+      { prompts: {} },
+    );
+    expect(() => loadConfig("demo")).toThrow(/Unrecognized key|steps/i);
+  });
+
+  it("rejects a work_to_pull_request agent with tab but no pane (must be set together)", () => {
+    setup(
+      cfg(JIRA_SRC, `  - name: ship
+    belt_type: work_to_pull_request
+    source: jira
+    agents:
+      fix:    { tab: fix }
+      review: { tab: review, pane: agent }
+      pr:     { tab: pr, pane: agent }
+`),
+      { prompts: {} },
     );
     expect(() => loadConfig("demo")).toThrow();
   });
 
-  it("rejects replace mode without a prompt_file", () => {
+  it("rejects a work_to_pull_request belt missing its agents block", () => {
     setup(
-      cfg(`  - type: jira
-    jira: { base_url: https://x.atlassian.net, project: RWR, board: 254 }
-    agents:
-      fix:    { tab: fix, pane: agent, prompt_type: replace }
-      review: { tab: review, pane: agent, prompt_type: replace, prompt_file: review.md }
-      pr:     { tab: pr, pane: agent, prompt_type: replace, prompt_file: pr.md }
-`),
-    );
-    expect(() => loadConfig("demo")).toThrow(/prompt_file is required/);
-  });
-
-  it("allows an agent with no tab/pane (spawns its own pane)", () => {
-    setup(
-      cfg(`  - type: jira
-    jira: { base_url: https://x.atlassian.net, project: RWR, board: 254 }
-    agents:
-      fix:    { prompt_type: augment }
-      review: { tab: review, pane: agent, prompt_type: replace, prompt_file: review.md }
-      pr:     { tab: pr, pane: agent, prompt_type: replace, prompt_file: pr.md }
-`),
-      { prompts: { "review.md": "r\n", "pr.md": "p\n" } },
-    );
-    const a = loadConfig("demo").config.sources[0]!.agents;
-    expect(a.fix.tab).toBeUndefined();
-    expect(a.fix.pane).toBeUndefined();
-    expect(a.review.tab).toBe("review");
-  });
-
-  it("rejects an agent with tab but no pane (must be set together)", () => {
-    setup(
-      cfg(`  - type: jira
-    jira: { base_url: https://x.atlassian.net, project: RWR, board: 254 }
-    agents:
-      fix:    { tab: fix, prompt_type: replace, prompt_file: fix.md }
-      review: { tab: review, pane: agent, prompt_type: replace, prompt_file: review.md }
-      pr:     { tab: pr, pane: agent, prompt_type: replace, prompt_file: pr.md }
-`),
-    );
-    expect(() => loadConfig("demo")).toThrow();
-  });
-
-  it("rejects a source missing its agents block", () => {
-    setup(
-      cfg(`  - type: jira
-    jira: { base_url: https://x.atlassian.net, project: RWR, board: 254 }
+      cfg(JIRA_SRC, `  - name: ship
+    belt_type: work_to_pull_request
+    source: jira
 `),
       { prompts: {} },
     );
@@ -273,21 +381,20 @@ describe("loadConfig — work sources", () => {
   });
 
   it("rejects an empty work_sources list", () => {
-    setup("repo:\n  path: __REPO__\nwork_sources: []\n", { prompts: {} });
+    setup("repo:\n  path: __REPO__\nwork_sources: []\nbelt: []\n", { prompts: {} });
     expect(() => loadConfig("demo")).toThrow();
   });
 
-  it("throws when an agent prompt_file is missing on disk", () => {
-    setup(cfg(JIRA_SOURCE), { prompts: {} });
-    expect(() => loadConfig("demo")).toThrow(/prompt_file not found/);
+  it("rejects an empty belt list", () => {
+    setup(`repo:\n  path: __REPO__\nwork_sources:\n${JIRA_SRC}belt: []\n`, { prompts: {} });
+    expect(() => loadConfig("demo")).toThrow();
   });
 
   it("rejects a jira source missing project", () => {
     setup(
       cfg(`  - type: jira
     jira: { base_url: https://x.atlassian.net, board: 1 }
-    agents: { fix: { prompt_type: augment }, review: { prompt_type: augment }, pr: { prompt_type: augment } }
-`),
+`, SHIP_BELT),
       { prompts: {} },
     );
     expect(() => loadConfig("demo")).toThrow();
@@ -297,8 +404,7 @@ describe("loadConfig — work sources", () => {
     setup(
       cfg(`  - type: jira
     jira: { project: RWR, board: 254 }
-    agents: { fix: { prompt_type: augment }, review: { prompt_type: augment }, pr: { prompt_type: augment } }
-`),
+`, SHIP_BELT),
       { prompts: {} },
     );
     expect(() => loadConfig("demo")).toThrow();
@@ -307,8 +413,12 @@ describe("loadConfig — work sources", () => {
   it("rejects a local_markdown source missing its folder", () => {
     setup(
       cfg(`  - type: local_markdown
+    name: ideas
     local_markdown: {}
-    agents: { fix: { prompt_type: augment }, review: { prompt_type: augment }, pr: { prompt_type: augment } }
+`, `  - name: ship
+    belt_type: work_to_pull_request
+    source: ideas
+    agents: { fix: { tab: fix, pane: agent }, review: { tab: review, pane: agent }, pr: { tab: pr, pane: agent } }
 `),
       { prompts: {} },
     );
@@ -316,36 +426,61 @@ describe("loadConfig — work sources", () => {
   });
 
   it("rejects a missing repo config", () => {
-    setup(cfg(JIRA_SOURCE));
+    setup(cfg(JIRA_SRC, SHIP_BELT), { prompts: {} });
     expect(() => loadConfig("nope")).toThrow(/no config for repo/);
   });
 
-  it("maps a per-source workspace_name through", () => {
+  it("maps a per-belt workspace_name through", () => {
     setup(
-      cfg(`  - type: jira
-    workspace_name: "fix/{{ticket_id}}-{{ticket_short_slug}}"
-    jira: { base_url: https://x.atlassian.net, project: RWR, board: 254 }
-    agents:
-      fix:    { tab: fix, pane: agent, prompt_type: replace, prompt_file: fix.md }
-      review: { tab: review, pane: agent, prompt_type: replace, prompt_file: review.md }
-      pr:     { tab: pr, pane: agent, prompt_type: replace, prompt_file: pr.md }
+      cfg(JIRA_SRC, `  - name: ship
+    belt_type: work_to_pull_request
+    source: jira
+    workspace_name: "fix/{{work_id}}-{{work_slug}}"
+    agents: { fix: { tab: fix, pane: agent }, review: { tab: review, pane: agent }, pr: { tab: pr, pane: agent } }
 `),
+      { prompts: {} },
     );
-    expect(loadConfig("demo").config.sources[0]!.workspaceName).toBe("fix/{{ticket_id}}-{{ticket_short_slug}}");
+    expect(loadConfig("demo").config.belts[0]!.workspaceName).toBe("fix/{{work_id}}-{{work_slug}}");
   });
 
-  it("rejects a workspace_name template missing {{ticket_id}}", () => {
+  it("rejects a workspace_name template missing {{work_id}}", () => {
     setup(
-      cfg(`  - type: jira
-    workspace_name: "fix/{{ticket_short_slug}}"
-    jira: { base_url: https://x.atlassian.net, project: RWR, board: 254 }
-    agents:
-      fix:    { tab: fix, pane: agent, prompt_type: replace, prompt_file: fix.md }
-      review: { tab: review, pane: agent, prompt_type: replace, prompt_file: review.md }
-      pr:     { tab: pr, pane: agent, prompt_type: replace, prompt_file: pr.md }
+      cfg(JIRA_SRC, `  - name: ship
+    belt_type: work_to_pull_request
+    source: jira
+    workspace_name: "fix/{{work_slug}}"
+    agents: { fix: { tab: fix, pane: agent }, review: { tab: review, pane: agent }, pr: { tab: pr, pane: agent } }
 `),
+      { prompts: {} },
     );
-    expect(() => loadConfig("demo")).toThrow(/ticket_id/);
+    expect(() => loadConfig("demo")).toThrow(/work_id/);
+  });
+});
+
+describe("configJsonSchema", () => {
+  it("generates a JSON Schema for config.yml editor validation, derived from the zod schema", () => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const js = configJsonSchema() as any;
+    expect(String(js.$schema)).toContain("json-schema.org");
+    expect(js.required).toEqual(expect.arrayContaining(["repo", "work_sources", "belt"]));
+    const beltVariants = js.properties.belt.items.oneOf ?? js.properties.belt.items.anyOf;
+    expect(beltVariants.map((v: { properties: { belt_type: { const: string } } }) => v.properties.belt_type.const).sort()).toEqual([
+      "custom",
+      "work_to_pull_request",
+    ]);
+    // .strict() → additionalProperties:false, so editors flag unknown keys (the agents-on-custom mixup)
+    expect(beltVariants.every((v: { additionalProperties: unknown }) => v.additionalProperties === false)).toBe(true);
+    // the step-name slug regex survives into the schema
+    const custom = beltVariants.find((v: { properties: { belt_type: { const: string } } }) => v.properties.belt_type.const === "custom");
+    expect(custom.properties.steps.items.properties.name.pattern).toBeTruthy();
+  });
+
+  it("the committed repo-root config.schema.json is in sync (the example's modeline resolves to it)", () => {
+    // examples/example-repo/config.yml's `# yaml-language-server: $schema=../../config.schema.json`
+    // resolves to <repo>/config.schema.json when edited in-repo — so it must be committed + current.
+    const repoRoot = fileURLToPath(new URL("../", import.meta.url)); // test/ → repo root
+    const committed = JSON.parse(readFileSync(join(repoRoot, "config.schema.json"), "utf8"));
+    expect(committed, "config.schema.json is stale — regenerate with `npm run schema`").toEqual(configJsonSchema());
   });
 });
 

@@ -100,6 +100,37 @@ const MIGRATIONS: { version: number; sql: string }[] = [
       CREATE INDEX idx_work_items ON work_items(repo, source, status);
     `,
   },
+  {
+    version: 7,
+    // Belts. A run now records which BELT (its ordered steps + lifecycle) is processing it, in
+    // addition to its work_source, and which step is active (run.step, set while phase='running').
+    // Both columns are NULLABLE: this is a clean-break redesign (see ARCHITECTURE / README) — any
+    // run left in-flight across the upgrade lands with belt=NULL and is escalated to attention by
+    // the reconciler rather than silently resumed onto a guessed belt. run_steps.step stays TEXT
+    // (already unconstrained), so arbitrary custom step names persist with no schema change.
+    //
+    // work_items.status gains a sixth value 'done' — the terminal state a custom (non-PR) belt
+    // writes when its last step finishes. SQLite can't ALTER a CHECK constraint, so the table is
+    // rebuilt (copy → drop → rename); the whole version runs in one transaction (see migrate()).
+    sql: `
+      ALTER TABLE runs ADD COLUMN belt TEXT;
+      ALTER TABLE runs ADD COLUMN step TEXT;
+      CREATE TABLE work_items_v7 (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        repo TEXT NOT NULL, source TEXT NOT NULL, key TEXT NOT NULL,
+        title TEXT, item_type TEXT, path TEXT,
+        status TEXT NOT NULL
+          CHECK (status IN ('todo','in_development','in_review','merged','aborted','done')),
+        created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+        UNIQUE(repo, source, key)
+      );
+      INSERT INTO work_items_v7 (id, repo, source, key, title, item_type, path, status, created_at, updated_at)
+        SELECT id, repo, source, key, title, item_type, path, status, created_at, updated_at FROM work_items;
+      DROP TABLE work_items;
+      ALTER TABLE work_items_v7 RENAME TO work_items;
+      CREATE INDEX idx_work_items ON work_items(repo, source, status);
+    `,
+  },
 ];
 
 /** Apply pending migrations in a transaction. Idempotent. */

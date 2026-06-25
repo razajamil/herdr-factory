@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { JiraSourceCfg } from "../config.ts";
 import type { Logger, WorkSource } from "../core/deps.ts";
-import type { Ticket, WorkState } from "../types.ts";
+import type { MatchItem, Ticket, WorkState } from "../types.ts";
 import { JiraClient } from "./jira.ts";
 
 // Attachment caps for materialize (images + videos share the count budget). Moved here from
@@ -26,8 +26,17 @@ export class JiraSource implements WorkSource {
     this.jira = new JiraClient(cfg.baseUrl, email, token);
   }
 
-  listEligible(): Promise<Ticket[]> {
-    return this.jira.listEligible(this.cfg.board, this.cfg.label, this.cfg.statusTodo);
+  async listEligible(): Promise<MatchItem[]> {
+    const items = await this.jira.listEligible(this.cfg.board, this.cfg.label, this.cfg.statusTodo);
+    return items.map((i) => ({
+      sourceType: "jira",
+      key: i.key,
+      summary: i.summary,
+      type: i.type,
+      status: i.status,
+      labels: i.labels,
+      fields: i.fields,
+    }));
   }
 
   async describe(key: string): Promise<Ticket> {
@@ -46,7 +55,11 @@ export class JiraSource implements WorkSource {
         return this.cfg.statusReview;
       case "merged":
       case "aborted":
-        return undefined; // owned by Jira's GitHub integration — never written here
+      case "done":
+        // Terminal states are unmapped for Jira: merged/aborted are owned by Jira's GitHub
+        // integration, and `done` (a custom belt's terminal) has no configured Jira status — so
+        // teardown stays Jira-silent (no network) regardless of which belt produced the run.
+        return undefined;
     }
   }
 

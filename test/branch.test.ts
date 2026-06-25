@@ -41,22 +41,22 @@ describe("renderWorkspaceName", () => {
   const t = { key: "RWR-17202", type: "Bug", summary: "[UI] Fix chargeable item list loading state" };
 
   it("interpolates the user's example template (short slug capped at 20)", () => {
-    expect(renderWorkspaceName("fix/{{ticket_id}}-{{ticket_short_slug}}", t)).toBe("fix/RWR-17202-ui-fix-chargeable-it");
+    expect(renderWorkspaceName("fix/{{work_id}}-{{work_slug}}", t)).toBe("fix/RWR-17202-ui-fix-chargeable-it");
   });
   it("supports prefix/type/full-slug vars", () => {
-    expect(renderWorkspaceName("{{ticket_prefix}}/{{ticket_id}}-{{ticket_short_slug}}", t)).toBe(
+    expect(renderWorkspaceName("{{semantic_work_prefix}}/{{work_id}}-{{work_slug}}", t)).toBe(
       "fix/RWR-17202-ui-fix-chargeable-it",
     );
-    expect(renderWorkspaceName("{{ticket_type}}/{{ticket_id}}", t)).toBe("bug/RWR-17202");
-    expect(renderWorkspaceName("{{ticket_prefix}}/{{ticket_id}}-{{ticket_slug}}", t)).toBe(
+    expect(renderWorkspaceName("{{work_type}}/{{work_id}}", t)).toBe("bug/RWR-17202");
+    expect(renderWorkspaceName("{{semantic_work_prefix}}/{{work_id}}-{{work_full_slug}}", t)).toBe(
       "fix/RWR-17202-ui-fix-chargeable-item-list-loading-state",
     );
   });
   it("tolerates whitespace in the braces and drops unknown vars", () => {
-    expect(renderWorkspaceName("fix/{{ ticket_id }}{{nope}}", t)).toBe("fix/RWR-17202");
+    expect(renderWorkspaceName("fix/{{ work_id }}{{nope}}", t)).toBe("fix/RWR-17202");
   });
   it("sanitises spaces / illegal chars and tidies separators", () => {
-    expect(renderWorkspaceName("wip/{{ticket_id}} draft?", t)).toBe("wip/RWR-17202-draft");
-    expect(renderWorkspaceName("{{ticket_prefix}}//{{ticket_id}}", t)).toBe("fix/RWR-17202");
+    expect(renderWorkspaceName("wip/{{work_id}} draft?", t)).toBe("wip/RWR-17202-draft");
+    expect(renderWorkspaceName("{{semantic_work_prefix}}//{{work_id}}", t)).toBe("fix/RWR-17202");
   });
 });

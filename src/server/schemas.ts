@@ -46,11 +46,13 @@ const RunSchema = z
     id: z.number(),
     repo: z.string(),
     workSource: z.string().nullable(),
+    belt: z.string().nullable(),
     ticketKey: z.string(),
     summary: z.string().nullable(),
     issueType: z.string().nullable(),
     branch: z.string().nullable(),
     phase: z.string(),
+    step: z.string().nullable(),
     prNumber: z.number().nullable(),
     outcome: z.string().nullable(),
     createdAt: z.number(),
@@ -64,13 +66,16 @@ const StatusResponse = z
   .object({
     repo: z.string(),
     limits: z.object({ maxActive: z.number(), watchHours: z.number() }),
-    sources: z.array(z.object({ name: z.string(), type: z.string(), priority: z.number() })),
+    sources: z.array(z.object({ name: z.string(), type: z.string() })),
+    belts: z.array(z.object({ name: z.string(), beltType: z.string(), source: z.string(), priority: z.number() })),
     active: z.array(
       z.object({
         id: z.number(),
         ticketKey: z.string(),
         workSource: z.string().nullable(),
+        belt: z.string().nullable(),
         phase: z.string(),
+        step: z.string().nullable(),
         prNumber: z.number().nullable(),
         summary: z.string().nullable(),
         outcome: z.string().nullable(),
@@ -105,10 +110,12 @@ const TimelineResponse = z
   .openapi("Timeline");
 
 // ---- request bodies -------------------------------------------------------
+// `step` is any string — it's validated against the run's resolved belt in the handler, since the
+// valid step set is belt-specific (and the belt isn't known until the run is resolved from `key`).
 export const StepDoneBody = z
-  .object({ key: z.string(), step: z.enum(["fix", "review", "pr"]), source: z.string().optional() })
+  .object({ key: z.string(), step: z.string(), source: z.string().optional() })
   .openapi("StepDoneBody");
-export const ClaimBody = z.object({ key: z.string(), source: z.string().optional() }).openapi("ClaimBody");
+export const ClaimBody = z.object({ key: z.string(), belt: z.string().optional() }).openapi("ClaimBody");
 export const TeardownBody = z.object({ key: z.string(), source: z.string().optional() }).openapi("TeardownBody");
 
 const jsonBody = <T extends z.ZodType>(schema: T) => ({
@@ -156,7 +163,7 @@ export const stepDoneRoute = createRoute({
   method: "post",
   path: "/repos/{repo}/step-done",
   tags: ["repo"],
-  summary: "A pipeline agent signals it finished a step (fix|review|pr) — event-nudges the dispatcher",
+  summary: "A belt agent signals it finished a step — event-nudges the dispatcher",
   request: { params: RepoParam, ...jsonBody(StepDoneBody) },
   responses: {
     200: { description: "Step recorded", content: { "application/json": { schema: StepDoneResponse } } },

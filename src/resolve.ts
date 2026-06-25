@@ -5,17 +5,17 @@ import type { Run } from "./types.ts";
 // returns an HTTP error). They THROW rather than process.exit, so they're safe in a long-lived
 // process.
 
-/** The source name for a manual command: the explicit `optSource` (validated), else the sole
- *  configured source, else throw asking which one. */
-export function resolveSourceName(deps: Deps, optSource?: string): string {
-  if (optSource) {
-    if (!deps.sources.some((s) => s.name === optSource)) {
-      throw new Error(`unknown source "${optSource}"; configured: ${deps.sources.map((s) => s.name).join(", ")}`);
+/** The belt name for a manual `claim`: the explicit `optBelt` (validated), else the sole
+ *  configured belt, else throw asking which one. */
+export function resolveBeltName(deps: Deps, optBelt?: string): string {
+  if (optBelt) {
+    if (!deps.belts.some((b) => b.name === optBelt)) {
+      throw new Error(`unknown belt "${optBelt}"; configured: ${deps.belts.map((b) => b.name).join(", ")}`);
     }
-    return optSource;
+    return optBelt;
   }
-  if (deps.sources.length === 1) return deps.sources[0]!.name;
-  throw new Error(`multiple sources configured — pass --source <name> (one of: ${deps.sources.map((s) => s.name).join(", ")})`);
+  if (deps.belts.length === 1) return deps.belts[0]!.name;
+  throw new Error(`multiple belts configured — pass --belt <name> (one of: ${deps.belts.map((b) => b.name).join(", ")})`);
 }
 
 /** Resolve a single active run by key for a manual mutation, throwing on cross-source ambiguity. */

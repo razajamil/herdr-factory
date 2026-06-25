@@ -1,16 +1,17 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { Command } from "commander";
-import { globalDbPath, nodePathFile } from "../config.ts";
+import { configJsonSchema, configSchemaPath, globalDbPath, nodePathFile, writeConfigSchema } from "../config.ts";
 import { openDb } from "../db/index.ts";
 import { Store } from "../db/store.ts";
-import { systemClock, type Run, type StepName } from "../types.ts";
+import { systemClock, type Run } from "../types.ts";
 import type { Deps } from "../core/deps.ts";
 import { claimTicket, reconcileRepo, reconcileRun, teardownTicket, withTickLock } from "../core/reconcile.ts";
+import { stepByName } from "../core/step.ts";
 import { run } from "../clients/exec.ts";
 import * as launchd from "../watchers/launchd.ts";
 import { buildDeps, today } from "../build-deps.ts";
-import { resolveActiveRun, resolveSourceName } from "../resolve.ts";
+import { resolveActiveRun, resolveBeltName } from "../resolve.ts";
 import { serve } from "../server/serve.ts";
 import { ensureUp, stopServer, type Log } from "../watchers/supervisor.ts";
 import { selfUpdate } from "../watchers/updater.ts";
@@ -125,11 +126,13 @@ program
       const active = deps.store.activeRuns(c.repoName);
       const recent = deps.store.listRuns(c.repoName, true);
       const finished = recent.filter((r) => r.endedAt !== null);
+      // The phase column shows the active step when running (phase is just "running" otherwise).
       const fmt = (r: Run, statusCol: string) =>
-        `    ${r.ticketKey.padEnd(16)} ${(r.workSource ?? "?").padEnd(14)} ${r.phase.padEnd(12)} ${statusCol.padEnd(16)} PR:${(r.prNumber ? `#${r.prNumber}` : "-").padEnd(6)} ${(r.summary ?? "").slice(0, 50)}`;
+        `    ${r.ticketKey.padEnd(16)} ${(r.belt ?? "?").padEnd(16)} ${(r.phase === "running" && r.step ? r.step : r.phase).padEnd(12)} ${statusCol.padEnd(16)} PR:${(r.prNumber ? `#${r.prNumber}` : "-").padEnd(6)} ${(r.summary ?? "").slice(0, 50)}`;
       console.log(`herdr-factory [${c.repoName}] — cap ${c.limits.maxActive}, watch ${c.limits.watchHours}h`);
+      console.log(`Sources: ${c.sources.map((s) => `${s.name}(${s.type})`).join(" · ")}`);
       console.log(
-        `Sources (priority order): ${c.sources.map((s) => `${s.name}(${s.type}, p${s.priority})`).join(" · ")}`,
+        `Belts (priority order): ${c.belts.map((b) => `${b.name}(${b.beltType}, src:${b.source}, p${b.priority})`).join(" · ")}`,
       );
       console.log(`Runs: ${active.length} running (cap ${c.limits.maxActive}) · ${finished.length} finished`);
       console.log("");
@@ -169,7 +172,7 @@ program
       const out: { source: string; key: string; summary: string; type: string }[] = [];
       for (const src of deps.sources) {
         try {
-          for (const t of await src.client.listEligible()) out.push({ source: src.name, ...t });
+          for (const t of await src.client.listEligible()) out.push({ source: src.name, key: t.key, summary: t.summary, type: t.type });
         } catch (e) {
           deps.log("warn", `${src.name}: eligible query failed: ${e instanceof Error ? e.message : String(e)}`);
         }
@@ -182,14 +185,14 @@ program
 
 program
   .command("claim <key>")
-  .description("manually claim + start one work item")
-  .option("--source <name>", "which work source the key belongs to (required if >1 source)")
-  .action(async (key: string, opts: { source?: string }) => {
+  .description("manually claim + start one work item on a belt")
+  .option("--belt <name>", "which belt to run the item on (required if >1 belt)")
+  .action(async (key: string, opts: { belt?: string }) => {
     try {
       const repo = requireRepo();
-      await viaServerOrLocal({ method: "POST", path: `/repos/${encodeURIComponent(repo)}/claim`, body: { key, source: opts.source } }, async () => {
+      await viaServerOrLocal({ method: "POST", path: `/repos/${encodeURIComponent(repo)}/claim`, body: { key, belt: opts.belt } }, async () => {
         const deps = await buildDeps(repo);
-        await claimTicket(deps, resolveSourceName(deps, opts.source), key);
+        await claimTicket(deps, resolveBeltName(deps, opts.belt), key);
         return { ok: true };
       });
       console.log(`${key}: claimed`);
@@ -217,11 +220,10 @@ program
 
 program
   .command("step-done <key> <step>")
-  .description("a pipeline agent signals it finished its step (fix|review|pr) — event-nudges the dispatcher")
+  .description("a belt agent signals it finished its step — event-nudges the dispatcher")
   .option("--source <name>", "the work source the run belongs to (passed by the agent)")
   .action(async (key: string, step: string, opts: { source?: string }) => {
     try {
-      if (!["fix", "review", "pr"].includes(step)) fail(`step-done: step must be fix|review|pr (got "${step}")`);
       const repo = requireRepo();
       // Route through the server (warm reconcile in ~ms) with a direct in-process fallback so the
       // nudge still lands while the server is restarting — the next tick is the backstop either way.
@@ -232,17 +234,24 @@ program
           const run = resolveActiveRun(deps, key, opts.source);
           if (!run) {
             deps.log("warn", `${key}: no active run to mark step-done`);
-            return { ok: false };
+            return { ok: false, message: "no active run" };
           }
-          deps.store.markStepDone(run.id, step as StepName);
+          // The valid step set is belt-specific; reject a step that isn't part of the run's belt.
+          const belt = deps.resolveBelt(run.belt);
+          if (belt && !stepByName(belt, step)) {
+            deps.log("warn", `${key}: step "${step}" is not in belt "${belt.name}"`);
+            return { ok: false, message: `step "${step}" is not in belt "${belt.name}"` };
+          }
+          deps.store.markStepDone(run.id, step);
           deps.store.recordEvent({ runId: run.id, repo: deps.config.repoName, ticketKey: key, type: "step_done", detail: { step } });
           deps.log("info", `${key}: step-done ${step} recorded`);
           const advanced = await withTickLock(deps, () => reconcileRun(deps, deps.store.getRun(run.id)!));
-          if (!advanced) deps.log("info", `${key}: tick busy — next tick will advance the pipeline`);
+          if (!advanced) deps.log("info", `${key}: tick busy — next tick will advance the belt`);
           return { ok: true, advanced };
         },
       );
-      if ((data as { ok?: boolean }).ok === false) console.log(`${key}: no active run to mark step-done`);
+      const d = data as { ok?: boolean; message?: string };
+      if (d.ok === false) console.log(`${key}: ${d.message ?? "no active run"}`);
     } catch (e) {
       fail(e);
     }
@@ -380,13 +389,33 @@ program
   });
 
 program
+  .command("schema")
+  .description("write the config.yml JSON Schema (editor autocomplete + validation) to <configDir>/config.schema.json")
+  .option("--stdout", "print the schema to stdout instead of writing the file")
+  .action((opts: { stdout?: boolean }) => {
+    try {
+      if (opts.stdout) {
+        console.log(JSON.stringify(configJsonSchema(), null, 2));
+        return;
+      }
+      console.log(`wrote ${writeConfigSchema()}`);
+      console.log("add this first line to a repo's config.yml so your editor uses it:");
+      console.log("  # yaml-language-server: $schema=../../config.schema.json");
+    } catch (e) {
+      fail(e);
+    }
+  });
+
+program
   .command("install")
   .description("install the machine-wide supervisor (one launchd job that keeps the server up for all repos)")
   .action(async () => {
     try {
+      writeConfigSchema(); // keep the editor schema current with this version's config shape
       await launchd.install();
       await ensureUp({}, consoleLog);
       console.log(`installed + loaded ${launchd.label()} — scheduled ensure-up keeps the server serving all configured repos`);
+      console.log(`config schema at ${configSchemaPath()} (reference it with: # yaml-language-server: $schema=../../config.schema.json)`);
     } catch (e) {
       fail(e);
     }

@@ -76,6 +76,20 @@ describe("JiraSource", () => {
     expect(t).toEqual({ key: "RWR-1", summary: "s", type: "Bug" });
   });
 
+  it("listEligible returns the jira match item (status + labels + raw fields)", async () => {
+    globalThis.fetch = (async (url: string | URL) => {
+      const u = String(url);
+      if (u.includes("/board/254/issue")) {
+        const issues = [{ key: "RWR-9", fields: { summary: "Crash on save", issuetype: { name: "Bug" }, status: { name: "To Do" }, labels: ["agent", "p1"] } }];
+        return { ok: true, status: 200, json: async () => ({ issues }), text: async () => "" } as Response;
+      }
+      return { ok: true, status: 200, json: async () => ({}), text: async () => "" } as Response;
+    }) as typeof fetch;
+    const items = await src().listEligible();
+    expect(items.length).toBe(1);
+    expect(items[0]!).toMatchObject({ sourceType: "jira", key: "RWR-9", summary: "Crash on save", type: "Bug", status: "To Do", labels: ["agent", "p1"] });
+  });
+
   it("materialize writes ticket.json (idempotent)", async () => {
     const dir = mkdtempSync(join(tmpdir(), "jira-mat-"));
     tmps.push(dir);

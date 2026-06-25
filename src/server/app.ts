@@ -7,7 +7,8 @@ import { OpenAPIHono } from "@hono/zod-openapi";
 import { swaggerUI } from "@hono/swagger-ui";
 import { VERSION } from "../version.ts";
 import { claimTicket, reconcileRepo, reconcileRun, teardownTicket, withTickLock } from "../core/reconcile.ts";
-import { resolveActiveRun, resolveSourceName } from "../resolve.ts";
+import { stepByName } from "../core/step.ts";
+import { resolveActiveRun, resolveBeltName } from "../resolve.ts";
 import type { Deps } from "../core/deps.ts";
 import {
   claimRoute,
@@ -61,7 +62,9 @@ async function statusPayload(rt: RepoRuntime) {
     id: r.id,
     ticketKey: r.ticketKey,
     workSource: r.workSource,
+    belt: r.belt,
     phase: r.phase as string,
+    step: r.step,
     prNumber: r.prNumber,
     summary: r.summary,
     outcome: r.outcome as string | null,
@@ -71,7 +74,8 @@ async function statusPayload(rt: RepoRuntime) {
   return {
     repo: cfg.repoName,
     limits: { maxActive: cfg.limits.maxActive, watchHours: cfg.limits.watchHours },
-    sources: cfg.sources.map((s) => ({ name: s.name, type: s.type as string, priority: s.priority })),
+    sources: cfg.sources.map((s) => ({ name: s.name, type: s.type as string })),
+    belts: cfg.belts.map((b) => ({ name: b.name, beltType: b.beltType as string, source: b.source, priority: b.priority })),
     active: await Promise.all(active.map(runView)),
     finished: finished.map((r) => ({
       id: r.id,
@@ -138,6 +142,10 @@ export function createApp(ctx: ServerContext): OpenAPIHono {
     if (!rt) return c.json({ error: notConfigured(repo) }, 404);
     const run = resolveActiveRun(rt.deps, key, source);
     if (!run) return c.json({ ok: false, message: `${key}: no active run` }, 200);
+    const belt = rt.deps.resolveBelt(run.belt);
+    if (belt && !stepByName(belt, step)) {
+      return c.json({ ok: false, message: `${key}: step "${step}" is not in belt "${belt.name}"` }, 200);
+    }
     rt.deps.store.markStepDone(run.id, step);
     rt.deps.store.recordEvent({ runId: run.id, repo, ticketKey: key, type: "step_done", detail: { step } });
     rt.deps.log("info", `${key}: step-done ${step} recorded`);
@@ -147,10 +155,10 @@ export function createApp(ctx: ServerContext): OpenAPIHono {
 
   app.openapi(claimRoute, async (c) => {
     const { repo } = c.req.valid("param");
-    const { key, source } = c.req.valid("json");
+    const { key, belt } = c.req.valid("json");
     const rt = ctx.getRepo(repo);
     if (!rt) return c.json({ error: notConfigured(repo) }, 404);
-    await claimTicket(rt.deps, resolveSourceName(rt.deps, source), key);
+    await claimTicket(rt.deps, resolveBeltName(rt.deps, belt), key);
     return c.json({ ok: true }, 200);
   });
 

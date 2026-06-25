@@ -1,0 +1,388 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "repo": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "base_ref": {
+          "default": "origin/main",
+          "type": "string"
+        },
+        "github": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "path"
+      ]
+    },
+    "limits": {
+      "default": {},
+      "type": "object",
+      "properties": {
+        "max_active": {
+          "default": 3,
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991
+        },
+        "watch_hours": {
+          "default": 7,
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "develop_budget_seconds": {
+          "default": 5400,
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991
+        },
+        "stall_seconds": {
+          "default": 2700,
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991
+        },
+        "review_budget_seconds": {
+          "default": 1800,
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991
+        },
+        "pr_budget_seconds": {
+          "default": 3600,
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991
+        },
+        "step_budget_seconds": {
+          "default": 3600,
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991
+        },
+        "tick_interval_seconds": {
+          "default": 60,
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991
+        },
+        "layout_wait_seconds": {
+          "default": 600,
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991
+        }
+      }
+    },
+    "work_sources": {
+      "minItems": 1,
+      "type": "array",
+      "items": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "type": {
+                "type": "string",
+                "const": "jira"
+              },
+              "name": {
+                "type": "string",
+                "minLength": 1
+              },
+              "jira": {
+                "type": "object",
+                "properties": {
+                  "base_url": {
+                    "type": "string",
+                    "format": "uri"
+                  },
+                  "project": {
+                    "type": "string"
+                  },
+                  "board": {
+                    "type": "string"
+                  },
+                  "label": {
+                    "default": "agent",
+                    "type": "string"
+                  },
+                  "status": {
+                    "default": {},
+                    "type": "object",
+                    "properties": {
+                      "todo": {
+                        "default": "To Do",
+                        "type": "string"
+                      },
+                      "in_development": {
+                        "default": "In Progress",
+                        "type": "string"
+                      },
+                      "review": {
+                        "default": "In Review",
+                        "type": "string"
+                      }
+                    }
+                  }
+                },
+                "required": [
+                  "base_url",
+                  "project",
+                  "board"
+                ]
+              }
+            },
+            "required": [
+              "type",
+              "jira"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "type": {
+                "type": "string",
+                "const": "local_markdown"
+              },
+              "name": {
+                "type": "string",
+                "minLength": 1
+              },
+              "local_markdown": {
+                "type": "object",
+                "properties": {
+                  "folder": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "folder"
+                ]
+              }
+            },
+            "required": [
+              "type",
+              "local_markdown"
+            ],
+            "additionalProperties": false
+          }
+        ]
+      }
+    },
+    "belt": {
+      "minItems": 1,
+      "type": "array",
+      "items": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "belt_type": {
+                "type": "string",
+                "const": "work_to_pull_request"
+              },
+              "name": {
+                "type": "string",
+                "minLength": 1
+              },
+              "source": {
+                "type": "string",
+                "minLength": 1
+              },
+              "priority": {
+                "default": 100,
+                "type": "integer",
+                "minimum": -9007199254740991,
+                "maximum": 9007199254740991
+              },
+              "workspace_name": {
+                "type": "string"
+              },
+              "match": {
+                "type": "string"
+              },
+              "agents": {
+                "type": "object",
+                "properties": {
+                  "fix": {
+                    "type": "object",
+                    "properties": {
+                      "tab": {
+                        "type": "string"
+                      },
+                      "pane": {
+                        "type": "string"
+                      },
+                      "prompt_file": {
+                        "type": "string"
+                      },
+                      "prompt_file_source": {
+                        "type": "string",
+                        "enum": [
+                          "repo",
+                          "config"
+                        ]
+                      }
+                    },
+                    "additionalProperties": false
+                  },
+                  "review": {
+                    "type": "object",
+                    "properties": {
+                      "tab": {
+                        "type": "string"
+                      },
+                      "pane": {
+                        "type": "string"
+                      },
+                      "prompt_file": {
+                        "type": "string"
+                      },
+                      "prompt_file_source": {
+                        "type": "string",
+                        "enum": [
+                          "repo",
+                          "config"
+                        ]
+                      }
+                    },
+                    "additionalProperties": false
+                  },
+                  "pr": {
+                    "type": "object",
+                    "properties": {
+                      "tab": {
+                        "type": "string"
+                      },
+                      "pane": {
+                        "type": "string"
+                      },
+                      "prompt_file": {
+                        "type": "string"
+                      },
+                      "prompt_file_source": {
+                        "type": "string",
+                        "enum": [
+                          "repo",
+                          "config"
+                        ]
+                      }
+                    },
+                    "additionalProperties": false
+                  }
+                },
+                "required": [
+                  "fix",
+                  "review",
+                  "pr"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "required": [
+              "belt_type",
+              "name",
+              "source",
+              "agents"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "belt_type": {
+                "type": "string",
+                "const": "custom"
+              },
+              "name": {
+                "type": "string",
+                "minLength": 1
+              },
+              "source": {
+                "type": "string",
+                "minLength": 1
+              },
+              "priority": {
+                "default": 100,
+                "type": "integer",
+                "minimum": -9007199254740991,
+                "maximum": 9007199254740991
+              },
+              "workspace_name": {
+                "type": "string"
+              },
+              "match": {
+                "type": "string"
+              },
+              "steps": {
+                "minItems": 1,
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "name": {
+                      "type": "string",
+                      "pattern": "^[a-z0-9][a-z0-9_-]*$"
+                    },
+                    "prompt_file": {
+                      "type": "string"
+                    },
+                    "prompt_file_source": {
+                      "type": "string",
+                      "enum": [
+                        "repo",
+                        "config"
+                      ]
+                    },
+                    "budget_seconds": {
+                      "type": "integer",
+                      "exclusiveMinimum": 0,
+                      "maximum": 9007199254740991
+                    },
+                    "heartbeat": {
+                      "default": false,
+                      "type": "boolean"
+                    },
+                    "tab": {
+                      "type": "string"
+                    },
+                    "pane": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "name",
+                    "prompt_file",
+                    "prompt_file_source"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            },
+            "required": [
+              "belt_type",
+              "name",
+              "source",
+              "steps"
+            ],
+            "additionalProperties": false
+          }
+        ]
+      }
+    }
+  },
+  "required": [
+    "repo",
+    "work_sources",
+    "belt"
+  ],
+  "title": "herdr-factory repo config (config.yml)",
+  "description": "Structural schema for a per-repo config.yml. Cross-field rules (belt.source refs, unique names, layout both-or-neither, workspace_name {{work_id}}, file existence) are validated at load time, not here."
+}

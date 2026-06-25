@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { parse as parseYaml } from "yaml";
 import type { Store } from "../db/store.ts";
 import type { Logger, WorkSource } from "../core/deps.ts";
-import type { Ticket, WorkState } from "../types.ts";
+import type { MatchItem, Ticket, WorkState } from "../types.ts";
 
 /** Split optional YAML front-matter (`--- … ---`) off the head of a markdown doc. Only consumes
  *  the block when it parses to a YAML object — so a leading `---` thematic break (a horizontal
@@ -131,7 +131,7 @@ export class LocalMarkdownSource implements WorkSource {
     throw new Error(`local_markdown: no source at ${r.path}`);
   }
 
-  async listEligible(): Promise<Ticket[]> {
+  async listEligible(): Promise<MatchItem[]> {
     if (!existsSync(this.folder)) return []; // missing folder = no work (doctor's health() flags it)
     let names: string[];
     try {
@@ -150,7 +150,7 @@ export class LocalMarkdownSource implements WorkSource {
         /* unreadable — ignore */
       }
     }
-    const out: Ticket[] = [];
+    const out: MatchItem[] = [];
     for (const name of names.sort()) {
       if (name.startsWith(".") || name.startsWith("__")) continue; // hidden, or `__`-prefixed = being prepared
       const full = join(this.folder, name);
@@ -181,7 +181,9 @@ export class LocalMarkdownSource implements WorkSource {
       } catch {
         continue;
       }
-      out.push(deriveTicket(key, spec));
+      const ticket = deriveTicket(key, spec); // for summary/type
+      const { data: frontMatter, body } = splitFrontmatter(spec);
+      out.push({ sourceType: "local_markdown", key, summary: ticket.summary, type: ticket.type, path: full, filename: name, frontMatter, body });
     }
     return out;
   }

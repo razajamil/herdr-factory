@@ -1,41 +1,33 @@
+# yaml-language-server: $schema=../../config.schema.json
 # herdr-factory per-repo config.
 # Copy this folder to ~/.config/herdr-factory/repos/<name>/ (<name> = what you pass to --repo),
 # edit config.yml, and put any repo-specific brief text in guidelines-prompt.md (optional).
 # Anything omitted falls back to the engine defaults.
 
 repo:
-  path: $HOME/dev/my-repo        # MAIN (non-linked) checkout. ~ and $HOME are expanded.
-  base_ref: origin/main          # branch worktrees fork from
+  path: $HOME/dev/my-repo # MAIN (non-linked) checkout. ~ and $HOME are expanded.
+  base_ref: origin/main # branch worktrees fork from
   # github: owner/name           # default: derived from the origin remote
 
-# Repo-global limits (shared across every work source below).
+# Repo-global limits (shared across every belt below).
 limits:
-  max_active: 3                  # global concurrency cap across ALL sources
+  max_active: 3 # global concurrency cap across ALL belts
   watch_hours: 7
-  develop_budget_seconds: 5400   # fix step budget (a still-committing agent is extended)
-  stall_seconds: 2700            # no new commits for this long → stalled → attention
-  review_budget_seconds: 1800    # review step budget
-  pr_budget_seconds: 3600        # pr step budget (open PR + CI/bot round)
+  develop_budget_seconds: 5400 # work_to_pull_request fix-step budget
+  stall_seconds: 2700 # no new commits for this long → stalled → attention
+  review_budget_seconds: 1800 # work_to_pull_request review-step budget
+  pr_budget_seconds: 3600 # work_to_pull_request pr-step budget (open PR + CI/bot round)
+  step_budget_seconds: 3600 # default budget for a custom belt step (override per-step)
   tick_interval_seconds: 60
 
-# Where this repo pulls work from — an ordered, priority-ranked list. When there are open slots
-# (under max_active), the reconciler walks sources in PRIORITY order (lower number first; ties
-# break by the order listed here) and claims their eligible work. Each source owns its own
-# workspace_name + agents + type-specific block; repo + limits above are shared.
+# ── Work sources: WHERE work is pulled from. Backends only — no pipeline here. ─────────────────
+# Each has a `type` (jira | local_markdown), an optional `name` (default = type, unique per repo),
+# and a type-specific block. Belts reference a source by this name.
 work_sources:
-  # ── Jira: poll an Agile board; status of record lives in Jira. ───────────────────────────────
   - type: jira
-    name: jira                   # OPTIONAL identifier (default = type); must be unique in this repo
-    priority: 1                  # pulled before lower-priority sources
-    # Branch name for each item (the worktree + workspace derive from it). Must include
-    # {{ticket_id}}. Vars: {{ticket_id}} {{ticket_short_slug}} (<=20) {{ticket_slug}} (<=50)
-    # {{ticket_type}} {{ticket_prefix}} (fix|chore|feature, by issue type).
-    workspace_name: "{{ticket_prefix}}/{{ticket_id}}-{{ticket_short_slug}}"
-    # base_url is the Atlassian site (not a secret); the Jira auth (email + token) stays in the
-    # shared ~/.config/herdr-factory/env. merged/aborted are NOT mapped here — Jira's terminal
-    # state is owned by its GitHub integration, so herdr-factory never writes it.
+    name: jira
     jira:
-      base_url: https://your-org.atlassian.net
+      base_url: https://your-org.atlassian.net # the Atlassian site (auth — email+token — lives in this repo's env file)
       project: PROJ
       board: 123
       label: agent
@@ -43,30 +35,50 @@ work_sources:
         todo: To Do
         in_development: In Progress
         review: In Review
-    # The three pipeline agents — fix → review → pr. All required, no defaults. Each runs in its
-    # own herdr layout pane (tab/pane). prompt_type is REQUIRED for every agent (no silent default):
-    #   augment — engine's built-in step prompt + your prompt_file (OPTIONAL) as extra notes.
-    #   replace — your prompt_file (REQUIRED) is sent verbatim. prompt_file paths are relative to
-    # this folder; tokens @@KEY@@ / @@WORK_DOC@@ / @@HANDOFF_IN@@ / @@STEP_DONE_CMD@@ are substituted.
-    agents:
-      fix:    { tab: fix,    pane: agent, prompt_type: augment, prompt_file: fix.md }
-      review: { tab: review, pane: agent, prompt_type: augment }
-      pr:     { tab: pr,     pane: agent, prompt_type: augment }
 
-  # ── local_markdown: a folder of *.md files; herdr-factory tracks the lifecycle internally. ──
-  # Each top-level *.md (dot/underscore-prefixed files are skipped) is one work item, keyed by
-  # filename. Status (todo → in_development → in_review → merged|aborted) is tracked in the DB's
-  # work_items table — the files are never modified. Title/type come from optional YAML
-  # front-matter (`title:` / `type:`), else the first H1 / humanized filename, and "task".
   - type: local_markdown
-    name: local_markdown
-    priority: 2
-    workspace_name: "feature/{{ticket_id}}-{{ticket_short_slug}}"
+    name: ideas
     local_markdown:
-      folder: $HOME/dev/my-repo-work-items   # ~ and $HOME are expanded
+      folder: $HOME/dev/my-repo-work-items # a folder of *.md task briefs; ~ and $HOME expand
+
+# ── Belts: WHAT we do with the work. A belt pairs a source with an ordered pipeline. ───────────
+# At claim time belts are walked in `priority` order (lower first); the FIRST belt whose optional
+# `match` predicate accepts an item claims it (first match wins). `match` is a path (relative to
+# this folder) to a .ts module whose default export is `(ctx) => boolean` — ctx = { item, source }.
+# Each belt owns its own `workspace_name` branch template (the worktree name reflects the belt).
+belt:
+  # ── work_to_pull_request: the classic fix → review → pr flow with the "walk away" PR watch. ──
+  # The engine owns the three steps + their prompts and rides the PR through CI/review to merge,
+  # then tears the worktree down. An `agents.{fix,review,pr}` block picks each step's layout pane
+  # (set tab+pane together for a layout your herdr setup provisions; omit both to have herdr-factory
+  # spawn its own dedicated pane). Each agent may OPTIONALLY add a `prompt_file` (+ a required
+  # `prompt_file_source`: `config` = this folder, `repo` = the target repo checkout, read from the
+  # worktree at run time) that AUGMENTS that step's engine prompt with repo-specific instructions —
+  # e.g. `fix: { tab: fix, pane: agent, prompt_file: .herdr/fix-notes.md, prompt_file_source: repo }`.
+  - name: ship_bugs
+    belt_type: work_to_pull_request
+    source: jira
+    priority: 1
+    match: match-bugs.ts # optional; omit ⇒ this belt accepts anything from `jira`
+    workspace_name: "{{semantic_work_prefix}}/{{work_id}}-{{work_slug}}"
     agents:
-      # fix here uses the markdown-specific built-in prompt (prompts/local_markdown/fix.md).
-      fix:    { tab: fix,    pane: agent, prompt_type: augment }
-      review: { tab: review, pane: agent, prompt_type: augment }
-      pr:     { tab: pr,     pane: agent, prompt_type: augment }
-  # guidelines-prompt.md in this folder (if present) is appended to every agent prompt.
+      fix: { tab: fix, pane: agent }
+      review: { tab: review, pane: agent }
+      pr: { tab: pr, pane: agent }
+
+  # ── custom: a fully user-defined, agent-driven flow. Each step's prompt_file is the whole step
+  # body (the engine adds only a handover scaffold naming the belt + sibling steps); prompt_file +
+  # prompt_file_source (`config` = this folder, `repo` = the target repo checkout) are REQUIRED. The
+  # run ends when the LAST step signals step-done — no PR, no review watch. budget_seconds/heartbeat
+  # are optional per step (heartbeat off by default — these steps make no commits).
+  - name: work_generation
+    belt_type: custom
+    source: ideas
+    priority: 2
+    workspace_name: "research/{{work_id}}-{{work_slug}}"
+    steps:
+      - { name: research, tab: research, pane: agent, prompt_file: prompts/work_generation/research.md, prompt_file_source: config }
+      - { name: propose, prompt_file: prompts/work_generation/propose.md, prompt_file_source: config }
+      - { name: create_jira_ticket, prompt_file: prompts/work_generation/create-jira-ticket.md, prompt_file_source: config }
+
+# guidelines-prompt.md in this folder (if present) is appended to EVERY step prompt of EVERY belt.

@@ -1,6 +1,17 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import type { JiraIssue, Ticket } from "../types.ts";
+import type { JiraIssue } from "../types.ts";
+
+/** A board-search result with the fields a belt's match predicate routes on. `fields` is the raw
+ *  Jira issue.fields object (summary/issuetype/status/labels) fetched by the board query. */
+export interface JiraEligible {
+  key: string;
+  summary: string;
+  type: string;
+  status: string;
+  labels: string[];
+  fields: Record<string, unknown>;
+}
 
 /** Jira Cloud REST via fetch + API-token basic auth. */
 export class JiraClient {
@@ -15,7 +26,9 @@ export class JiraClient {
 
   requireAuth(): void {
     if (!this.email || !this.token) {
-      throw new Error("Jira auth missing — set JIRA_EMAIL + JIRA_API_TOKEN in ~/.config/herdr-factory/env");
+      throw new Error(
+        "Jira auth missing — set JIRA_EMAIL + JIRA_API_TOKEN in the repo's env (~/.config/herdr-factory/repos/<name>/env) or the shared ~/.config/herdr-factory/env",
+      );
     }
   }
 
@@ -32,14 +45,25 @@ export class JiraClient {
     return (await res.json()) as T;
   }
 
-  /** On board `board`, status `todoStatus`, label `label`. */
-  async listEligible(board: string, label: string, todoStatus: string): Promise<Ticket[]> {
+  /** On board `board`, status `todoStatus`, label `label`. Returns each issue's routing fields
+   *  (status/labels + the raw fields object) so a belt's match predicate can route at claim time. */
+  async listEligible(board: string, label: string, todoStatus: string): Promise<JiraEligible[]> {
     this.requireAuth();
     const jql = `status = "${todoStatus}" AND labels = "${label}" ORDER BY created ASC`;
     const data = await this.getJson<{
-      issues?: { key: string; fields: { summary: string; issuetype: { name: string } } }[];
-    }>(`/rest/agile/1.0/board/${board}/issue?jql=${encodeURIComponent(jql)}&fields=summary,issuetype&maxResults=50`);
-    return (data.issues ?? []).map((i) => ({ key: i.key, summary: i.fields.summary, type: i.fields.issuetype.name }));
+      issues?: {
+        key: string;
+        fields: { summary: string; issuetype: { name: string }; status?: { name: string }; labels?: string[] };
+      }[];
+    }>(`/rest/agile/1.0/board/${board}/issue?jql=${encodeURIComponent(jql)}&fields=summary,issuetype,status,labels&maxResults=50`);
+    return (data.issues ?? []).map((i) => ({
+      key: i.key,
+      summary: i.fields.summary,
+      type: i.fields.issuetype.name,
+      status: i.fields.status?.name ?? todoStatus,
+      labels: i.fields.labels ?? [],
+      fields: i.fields as Record<string, unknown>,
+    }));
   }
 
   async getIssue(key: string): Promise<JiraIssue> {
