@@ -99,8 +99,10 @@ const CustomStepSchema = z
   .refine(bothOrNeither, layoutRefine);
 
 // A per-belt branch-name template (the worktree + workspace derive from it). Must include
-// {{work_id}} so each item gets a unique branch. Vars: {{work_id}} {{work_slug}} (<=20)
-// {{work_full_slug}} (<=50) {{work_type}} {{semantic_work_prefix}} (fix|chore|feature).
+// {{work_id}} so the branch is identifiable by ticket; a short unique suffix is appended
+// automatically (see branchName) so each claim — including a RE-claim of a previously-merged
+// ticket — gets a distinct branch. Vars: {{work_id}} {{work_slug}} (<=20) {{work_full_slug}}
+// (<=50) {{work_type}} {{semantic_work_prefix}} (fix|chore|feature).
 const WorkspaceNameSchema = z
   .string()
   .refine((s) => /\{\{\s*work_id\s*\}\}/.test(s), {

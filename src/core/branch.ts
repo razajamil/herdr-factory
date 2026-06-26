@@ -55,7 +55,12 @@ export function renderWorkspaceName(template: string, t: TicketVars): string {
   return safe || `${prefixForType(t.type)}/${t.key}`;
 }
 
-/** Branch name for a cat. `template` defaults to the historical naming when unset. */
-export function branchName(key: string, type: string, summary: string, template?: string): string {
-  return renderWorkspaceName(template || DEFAULT_WORKSPACE_NAME, { key, type, summary });
+/** Branch name for a cat. `template` defaults to the historical naming when unset. A `uid` (a short
+ *  per-run unique suffix) is appended when given, so each claim — including a RE-claim of a ticket
+ *  whose prior branch was already merged — gets a distinct branch. That's what keeps the pr step's
+ *  `prForBranch` poll matching the CURRENT attempt's PR rather than a stale merged one on a reused
+ *  branch name. */
+export function branchName(key: string, type: string, summary: string, template?: string, uid?: string): string {
+  const base = renderWorkspaceName(template || DEFAULT_WORKSPACE_NAME, { key, type, summary });
+  return uid ? `${base}-${uid}` : base;
 }

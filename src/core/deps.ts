@@ -103,6 +103,7 @@ export interface Deps {
   git: GitApi;
   log: Logger;
   now: () => number; // epoch seconds
+  uid: () => string; // short unique suffix for a run's branch (distinct per claim; see branchName)
   sleep: (ms: number) => Promise<void>;
   rmrf: (path: string) => Promise<void>; // recursive force delete (teardown's defensive dir cleanup)
 }

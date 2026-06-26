@@ -608,7 +608,10 @@ left as-is).
       - `workspace_name` — **per source** now. Branch-name template (worktree + workspace derive
         from it). Vars: `{{work_id}}` `{{work_slug}}` (≤20) `{{work_full_slug}}` (≤50)
         `{{work_type}}` `{{semantic_work_prefix}}` (`fix`/`chore`/`feature`). zod requires `{{work_id}}`.
-        Default `{{semantic_work_prefix}}/{{work_id}}-{{work_full_slug}}`. (Keys should be unique across
+        Default `{{semantic_work_prefix}}/{{work_id}}-{{work_full_slug}}`. A short per-run uid
+        (`deps.uid()`) is appended to the rendered name so each claim — incl. a re-claim of a merged
+        ticket — gets a distinct branch (the pr step's `prForBranch` then can't match a stale merged
+        PR on a reused branch name). (Keys should be unique across
         sources, and per-source templates should differ, so two sources can't collide on a branch.)
       - `agents` — **per source**, required, one block each for `fix`/`review`/`pr`: `tab`/`pane`
         (optional, both-or-neither) + `prompt_type` (required, no default: `augment` | `replace`)

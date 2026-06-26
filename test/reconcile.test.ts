@@ -46,6 +46,7 @@ function build(opts: { multi?: boolean } = {}) {
   const worktree = mkdtempSync(join(tmpdir(), "cats-wt-"));
   tmps.push(worktree);
   let now = 1000;
+  let uidN = 0; // deterministic per-claim branch suffix (u1, u2, …) so re-claims get distinct branches
   const store = new Store(openDb(":memory:"), () => now);
   const state: FakeState = { eligible: [], eligible2: [], pr: null, sig: { unresolved: 0, failing: 0, sig: "s0" }, paneState: "idle", deadPanes: new Set(), headSha: "sha0", sessionId: "sess-1", workspaceExists: false, focusedPane: { paneId: "w1:p1", workspaceId: "w1", tabId: "w1:t1", label: "agent" } };
   const calls = {
@@ -144,6 +145,7 @@ function build(opts: { multi?: boolean } = {}) {
     git,
     log: () => {},
     now: () => now,
+    uid: () => `u${++uidN}`,
     sleep: async () => {},
     rmrf: async (p) => { calls.rmrf.push(p); },
   };
@@ -178,7 +180,7 @@ describe("reconcile pipeline (work_to_pull_request belt)", () => {
     expect(run.phase).toBe("running");
     expect(run.step).toBe("fix");
     expect(run.belt).toBe("ship");
-    expect(run.branch).toBe("fix/K-1-fix-the-thing");
+    expect(run.branch).toBe("fix/K-1-fix-the-thing-u1"); // workspace_name render + per-run uid suffix
     expect(run.workspaceId).toBe("w1");
     expect(run.paneId).toBe("w1:p1"); // latest active pane = the fix agent
     expect(store.getRunStep(run.id, "fix")?.paneId).toBe("w1:p1");
@@ -186,6 +188,23 @@ describe("reconcile pipeline (work_to_pull_request belt)", () => {
     expect(calls.transitions).toContainEqual(["K-1", "in_development"]);
     // materializeWork wrote the work doc the fix agent reads
     expect(existsSync(join(worktree, ".memory/herdr-factory/ticket.json"))).toBe(true);
+  });
+
+  it("a re-claimed ticket gets a fresh unique branch (so a prior merged PR isn't matched)", async () => {
+    const { deps, store, state } = build();
+    state.eligible = [ticket("K-RC")];
+    await reconcileRepo(deps);
+    const run1 = store.activeRunForTicket("demo", "jira", "K-RC")!;
+    store.endRun(run1.id, "merged"); // prior attempt's PR merged + run ended
+    state.eligible = [ticket("K-RC")]; // the ticket re-appears (re-labelled / moved back to To Do)
+    await reconcileRepo(deps);
+    const run2 = store.activeRunForTicket("demo", "jira", "K-RC")!;
+    expect(run2.id).not.toBe(run1.id);
+    // Same human-readable base, distinct per-run suffix — so prForBranch(run2.branch) can't match the
+    // old merged PR that lives on run1.branch (the bug this fixes).
+    expect(run1.branch).toBe("fix/K-RC-fix-the-thing-u1");
+    expect(run2.branch).toBe("fix/K-RC-fix-the-thing-u2");
+    expect(run2.branch).not.toBe(run1.branch);
   });
 
   it("claiming + configured pane not idle yet → waits (stays claiming, never spawns its own)", async () => {

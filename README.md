@@ -92,8 +92,9 @@ In `repos/<name>/config.yml`, set:
 - `belt` — pipelines (≥1): **what** to do with the work. Each belt has a `name`, a `belt_type`, a
   `source` (referencing a `work_sources` name), a `priority` (lower = matched first), its own
   `workspace_name` branch template (must include `{{work_id}}`; other vars: `{{work_slug}}` (≤20),
-  `{{work_full_slug}}` (≤50), `{{work_type}}`, `{{semantic_work_prefix}}` = fix/chore/feature), and
-  an optional `match`.
+  `{{work_full_slug}}` (≤50), `{{work_type}}`, `{{semantic_work_prefix}}` = fix/chore/feature — and a
+  short unique suffix is appended automatically, so re-claiming a previously-merged ticket gets a
+  fresh branch + a fresh PR), and an optional `match`.
 
 **Belt selection.** At claim time belts are walked in `priority` order; the first belt whose
 `match` predicate accepts an item claims it (**first match wins**). `match` is a path (relative to

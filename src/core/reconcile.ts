@@ -114,7 +114,9 @@ export async function reconcileRepo(deps: Deps): Promise<void> {
 
 async function claim(deps: Deps, belt: BeltRuntime, src: SourceRuntime, ticket: Ticket): Promise<void> {
   const repo = deps.config.repoName;
-  const branch = branchName(ticket.key, ticket.type, ticket.summary, belt.workspaceName);
+  // The per-run uid makes the branch unique to THIS attempt, so a re-claimed ticket doesn't reuse a
+  // branch name whose prior PR was already merged (which the pr step would otherwise treat as done).
+  const branch = branchName(ticket.key, ticket.type, ticket.summary, belt.workspaceName, deps.uid());
   const run = deps.store.createRun({
     repo,
     workSource: src.name,

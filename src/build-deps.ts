@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import { appendFileSync, mkdirSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import { join } from "node:path";
@@ -82,6 +83,7 @@ export async function buildDeps(repoName: string): Promise<Deps> {
     git,
     log: makeLogger(config),
     now: systemClock,
+    uid: () => randomBytes(3).toString("hex"), // 6 hex chars — unique per claim, ample for branch suffixes
     sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
     rmrf: (p) => rm(p, { recursive: true, force: true }),
   };

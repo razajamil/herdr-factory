@@ -27,6 +27,10 @@ describe("branchName", () => {
   it("default behaviour is unchanged when no template is given", () => {
     expect(branchName("RWR-9", "Chore", "upgrade eslint", undefined)).toBe("chore/RWR-9-upgrade-eslint");
   });
+  it("appends a per-run uid suffix when given — same ticket, different uid → distinct branch", () => {
+    expect(branchName("RWR-9", "Chore", "upgrade eslint", undefined, "a1b2c3")).toBe("chore/RWR-9-upgrade-eslint-a1b2c3");
+    expect(branchName("RWR-9", "Chore", "upgrade eslint", undefined, "deadbe")).toBe("chore/RWR-9-upgrade-eslint-deadbe");
+  });
 });
 
 describe("slugify", () => {
