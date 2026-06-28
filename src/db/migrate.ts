@@ -131,6 +131,37 @@ const MIGRATIONS: { version: number; sql: string }[] = [
       CREATE INDEX idx_work_items ON work_items(repo, source, status);
     `,
   },
+  {
+    version: 8,
+    // Human-in-the-loop questions. These are source-agnostic: the engine records the paused run
+    // and the source adapter records whatever external object represents the question (a Jira
+    // comment for Jira today, Linear comment / local inbox later). One pending question per run is
+    // enough for the current belt model and prevents duplicate comments when an agent retries the
+    // ask command or the dispatcher retries a failed post.
+    sql: `
+      CREATE TABLE human_questions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        run_id INTEGER NOT NULL REFERENCES runs(id),
+        repo TEXT NOT NULL,
+        work_source TEXT NOT NULL,
+        ticket_key TEXT NOT NULL,
+        step TEXT,
+        question TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('pending','answered')),
+        external_id TEXT,
+        external_created_at TEXT,
+        answer TEXT,
+        answer_external_id TEXT,
+        answer_author TEXT,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        answered_at INTEGER
+      );
+      CREATE INDEX idx_human_questions_pending ON human_questions(repo, status);
+      CREATE INDEX idx_human_questions_run ON human_questions(run_id, status);
+      CREATE UNIQUE INDEX idx_human_questions_one_pending_run ON human_questions(run_id) WHERE status = 'pending';
+    `,
+  },
 ];
 
 /** Apply pending migrations in a transaction. Idempotent. */

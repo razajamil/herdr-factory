@@ -13,6 +13,26 @@ export interface JiraEligible {
   fields: Record<string, unknown>;
 }
 
+export interface JiraComment {
+  id: string;
+  created?: string;
+  updated?: string;
+  author?: { displayName?: string; accountId?: string };
+  body?: unknown;
+}
+
+function adfDoc(text: string): unknown {
+  const lines = text.replace(/\r\n/g, "\n").split("\n");
+  return {
+    type: "doc",
+    version: 1,
+    content: lines.map((line) => ({
+      type: "paragraph",
+      content: line ? [{ type: "text", text: line }] : [],
+    })),
+  };
+}
+
 /** Jira Cloud REST via fetch + API-token basic auth. */
 export class JiraClient {
   private readonly baseUrl: string;
@@ -42,6 +62,16 @@ export class JiraClient {
   private async getJson<T>(path: string): Promise<T> {
     const res = await fetch(this.baseUrl + path, { headers: this.headers() });
     if (!res.ok) throw new Error(`Jira GET ${path} -> ${res.status}: ${(await res.text()).slice(0, 300)}`);
+    return (await res.json()) as T;
+  }
+
+  private async postJson<T>(path: string, body: unknown): Promise<T> {
+    const res = await fetch(this.baseUrl + path, {
+      method: "POST",
+      headers: { ...this.headers(), "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) throw new Error(`Jira POST ${path} -> ${res.status}: ${(await res.text()).slice(0, 300)}`);
     return (await res.json()) as T;
   }
 
@@ -75,6 +105,19 @@ export class JiraClient {
 
   async currentStatus(key: string): Promise<string> {
     return (await this.getIssue(key)).fields.status?.name ?? "";
+  }
+
+  async addComment(key: string, text: string): Promise<JiraComment> {
+    this.requireAuth();
+    return this.postJson<JiraComment>(`/rest/api/3/issue/${key}/comment`, { body: adfDoc(text) });
+  }
+
+  async listComments(key: string): Promise<JiraComment[]> {
+    this.requireAuth();
+    const data = await this.getJson<{ comments?: JiraComment[] }>(
+      `/rest/api/3/issue/${key}/comment?orderBy=created&maxResults=100`,
+    );
+    return data.comments ?? [];
   }
 
   /** Idempotent, case-insensitive transition. Returns false if already in target. */

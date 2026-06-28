@@ -1,9 +1,9 @@
-import { cpSync, existsSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { parse as parseYaml } from "yaml";
 import type { Store } from "../db/store.ts";
 import type { Logger, WorkSource } from "../core/deps.ts";
-import type { MatchItem, Ticket, WorkState } from "../types.ts";
+import type { HumanAskInput, HumanAskResult, HumanPollInput, HumanReply, MatchItem, Ticket, WorkState } from "../types.ts";
 
 /** Split optional YAML front-matter (`--- … ---`) off the head of a markdown doc. Only consumes
  *  the block when it parses to a YAML object — so a leading `---` thematic break (a horizontal
@@ -44,6 +44,10 @@ function humanize(stem: string): string {
   return stem.replace(/[-_]+/g, " ").trim();
 }
 
+function safeName(key: string): string {
+  return key.replace(/[^A-Za-z0-9._-]/g, "_");
+}
+
 /** Derive a Ticket (key/summary/type) from a markdown file's key + contents. Title comes from
  *  front-matter `title`, else the first H1, else the humanised filename. Type from front-matter
  *  `type`, else "task". */
@@ -61,7 +65,8 @@ function deriveTicket(key: string, content: string): Ticket {
  * a top-level directory that contains at least one top-level `*.md` (only that directory's own
  * level is checked — markdown nested deeper does not qualify it). herdr-factory owns the status of
  * record here — the lifecycle (todo → in_development → in_review → merged|aborted) is tracked in
- * the `work_items` table, NOT in the source (which is never modified).
+ * the `work_items` table, NOT in the source markdown. Human questions may create a separate
+ * `.herdr-factory-human/` inbox under the source folder.
  *
  * An item's key is its filename without `.md` (file) or its directory name (directory); a
  * `<key>.md` file wins a collision with a `<key>/` directory. At materialize time a file is
@@ -231,6 +236,51 @@ export class LocalMarkdownSource implements WorkSource {
       return;
     }
     writeFileSync(dest, readFileSync(r.path, "utf8"));
+  }
+
+  private humanQuestionPath(key: string, questionId: number): string {
+    return join(this.folder, ".herdr-factory-human", `${safeName(key)}-q${questionId}.md`);
+  }
+
+  async askHuman(input: HumanAskInput): Promise<HumanAskResult> {
+    const file = this.humanQuestionPath(input.key, input.questionId);
+    mkdirSync(join(this.folder, ".herdr-factory-human"), { recursive: true });
+    if (!existsSync(file)) {
+      writeFileSync(
+        file,
+        [
+          `# Human question for ${input.key}`,
+          "",
+          `Run: ${input.repo}/${input.runId}`,
+          `Step: ${input.step ?? "unknown"}`,
+          "",
+          "## Question",
+          "",
+          input.question.trim(),
+          "",
+          "## Answer",
+          "",
+          "_Write the answer below this line. herdr-factory resumes automatically once this section is non-empty._",
+          "",
+        ].join("\n"),
+      );
+    }
+    return { externalId: file, externalCreatedAt: null };
+  }
+
+  async pollHumanReply(input: HumanPollInput): Promise<HumanReply | null> {
+    const file = input.externalId || this.humanQuestionPath(input.key, input.questionId);
+    if (!existsSync(file)) return null;
+    const text = readFileSync(file, "utf8");
+    const marker = "## Answer";
+    const i = text.indexOf(marker);
+    if (i < 0) return null;
+    const answer = text
+      .slice(i + marker.length)
+      .replace(/_Write the answer below this line[\s\S]*?_/, "")
+      .trim();
+    if (!answer) return null;
+    return { body: answer, externalId: file, externalCreatedAt: null, author: "local_markdown" };
   }
 
   async health(): Promise<void> {

@@ -2,8 +2,8 @@ import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { JiraSourceCfg } from "../config.ts";
 import type { Logger, WorkSource } from "../core/deps.ts";
-import type { MatchItem, Ticket, WorkState } from "../types.ts";
-import { JiraClient } from "./jira.ts";
+import type { HumanAskInput, HumanAskResult, HumanPollInput, HumanReply, MatchItem, Ticket, WorkState } from "../types.ts";
+import { JiraClient, type JiraComment } from "./jira.ts";
 
 // Attachment caps for materialize (images + videos share the count budget). Moved here from
 // step.ts — they're Jira-specific (other sources have their own materialize).
@@ -11,6 +11,36 @@ const MAX_ATTACHMENTS = 12;
 const MAX_IMAGE_BYTES = 10 * 1024 * 1024; // 10 MB
 const MAX_VIDEO_BYTES = 50 * 1024 * 1024; // 50 MB
 const isMedia = (mime: string): boolean => mime.startsWith("image/") || mime.startsWith("video/");
+
+const QUESTION_MARKER = "[herdr-factory question:";
+
+function bodyText(node: unknown): string {
+  if (!node || typeof node !== "object") return "";
+  const rec = node as Record<string, unknown>;
+  let out = typeof rec.text === "string" ? rec.text : "";
+  const content = Array.isArray(rec.content) ? rec.content : [];
+  for (const child of content) out += bodyText(child);
+  if (rec.type === "paragraph" || rec.type === "heading") out += "\n";
+  if (rec.type === "hardBreak") out += "\n";
+  return out;
+}
+
+function commentText(comment: JiraComment): string {
+  return bodyText(comment.body).replace(/\n{3,}/g, "\n\n").trim();
+}
+
+function humanQuestionComment(input: HumanAskInput): string {
+  const step = input.step ?? "unknown";
+  return [
+    `[herdr-factory question: ${input.repo}/${input.runId}/${input.questionId}]`,
+    `Work item: ${input.key}`,
+    `Step: ${step}`,
+    "",
+    input.question.trim(),
+    "",
+    "Reply in a new Jira comment. herdr-factory will resume automatically when it sees the reply.",
+  ].join("\n");
+}
 
 /**
  * The Jira work source: a thin adapter over JiraClient that maps the canonical WorkState
@@ -98,6 +128,35 @@ export class JiraSource implements WorkSource {
     } catch {
       log("warn", `${key}: attachment download had issues`);
     }
+  }
+
+  async askHuman(input: HumanAskInput): Promise<HumanAskResult> {
+    const comment = await this.jira.addComment(input.key, humanQuestionComment(input));
+    return { externalId: comment.id, externalCreatedAt: comment.created ?? null };
+  }
+
+  async pollHumanReply(input: HumanPollInput): Promise<HumanReply | null> {
+    const comments = await this.jira.listComments(input.key);
+    const questionIndex = comments.findIndex((c) => c.id === input.externalId);
+    const cutoff = input.externalCreatedAt ? Date.parse(input.externalCreatedAt) : Number.NaN;
+    const candidates = questionIndex >= 0
+      ? comments.slice(questionIndex + 1)
+      : Number.isFinite(cutoff)
+        ? comments.filter((c) => (c.created ? Date.parse(c.created) : 0) > cutoff)
+        : comments;
+    for (const comment of candidates) {
+      if (comment.id === input.externalId) continue;
+      const text = commentText(comment);
+      if (text.includes(QUESTION_MARKER)) continue;
+      if (!text && !comment.body) continue;
+      return {
+        body: text || "(Jira comment had no extractable text.)",
+        externalId: comment.id,
+        externalCreatedAt: comment.created ?? null,
+        author: comment.author?.displayName ?? comment.author?.accountId ?? null,
+      };
+    }
+    return null;
   }
 
   async health(): Promise<void> {

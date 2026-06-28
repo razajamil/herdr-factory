@@ -191,16 +191,19 @@ launchd ─StartInterval─> herdr-factory ensure-up   (stateless one-shot: keep
         ▼
   todo ─claim(belt)─> running step₁ → … → stepₙ ─┬─ work_to_pull_request: → reviewing ─merged─> teardown
    (eligible)         worktree + one agent per     │  (PR + CI/bot round; 7h watch wakes the worker)
-                      step (handoff between them)  └─ custom: last step step-done ───────────> teardown
+                      step (handoff between them)  ├─ ask-human → waiting_for_human → same step resumes
+                                                   └─ custom: last step step-done ───────────> teardown
 ```
 
 A single idempotent reconciler (`reconcileRepo`), looped by the resident `serve` daemon, finds
 eligible work, picks a belt (priority order, first `match` wins), spins up one herdr worktree, and
 runs one Claude agent per belt step, handing off between them. A `work_to_pull_request` belt then
 watches its PR through to merge and tears the worktree down; a `custom` belt finishes when its last
-step signals done. **All polling is plain shell — no LLM tokens are spent finding or watching
-work.** Claude agents run only for the jobs that need reasoning: the belt's steps, and (for
-`work_to_pull_request`) addressing review comments. The dispatcher is generic; everything
+step signals done. If an agent is blocked or unsure, it can run `ask-human`; the dispatcher posts a
+source-native question (Jira comment today), polls for a reply, writes the answer into `.memory`, and
+resumes the same step automatically. **All polling is plain shell — no LLM tokens are spent finding
+or watching work.** Claude agents run only for the jobs that need reasoning: the belt's steps, and
+(for `work_to_pull_request`) addressing review comments. The dispatcher is generic; everything
 repo-specific lives in per-repo config, so the same engine drives many repos.
 
 State is on disk (SQLite), so a tick can be killed at any point and the next one resumes. The DB —
@@ -219,6 +222,7 @@ injected from config plus an optional per-repo guidance addendum.
 herdr-factory --repo <name> tick|status|eligible|runs [--all]|timeline <KEY>|logs [N]
 herdr-factory --repo <name> claim <KEY> [--belt <name>]|teardown <KEY> [--source <name>]
 herdr-factory --repo <name> step-done <KEY> <step> [--source <name>]   # agent → dispatcher (event-nudge)
+herdr-factory --repo <name> ask-human <KEY> <step> [--source <name>] --question-file <path>
 herdr-factory serve|ensure-up [--restart]|restart|reload|update   # the server + its supervisor (no --repo)
 herdr-factory install|uninstall|start|stop             # the one supervisor launchd job (no --repo)
 herdr-factory schema [--stdout]                        # write the config.yml JSON Schema for editors (no --repo)
@@ -231,7 +235,9 @@ in-process reconcile) and fall back to running in-process when it isn't. `eligib
 across all sources; `doctor` runs a per-source health check plus server liveness. `claim` takes
 `--belt` (which belt to run the item on; defaulted when there's a single belt); `step-done` takes
 the belt step name and `--source` to disambiguate; `teardown` takes `--source` to disambiguate a
-key active in more than one source.
+key active in more than one source. `ask-human` is the agent escape hatch for uncertainty: it records
+a source-agnostic pending question, posts it through the work source, and pauses the run until a human
+reply arrives.
 
 `serve` exposes a local HTTP API on `127.0.0.1:8765` (Hono) with the OpenAPI spec at `/doc` and
 Swagger UI at `/ui`. `update` pulls the latest code (hard reset to the branch's upstream) and

@@ -99,4 +99,42 @@ describe("JiraSource", () => {
     await src().materialize("RWR-1", dir, () => {}); // idempotent: ticket.json exists → no work
     expect(fetchCalls.length).toBe(after);
   });
+
+  it("askHuman posts a marked Jira comment", async () => {
+    let posted = "";
+    globalThis.fetch = (async (url: string | URL, init?: RequestInit) => {
+      fetchCalls.push({ url: String(url), method: init?.method ?? "GET" });
+      posted = String(init?.body ?? "");
+      return { ok: true, status: 201, json: async () => ({ id: "10000", created: "2026-06-28T00:00:00.000+0000" }), text: async () => "" } as Response;
+    }) as typeof fetch;
+
+    const res = await src().askHuman({ repo: "demo", runId: 7, questionId: 3, key: "RWR-1", step: "fix", question: "Which path should win?" });
+
+    expect(res.externalId).toBe("10000");
+    expect(fetchCalls).toEqual([{ url: "https://x.atlassian.net/rest/api/3/issue/RWR-1/comment", method: "POST" }]);
+    expect(posted).toContain("herdr-factory question: demo/7/3");
+    expect(posted).toContain("Which path should win?");
+  });
+
+  it("pollHumanReply returns the first later non-question Jira comment", async () => {
+    const adf = (text: string) => ({ type: "doc", version: 1, content: [{ type: "paragraph", content: [{ type: "text", text }] }] });
+    globalThis.fetch = (async (url: string | URL, init?: RequestInit) => {
+      fetchCalls.push({ url: String(url), method: init?.method ?? "GET" });
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          comments: [
+            { id: "q1", created: "2026-06-28T00:00:00.000+0000", body: adf("[herdr-factory question: demo/7/3]") },
+            { id: "a1", created: "2026-06-28T00:01:00.000+0000", author: { displayName: "Pat" }, body: adf("Use the new behavior.") },
+          ],
+        }),
+        text: async () => "",
+      } as Response;
+    }) as typeof fetch;
+
+    const reply = await src().pollHumanReply({ key: "RWR-1", questionId: 3, externalId: "q1", externalCreatedAt: "2026-06-28T00:00:00.000+0000" });
+
+    expect(reply).toMatchObject({ body: "Use the new behavior.", externalId: "a1", author: "Pat" });
+  });
 });

@@ -4,6 +4,10 @@ import type {
   Agent,
   BeltMatch,
   FocusedPane,
+  HumanAskInput,
+  HumanAskResult,
+  HumanPollInput,
+  HumanReply,
   MatchItem,
   PrInfo,
   ReviewSig,
@@ -55,6 +59,10 @@ export interface WorkSource {
   /** Write the item's work doc (+ any media) into `memDir` for the fix agent. Idempotent (a
    *  no-op once already materialized). Best-effort: logs rather than throwing on backend issues. */
   materialize(key: string, memDir: string, log: Logger): Promise<void>;
+  /** Post a source-native question for a human (Jira/Linear comment, local inbox, …). */
+  askHuman(input: HumanAskInput): Promise<HumanAskResult>;
+  /** Poll the source for a human reply to a previously-posted question. */
+  pollHumanReply(input: HumanPollInput): Promise<HumanReply | null>;
   /** Throw if the source is misconfigured/unreachable (the `doctor` per-source check). */
   health(): Promise<void>;
 }

@@ -4,10 +4,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openDb } from "../src/db/index.ts";
 import { Store } from "../src/db/store.ts";
-import { applyPendingFocus, reconcileRepo, reconcileRun, withTickLock } from "../src/core/reconcile.ts";
+import { applyPendingFocus, reconcileRepo, reconcileRun, requestHumanInput, withTickLock } from "../src/core/reconcile.ts";
 import type { BeltRuntime, Deps, GitApi, GitHubApi, HerdrApi, SourceRuntime, WorkSource } from "../src/core/deps.ts";
 import type { Config, Secrets, StepConfig } from "../src/config.ts";
-import type { FocusedPane, MatchItem, Phase, PrInfo, ReviewSig, Ticket, WorkState } from "../src/types.ts";
+import type { FocusedPane, HumanAskInput, HumanPollInput, HumanReply, MatchItem, Phase, PrInfo, ReviewSig, Ticket, WorkState } from "../src/types.ts";
 
 const tmps: string[] = [];
 afterEach(() => {
@@ -26,6 +26,7 @@ interface FakeState {
   sessionId: string | null;
   workspaceExists: boolean; // does the workspace still exist after a worktree remove?
   focusedPane: FocusedPane | null; // the pane the user is currently looking at
+  humanReply: HumanReply | null; // source-native reply to a pending human question
 }
 
 /** A resolved belt step for the fakes. Budgets/heartbeat/opensPr mirror what config.ts derives for
@@ -48,7 +49,7 @@ function build(opts: { multi?: boolean } = {}) {
   let now = 1000;
   let uidN = 0; // deterministic per-claim branch suffix (u1, u2, …) so re-claims get distinct branches
   const store = new Store(openDb(":memory:"), () => now);
-  const state: FakeState = { eligible: [], eligible2: [], pr: null, sig: { unresolved: 0, failing: 0, sig: "s0" }, paneState: "idle", deadPanes: new Set(), headSha: "sha0", sessionId: "sess-1", workspaceExists: false, focusedPane: { paneId: "w1:p1", workspaceId: "w1", tabId: "w1:t1", label: "agent" } };
+  const state: FakeState = { eligible: [], eligible2: [], pr: null, sig: { unresolved: 0, failing: 0, sig: "s0" }, paneState: "idle", deadPanes: new Set(), headSha: "sha0", sessionId: "sess-1", workspaceExists: false, focusedPane: { paneId: "w1:p1", workspaceId: "w1", tabId: "w1:t1", label: "agent" }, humanReply: null };
   const calls = {
     transitions: [] as [string, WorkState][],
     agentSend: [] as [string, string][],
@@ -58,6 +59,8 @@ function build(opts: { multi?: boolean } = {}) {
     workspaceClose: [] as string[],
     rmrf: [] as string[],
     branchDelete: [] as string[],
+    humanAsk: [] as HumanAskInput[],
+    humanPoll: [] as HumanPollInput[],
     agentStart: 0,
     notify: 0,
   };
@@ -70,6 +73,8 @@ function build(opts: { multi?: boolean } = {}) {
     describe: async (key) => ({ key, summary: "Fix the thing", type: "Bug" }),
     transition: async (key, to) => { calls.transitions.push([key, to]); return true; },
     materialize: async (_key, memDir) => { mkdirSync(memDir, { recursive: true }); writeFileSync(join(memDir, "ticket.json"), "{}"); },
+    askHuman: async (input) => { calls.humanAsk.push(input); return { externalId: `q-${input.questionId}`, externalCreatedAt: "2026-06-28T00:00:00.000+0000" }; },
+    pollHumanReply: async (input) => { calls.humanPoll.push(input); return state.humanReply; },
     health: async () => {},
   };
   const sources: SourceRuntime[] = [{ name: "jira", type: "jira", client: jiraClient }];
@@ -84,6 +89,8 @@ function build(opts: { multi?: boolean } = {}) {
       describe: async (key) => ({ key, summary: "md work", type: "task" }),
       transition: async (key, to) => { calls.transitions.push([key, to]); return true; },
       materialize: async (_key, memDir) => { mkdirSync(memDir, { recursive: true }); writeFileSync(join(memDir, "task.md"), "# md"); },
+      askHuman: async (input) => { calls.humanAsk.push(input); return { externalId: `q-${input.questionId}`, externalCreatedAt: "2026-06-28T00:00:00.000+0000" }; },
+      pollHumanReply: async (input) => { calls.humanPoll.push(input); return state.humanReply; },
       health: async () => {},
     };
     sources.push({ name: "lm", type: "local_markdown", client: lmClient });
@@ -273,6 +280,34 @@ describe("reconcile pipeline (work_to_pull_request belt)", () => {
     expect(got.phase).toBe("running");
     expect(got.step).toBe("fix");
     expect(calls.agentSend.length).toBe(0); // alive + working, nothing to do
+  });
+
+  it("ask-human parks a step, polls the source, then automatically resumes with the reply", async () => {
+    const { deps, store, state, worktree, calls } = build();
+    const run = seed(store, worktree, "K-HITL", "running", "fix");
+
+    const asked = await requestHumanInput(deps, run, "fix", "Which behavior should win when the flags conflict?");
+    expect(asked.posted).toBe(true);
+    expect(calls.humanAsk).toHaveLength(1);
+    expect(calls.humanAsk[0]?.question).toContain("Which behavior");
+    expect(store.getRun(run.id)!.phase).toBe("waiting_for_human");
+    expect(store.getRun(run.id)!.step).toBe("fix");
+
+    await reconcileRun(deps, store.getRun(run.id)!);
+    expect(calls.humanPoll).toHaveLength(1);
+    expect(store.getRun(run.id)!.phase).toBe("waiting_for_human");
+    expect(store.getRun(run.id)!.step).toBe("fix");
+
+    state.humanReply = { body: "Prefer the new flag and keep the legacy behavior as fallback.", externalId: "answer-1", author: "PM" };
+    await reconcileRun(deps, store.getRun(run.id)!);
+
+    const got = store.getRun(run.id)!;
+    expect(got.phase).toBe("running");
+    expect(got.step).toBe("fix");
+    expect(store.getHumanQuestion(asked.questionId)!.status).toBe("answered");
+    const replyFile = join(worktree, ".memory/herdr-factory/human-replies/question-1.md");
+    expect(readFileSync(replyFile, "utf8")).toContain("Prefer the new flag");
+    expect(calls.agentSend.at(-1)?.[1]).toContain("Human guidance has arrived");
   });
 
   it("running fix + step-done fix → review (spawns review agent, no Jira move; wires the handoff)", async () => {

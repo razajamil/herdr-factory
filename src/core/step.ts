@@ -7,7 +7,7 @@ import type { Run, RunStep } from "../types.ts";
 
 export const CLAUDE_FLAGS = ["--dangerously-skip-permissions"];
 export const CLI_PATH = fileURLToPath(new URL("../../bin/herdr-factory", import.meta.url));
-const MEMORY_DIR = ".memory/herdr-factory";
+export const MEMORY_DIR = ".memory/herdr-factory";
 
 // --- belt step sequencing (belt.steps is the ordered source of truth) -------
 
@@ -103,7 +103,7 @@ export async function materializeWork(deps: Deps, run: Run, src: SourceRuntime):
  *  agent, and the mandatory finish protocol (write a handoff note, then signal step-done). This is
  *  the "you're working in herdr, here are the other agents in this belt" wiring — the only thing the
  *  engine injects on top of the step's own prompt body. */
-function scaffold(belt: BeltRuntime, step: StepConfig, prior: RunStep | null, stepDoneCmd: string): string {
+function scaffold(belt: BeltRuntime, step: StepConfig, prior: RunStep | null, stepDoneCmd: string, askHumanCmd: string): string {
   const seq = belt.steps.map((s) => (s.name === step.name ? `**${s.name}** (you)` : s.name)).join(" → ");
   const inputs = prior
     ? `\n\n## Input from the previous step (${prior.step})\n` +
@@ -117,6 +117,11 @@ function scaffold(belt: BeltRuntime, step: StepConfig, prior: RunStep | null, st
     `You are the **${step.name}** step of the **${belt.name}** belt. The belt runs these steps in order: ${seq}. ` +
     `Each step is a separate agent in its own herdr pane; you hand work forward via a handoff note (and can query earlier agents directly).\n` +
     inputs +
+    `\n## Asking a human for guidance\n` +
+    `If you are blocked by ambiguous requirements, missing source material, impossible verification, or conflicting evidence, do NOT guess and do NOT run step-done. ` +
+    `Write a concise question to \`${MEMORY_DIR}/human-question-${step.name}.md\`, then run \`${askHumanCmd}\` and stop. ` +
+    `The dispatcher will post the question through the work source, wait for a human reply, write the answer under \`${MEMORY_DIR}/human-replies/\`, and resume this same step automatically. ` +
+    `If \`${MEMORY_DIR}/human-replies/\` already exists when you start or resume, read its files before continuing.\n` +
     `\n## Finishing this step (required)\n` +
     `1. Write your handoff note to \`${MEMORY_DIR}/handoff-${step.name}.md\` — what you did, key decisions and why, ` +
     `anything uncertain, and what the next step should verify.\n` +
@@ -165,6 +170,7 @@ export function renderStepPrompt(
   // The step-done command carries --source so the signal resolves to the right run even when two
   // sources share a key (the worker only knows its key, via HERDR_FACTORY_TICKET).
   const stepDoneCmd = `${CLI_PATH} --repo ${deps.config.repoName} step-done ${run.ticketKey} ${step.name} --source ${src.name}`;
+  const askHumanCmd = `${CLI_PATH} --repo ${deps.config.repoName} ask-human ${run.ticketKey} ${step.name} --source ${src.name} --question-file ${MEMORY_DIR}/human-question-${step.name}.md`;
   // Where the work item's spec lives + how to describe it. Jira → a single ticket.json.
   // local_markdown is either a single file (snapshotted to task.md) or a whole directory (copied
   // to task/); detect which from what materialize wrote into this worktree's .memory.
@@ -203,7 +209,7 @@ export function renderStepPrompt(
   let out = stepBody(deps, run, step);
   for (const [token, value] of Object.entries(sub)) out = out.replaceAll(token, () => value);
   if (deps.config.guidance) out += `\n\n## Repo-specific guidance\n\n${deps.config.guidance}\n`;
-  out += scaffold(belt, step, prior, stepDoneCmd);
+  out += scaffold(belt, step, prior, stepDoneCmd, askHumanCmd);
   const mem = join(worktree, MEMORY_DIR);
   mkdirSync(mem, { recursive: true });
   writeFileSync(join(mem, `prompt-${step.name}.md`), out);

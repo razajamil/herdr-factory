@@ -6,7 +6,7 @@ import { openDb } from "../db/index.ts";
 import { Store } from "../db/store.ts";
 import { systemClock, type Run } from "../types.ts";
 import type { Deps } from "../core/deps.ts";
-import { claimTicket, reconcileRepo, reconcileRun, teardownTicket, withTickLock } from "../core/reconcile.ts";
+import { claimTicket, reconcileRepo, reconcileRun, requestHumanInput, teardownTicket, withTickLock } from "../core/reconcile.ts";
 import { stepByName } from "../core/step.ts";
 import { run } from "../clients/exec.ts";
 import * as launchd from "../watchers/launchd.ts";
@@ -58,6 +58,13 @@ function requireRepo(): string {
   const repo = (program.opts() as { repo?: string }).repo;
   if (!repo) fail("this command needs a repo: herdr-factory --repo <name> <command>");
   return repo;
+}
+
+function humanQuestionText(opts: { question?: string; questionFile?: string }): string {
+  if (opts.question && opts.questionFile) fail("ask-human: pass either --question or --question-file, not both");
+  const text = opts.questionFile ? readFileSync(opts.questionFile, "utf8") : opts.question;
+  if (!text?.trim()) fail("ask-human: provide a non-empty --question or --question-file");
+  return text.trim();
 }
 
 program
@@ -252,6 +259,48 @@ program
       );
       const d = data as { ok?: boolean; message?: string };
       if (d.ok === false) console.log(`${key}: ${d.message ?? "no active run"}`);
+    } catch (e) {
+      fail(e);
+    }
+  });
+
+program
+  .command("ask-human <key> <step>")
+  .description("a belt agent asks a human through the work source and pauses until a reply arrives")
+  .option("--source <name>", "the work source the run belongs to (passed by the agent)")
+  .option("--question <text>", "question text")
+  .option("--question-file <path>", "file containing the question text")
+  .action(async (key: string, step: string, opts: { source?: string; question?: string; questionFile?: string }) => {
+    try {
+      const repo = requireRepo();
+      const question = humanQuestionText(opts);
+      const { data } = await viaServerOrLocal(
+        { method: "POST", path: `/repos/${encodeURIComponent(repo)}/ask-human`, body: { key, step, source: opts.source, question } },
+        async () => {
+          const deps = await buildDeps(repo);
+          const run = resolveActiveRun(deps, key, opts.source);
+          if (!run) {
+            deps.log("warn", `${key}: no active run to ask human`);
+            return { ok: false, message: "no active run" };
+          }
+          const belt = deps.resolveBelt(run.belt);
+          if (belt && !stepByName(belt, step)) {
+            deps.log("warn", `${key}: step "${step}" is not in belt "${belt.name}"`);
+            return { ok: false, message: `step "${step}" is not in belt "${belt.name}"` };
+          }
+          const result = await requestHumanInput(deps, run, step, question);
+          const advanced = await withTickLock(deps, () => reconcileRun(deps, deps.store.getRun(run.id)!));
+          if (!advanced) deps.log("info", `${key}: tick busy — next tick will poll for a human reply`);
+          return result;
+        },
+      );
+      const d = data as { ok?: boolean; questionId?: number; posted?: boolean; message?: string };
+      if (d.ok === false) {
+        console.log(`${key}: ${d.message ?? "no active run"}`);
+        return;
+      }
+      console.log(`${key}: waiting for human answer (question #${d.questionId}${d.posted ? "" : ", posting deferred"})`);
+      if (d.message) console.log(d.message);
     } catch (e) {
       fail(e);
     }

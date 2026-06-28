@@ -1,5 +1,18 @@
 import type { DatabaseSync } from "node:sqlite";
-import type { Clock, EventType, Outcome, Run, RunPatch, RunStep, RunStepPatch, StepName, WorkItem, WorkState } from "../types.ts";
+import type {
+  Clock,
+  EventType,
+  HumanQuestion,
+  HumanQuestionPatch,
+  Outcome,
+  Run,
+  RunPatch,
+  RunStep,
+  RunStepPatch,
+  StepName,
+  WorkItem,
+  WorkState,
+} from "../types.ts";
 import { systemClock } from "../types.ts";
 import { tx } from "./tx.ts";
 
@@ -108,6 +121,46 @@ function toWorkItem(r: WorkItemRow): WorkItem {
     status: r.status as WorkState,
     createdAt: r.created_at,
     updatedAt: r.updated_at,
+  };
+}
+
+interface HumanQuestionRow {
+  id: number;
+  run_id: number;
+  repo: string;
+  work_source: string;
+  ticket_key: string;
+  step: string | null;
+  question: string;
+  status: string;
+  external_id: string | null;
+  external_created_at: string | null;
+  answer: string | null;
+  answer_external_id: string | null;
+  answer_author: string | null;
+  created_at: number;
+  updated_at: number;
+  answered_at: number | null;
+}
+
+function toHumanQuestion(r: HumanQuestionRow): HumanQuestion {
+  return {
+    id: r.id,
+    runId: r.run_id,
+    repo: r.repo,
+    workSource: r.work_source,
+    ticketKey: r.ticket_key,
+    step: r.step,
+    question: r.question,
+    status: r.status as HumanQuestion["status"],
+    externalId: r.external_id,
+    externalCreatedAt: r.external_created_at,
+    answer: r.answer,
+    answerExternalId: r.answer_external_id,
+    answerAuthor: r.answer_author,
+    createdAt: r.created_at,
+    updatedAt: r.updated_at,
+    answeredAt: r.answered_at,
   };
 }
 
@@ -330,6 +383,78 @@ export class Store {
 
   markStepDone(runId: number, step: StepName): void {
     this.upsertRunStep(runId, step, { done: true });
+  }
+
+  // --- human-in-the-loop questions ------------------------------------------
+
+  getHumanQuestion(id: number): HumanQuestion | undefined {
+    const row = this.db.prepare("SELECT * FROM human_questions WHERE id = ?").get(id) as HumanQuestionRow | undefined;
+    return row ? toHumanQuestion(row) : undefined;
+  }
+
+  pendingHumanQuestionForRun(runId: number): HumanQuestion | undefined {
+    const row = this.db
+      .prepare("SELECT * FROM human_questions WHERE run_id = ? AND status = 'pending' ORDER BY id DESC LIMIT 1")
+      .get(runId) as HumanQuestionRow | undefined;
+    return row ? toHumanQuestion(row) : undefined;
+  }
+
+  createHumanQuestion(input: {
+    runId: number;
+    repo: string;
+    workSource: string;
+    ticketKey: string;
+    step?: string | null;
+    question: string;
+  }): HumanQuestion {
+    const existing = this.pendingHumanQuestionForRun(input.runId);
+    if (existing) return existing;
+    const t = this.now();
+    const info = this.db
+      .prepare(
+        `INSERT INTO human_questions (run_id, repo, work_source, ticket_key, step, question, status, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)`,
+      )
+      .run(input.runId, input.repo, input.workSource, input.ticketKey, input.step ?? null, input.question, t, t);
+    const q = this.getHumanQuestion(Number(info.lastInsertRowid));
+    if (!q) throw new Error("createHumanQuestion: row vanished after insert");
+    return q;
+  }
+
+  updateHumanQuestion(id: number, patch: HumanQuestionPatch): void {
+    const sets: string[] = [];
+    const vals: Bind[] = [];
+    const set = (col: string, v: Bind) => {
+      sets.push(`${col} = ?`);
+      vals.push(v);
+    };
+    if (patch.status !== undefined) set("status", patch.status);
+    if (patch.externalId !== undefined) set("external_id", patch.externalId);
+    if (patch.externalCreatedAt !== undefined) set("external_created_at", patch.externalCreatedAt);
+    if (patch.answer !== undefined) set("answer", patch.answer);
+    if (patch.answerExternalId !== undefined) set("answer_external_id", patch.answerExternalId);
+    if (patch.answerAuthor !== undefined) set("answer_author", patch.answerAuthor);
+    if (patch.answeredAt !== undefined) set("answered_at", patch.answeredAt);
+    if (sets.length === 0) return;
+    set("updated_at", this.now());
+    this.db.prepare(`UPDATE human_questions SET ${sets.join(", ")} WHERE id = ?`).run(...vals, id);
+  }
+
+  answerHumanQuestion(
+    id: number,
+    reply: { body: string; externalId: string; externalCreatedAt?: string | null; author?: string | null },
+  ): HumanQuestion {
+    const t = this.now();
+    this.updateHumanQuestion(id, {
+      status: "answered",
+      answer: reply.body,
+      answerExternalId: reply.externalId,
+      answerAuthor: reply.author ?? null,
+      answeredAt: t,
+    });
+    const q = this.getHumanQuestion(id);
+    if (!q) throw new Error("answerHumanQuestion: row vanished after update");
+    return q;
   }
 
   // --- work_items (internal lifecycle ledger for sources with no external status; local_markdown) ---

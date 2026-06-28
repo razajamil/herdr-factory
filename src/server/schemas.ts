@@ -40,6 +40,9 @@ const TickResponse = z.object({ ran: z.boolean() }).openapi("Tick");
 const StepDoneResponse = z
   .object({ ok: z.boolean(), advanced: z.boolean().optional(), message: z.string().optional() })
   .openapi("StepDone");
+const AskHumanResponse = z
+  .object({ ok: z.boolean(), questionId: z.number().optional(), posted: z.boolean().optional(), message: z.string().optional() })
+  .openapi("AskHuman");
 
 const RunSchema = z
   .object({
@@ -115,6 +118,9 @@ const TimelineResponse = z
 export const StepDoneBody = z
   .object({ key: z.string(), step: z.string(), source: z.string().optional() })
   .openapi("StepDoneBody");
+export const AskHumanBody = z
+  .object({ key: z.string(), step: z.string(), source: z.string().optional(), question: z.string().min(1) })
+  .openapi("AskHumanBody");
 export const ClaimBody = z.object({ key: z.string(), belt: z.string().optional() }).openapi("ClaimBody");
 export const TeardownBody = z.object({ key: z.string(), source: z.string().optional() }).openapi("TeardownBody");
 
@@ -167,6 +173,18 @@ export const stepDoneRoute = createRoute({
   request: { params: RepoParam, ...jsonBody(StepDoneBody) },
   responses: {
     200: { description: "Step recorded", content: { "application/json": { schema: StepDoneResponse } } },
+    ...repoErrors,
+  },
+});
+
+export const askHumanRoute = createRoute({
+  method: "post",
+  path: "/repos/{repo}/ask-human",
+  tags: ["repo"],
+  summary: "A belt agent asks a human through its work source and pauses the run",
+  request: { params: RepoParam, ...jsonBody(AskHumanBody) },
+  responses: {
+    200: { description: "Question recorded", content: { "application/json": { schema: AskHumanResponse } } },
     ...repoErrors,
   },
 });

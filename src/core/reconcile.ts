@@ -1,9 +1,11 @@
+import { mkdirSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import type { BeltRuntime, Deps, SourceRuntime } from "./deps.ts";
 import type { StepConfig } from "../config.ts";
-import type { MatchItem, Outcome, Run, RunStep, Ticket } from "../types.ts";
+import type { HumanQuestion, MatchItem, Outcome, Run, RunStep, Ticket } from "../types.ts";
 import { outcomeToWorkState, ticketOf } from "../types.ts";
 import { branchName } from "./branch.ts";
-import { firstStep, materializeWork, nextStep, spawnStep, stepByName } from "./step.ts";
+import { firstStep, materializeWork, MEMORY_DIR, nextStep, spawnStep, stepByName } from "./step.ts";
 import { wakeResolver } from "./watch.ts";
 
 function err(e: unknown): string {
@@ -177,6 +179,8 @@ async function dispatchPhase(deps: Deps, run: Run, belt: BeltRuntime, src: Sourc
         detail: { step: run.step, belt: belt.name },
       });
     }
+    case "waiting_for_human":
+      return reconcileWaitingForHuman(deps, run, belt, src);
     case "reviewing":
       return reconcileReviewing(deps, run, src);
     case "tearing_down":
@@ -306,6 +310,178 @@ async function escalateAttention(
   // until the run resolves (re-spawn renames it back; teardown removes the pane). Best-effort.
   if (run.paneId) await deps.herdr.agentRename(run.paneId, `⚠ ATTENTION ${run.ticketKey}`).catch(() => {});
   await deps.herdr.notify(`herdr-factory: ${run.ticketKey} needs attention`, opts.body).catch(() => {});
+}
+
+async function postHumanQuestion(deps: Deps, src: SourceRuntime, q: HumanQuestion): Promise<HumanQuestion> {
+  if (q.externalId) return q;
+  const res = await src.client.askHuman({
+    repo: deps.config.repoName,
+    runId: q.runId,
+    questionId: q.id,
+    key: q.ticketKey,
+    step: q.step,
+    question: q.question,
+  });
+  deps.store.updateHumanQuestion(q.id, { externalId: res.externalId, externalCreatedAt: res.externalCreatedAt ?? null });
+  return deps.store.getHumanQuestion(q.id)!;
+}
+
+/** Agent-facing pause primitive: persist a human question, post it through the run's source, and
+ *  park the run until `reconcileWaitingForHuman` sees a source-native reply. */
+export async function requestHumanInput(
+  deps: Deps,
+  run: Run,
+  step: string,
+  question: string,
+): Promise<{ ok: boolean; questionId: number; posted: boolean; message?: string }> {
+  const src = deps.resolveSource(run.workSource);
+  if (!src) throw new Error(`${run.ticketKey}: work source "${run.workSource}" not configured`);
+
+  const existing = deps.store.pendingHumanQuestionForRun(run.id);
+  let q = existing ?? deps.store.createHumanQuestion({
+    runId: run.id,
+    repo: deps.config.repoName,
+    workSource: src.name,
+    ticketKey: run.ticketKey,
+    step,
+    question: question.trim(),
+  });
+
+  deps.store.updateRun(run.id, { phase: "waiting_for_human", step, attentionReason: null });
+  let posted = q.externalId !== null;
+  let message: string | undefined;
+  try {
+    q = await postHumanQuestion(deps, src, q);
+    posted = q.externalId !== null;
+  } catch (e) {
+    message = `question recorded; posting deferred: ${err(e)}`;
+    deps.log("warn", `${run.ticketKey}: human question #${q.id} post deferred: ${err(e)}`);
+  }
+
+  deps.store.recordEvent({
+    runId: run.id,
+    repo: deps.config.repoName,
+    ticketKey: run.ticketKey,
+    type: "human_question",
+    detail: { step, questionId: q.id, externalId: q.externalId, posted, reused: existing !== undefined },
+  });
+  deps.log("info", `${run.ticketKey}: waiting for human answer to question #${q.id}`);
+  return { ok: true, questionId: q.id, posted, message };
+}
+
+function writeHumanReply(run: Run, q: HumanQuestion, replyBody: string, author: string | null | undefined): string | null {
+  if (!run.worktreePath) return null;
+  const dir = join(run.worktreePath, MEMORY_DIR, "human-replies");
+  mkdirSync(dir, { recursive: true });
+  const file = join(dir, `question-${q.id}.md`);
+  writeFileSync(
+    file,
+    [
+      `# Human reply for ${run.ticketKey}`,
+      "",
+      `Question: #${q.id}`,
+      `Step: ${q.step ?? "unknown"}`,
+      author ? `Author: ${author}` : null,
+      "",
+      "## Question",
+      "",
+      q.question,
+      "",
+      "## Reply",
+      "",
+      replyBody,
+      "",
+    ]
+      .filter((line): line is string => line !== null)
+      .join("\n"),
+  );
+  return file;
+}
+
+async function resumeAfterHumanReply(deps: Deps, run: Run, belt: BeltRuntime, src: SourceRuntime, q: HumanQuestion, replyFile: string | null): Promise<void> {
+  const step = q.step ?? run.step;
+  if (!step || !stepByName(belt, step)) {
+    await escalateAttention(deps, run, {
+      reason: "human_reply_unknown_step",
+      attentionReason: `human reply arrived for unknown step "${step ?? "(none)"}"`,
+      body: `${run.ticketKey}: a human replied to question #${q.id}, but the original step no longer exists in belt "${belt.name}".`,
+      detail: { questionId: q.id, step },
+    });
+    return;
+  }
+
+  deps.store.updateRun(run.id, { phase: "running", step, attentionReason: null, focusPending: true });
+  const prompt =
+    `Human guidance has arrived for ${run.ticketKey} question #${q.id}. ` +
+    (replyFile ? `Read ${replyFile} in this worktree, ` : "Read the latest human reply in this worktree, ") +
+    `continue the ${step} step, and only run step-done when the step is actually complete.`;
+
+  if (run.paneId && (await deps.herdr.paneAlive(run.paneId))) {
+    await deps.herdr.agentSend(run.paneId, prompt);
+    await deps.herdr.paneSendKeys(run.paneId, "Enter");
+    deps.log("info", `${run.ticketKey}: resumed ${step} with human reply #${q.id}`);
+    return;
+  }
+
+  await spawnStep(deps, deps.store.getRun(run.id)!, belt, src, step);
+  deps.log("info", `${run.ticketKey}: respawned ${step} after human reply #${q.id}`);
+}
+
+async function reconcileWaitingForHuman(deps: Deps, run: Run, belt: BeltRuntime, src: SourceRuntime): Promise<void> {
+  let q = deps.store.pendingHumanQuestionForRun(run.id);
+  if (!q) {
+    if (run.step && stepByName(belt, run.step)) {
+      deps.log("warn", `${run.ticketKey}: waiting_for_human without a pending question — resuming ${run.step}`);
+      deps.store.updateRun(run.id, { phase: "running", attentionReason: null });
+    } else {
+      await escalateAttention(deps, run, {
+        reason: "human_wait_missing_question",
+        attentionReason: "waiting_for_human without a pending question",
+        body: `${run.ticketKey}: run is waiting_for_human but no pending question exists in the database.`,
+      });
+    }
+    return;
+  }
+
+  if (!q.externalId) {
+    try {
+      q = await postHumanQuestion(deps, src, q);
+      deps.store.recordEvent({
+        runId: run.id,
+        repo: deps.config.repoName,
+        ticketKey: run.ticketKey,
+        type: "human_question",
+        detail: { step: q.step, questionId: q.id, externalId: q.externalId, posted: true, retry: true },
+      });
+    } catch (e) {
+      deps.log("warn", `${run.ticketKey}: human question #${q.id} still not posted: ${err(e)}`);
+      return;
+    }
+  }
+  const externalId = q.externalId;
+  if (!externalId) return;
+
+  const reply = await src.client.pollHumanReply({
+    key: run.ticketKey,
+    questionId: q.id,
+    externalId,
+    externalCreatedAt: q.externalCreatedAt,
+  });
+  if (!reply) {
+    deps.log("info", `${run.ticketKey}: waiting for human reply to question #${q.id}`);
+    return;
+  }
+
+  const answered = deps.store.answerHumanQuestion(q.id, reply);
+  const replyFile = writeHumanReply(run, q, reply.body, reply.author);
+  deps.store.recordEvent({
+    runId: run.id,
+    repo: deps.config.repoName,
+    ticketKey: run.ticketKey,
+    type: "human_reply",
+    detail: { questionId: q.id, externalId: reply.externalId, author: reply.author ?? null, replyFile },
+  });
+  await resumeAfterHumanReply(deps, run, belt, src, answered, replyFile);
 }
 
 /** A step is waiting for its configured layout pane to come up (an idle agent in tab/pane).

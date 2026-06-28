@@ -9,6 +9,7 @@
 export type Phase =
   | "claiming"
   | "running" // a belt step's agent is active (run.step says which)
+  | "waiting_for_human" // a belt step is parked until its source returns human guidance
   | "reviewing" // work_to_pull_request only: human-review watch + resolver
   | "tearing_down"
   | "done"
@@ -57,6 +58,8 @@ export type EventType =
   | "review_done"
   | "step_spawned"
   | "step_done"
+  | "human_question"
+  | "human_reply"
   | "focus_applied"
   | "merged"
   | "closed"
@@ -143,6 +146,60 @@ export interface WorkItem {
   status: WorkState;
   createdAt: number;
   updatedAt: number;
+}
+
+export type HumanQuestionStatus = "pending" | "answered";
+
+/** A source-agnostic human-in-the-loop question parked by an agent and resumed by the reconciler. */
+export interface HumanQuestion {
+  id: number;
+  runId: number;
+  repo: string;
+  workSource: string;
+  ticketKey: string;
+  step: string | null;
+  question: string;
+  status: HumanQuestionStatus;
+  externalId: string | null;
+  externalCreatedAt: string | null;
+  answer: string | null;
+  answerExternalId: string | null;
+  answerAuthor: string | null;
+  createdAt: number;
+  updatedAt: number;
+  answeredAt: number | null;
+}
+
+export type HumanQuestionPatch = Partial<
+  Pick<HumanQuestion, "status" | "externalId" | "externalCreatedAt" | "answer" | "answerExternalId" | "answerAuthor" | "answeredAt">
+>;
+
+export interface HumanAskInput {
+  repo: string;
+  runId: number;
+  questionId: number;
+  key: string;
+  step: string | null;
+  question: string;
+}
+
+export interface HumanAskResult {
+  externalId: string;
+  externalCreatedAt?: string | null;
+}
+
+export interface HumanPollInput {
+  key: string;
+  questionId: number;
+  externalId: string;
+  externalCreatedAt?: string | null;
+}
+
+export interface HumanReply {
+  body: string;
+  externalId: string;
+  externalCreatedAt?: string | null;
+  author?: string | null;
 }
 
 /** The kind of backend a work source polls. */

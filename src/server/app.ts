@@ -6,12 +6,13 @@
 import { OpenAPIHono } from "@hono/zod-openapi";
 import { swaggerUI } from "@hono/swagger-ui";
 import { VERSION } from "../version.ts";
-import { claimTicket, reconcileRepo, reconcileRun, teardownTicket, withTickLock } from "../core/reconcile.ts";
+import { claimTicket, reconcileRepo, reconcileRun, requestHumanInput, teardownTicket, withTickLock } from "../core/reconcile.ts";
 import { stepByName } from "../core/step.ts";
 import { resolveActiveRun, resolveBeltName } from "../resolve.ts";
 import type { Deps } from "../core/deps.ts";
 import {
   claimRoute,
+  askHumanRoute,
   eligibleRoute,
   healthRoute,
   reloadRoute,
@@ -151,6 +152,22 @@ export function createApp(ctx: ServerContext): OpenAPIHono {
     rt.deps.log("info", `${key}: step-done ${step} recorded`);
     const advanced = await withTickLock(rt.deps, () => reconcileRun(rt.deps, rt.deps.store.getRun(run.id)!));
     return c.json({ ok: true, advanced }, 200);
+  });
+
+  app.openapi(askHumanRoute, async (c) => {
+    const { repo } = c.req.valid("param");
+    const { key, step, source, question } = c.req.valid("json");
+    const rt = ctx.getRepo(repo);
+    if (!rt) return c.json({ error: notConfigured(repo) }, 404);
+    const run = resolveActiveRun(rt.deps, key, source);
+    if (!run) return c.json({ ok: false, message: `${key}: no active run` }, 200);
+    const belt = rt.deps.resolveBelt(run.belt);
+    if (belt && !stepByName(belt, step)) {
+      return c.json({ ok: false, message: `${key}: step "${step}" is not in belt "${belt.name}"` }, 200);
+    }
+    const result = await requestHumanInput(rt.deps, run, step, question);
+    const advanced = await withTickLock(rt.deps, () => reconcileRun(rt.deps, rt.deps.store.getRun(run.id)!));
+    return c.json({ ...result, message: result.message ?? (advanced ? undefined : `${key}: tick busy — next tick will poll`) }, 200);
   });
 
   app.openapi(claimRoute, async (c) => {
