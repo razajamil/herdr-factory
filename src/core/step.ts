@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 import type { StepConfig } from "../config.ts";
 import type { BeltRuntime, Deps, SourceRuntime } from "./deps.ts";
 import type { Run, RunStep } from "../types.ts";
+import { telemetrySpan, telemetrySpanSync } from "../telemetry/index.ts";
 
 export const CLAUDE_FLAGS = ["--dangerously-skip-permissions"];
 export const CLI_PATH = fileURLToPath(new URL("../../bin/herdr-factory", import.meta.url));
@@ -56,6 +57,24 @@ export async function dispatchToLayout(
   deps: Deps,
   opts: { workspaceId: string; worktree: string; tab?: string; pane?: string; prompt: string; paneName: string; ticketKey: string },
 ): Promise<DispatchResult> {
+  return telemetrySpan(
+    "step.dispatch",
+    {
+      repo: deps.config.repoName,
+      "work.key": opts.ticketKey,
+      "herdr.workspace_id": opts.workspaceId,
+      "step.layout.configured": opts.tab != null && opts.pane != null,
+      "step.layout.tab": opts.tab,
+      "step.layout.pane": opts.pane,
+    },
+    () => dispatchToLayoutImpl(deps, opts),
+  );
+}
+
+async function dispatchToLayoutImpl(
+  deps: Deps,
+  opts: { workspaceId: string; worktree: string; tab?: string; pane?: string; prompt: string; paneName: string; ticketKey: string },
+): Promise<DispatchResult> {
   if (opts.tab && opts.pane) {
     const target = await deps.herdr.tabPaneByLabel(opts.workspaceId, opts.tab, opts.pane);
     if (!target) return { status: "waiting" }; // the layout hasn't created this tab/pane yet
@@ -87,15 +106,21 @@ export async function dispatchToLayout(
  *  re-materializing) and best-effort (it logs rather than throwing), so it's safe to call on
  *  every claiming tick while we wait for the step's layout pane to come up. */
 export async function materializeWork(deps: Deps, run: Run, src: SourceRuntime): Promise<void> {
-  const worktree = run.worktreePath;
-  if (!worktree) throw new Error(`${run.ticketKey}: no worktree path`);
-  const mem = join(worktree, MEMORY_DIR);
-  mkdirSync(mem, { recursive: true });
-  try {
-    await src.client.materialize(run.ticketKey, mem, deps.log);
-  } catch {
-    deps.log("warn", `${run.ticketKey}: materialize had issues`);
-  }
+  return telemetrySpan(
+    "step.materialize_work",
+    { repo: deps.config.repoName, "run.id": run.id, "work.key": run.ticketKey, "work.source": src.name, "source.type": src.type },
+    async () => {
+      const worktree = run.worktreePath;
+      if (!worktree) throw new Error(`${run.ticketKey}: no worktree path`);
+      const mem = join(worktree, MEMORY_DIR);
+      mkdirSync(mem, { recursive: true });
+      try {
+        await src.client.materialize(run.ticketKey, mem, deps.log);
+      } catch {
+        deps.log("warn", `${run.ticketKey}: materialize had issues`);
+      }
+    },
+  );
 }
 
 /** The handover scaffold appended to EVERY step prompt (work_to_pull_request + custom alike): which
@@ -165,6 +190,21 @@ export function renderStepPrompt(
   step: StepConfig,
   prior: RunStep | null,
 ): void {
+  return telemetrySpanSync(
+    "step.render_prompt",
+    { repo: deps.config.repoName, "run.id": run.id, "work.key": run.ticketKey, "work.source": src.name, belt: belt.name, step: step.name },
+    () => renderStepPromptImpl(deps, run, belt, src, step, prior),
+  );
+}
+
+function renderStepPromptImpl(
+  deps: Deps,
+  run: Run,
+  belt: BeltRuntime,
+  src: SourceRuntime,
+  step: StepConfig,
+  prior: RunStep | null,
+): void {
   const worktree = run.worktreePath;
   if (!worktree) throw new Error(`${run.ticketKey}: no worktree path`);
   // The step-done command carries --source so the signal resolves to the right run even when two
@@ -224,6 +264,20 @@ export function renderStepPrompt(
  *     whether to retry next tick or escalate to attention.
  */
 export async function spawnStep(
+  deps: Deps,
+  run: Run,
+  belt: BeltRuntime,
+  src: SourceRuntime,
+  stepName: string,
+): Promise<DispatchResult> {
+  return telemetrySpan(
+    "step.spawn",
+    { repo: deps.config.repoName, "run.id": run.id, "work.key": run.ticketKey, "work.source": src.name, belt: belt.name, step: stepName },
+    () => spawnStepImpl(deps, run, belt, src, stepName),
+  );
+}
+
+async function spawnStepImpl(
   deps: Deps,
   run: Run,
   belt: BeltRuntime,

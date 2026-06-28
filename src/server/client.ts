@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs";
 import { serverInfoPath } from "../config.ts";
+import { injectTelemetryHeaders, recordHttpClientDuration, telemetryEvent, telemetrySpan } from "../telemetry/index.ts";
 
 /** What a running `serve` advertises in server.json. */
 export interface ServerInfo {
@@ -31,38 +32,57 @@ export function readServerInfo(): ServerInfo | null {
  *  A wedged-but-alive server fails this just like a dead one — which is exactly what the
  *  supervisor wants (restart on either). */
 export async function pingHealth(port: number, timeoutMs = 3000): Promise<boolean> {
-  try {
-    const res = await fetch(`http://127.0.0.1:${port}/health`, { signal: AbortSignal.timeout(timeoutMs) });
-    if (!res.ok) return false;
-    const j = (await res.json()) as { ok?: boolean };
-    return j.ok === true;
-  } catch {
-    return false;
-  }
+  const startedAt = Date.now();
+  return telemetrySpan("http.client.health", { "server.port": port, "url.path": "/health" }, async (span) => {
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/health`, { signal: AbortSignal.timeout(timeoutMs) });
+      span.setAttribute("http.response.status_code", res.status);
+      if (!res.ok) return false;
+      const j = (await res.json()) as { ok?: boolean };
+      return j.ok === true;
+    } catch {
+      span.setAttribute("server.reachable", false);
+      return false;
+    } finally {
+      recordHttpClientDuration(Date.now() - startedAt, { "url.path": "/health", "server.port": port });
+    }
+  });
 }
 
 /** Issue a request to the running server. Throws NoServerError if there's no server to reach
  *  (no server.json / connection refused / timeout); throws a normal Error if a reached server
  *  returns a non-2xx. The default timeout is generous because claim/tick can do real work. */
 export async function serverFetch(method: string, path: string, body?: unknown, timeoutMs = 600_000): Promise<unknown> {
-  const info = readServerInfo();
-  if (!info) throw new NoServerError("no server.json (server not running)");
-  let res: Response;
-  try {
-    res = await fetch(`http://127.0.0.1:${info.port}${path}`, {
-      method,
-      signal: AbortSignal.timeout(timeoutMs),
-      headers: body !== undefined ? { "content-type": "application/json" } : undefined,
-      body: body !== undefined ? JSON.stringify(body) : undefined,
-    });
-  } catch (e) {
-    // ECONNREFUSED / timeout / DNS — the server isn't reachable. Fall back.
-    throw new NoServerError(e instanceof Error ? e.message : String(e));
-  }
-  const text = await res.text();
-  const json = text ? (JSON.parse(text) as Record<string, unknown>) : {};
-  if (!res.ok) throw new Error(typeof json.error === "string" ? json.error : `server returned ${res.status}`);
-  return json;
+  const startedAt = Date.now();
+  return telemetrySpan("http.client.server_fetch", { "http.request.method": method, "url.path": path }, async (span) => {
+    const info = readServerInfo();
+    if (!info) {
+      span.setAttribute("server.advertised", false);
+      throw new NoServerError("no server.json (server not running)");
+    }
+    span.setAttribute("server.port", info.port);
+    let res: Response;
+    try {
+      const headers = injectTelemetryHeaders(body !== undefined ? { "content-type": "application/json" } : {});
+      res = await fetch(`http://127.0.0.1:${info.port}${path}`, {
+        method,
+        signal: AbortSignal.timeout(timeoutMs),
+        headers,
+        body: body !== undefined ? JSON.stringify(body) : undefined,
+      });
+    } catch (e) {
+      // ECONNREFUSED / timeout / DNS — the server isn't reachable. Fall back.
+      span.setAttribute("server.reachable", false);
+      throw new NoServerError(e instanceof Error ? e.message : String(e));
+    } finally {
+      recordHttpClientDuration(Date.now() - startedAt, { "http.request.method": method, "url.path": path, "server.port": info.port });
+    }
+    span.setAttribute("http.response.status_code", res.status);
+    const text = await res.text();
+    const json = text ? (JSON.parse(text) as Record<string, unknown>) : {};
+    if (!res.ok) throw new Error(typeof json.error === "string" ? json.error : `server returned ${res.status}`);
+    return json;
+  });
 }
 
 /**
@@ -75,11 +95,18 @@ export async function viaServerOrLocal<T>(
   req: { method: string; path: string; body?: unknown },
   local: () => Promise<T>,
 ): Promise<{ viaServer: boolean; data: unknown | T }> {
-  try {
-    const data = await serverFetch(req.method, req.path, req.body);
-    return { viaServer: true, data };
-  } catch (e) {
-    if (e instanceof NoServerError) return { viaServer: false, data: await local() };
-    throw e;
-  }
+  return telemetrySpan("server.via_server_or_local", { "http.request.method": req.method, "url.path": req.path }, async (span) => {
+    try {
+      const data = await serverFetch(req.method, req.path, req.body);
+      span.setAttribute("server.via_server", true);
+      return { viaServer: true, data };
+    } catch (e) {
+      if (e instanceof NoServerError) {
+        span.setAttribute("server.via_server", false);
+        telemetryEvent("server.fallback_local", { "url.path": req.path, reason: e.message });
+        return { viaServer: false, data: await local() };
+      }
+      throw e;
+    }
+  });
 }

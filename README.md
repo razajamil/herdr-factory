@@ -244,6 +244,10 @@ Swagger UI at `/ui`. `update` pulls the latest code (hard reset to the branch's 
 restarts onto it; the supervisor also does this automatically every ~60s unless
 `HERDR_FACTORY_AUTO_UPDATE=0` is set.
 
+OpenTelemetry traces and metrics are available when `HERDR_FACTORY_TELEMETRY=1` is set. For local
+testing, run the Grafana LGTM stack with `docker compose -f docker-compose.telemetry.yml up`; see
+[`docs/TELEMETRY.md`](docs/TELEMETRY.md).
+
 ## What's repo-specific (all in `repos/<name>/config.yml`)
 
 repo checkout + base branch (repo-global) · `limits` incl. the global `max_active` cap · the

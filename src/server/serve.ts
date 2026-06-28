@@ -10,6 +10,7 @@ import { createApp, type HealthInfo, type RepoRuntime, type ServerContext } from
 import { reconcileRepo, withTickLock } from "../core/reconcile.ts";
 import { systemClock } from "../types.ts";
 import { VERSION } from "../version.ts";
+import { shutdownTelemetry, telemetrySpan, withRootTelemetryContext } from "../telemetry/index.ts";
 
 function msg(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
@@ -28,40 +29,50 @@ let shuttingDown = false;
 
 /** (Re)build the per-repo runtimes from config. Clears any existing tick timers first. */
 async function loadRepos(): Promise<void> {
-  for (const rt of repos.values()) if (rt.timer) clearInterval(rt.timer);
-  repos.clear();
-  for (const name of listConfiguredRepos()) {
-    try {
-      const deps = await buildDeps(name);
-      repos.set(name, { deps, ticking: false });
-    } catch (e) {
-      slog("error", `repo "${name}": failed to load — ${msg(e)}`);
+  return telemetrySpan("server.load_repos", {}, async () => {
+    for (const rt of repos.values()) if (rt.timer) clearInterval(rt.timer);
+    repos.clear();
+    for (const name of listConfiguredRepos()) {
+      try {
+        const deps = await buildDeps(name);
+        repos.set(name, { deps, ticking: false });
+      } catch (e) {
+        slog("error", `repo "${name}": failed to load — ${msg(e)}`);
+      }
     }
-  }
+  });
 }
 
 /** One guarded reconcile pass for a repo: the in-flight flag stops a slow tick from stacking, and
  *  withTickLock is the cross-process backstop (a stray CLI `tick` can't overlap either). */
 async function tickRepo(name: string): Promise<void> {
-  const rt = repos.get(name);
-  if (!rt || rt.ticking) return;
-  rt.ticking = true;
-  try {
-    const ran = await withTickLock(rt.deps, () => reconcileRepo(rt.deps));
-    if (!ran) rt.deps.log("info", "another tick already running — skipping");
-  } catch (e) {
-    rt.deps.log("error", `tick failed — ${msg(e)}`);
-  } finally {
-    rt.ticking = false;
-  }
+  return telemetrySpan("server.tick_repo", { repo: name }, async (span) => {
+    const rt = repos.get(name);
+    if (!rt) return;
+    if (rt.ticking) {
+      span.setAttribute("tick.skipped", true);
+      span.setAttribute("tick.skip_reason", "already_ticking");
+      return;
+    }
+    rt.ticking = true;
+    try {
+      const ran = await withTickLock(rt.deps, () => reconcileRepo(rt.deps));
+      span.setAttribute("tick.ran", ran);
+      if (!ran) rt.deps.log("info", "another tick already running — skipping");
+    } catch (e) {
+      rt.deps.log("error", `tick failed — ${msg(e)}`);
+    } finally {
+      rt.ticking = false;
+    }
+  });
 }
 
 /** Start each repo's tick loop at its own tick_interval, with an immediate first pass (RunAtLoad
  *  equivalent). */
 function startLoops(): void {
   for (const [name, rt] of repos) {
-    void tickRepo(name);
-    rt.timer = setInterval(() => void tickRepo(name), rt.deps.config.limits.tickIntervalSeconds * 1000);
+    void withRootTelemetryContext(() => tickRepo(name));
+    rt.timer = setInterval(() => void withRootTelemetryContext(() => tickRepo(name)), rt.deps.config.limits.tickIntervalSeconds * 1000);
   }
 }
 
@@ -93,12 +104,17 @@ async function shutdown(why: string): Promise<void> {
   } catch {
     /* already gone */
   }
+  await shutdownTelemetry();
   process.exit(0);
 }
 
 /** Entry point for the `serve` command: bind (Hono on @hono/node-server), advertise (server.json),
  *  run the per-repo loops. */
 export async function serve(): Promise<void> {
+  return telemetrySpan("server.serve", {}, serveImpl);
+}
+
+async function serveImpl(): Promise<void> {
   // Single-instance guard #1: if a healthy server is already advertised, defer to it.
   const existing = readServerInfo();
   if (existing && (await pingHealth(existing.port))) {

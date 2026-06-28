@@ -7,6 +7,7 @@ import { outcomeToWorkState, ticketOf } from "../types.ts";
 import { branchName } from "./branch.ts";
 import { firstStep, materializeWork, MEMORY_DIR, nextStep, spawnStep, stepByName } from "./step.ts";
 import { wakeResolver } from "./watch.ts";
+import { recordTick, recordTickDuration, recordTickLockSkipped, telemetryEvent, telemetrySpan } from "../telemetry/index.ts";
 
 function err(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
@@ -20,20 +21,35 @@ function err(e: unknown): string {
  * Shared by the `tick` command and the `step-done` event-nudge.
  */
 export async function withTickLock(deps: Deps, fn: () => Promise<void>): Promise<boolean> {
-  const key = `tick:${deps.config.repoName}`;
-  const owner = `pid:${process.pid}`;
-  const ttl = Math.max(deps.config.limits.tickIntervalSeconds * 2, 300);
-  if (!deps.store.acquireLock(key, owner, ttl)) return false;
-  try {
-    await fn();
-  } finally {
-    deps.store.releaseLock(key, owner);
-  }
-  return true;
+  return telemetrySpan("tick.lock", { repo: deps.config.repoName }, async (span) => {
+    const key = `tick:${deps.config.repoName}`;
+    const owner = `pid:${process.pid}`;
+    const ttl = Math.max(deps.config.limits.tickIntervalSeconds * 2, 300);
+    if (!deps.store.acquireLock(key, owner, ttl)) {
+      span.setAttribute("lock.acquired", false);
+      recordTick(false, { repo: deps.config.repoName, "tick.skip_reason": "lock_held" });
+      recordTickLockSkipped({ repo: deps.config.repoName });
+      return false;
+    }
+    span.setAttribute("lock.acquired", true);
+    const startedAt = Date.now();
+    try {
+      await fn();
+    } finally {
+      deps.store.releaseLock(key, owner);
+      recordTickDuration(Date.now() - startedAt, { repo: deps.config.repoName });
+      recordTick(true, { repo: deps.config.repoName });
+    }
+    return true;
+  });
 }
 
 /** One reconcile pass: advance active runs, then claim new work up to the cap. */
 export async function reconcileRepo(deps: Deps): Promise<void> {
+  return telemetrySpan("reconcile.repo", { repo: deps.config.repoName }, () => reconcileRepoImpl(deps));
+}
+
+async function reconcileRepoImpl(deps: Deps): Promise<void> {
   const repo = deps.config.repoName;
   deps.store.upsertRepo(repo, deps.config.repo.path, deps.config.repo.baseRef, deps.ghRepo);
 
@@ -115,6 +131,14 @@ export async function reconcileRepo(deps: Deps): Promise<void> {
 }
 
 async function claim(deps: Deps, belt: BeltRuntime, src: SourceRuntime, ticket: Ticket): Promise<void> {
+  return telemetrySpan(
+    "reconcile.claim",
+    { repo: deps.config.repoName, "work.source": src.name, belt: belt.name, "work.key": ticket.key, "work.type": ticket.type },
+    () => claimImpl(deps, belt, src, ticket),
+  );
+}
+
+async function claimImpl(deps: Deps, belt: BeltRuntime, src: SourceRuntime, ticket: Ticket): Promise<void> {
   const repo = deps.config.repoName;
   // The per-run uid makes the branch unique to THIS attempt, so a re-claimed ticket doesn't reuse a
   // branch name whose prior PR was already merged (which the pr step would otherwise treat as done).
@@ -134,6 +158,22 @@ async function claim(deps: Deps, belt: BeltRuntime, src: SourceRuntime, ticket: 
 }
 
 export async function reconcileRun(deps: Deps, run: Run): Promise<void> {
+  return telemetrySpan(
+    "reconcile.run",
+    {
+      repo: deps.config.repoName,
+      "run.id": run.id,
+      "work.key": run.ticketKey,
+      "work.source": run.workSource ?? undefined,
+      belt: run.belt ?? undefined,
+      phase: run.phase,
+      step: run.step ?? undefined,
+    },
+    () => reconcileRunImpl(deps, run),
+  );
+}
+
+async function reconcileRunImpl(deps: Deps, run: Run): Promise<void> {
   // Resolve the run's source + belt ONCE and thread them down. The belt carries the step sequence
   // + lifecycle; the source materializes the work doc and owns the lifecycle write-back.
   const src = deps.resolveSource(run.workSource);
@@ -165,30 +205,44 @@ export async function reconcileRun(deps: Deps, run: Run): Promise<void> {
 }
 
 async function dispatchPhase(deps: Deps, run: Run, belt: BeltRuntime, src: SourceRuntime): Promise<void> {
-  switch (run.phase) {
-    case "claiming":
-      return reconcileClaiming(deps, run, belt, src);
-    case "running": {
-      const step = stepByName(belt, run.step);
-      if (step) return reconcileStep(deps, run, belt, src, step);
-      // The active step isn't in this belt anymore (belt steps reordered/renamed mid-flight).
-      return escalateAttention(deps, run, {
-        reason: "unknown_step",
-        attentionReason: `step "${run.step}" is not in belt "${belt.name}"`,
-        body: `${run.ticketKey}: its active step "${run.step}" no longer exists in belt "${belt.name}".`,
-        detail: { step: run.step, belt: belt.name },
-      });
-    }
-    case "waiting_for_human":
-      return reconcileWaitingForHuman(deps, run, belt, src);
-    case "reviewing":
-      return reconcileReviewing(deps, run, src);
-    case "tearing_down":
-      return teardown(deps, run, run.outcome ?? "abandoned", src);
-    case "attention":
-    case "done":
-      return;
-  }
+  return telemetrySpan(
+    `reconcile.phase.${run.phase}`,
+    {
+      repo: deps.config.repoName,
+      "run.id": run.id,
+      "work.key": run.ticketKey,
+      "work.source": src.name,
+      belt: belt.name,
+      phase: run.phase,
+      step: run.step ?? undefined,
+    },
+    async () => {
+      switch (run.phase) {
+        case "claiming":
+          return reconcileClaiming(deps, run, belt, src);
+        case "running": {
+          const step = stepByName(belt, run.step);
+          if (step) return reconcileStep(deps, run, belt, src, step);
+          // The active step isn't in this belt anymore (belt steps reordered/renamed mid-flight).
+          return escalateAttention(deps, run, {
+            reason: "unknown_step",
+            attentionReason: `step "${run.step}" is not in belt "${belt.name}"`,
+            body: `${run.ticketKey}: its active step "${run.step}" no longer exists in belt "${belt.name}".`,
+            detail: { step: run.step, belt: belt.name },
+          });
+        }
+        case "waiting_for_human":
+          return reconcileWaitingForHuman(deps, run, belt, src);
+        case "reviewing":
+          return reconcileReviewing(deps, run, src);
+        case "tearing_down":
+          return teardown(deps, run, run.outcome ?? "abandoned", src);
+        case "attention":
+        case "done":
+          return;
+      }
+    },
+  );
 }
 
 /**
@@ -653,6 +707,21 @@ async function reconcileReviewing(deps: Deps, run: Run, src: SourceRuntime): Pro
  * dir → prune the stale git registration → delete the branch (now safely not "checked out").
  */
 async function teardown(deps: Deps, run: Run, outcome: Outcome, src: SourceRuntime | undefined): Promise<void> {
+  return telemetrySpan(
+    "reconcile.teardown",
+    {
+      repo: deps.config.repoName,
+      "run.id": run.id,
+      "work.key": run.ticketKey,
+      "work.source": src?.name,
+      belt: run.belt ?? undefined,
+      outcome,
+    },
+    () => teardownImpl(deps, run, outcome, src),
+  );
+}
+
+async function teardownImpl(deps: Deps, run: Run, outcome: Outcome, src: SourceRuntime | undefined): Promise<void> {
   const repo = deps.config.repoName;
   deps.store.updateRun(run.id, { phase: "tearing_down", outcome });
 

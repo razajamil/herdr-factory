@@ -17,6 +17,7 @@ import { ensureUp, stopServer, type Log } from "../watchers/supervisor.ts";
 import { selfUpdate } from "../watchers/updater.ts";
 import { NoServerError, pingHealth, readServerInfo, serverFetch, viaServerOrLocal } from "../server/client.ts";
 import { VERSION } from "../version.ts";
+import { initTelemetry, recordCliDuration, shutdownTelemetry, telemetryEnabled, telemetryEvent, telemetrySpan } from "../telemetry/index.ts";
 
 function fail(e: unknown): never {
   console.error(e instanceof Error ? e.message : String(e));
@@ -43,9 +44,11 @@ function bakeNodePath(): void {
   }
 }
 bakeNodePath();
+initTelemetry();
 
 /** A console logger for the repo-agnostic supervisor commands (serve/ensure-up/install/…). */
 const consoleLog: Log = (level, msg) => console.log(`[${level}] ${msg}`);
+let residentCommand = false;
 
 const program = new Command();
 program
@@ -67,10 +70,38 @@ function humanQuestionText(opts: { question?: string; questionFile?: string }): 
   return text.trim();
 }
 
+function cliAction<Args extends unknown[]>(name: string, fn: (...args: Args) => Promise<void> | void): (...args: Args) => Promise<void> {
+  return async (...args: Args) => {
+    const startedAt = Date.now();
+    const repo = (program.opts() as { repo?: string }).repo;
+    await telemetrySpan("cli.command", { "cli.command": name, repo }, async () => {
+      try {
+        await fn(...args);
+      } finally {
+        recordCliDuration(Date.now() - startedAt, { "cli.command": name, repo });
+      }
+    });
+  };
+}
+
+program
+  .command("telemetry-smoke")
+  .description("emit a small OpenTelemetry trace/metric to verify local telemetry export")
+  .action(cliAction("telemetry-smoke", async () => {
+    if (!telemetryEnabled()) {
+      console.log("telemetry disabled — set HERDR_FACTORY_TELEMETRY=1 and OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318");
+      return;
+    }
+    await telemetrySpan("telemetry.smoke", {}, async () => {
+      telemetryEvent("telemetry.smoke.event", { ok: true });
+    });
+    console.log("telemetry smoke trace emitted (service: herdr-factory, trace root: cli.command)");
+  }));
+
 program
   .command("tick")
   .description("run one reconcile pass (routes through the server if up, else runs in-process)")
-  .action(async () => {
+  .action(cliAction("tick", async () => {
     try {
       const repo = requireRepo();
       const { viaServer, data } = await viaServerOrLocal({ method: "POST", path: `/repos/${encodeURIComponent(repo)}/tick` }, async () => {
@@ -84,12 +115,13 @@ program
     } catch (e) {
       fail(e);
     }
-  });
+  }));
 
 program
   .command("watch")
   .description("[legacy/dev] single-repo resident loop (the server now does this for all repos)")
-  .action(async () => {
+  .action(cliAction("watch", async () => {
+    residentCommand = true;
     let deps: Deps;
     try {
       deps = await buildDeps(requireRepo());
@@ -120,13 +152,14 @@ program
       }
     }
     deps.log("info", "watch: stopped");
+    await shutdownTelemetry();
     process.exit(0);
-  });
+  }));
 
 program
   .command("status")
   .description("show active tickets + server/supervisor state for the repo")
-  .action(async () => {
+  .action(cliAction("status", async () => {
     try {
       const deps = await buildDeps(requireRepo());
       const c = deps.config;
@@ -168,12 +201,12 @@ program
     } catch (e) {
       fail(e);
     }
-  });
+  }));
 
 program
   .command("eligible")
   .description("list eligible (todo) work items across all sources")
-  .action(async () => {
+  .action(cliAction("eligible", async () => {
     try {
       const deps = await buildDeps(requireRepo());
       const out: { source: string; key: string; summary: string; type: string }[] = [];
@@ -188,13 +221,13 @@ program
     } catch (e) {
       fail(e);
     }
-  });
+  }));
 
 program
   .command("claim <key>")
   .description("manually claim + start one work item on a belt")
   .option("--belt <name>", "which belt to run the item on (required if >1 belt)")
-  .action(async (key: string, opts: { belt?: string }) => {
+  .action(cliAction("claim", async (key: string, opts: { belt?: string }) => {
     try {
       const repo = requireRepo();
       await viaServerOrLocal({ method: "POST", path: `/repos/${encodeURIComponent(repo)}/claim`, body: { key, belt: opts.belt } }, async () => {
@@ -206,13 +239,13 @@ program
     } catch (e) {
       fail(e);
     }
-  });
+  }));
 
 program
   .command("teardown <key>")
   .description("tear down one work item's worktree")
   .option("--source <name>", "disambiguate when the key is active in more than one source")
-  .action(async (key: string, opts: { source?: string }) => {
+  .action(cliAction("teardown", async (key: string, opts: { source?: string }) => {
     try {
       const repo = requireRepo();
       await viaServerOrLocal({ method: "POST", path: `/repos/${encodeURIComponent(repo)}/teardown`, body: { key, source: opts.source } }, async () => {
@@ -223,13 +256,13 @@ program
     } catch (e) {
       fail(e);
     }
-  });
+  }));
 
 program
   .command("step-done <key> <step>")
   .description("a belt agent signals it finished its step — event-nudges the dispatcher")
   .option("--source <name>", "the work source the run belongs to (passed by the agent)")
-  .action(async (key: string, step: string, opts: { source?: string }) => {
+  .action(cliAction("step-done", async (key: string, step: string, opts: { source?: string }) => {
     try {
       const repo = requireRepo();
       // Route through the server (warm reconcile in ~ms) with a direct in-process fallback so the
@@ -262,7 +295,7 @@ program
     } catch (e) {
       fail(e);
     }
-  });
+  }));
 
 program
   .command("ask-human <key> <step>")
@@ -270,7 +303,7 @@ program
   .option("--source <name>", "the work source the run belongs to (passed by the agent)")
   .option("--question <text>", "question text")
   .option("--question-file <path>", "file containing the question text")
-  .action(async (key: string, step: string, opts: { source?: string; question?: string; questionFile?: string }) => {
+  .action(cliAction("ask-human", async (key: string, step: string, opts: { source?: string; question?: string; questionFile?: string }) => {
     try {
       const repo = requireRepo();
       const question = humanQuestionText(opts);
@@ -304,13 +337,13 @@ program
     } catch (e) {
       fail(e);
     }
-  });
+  }));
 
 program
   .command("runs")
   .description("list runs for the repo")
   .option("--all", "include finished runs")
-  .action(async (opts: { all?: boolean }) => {
+  .action(cliAction("runs", async (opts: { all?: boolean }) => {
     try {
       const deps = await buildDeps(requireRepo());
       for (const r of deps.store.listRuns(deps.config.repoName, !!opts.all)) {
@@ -321,12 +354,12 @@ program
     } catch (e) {
       fail(e);
     }
-  });
+  }));
 
 program
   .command("timeline <key>")
   .description("show the event timeline for a ticket")
-  .action(async (key: string) => {
+  .action(cliAction("timeline", async (key: string) => {
     try {
       const deps = await buildDeps(requireRepo());
       for (const ev of deps.store.timeline(deps.config.repoName, key)) {
@@ -335,12 +368,12 @@ program
     } catch (e) {
       fail(e);
     }
-  });
+  }));
 
 program
   .command("capture-lock <action> [owner]")
   .description("machine-global dev-server/screenshot lock (acquire|release)")
-  .action(async (act: string, owner = "worker") => {
+  .action(cliAction("capture-lock", async (act: string, owner = "worker") => {
     try {
       const dbPath = globalDbPath();
       mkdirSync(dirname(dbPath), { recursive: true });
@@ -364,48 +397,49 @@ program
     } catch (e) {
       fail(e);
     }
-  });
+  }));
 
 program
   .command("serve")
   .description("run the resident server: tick every configured repo + expose the HTTP API (kept alive by the supervisor)")
-  .action(async () => {
+  .action(cliAction("serve", async () => {
+    residentCommand = true;
     try {
       await serve();
     } catch (e) {
       fail(e);
     }
-  });
+  }));
 
 program
   .command("ensure-up")
   .description("[supervisor] one-shot: (re)start the server if it's down/wedged/outdated, then exit (what launchd schedules)")
   .option("--restart", "force a graceful restart even if the server is healthy")
-  .action(async (opts: { restart?: boolean }) => {
+  .action(cliAction("ensure-up", async (opts: { restart?: boolean }) => {
     try {
       const { action } = await ensureUp({ force: opts.restart }, consoleLog);
       console.log(`ensure-up: ${action}`);
     } catch (e) {
       fail(e);
     }
-  });
+  }));
 
 program
   .command("restart")
   .description("gracefully restart the running server (picks up new code after a pull)")
-  .action(async () => {
+  .action(cliAction("restart", async () => {
     try {
       const { action } = await ensureUp({ force: true }, consoleLog);
       console.log(`restart: ${action}`);
     } catch (e) {
       fail(e);
     }
-  });
+  }));
 
 program
   .command("update")
   .description("pull the latest code (hard reset to upstream) and restart the server onto it")
-  .action(async () => {
+  .action(cliAction("update", async () => {
     try {
       const res = await selfUpdate(consoleLog);
       if (!res.updated) {
@@ -418,12 +452,12 @@ program
     } catch (e) {
       fail(e);
     }
-  });
+  }));
 
 program
   .command("reload")
   .description("hot-reload config: the running server re-reads every repo's config + re-discovers repos (no restart)")
-  .action(async () => {
+  .action(cliAction("reload", async () => {
     try {
       const data = await serverFetch("POST", "/reload");
       const repos = (data as { repos?: string[] }).repos ?? [];
@@ -435,13 +469,13 @@ program
       }
       fail(e);
     }
-  });
+  }));
 
 program
   .command("schema")
   .description("write the config.yml JSON Schema (editor autocomplete + validation) to <configDir>/config.schema.json")
   .option("--stdout", "print the schema to stdout instead of writing the file")
-  .action((opts: { stdout?: boolean }) => {
+  .action(cliAction("schema", (opts: { stdout?: boolean }) => {
     try {
       if (opts.stdout) {
         console.log(JSON.stringify(configJsonSchema(), null, 2));
@@ -453,12 +487,12 @@ program
     } catch (e) {
       fail(e);
     }
-  });
+  }));
 
 program
   .command("install")
   .description("install the machine-wide supervisor (one launchd job that keeps the server up for all repos)")
-  .action(async () => {
+  .action(cliAction("install", async () => {
     try {
       writeConfigSchema(); // keep the editor schema current with this version's config shape
       await launchd.install();
@@ -468,12 +502,12 @@ program
     } catch (e) {
       fail(e);
     }
-  });
+  }));
 
 program
   .command("uninstall")
   .description("remove the supervisor job and stop the server (in-flight workers untouched)")
-  .action(async () => {
+  .action(cliAction("uninstall", async () => {
     try {
       await launchd.uninstall();
       await stopServer(consoleLog);
@@ -481,12 +515,12 @@ program
     } catch (e) {
       fail(e);
     }
-  });
+  }));
 
 program
   .command("start")
   .description("load the supervisor job (and bring the server up)")
-  .action(async () => {
+  .action(cliAction("start", async () => {
     try {
       await launchd.start();
       await ensureUp({}, consoleLog);
@@ -494,12 +528,12 @@ program
     } catch (e) {
       fail(e);
     }
-  });
+  }));
 
 program
   .command("stop")
   .description("unload the supervisor job and stop the server (workers keep running)")
-  .action(async () => {
+  .action(cliAction("stop", async () => {
     try {
       await launchd.stop();
       await stopServer(consoleLog);
@@ -507,12 +541,12 @@ program
     } catch (e) {
       fail(e);
     }
-  });
+  }));
 
 program
   .command("logs [n]")
   .description("tail today's log for the repo")
-  .action(async (n?: string) => {
+  .action(cliAction("logs", async (n?: string) => {
     try {
       const deps = await buildDeps(requireRepo());
       const file = join(deps.config.paths.logsDir, `${today()}.log`);
@@ -525,12 +559,12 @@ program
     } catch (e) {
       fail(e);
     }
-  });
+  }));
 
 program
   .command("doctor")
   .description("check herdr, gh, jira auth, db, and claude on PATH")
-  .action(async () => {
+  .action(cliAction("doctor", async () => {
     try {
       const deps = await buildDeps(requireRepo());
       const herdrBin = process.env.HERDR_BIN_PATH ?? "herdr";
@@ -558,6 +592,14 @@ program
     } catch (e) {
       fail(e);
     }
-  });
+  }));
 
-program.parseAsync().catch(fail);
+program
+  .parseAsync()
+  .then(async () => {
+    if (!residentCommand) await shutdownTelemetry();
+  })
+  .catch(async (e) => {
+    await shutdownTelemetry();
+    fail(e);
+  });

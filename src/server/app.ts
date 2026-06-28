@@ -6,6 +6,7 @@
 import { OpenAPIHono } from "@hono/zod-openapi";
 import { swaggerUI } from "@hono/swagger-ui";
 import { VERSION } from "../version.ts";
+import { recordHttpServerDuration, telemetrySpan, withExtractedTelemetryContext } from "../telemetry/index.ts";
 import { claimTicket, reconcileRepo, reconcileRun, requestHumanInput, teardownTicket, withTickLock } from "../core/reconcile.ts";
 import { stepByName } from "../core/step.ts";
 import { resolveActiveRun, resolveBeltName } from "../resolve.ts";
@@ -112,6 +113,33 @@ export function createApp(ctx: ServerContext): OpenAPIHono {
         return c.json({ error: detail || "invalid request" }, 400);
       }
     },
+  });
+
+  app.use("*", async (c, next) => {
+    const startedAt = Date.now();
+    const repo = c.req.path.match(/^\/repos\/([^/]+)/)?.[1];
+    return withExtractedTelemetryContext(c.req.raw.headers, () =>
+      telemetrySpan(
+        "http.server",
+        {
+          "http.request.method": c.req.method,
+          "url.path": c.req.path,
+          repo: repo ? decodeURIComponent(repo) : undefined,
+        },
+        async (span) => {
+          try {
+            await next();
+          } finally {
+            span.setAttribute("http.response.status_code", c.res.status);
+            recordHttpServerDuration(Date.now() - startedAt, {
+              "http.request.method": c.req.method,
+              "http.response.status_code": c.res.status,
+              repo: repo ? decodeURIComponent(repo) : undefined,
+            });
+          }
+        },
+      ),
+    );
   });
 
   const notConfigured = (repo: string): string =>

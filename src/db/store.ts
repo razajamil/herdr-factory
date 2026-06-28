@@ -14,6 +14,7 @@ import type {
   WorkState,
 } from "../types.ts";
 import { systemClock } from "../types.ts";
+import { recordDomainEvent, telemetryEvent } from "../telemetry/index.ts";
 import { tx } from "./tx.ts";
 
 interface RunRow {
@@ -165,6 +166,7 @@ function toHumanQuestion(r: HumanQuestionRow): HumanQuestion {
 }
 
 type Bind = string | number | null;
+const patchFields = (patch: Record<string, unknown>): string[] => Object.keys(patch).filter((k) => patch[k] !== undefined).sort();
 
 /** Typed repository over the SQLite DB. All methods are synchronous. */
 export class Store {
@@ -230,6 +232,14 @@ export class Store {
       .run(input.repo, input.workSource, input.belt, input.ticketKey, input.summary ?? null, input.issueType ?? null, input.branch ?? null, t, t);
     const run = this.getRun(Number(info.lastInsertRowid));
     if (!run) throw new Error("createRun: row vanished after insert");
+    telemetryEvent("store.run.create", {
+      repo: run.repo,
+      "run.id": run.id,
+      "work.source": run.workSource ?? undefined,
+      belt: run.belt ?? undefined,
+      "work.key": run.ticketKey,
+      phase: run.phase,
+    });
     return run;
   }
 
@@ -257,6 +267,16 @@ export class Store {
     if (sets.length === 0) return;
     set("updated_at", this.now());
     this.db.prepare(`UPDATE runs SET ${sets.join(", ")} WHERE id = ?`).run(...vals, id);
+    const run = this.getRun(id);
+    telemetryEvent("store.run.update", {
+      repo: run?.repo,
+      "run.id": id,
+      "work.key": run?.ticketKey,
+      phase: run?.phase,
+      step: run?.step ?? undefined,
+      outcome: run?.outcome ?? undefined,
+      "patch.fields": patchFields(patch),
+    });
   }
 
   endRun(id: number, outcome: Outcome): void {
@@ -264,6 +284,8 @@ export class Store {
     this.db
       .prepare("UPDATE runs SET phase = 'done', outcome = ?, ended_at = ?, updated_at = ? WHERE id = ?")
       .run(outcome, t, t, id);
+    const run = this.getRun(id);
+    telemetryEvent("store.run.end", { repo: run?.repo, "run.id": id, "work.key": run?.ticketKey, outcome });
   }
 
   recordEvent(e: {
@@ -283,12 +305,15 @@ export class Store {
         e.type,
         e.detail === undefined ? null : JSON.stringify(e.detail),
       );
+    const attrs = { repo: e.repo, "run.id": e.runId ?? undefined, "work.key": e.ticketKey ?? undefined, "event.type": e.type };
+    telemetryEvent(`domain.${e.type}`, attrs);
+    recordDomainEvent(e.type, attrs);
   }
 
   /** TTL lock; steals an expired holder. Atomic. */
   acquireLock(name: string, owner: string, ttlSec: number): boolean {
     const now = this.now();
-    return tx(this.db, (): boolean => {
+    const acquired = tx(this.db, (): boolean => {
       const row = this.db.prepare("SELECT expires_at FROM locks WHERE name = ?").get(name) as
         | { expires_at: number }
         | undefined;
@@ -301,10 +326,13 @@ export class Store {
         .run(name, owner, now, now + ttlSec);
       return true;
     });
+    telemetryEvent("store.lock.acquire", { "lock.name": name, "lock.owner": owner, "lock.acquired": acquired, "lock.ttl_sec": ttlSec });
+    return acquired;
   }
 
   releaseLock(name: string, owner: string): void {
     this.db.prepare("DELETE FROM locks WHERE name = ? AND owner = ?").run(name, owner);
+    telemetryEvent("store.lock.release", { "lock.name": name, "lock.owner": owner });
   }
 
   upsertRepo(name: string, repoPath: string, baseRef: string | null, github: string | null): void {
@@ -314,10 +342,12 @@ export class Store {
          ON CONFLICT(name) DO UPDATE SET repo_path = excluded.repo_path, base_ref = excluded.base_ref, github = excluded.github`,
       )
       .run(name, repoPath, baseRef, github);
+    telemetryEvent("store.repo.upsert", { repo: name, "git.base_ref": baseRef ?? undefined, "github.repo": github ?? undefined });
   }
 
   touchTick(repo: string): void {
     this.db.prepare("UPDATE repos SET last_tick_at = ? WHERE name = ?").run(this.now(), repo);
+    telemetryEvent("store.repo.touch_tick", { repo });
   }
 
   listRuns(repo: string, includeEnded: boolean): Run[] {
@@ -357,7 +387,8 @@ export class Store {
 
   /** Insert the step row if missing, then apply the patch. Returns the fresh row. */
   upsertRunStep(runId: number, step: StepName, patch: RunStepPatch = {}): RunStep {
-    if (!this.getRunStep(runId, step)) {
+    const created = !this.getRunStep(runId, step);
+    if (created) {
       this.db.prepare("INSERT INTO run_steps (run_id, step, started_at) VALUES (?, ?, ?)").run(runId, step, this.now());
     }
     const sets: string[] = [];
@@ -378,11 +409,21 @@ export class Store {
     if (sets.length > 0) {
       this.db.prepare(`UPDATE run_steps SET ${sets.join(", ")} WHERE run_id = ? AND step = ?`).run(...vals, runId, step);
     }
-    return this.getRunStep(runId, step)!;
+    const row = this.getRunStep(runId, step)!;
+    telemetryEvent("store.run_step.upsert", {
+      "run.id": runId,
+      step,
+      "step.created": created,
+      "step.done": row.done,
+      "herdr.pane_id": row.paneId ?? undefined,
+      "patch.fields": patchFields(patch),
+    });
+    return row;
   }
 
   markStepDone(runId: number, step: StepName): void {
     this.upsertRunStep(runId, step, { done: true });
+    telemetryEvent("store.run_step.done", { "run.id": runId, step });
   }
 
   // --- human-in-the-loop questions ------------------------------------------
@@ -418,6 +459,7 @@ export class Store {
       .run(input.runId, input.repo, input.workSource, input.ticketKey, input.step ?? null, input.question, t, t);
     const q = this.getHumanQuestion(Number(info.lastInsertRowid));
     if (!q) throw new Error("createHumanQuestion: row vanished after insert");
+    telemetryEvent("store.human_question.create", { repo: q.repo, "run.id": q.runId, "question.id": q.id, "work.key": q.ticketKey, step: q.step ?? undefined });
     return q;
   }
 
@@ -438,6 +480,14 @@ export class Store {
     if (sets.length === 0) return;
     set("updated_at", this.now());
     this.db.prepare(`UPDATE human_questions SET ${sets.join(", ")} WHERE id = ?`).run(...vals, id);
+    const q = this.getHumanQuestion(id);
+    telemetryEvent("store.human_question.update", {
+      repo: q?.repo,
+      "run.id": q?.runId,
+      "question.id": id,
+      "question.status": q?.status,
+      "patch.fields": patchFields(patch),
+    });
   }
 
   answerHumanQuestion(
@@ -454,6 +504,7 @@ export class Store {
     });
     const q = this.getHumanQuestion(id);
     if (!q) throw new Error("answerHumanQuestion: row vanished after update");
+    telemetryEvent("store.human_question.answer", { repo: q.repo, "run.id": q.runId, "question.id": q.id, "work.key": q.ticketKey });
     return q;
   }
 
@@ -504,6 +555,7 @@ export class Store {
           )
           .run(meta.title ?? null, meta.itemType ?? null, meta.path ?? null, t, repo, source, key);
       }
+      telemetryEvent("store.work_item.status_noop", { repo, "work.source": source, "work.key": key, "work.state": status });
       return false;
     }
     this.db
@@ -518,6 +570,7 @@ export class Store {
            updated_at = excluded.updated_at`,
       )
       .run(repo, source, key, meta.title ?? null, meta.itemType ?? null, meta.path ?? null, status, t, t);
+    telemetryEvent("store.work_item.status", { repo, "work.source": source, "work.key": key, "work.state": status });
     return true;
   }
 }

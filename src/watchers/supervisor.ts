@@ -5,8 +5,24 @@ import { serverInfoPath } from "../config.ts";
 import { pingHealth, readServerInfo } from "../server/client.ts";
 import { VERSION } from "../version.ts";
 import { autoUpdateEnabled, selfUpdate } from "./updater.ts";
+import { telemetrySpan } from "../telemetry/index.ts";
 
 const CLI_ENTRY = fileURLToPath(new URL("../cli/index.ts", import.meta.url));
+const SERVE_ENV_KEYS = [
+  "HERDR_FACTORY_AUTO_UPDATE",
+  "HERDR_FACTORY_CONFIG_DIR",
+  "HERDR_FACTORY_PORT",
+  "HERDR_FACTORY_STATE_ROOT",
+  "HERDR_FACTORY_TELEMETRY",
+  "HERDR_BIN_PATH",
+  "OTEL_EXPORTER_OTLP_ENDPOINT",
+  "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+  "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
+  "OTEL_METRIC_EXPORT_INTERVAL",
+  "OTEL_RESOURCE_ATTRIBUTES",
+  "OTEL_SDK_DISABLED",
+  "OTEL_SERVICE_NAME",
+] as const;
 
 export type Log = (level: "info" | "warn" | "error", msg: string) => void;
 
@@ -29,7 +45,12 @@ const signal = (pid: number, sig: NodeJS.Signals) => {
 
 /** Spawn a fully-detached `serve` that outlives this (one-shot) supervisor process. */
 function spawnServe(): void {
-  const child = spawn(process.execPath, [CLI_ENTRY, "serve"], { detached: true, stdio: "ignore" });
+  const env: NodeJS.ProcessEnv = { HOME: process.env.HOME, PATH: process.env.PATH };
+  for (const key of SERVE_ENV_KEYS) {
+    const value = process.env[key];
+    if (value !== undefined) env[key] = value;
+  }
+  const child = spawn(process.execPath, [CLI_ENTRY, "serve"], { detached: true, env, stdio: "ignore" });
   child.unref();
 }
 
@@ -63,6 +84,13 @@ async function killServer(pid: number, port: number): Promise<void> {
  * redesign — launchd just re-runs it on a schedule.
  */
 export async function ensureUp(
+  opts: { force?: boolean; skipAutoUpdate?: boolean },
+  log: Log,
+): Promise<{ action: "noop" | "started" | "restarted" }> {
+  return telemetrySpan("supervisor.ensure_up", { "supervisor.force": opts.force === true }, () => ensureUpImpl(opts, log));
+}
+
+async function ensureUpImpl(
   opts: { force?: boolean; skipAutoUpdate?: boolean },
   log: Log,
 ): Promise<{ action: "noop" | "started" | "restarted" }> {
@@ -104,11 +132,13 @@ export async function ensureUp(
 
 /** Stop the running server (for `uninstall`/`stop`). No-op if none is running. */
 export async function stopServer(log: Log): Promise<void> {
-  const info = readServerInfo();
-  if (!info) {
-    log("info", "no server running");
-    return;
-  }
-  await killServer(info.pid, info.port);
-  log("info", "server stopped");
+  return telemetrySpan("supervisor.stop_server", {}, async () => {
+    const info = readServerInfo();
+    if (!info) {
+      log("info", "no server running");
+      return;
+    }
+    await killServer(info.pid, info.port);
+    log("info", "server stopped");
+  });
 }

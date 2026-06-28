@@ -12,6 +12,7 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 import type { Log } from "./supervisor.ts";
+import { recordDependencyDuration, telemetrySpan } from "../telemetry/index.ts";
 
 const execFileP = promisify(execFile);
 const PKG_ROOT = fileURLToPath(new URL("../../", import.meta.url));
@@ -32,8 +33,15 @@ export interface UpdateResult {
 }
 
 async function git(args: string[]): Promise<string> {
-  const { stdout } = await execFileP("git", args, { cwd: PKG_ROOT });
-  return stdout.trim();
+  const startedAt = Date.now();
+  return telemetrySpan("updater.git", { "dependency.name": "git", "process.args.count": args.length }, async () => {
+    try {
+      const { stdout } = await execFileP("git", args, { cwd: PKG_ROOT });
+      return stdout.trim();
+    } finally {
+      recordDependencyDuration(Date.now() - startedAt, { "dependency.name": "git", "dependency.method": "updater" });
+    }
+  });
 }
 
 /** Did package.json / pnpm-lock.yaml change between two commits? */
@@ -73,6 +81,10 @@ async function installDeps(log: Log): Promise<void> {
 
 /** Fetch + hard-reset this package to its upstream. Returns whether the working tree changed. */
 export async function selfUpdate(log: Log): Promise<UpdateResult> {
+  return telemetrySpan("updater.self_update", {}, () => selfUpdateImpl(log));
+}
+
+async function selfUpdateImpl(log: Log): Promise<UpdateResult> {
   if (!existsSync(join(PKG_ROOT, ".git"))) return { updated: false, reason: "not a git checkout" };
 
   let before: string;

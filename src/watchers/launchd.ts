@@ -12,6 +12,16 @@ const CLI_ENTRY = join(PKG_ROOT, "src", "cli", "index.ts");
 // single resident `serve` process (serving every configured repo) alive. This replaces the old
 // per-repo `com.herdr-factory.<repo>` `watch` jobs.
 const LABEL = "com.herdr-factory.server";
+const PASSTHROUGH_ENV = [
+  "HERDR_FACTORY_TELEMETRY",
+  "OTEL_EXPORTER_OTLP_ENDPOINT",
+  "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+  "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
+  "OTEL_SERVICE_NAME",
+  "OTEL_RESOURCE_ATTRIBUTES",
+  "OTEL_METRIC_EXPORT_INTERVAL",
+  "OTEL_SDK_DISABLED",
+] as const;
 
 export function label(): string {
   return LABEL;
@@ -26,8 +36,23 @@ function domain(): string {
   return `gui/${process.getuid?.() ?? 0}`;
 }
 
+function xmlEscape(s: string): string {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&apos;");
+}
+
+function passthroughEnvXml(): string {
+  return PASSTHROUGH_ENV
+    .map((key) => {
+      const value = process.env[key]?.trim();
+      return value ? `    <key>${key}</key><string>${xmlEscape(value)}</string>` : "";
+    })
+    .filter(Boolean)
+    .join("\n");
+}
+
 function plistXml(): string {
   const logs = serverLogsDir();
+  const telemetryEnv = passthroughEnvXml();
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -42,9 +67,9 @@ function plistXml(): string {
   </array>
   <key>EnvironmentVariables</key>
   <dict>
-    <key>PATH</key><string>${process.env.PATH ?? ""}</string>
-    <key>HOME</key><string>${homedir()}</string>
-  </dict>
+    <key>PATH</key><string>${xmlEscape(process.env.PATH ?? "")}</string>
+    <key>HOME</key><string>${xmlEscape(homedir())}</string>
+${telemetryEnv ? `${telemetryEnv}\n` : ""}  </dict>
   <!-- Stateless supervisor: 'ensure-up' is a ONE-SHOT that (re)starts the resident 'serve'
        process if it's down/wedged/outdated, then exits. StartInterval re-runs it on a schedule.
        Because the supervised command is a one-shot (not a resident loop), it is itself immune to
