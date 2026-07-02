@@ -18,6 +18,7 @@ import { selfUpdate } from "../watchers/updater.ts";
 import { NoServerError, pingHealth, readServerInfo, serverFetch, viaServerOrLocal } from "../server/client.ts";
 import { VERSION } from "../version.ts";
 import { initTelemetry, recordCliDuration, shutdownTelemetry, telemetryEnabled, telemetryEvent, telemetrySpan } from "../telemetry/index.ts";
+import { disposeEffectRuntime } from "../runtime/effect.ts";
 
 function fail(e: unknown): never {
   console.error(e instanceof Error ? e.message : String(e));
@@ -45,6 +46,10 @@ function bakeNodePath(): void {
 }
 bakeNodePath();
 initTelemetry();
+
+async function shutdownRuntimes(): Promise<void> {
+  await Promise.all([shutdownTelemetry(), disposeEffectRuntime()]);
+}
 
 /** A console logger for the repo-agnostic supervisor commands (serve/ensure-up/install/…). */
 const consoleLog: Log = (level, msg) => console.log(`[${level}] ${msg}`);
@@ -152,7 +157,7 @@ program
       }
     }
     deps.log("info", "watch: stopped");
-    await shutdownTelemetry();
+    await shutdownRuntimes();
     process.exit(0);
   }));
 
@@ -597,9 +602,9 @@ program
 program
   .parseAsync()
   .then(async () => {
-    if (!residentCommand) await shutdownTelemetry();
+    if (!residentCommand) await shutdownRuntimes();
   })
   .catch(async (e) => {
-    await shutdownTelemetry();
+    await shutdownRuntimes();
     fail(e);
   });

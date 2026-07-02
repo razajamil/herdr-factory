@@ -5,8 +5,11 @@
 // failures and thrown errors are normalised to `{ error }` (the shape server/client.ts expects).
 import { OpenAPIHono } from "@hono/zod-openapi";
 import { swaggerUI } from "@hono/swagger-ui";
+import * as Effect from "effect/Effect";
 import { VERSION } from "../version.ts";
-import { recordHttpServerDuration, telemetrySpan, withExtractedTelemetryContext } from "../telemetry/index.ts";
+import { withExtractedTelemetryContext } from "../telemetry/index.ts";
+import { annotateCurrentSpan, recordHttpServerDurationEffect, withHttpServerSpan } from "../telemetry/effect.ts";
+import { runEffect } from "../runtime/effect.ts";
 import { claimTicket, reconcileRepo, reconcileRun, requestHumanInput, teardownTicket, withTickLock } from "../core/reconcile.ts";
 import { stepByName } from "../core/step.ts";
 import { resolveActiveRun, resolveBeltName } from "../resolve.ts";
@@ -25,6 +28,7 @@ import {
   tickRoute,
   timelineRoute,
 } from "./schemas.ts";
+import { runHandler } from "./effect.ts";
 
 /** A repo the resident server is currently serving: its injected Deps + tick-loop bookkeeping. */
 export interface RepoRuntime {
@@ -118,26 +122,30 @@ export function createApp(ctx: ServerContext): OpenAPIHono {
   app.use("*", async (c, next) => {
     const startedAt = Date.now();
     const repo = c.req.path.match(/^\/repos\/([^/]+)/)?.[1];
+    const decodedRepo = repo ? decodeURIComponent(repo) : undefined;
     return withExtractedTelemetryContext(c.req.raw.headers, () =>
-      telemetrySpan(
-        "http.server",
-        {
-          "http.request.method": c.req.method,
-          "url.path": c.req.path,
-          repo: repo ? decodeURIComponent(repo) : undefined,
-        },
-        async (span) => {
-          try {
-            await next();
-          } finally {
-            span.setAttribute("http.response.status_code", c.res.status);
-            recordHttpServerDuration(Date.now() - startedAt, {
-              "http.request.method": c.req.method,
-              "http.response.status_code": c.res.status,
-              repo: repo ? decodeURIComponent(repo) : undefined,
-            });
-          }
-        },
+      runEffect(
+        withHttpServerSpan(
+          {
+            "http.request.method": c.req.method,
+            "url.path": c.req.path,
+            repo: decodedRepo,
+          },
+          Effect.tryPromise({ try: () => next(), catch: (cause) => cause }).pipe(
+            Effect.ensuring(
+              Effect.suspend(() =>
+                Effect.all([
+                  annotateCurrentSpan({ "http.response.status_code": c.res.status }),
+                  recordHttpServerDurationEffect(Date.now() - startedAt, {
+                    "http.request.method": c.req.method,
+                    "http.response.status_code": c.res.status,
+                    repo: decodedRepo,
+                  }),
+                ], { discard: true }),
+              ),
+            ),
+          ),
+        ),
       ),
     );
   });
@@ -146,14 +154,25 @@ export function createApp(ctx: ServerContext): OpenAPIHono {
     `repo "${repo}" not configured (server knows: ${ctx.knownRepos().join(", ") || "none"})`;
 
   // --- server-wide ---------------------------------------------------------
-  app.openapi(healthRoute, (c) => c.json(ctx.health(), 200));
-  app.openapi(reloadRoute, async (c) => c.json({ ok: true, repos: await ctx.reload() }, 200));
-  app.openapi(shutdownRoute, (c) => {
-    // Fire-and-forget: shutdown drains in-flight ticks (up to 15s) before process.exit, leaving
-    // ample time for this response to flush first.
-    ctx.requestShutdown("http /shutdown");
-    return c.json({ ok: true }, 200);
-  });
+  app.openapi(healthRoute, (c) => runHandler(c, Effect.sync(() => ctx.health()), (health) => c.json(health, 200)));
+  app.openapi(reloadRoute, (c) =>
+    runHandler(
+      c,
+      Effect.tryPromise({ try: () => ctx.reload(), catch: (cause) => cause }),
+      (repos) => c.json({ ok: true, repos }, 200),
+    ),
+  );
+  app.openapi(shutdownRoute, (c) =>
+    runHandler(
+      c,
+      Effect.sync(() => {
+        // Fire-and-forget: shutdown drains in-flight ticks (up to 15s) before process.exit, leaving
+        // ample time for this response to flush first.
+        ctx.requestShutdown("http /shutdown");
+      }),
+      () => c.json({ ok: true }, 200),
+    ),
+  );
 
   // --- repo-scoped ---------------------------------------------------------
   app.openapi(tickRoute, async (c) => {

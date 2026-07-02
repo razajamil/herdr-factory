@@ -2,7 +2,7 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { BeltRuntime, Deps, SourceRuntime } from "./deps.ts";
 import type { StepConfig } from "../config.ts";
-import type { HumanQuestion, MatchItem, Outcome, Run, RunStep, Ticket } from "../types.ts";
+import type { HumanQuestion, MatchItem, Outcome, PrInfo, Run, RunStep, Ticket } from "../types.ts";
 import { outcomeToWorkState, ticketOf } from "../types.ts";
 import { branchName } from "./branch.ts";
 import { firstStep, materializeWork, MEMORY_DIR, nextStep, spawnStep, stepByName } from "./step.ts";
@@ -238,6 +238,7 @@ async function dispatchPhase(deps: Deps, run: Run, belt: BeltRuntime, src: Sourc
         case "tearing_down":
           return teardown(deps, run, run.outcome ?? "abandoned", src);
         case "attention":
+          return reconcileAttention(deps, run, belt, src);
         case "done":
           return;
       }
@@ -559,6 +560,26 @@ async function handleLayoutWait(deps: Deps, run: Run, belt: BeltRuntime, step: S
 }
 
 /**
+ * Resolve the run's PR. Once a number has been adopted we poll BY NUMBER — that's the PR's durable
+ * identity and it keeps resolving after the head branch is deleted (GitHub auto-delete-on-merge).
+ * Only the first sighting, before any number is recorded, falls back to branch discovery.
+ */
+async function currentPr(deps: Deps, run: Run): Promise<PrInfo | null> {
+  if (run.prNumber) return deps.github.prByNumber(deps.ghRepo, run.prNumber);
+  return run.branch ? deps.github.prForBranch(deps.ghRepo, run.branch) : null;
+}
+
+/** A PR we own was closed without merging — hand it to a human rather than tearing down silently. */
+function prClosedAttention(deps: Deps, run: Run, pr: PrInfo): Promise<void> {
+  return escalateAttention(deps, run, {
+    reason: "pr_closed",
+    attentionReason: `PR #${pr.number} closed without merging`,
+    body: `${run.ticketKey}: PR #${pr.number} was closed without being merged (${pr.url}). Reopen it and let the run continue, or tear the run down.`,
+    detail: { number: pr.number, url: pr.url },
+  });
+}
+
+/**
  * Generic per-step gate. Ensures the step's agent is alive, advances on `step-done` (or a merged
  * PR for a PR-opening step), else runs the watchdog: a commit-HEAD stall heartbeat (when the step
  * declares one), a per-step budget, and liveness — escalating to `attention` only when the agent
@@ -577,12 +598,13 @@ async function reconcileStep(deps: Deps, run: Run, belt: BeltRuntime, src: Sourc
     return;
   }
 
-  // Only a PR-opening step (work_to_pull_request's `pr`) watches GitHub. Adopt only a live
-  // (open/merged) PR's number, and abandon only on a CLOSED PR that is *ours* — a stale CLOSED PR
-  // left on a reused branch name must not tear down a fresh attempt.
-  const pr = step.opensPr && run.branch ? await deps.github.prForBranch(deps.ghRepo, run.branch) : null;
+  // Only a PR-opening step (work_to_pull_request's `pr`) watches GitHub. Adopt a live (open/merged)
+  // PR's number on first sighting; thereafter currentPr polls by that number. Act on a CLOSED PR
+  // only when it is *ours* (an adopted number) — a stale CLOSED PR discovered by a reused branch
+  // name must not disturb a fresh attempt.
+  const pr = step.opensPr ? await currentPr(deps, run) : null;
   if (pr && pr.state !== "CLOSED" && run.prNumber !== pr.number) deps.store.updateRun(run.id, { prNumber: pr.number });
-  if (pr && pr.state === "CLOSED" && pr.number === run.prNumber) return teardown(deps, run, "closed", src);
+  if (pr && pr.state === "CLOSED" && pr.number === run.prNumber) return prClosedAttention(deps, run, pr);
   const livePr = pr && pr.state !== "CLOSED" ? pr : null;
 
   // Advance when the agent signalled step-done (or its PR merged out from under us).
@@ -657,20 +679,22 @@ async function enterReviewing(deps: Deps, run: Run, src: SourceRuntime, prNumber
   } catch (e) {
     deps.log("warn", `${run.ticketKey}: review transition deferred: ${err(e)}`);
   }
-  // Clear the active step: in `reviewing` there's no belt step running (the engine watches the PR).
-  deps.store.updateRun(run.id, { phase: "reviewing", step: null, watchDeadline: deps.now() + deps.config.limits.watchHours * 3600 });
+  // Clear the active step: in `reviewing` there's no belt step running (the engine watches the PR
+  // by number). Record prNumber here too so the watch is self-sufficient even if step-adoption was
+  // skipped.
+  deps.store.updateRun(run.id, { phase: "reviewing", step: null, prNumber, watchDeadline: deps.now() + deps.config.limits.watchHours * 3600 });
   deps.store.recordEvent({ runId: run.id, repo, ticketKey: run.ticketKey, type: "pr_opened", detail: { number: prNumber } });
   deps.log("info", `${run.ticketKey}: PR #${prNumber} -> reviewing`);
 }
 
 async function reconcileReviewing(deps: Deps, run: Run, src: SourceRuntime): Promise<void> {
   const repo = deps.config.repoName;
-  const pr = run.branch ? await deps.github.prForBranch(deps.ghRepo, run.branch) : null;
+  const pr = await currentPr(deps, run);
   if (!pr) return;
   if (run.prNumber !== pr.number) deps.store.updateRun(run.id, { prNumber: pr.number });
 
   if (pr.state === "MERGED") return teardown(deps, run, "merged", src);
-  if (pr.state === "CLOSED") return teardown(deps, run, "closed", src);
+  if (pr.state === "CLOSED") return prClosedAttention(deps, run, pr);
 
   if (run.watchDeadline && deps.now() > run.watchDeadline) {
     await escalateAttention(deps, run, {
@@ -697,6 +721,19 @@ async function reconcileReviewing(deps: Deps, run: Run, src: SourceRuntime): Pro
   }
   deps.store.updateRun(run.id, { lastThreadSig: sig.sig });
   deps.store.recordEvent({ runId: run.id, repo, ticketKey: run.ticketKey, type: "resolver_woken", detail: { unresolved: sig.unresolved, failing: sig.failing } });
+}
+
+/**
+ * Attention isn't necessarily a dead end. For a work_to_pull_request belt whose run has already
+ * opened a PR (prNumber set), keep polling that PR by number even while parked here: a merge that
+ * lands while a human is looking — or after an escalation unrelated to the PR (watch timeout, step
+ * budget) — should still tear the run down and reclaim its slot. A still-open/closed PR leaves the
+ * attention state untouched (the human is handling it); non-PR belts and pre-PR runs stay put.
+ */
+async function reconcileAttention(deps: Deps, run: Run, belt: BeltRuntime, src: SourceRuntime): Promise<void> {
+  if (!belt.watchPr || !run.prNumber) return;
+  const pr = await currentPr(deps, run);
+  if (pr?.state === "MERGED") return teardown(deps, run, "merged", src);
 }
 
 /**

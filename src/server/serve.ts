@@ -3,6 +3,7 @@
 // All HTTP routing/validation lives in app.ts; this module owns the state + process lifecycle.
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { serve as nodeServe } from "@hono/node-server";
+import * as Effect from "effect/Effect";
 import { listConfiguredRepos, serverInfoPath, serverLogsDir, serverPort } from "../config.ts";
 import { buildDeps } from "../build-deps.ts";
 import { pingHealth, readServerInfo } from "./client.ts";
@@ -10,7 +11,9 @@ import { createApp, type HealthInfo, type RepoRuntime, type ServerContext } from
 import { reconcileRepo, withTickLock } from "../core/reconcile.ts";
 import { systemClock } from "../types.ts";
 import { VERSION } from "../version.ts";
-import { shutdownTelemetry, telemetrySpan, withRootTelemetryContext } from "../telemetry/index.ts";
+import { shutdownTelemetry, withRootTelemetryContext } from "../telemetry/index.ts";
+import { disposeEffectRuntime, runEffect } from "../runtime/effect.ts";
+import { annotateCurrentSpan, withTelemetrySpan } from "../telemetry/effect.ts";
 
 function msg(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
@@ -29,42 +32,63 @@ let shuttingDown = false;
 
 /** (Re)build the per-repo runtimes from config. Clears any existing tick timers first. */
 async function loadRepos(): Promise<void> {
-  return telemetrySpan("server.load_repos", {}, async () => {
-    for (const rt of repos.values()) if (rt.timer) clearInterval(rt.timer);
-    repos.clear();
-    for (const name of listConfiguredRepos()) {
-      try {
-        const deps = await buildDeps(name);
-        repos.set(name, { deps, ticking: false });
-      } catch (e) {
-        slog("error", `repo "${name}": failed to load — ${msg(e)}`);
+  return runEffect(
+    withTelemetrySpan(
+      "server.load_repos",
+      {},
+      Effect.tryPromise({
+        try: async () => {
+          for (const rt of repos.values()) if (rt.timer) clearInterval(rt.timer);
+          repos.clear();
+          for (const name of listConfiguredRepos()) {
+            try {
+              const deps = await buildDeps(name);
+              repos.set(name, { deps, ticking: false });
+            } catch (e) {
+              slog("error", `repo "${name}": failed to load — ${msg(e)}`);
+            }
+          }
+        },
+        catch: (cause) => cause,
+      }),
+    ),
+  );
+}
+
+function tickRepoEffect(name: string): Effect.Effect<void, never> {
+  return withTelemetrySpan(
+    "server.tick_repo",
+    { repo: name },
+    Effect.gen(function* () {
+      const rt = repos.get(name);
+      if (!rt) return;
+      if (rt.ticking) {
+        yield* annotateCurrentSpan({ "tick.skipped": true, "tick.skip_reason": "already_ticking" });
+        return;
       }
-    }
-  });
+      rt.ticking = true;
+      yield* Effect.tryPromise({ try: () => withTickLock(rt.deps, () => reconcileRepo(rt.deps)), catch: (cause) => cause }).pipe(
+        Effect.flatMap((ran) =>
+          Effect.all([
+            annotateCurrentSpan({ "tick.ran": ran }),
+            Effect.sync(() => {
+              if (!ran) rt.deps.log("info", "another tick already running — skipping");
+            }),
+          ], { discard: true }),
+        ),
+        Effect.catchAll((e) => Effect.sync(() => rt.deps.log("error", `tick failed — ${msg(e)}`))),
+        Effect.ensuring(Effect.sync(() => {
+          rt.ticking = false;
+        })),
+      );
+    }),
+  ).pipe(Effect.catchAll(() => Effect.succeed(undefined)));
 }
 
 /** One guarded reconcile pass for a repo: the in-flight flag stops a slow tick from stacking, and
  *  withTickLock is the cross-process backstop (a stray CLI `tick` can't overlap either). */
 async function tickRepo(name: string): Promise<void> {
-  return telemetrySpan("server.tick_repo", { repo: name }, async (span) => {
-    const rt = repos.get(name);
-    if (!rt) return;
-    if (rt.ticking) {
-      span.setAttribute("tick.skipped", true);
-      span.setAttribute("tick.skip_reason", "already_ticking");
-      return;
-    }
-    rt.ticking = true;
-    try {
-      const ran = await withTickLock(rt.deps, () => reconcileRepo(rt.deps));
-      span.setAttribute("tick.ran", ran);
-      if (!ran) rt.deps.log("info", "another tick already running — skipping");
-    } catch (e) {
-      rt.deps.log("error", `tick failed — ${msg(e)}`);
-    } finally {
-      rt.ticking = false;
-    }
-  });
+  return runEffect(tickRepoEffect(name));
 }
 
 /** Start each repo's tick loop at its own tick_interval, with an immediate first pass (RunAtLoad
@@ -104,14 +128,14 @@ async function shutdown(why: string): Promise<void> {
   } catch {
     /* already gone */
   }
-  await shutdownTelemetry();
+  await Promise.all([shutdownTelemetry(), disposeEffectRuntime()]);
   process.exit(0);
 }
 
 /** Entry point for the `serve` command: bind (Hono on @hono/node-server), advertise (server.json),
  *  run the per-repo loops. */
 export async function serve(): Promise<void> {
-  return telemetrySpan("server.serve", {}, serveImpl);
+  return runEffect(withTelemetrySpan("server.serve", {}, Effect.tryPromise({ try: serveImpl, catch: (cause) => cause })));
 }
 
 async function serveImpl(): Promise<void> {

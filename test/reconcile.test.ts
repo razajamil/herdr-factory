@@ -18,7 +18,8 @@ afterEach(() => {
 interface FakeState {
   eligible: Ticket[]; // jira source's eligible items
   eligible2: Ticket[]; // the optional second (lm) source's eligible items
-  pr: PrInfo | null;
+  pr: PrInfo | null; // what prForBranch (branch discovery) returns
+  prByNumber?: PrInfo | null; // what prByNumber returns; undefined ⇒ mirror `pr`
   sig: ReviewSig;
   paneState: string;
   deadPanes: Set<string>; // panes herdr no longer tracks (paneAlive → false)
@@ -119,6 +120,7 @@ function build(opts: { multi?: boolean } = {}) {
   };
   const github: GitHubApi = {
     prForBranch: async () => state.pr,
+    prByNumber: async () => (state.prByNumber === undefined ? state.pr : state.prByNumber),
     reviewSignature: async () => state.sig,
   };
   const git: GitApi = {
@@ -371,17 +373,19 @@ describe("reconcile pipeline (work_to_pull_request belt)", () => {
     expect(store.getRun(run.id)!.phase).toBe("reviewing");
   });
 
-  it("running pr + PR closed/abandoned → teardown (no bogus Jira review transition)", async () => {
+  it("running pr + our PR closed without merging → attention (not torn down)", async () => {
     const { deps, store, state, worktree, calls } = build();
     const run = seed(store, worktree, "K-8", "running", "pr", { prNumber: 15 });
     state.pr = { number: 15, state: "CLOSED", url: "u" };
     await reconcileRun(deps, store.getRun(run.id)!);
     const got = store.getRun(run.id)!;
-    expect(got.phase).toBe("done");
-    expect(got.outcome).toBe("closed");
+    expect(got.phase).toBe("attention"); // a closed-without-merge PR is a human decision
+    expect(got.outcome).toBeNull(); // run is NOT ended — worktree/branch left intact for reopen
+    expect(got.attentionReason).toContain("closed without merging");
     expect(calls.transitions).not.toContainEqual(["K-8", "in_review"]);
-    expect(calls.transitions).toContainEqual(["K-8", "aborted"]); // teardown writes the terminal state back
-    expect(calls.worktreeRemove).toContain("w1");
+    expect(calls.transitions).not.toContainEqual(["K-8", "aborted"]); // no terminal write-back
+    expect(calls.worktreeRemove).not.toContain("w1"); // worktree preserved
+    expect(calls.notify).toBe(1);
   });
 
   it("fix step 'working' but no commit progress past stall → attention (heartbeat)", async () => {
@@ -455,6 +459,66 @@ describe("reconcile pipeline (work_to_pull_request belt)", () => {
     expect(calls.transitions).toContainEqual(["K-9", "merged"]); // terminal state written back
     expect(calls.worktreeRemove).toContain("w1");
     expect(calls.branchDelete).toContain("fix/K-9-s");
+  });
+
+  it("reviewing polls by PR number — a merge is still detected after the head branch is deleted", async () => {
+    const { deps, store, state, worktree, calls } = build();
+    const run = seed(store, worktree, "K-9b", "reviewing", null, { watchDeadline: 99999, prNumber: 9 });
+    state.pr = null; // head branch deleted on merge → branch discovery finds nothing
+    state.prByNumber = { number: 9, state: "MERGED", url: "u" }; // …but the number still resolves
+    await reconcileRun(deps, store.getRun(run.id)!);
+    const got = store.getRun(run.id)!;
+    expect(got.phase).toBe("done");
+    expect(got.outcome).toBe("merged");
+    expect(calls.branchDelete).toContain("fix/K-9b-s"); // local branch still cleaned up
+  });
+
+  it("reviewing + PR closed without merging → attention (worktree preserved, not torn down)", async () => {
+    const { deps, store, state, worktree, calls } = build();
+    const run = seed(store, worktree, "K-9c", "reviewing", null, { watchDeadline: 99999, prNumber: 9 });
+    state.pr = { number: 9, state: "CLOSED", url: "u" };
+    await reconcileRun(deps, store.getRun(run.id)!);
+    const got = store.getRun(run.id)!;
+    expect(got.phase).toBe("attention");
+    expect(got.outcome).toBeNull();
+    expect(calls.worktreeRemove).not.toContain("w1");
+    expect(calls.branchDelete).not.toContain("fix/K-9c-s");
+    expect(calls.notify).toBe(1);
+  });
+
+  it("attention + our PR merges out-of-band → teardown (attention is not a dead end)", async () => {
+    const { deps, store, state, worktree, calls } = build();
+    // Parked in attention (e.g. the review watch expired) but the PR then merged.
+    const run = seed(store, worktree, "K-A1", "attention", null, { prNumber: 21, attentionReason: "review watch expired" });
+    state.pr = { number: 21, state: "MERGED", url: "u" };
+    await reconcileRun(deps, store.getRun(run.id)!);
+    const got = store.getRun(run.id)!;
+    expect(got.phase).toBe("done");
+    expect(got.outcome).toBe("merged");
+    expect(calls.worktreeRemove).toContain("w1");
+    expect(calls.branchDelete).toContain("fix/K-A1-s");
+    expect(store.countActive("demo")).toBe(0); // slot reclaimed
+  });
+
+  it("attention + PR still open → stays parked (no teardown)", async () => {
+    const { deps, store, state, worktree, calls } = build();
+    const run = seed(store, worktree, "K-A2", "attention", null, { prNumber: 22, attentionReason: "step over budget" });
+    state.pr = { number: 22, state: "OPEN", url: "u" };
+    await reconcileRun(deps, store.getRun(run.id)!);
+    const got = store.getRun(run.id)!;
+    expect(got.phase).toBe("attention");
+    expect(got.outcome).toBeNull();
+    expect(calls.worktreeRemove).not.toContain("w1");
+  });
+
+  it("attention before a PR was opened (no prNumber) → not polled, stays parked", async () => {
+    const { deps, store, state, worktree } = build();
+    const run = seed(store, worktree, "K-A3", "attention", null, { attentionReason: "fix step stalled" });
+    state.prByNumber = { number: 23, state: "MERGED", url: "u" }; // would fire IF we polled — but we never adopted a PR
+    await reconcileRun(deps, store.getRun(run.id)!);
+    const got = store.getRun(run.id)!;
+    expect(got.phase).toBe("attention");
+    expect(got.outcome).toBeNull();
   });
 
   it("teardown falls back to workspace close + dir removal when worktree remove leaves the workspace", async () => {
@@ -538,6 +602,18 @@ describe("custom belt (agent-driven, no PR)", () => {
     expect(calls.transitions).toContainEqual(["G-2", "done"]); // custom-belt terminal write-back
     expect(calls.worktreeRemove).toContain("w1");
     expect(calls.branchDelete).toContain("fix/G-2-s");
+  });
+
+  it("attention on a custom belt is never PR-polled (watchPr gate)", async () => {
+    const { deps, store, state, worktree, calls } = build();
+    customBelt(deps);
+    // Even with a prNumber + a merged PR, a non-PR belt stays parked — attention re-check is
+    // work_to_pull_request only.
+    const run = seed(store, worktree, "G-A", "attention", null, { prNumber: 24 }, "gen");
+    state.pr = { number: 24, state: "MERGED", url: "u" };
+    await reconcileRun(deps, store.getRun(run.id)!);
+    expect(store.getRun(run.id)!.phase).toBe("attention");
+    expect(calls.worktreeRemove).not.toContain("w1");
   });
 });
 

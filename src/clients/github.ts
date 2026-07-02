@@ -24,6 +24,9 @@ export class GitHubClient {
     this.gh = gh;
   }
 
+  /** Discover a PR by its head branch. Used only for the FIRST sighting of a run's PR (before we've
+   *  recorded its number) — `--head` stops matching once the head branch is deleted, so once a number
+   *  is known callers poll `prByNumber` instead, which survives head-branch deletion on merge. */
   async prForBranch(repo: string, branch: string): Promise<PrInfo | null> {
     const arr = await runJson<{ number: number; state: string; url: string }[]>(
       this.gh,
@@ -32,6 +35,17 @@ export class GitHubClient {
     ).catch(() => [] as { number: number; state: string; url: string }[]);
     const first = arr[0];
     return first ? { number: first.number, state: first.state as PrState, url: first.url } : null;
+  }
+
+  /** Look up a PR by number — the durable identity once a run has adopted one. Unlike `--head`,
+   *  this keeps resolving after the head branch is deleted (e.g. GitHub auto-delete-on-merge). */
+  async prByNumber(repo: string, prNumber: number): Promise<PrInfo | null> {
+    const pr = await runJson<{ number: number; state: string; url: string }>(
+      this.gh,
+      ["pr", "view", String(prNumber), "--repo", repo, "--json", "number,state,url"],
+      { allowFail: true },
+    ).catch(() => null);
+    return pr && pr.number ? { number: pr.number, state: pr.state as PrState, url: pr.url } : null;
   }
 
   async reviewSignature(repo: string, prNumber: number): Promise<ReviewSig> {

@@ -84,6 +84,7 @@ export interface BeltRuntime extends BeltConfig {
 
 export interface GitHubApi {
   prForBranch(repo: string, branch: string): Promise<PrInfo | null>;
+  prByNumber(repo: string, prNumber: number): Promise<PrInfo | null>;
   reviewSignature(repo: string, prNumber: number): Promise<ReviewSig>;
 }
 
