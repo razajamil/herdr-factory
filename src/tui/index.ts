@@ -5,7 +5,7 @@
 // Imperative opentui core API — no JSX.
 import { BoxRenderable, InputRenderable, TabSelectRenderable, TextRenderable, createCliRenderer, type CliRenderer } from "@opentui/core";
 import type { KeyEvent } from "@opentui/core";
-import { theme } from "./theme.ts";
+import { BORDER, theme } from "./theme.ts";
 import type { TabView } from "./types.ts";
 import { createDashboard } from "./dashboard.ts";
 import { createConfigEditor } from "./config-editor.ts";
@@ -50,8 +50,60 @@ export function createApp(renderer: CliRenderer): { currentTab: () => number; at
   root.add(content);
   root.add(footer);
 
+  // ── confirmation modal ──────────────────────────────────────────────────────────────────────
+  // A full-screen overlay (absolute, high zIndex) shown for destructive actions. While it's open the
+  // keypress handler routes only y/n to it, so nothing else in the shell fires.
+  const overlay = new BoxRenderable(renderer, {
+    position: "absolute",
+    top: 0,
+    left: 0,
+    width: "100%",
+    height: "100%",
+    zIndex: 100,
+    visible: false,
+    justifyContent: "center",
+    alignItems: "center",
+    backgroundColor: theme.bg,
+  });
+  const card = new BoxRenderable(renderer, {
+    flexDirection: "column",
+    border: true,
+    borderStyle: BORDER,
+    borderColor: theme.border.active,
+    backgroundColor: theme.bg,
+    paddingLeft: 2,
+    paddingRight: 2,
+    paddingTop: 1,
+    paddingBottom: 1,
+  });
+  const modalText = new TextRenderable(renderer, { content: "", fg: theme.text.primary, height: 1, wrapMode: "none" });
+  // "yes" is red to underscore that it's the destructive choice.
+  const hintRow = new BoxRenderable(renderer, { flexDirection: "row", height: 1, backgroundColor: theme.bg });
+  hintRow.add(new TextRenderable(renderer, { content: "[y] yes", fg: theme.status.bad, height: 1, wrapMode: "none" }));
+  hintRow.add(new TextRenderable(renderer, { content: "      [n / Esc] no", fg: theme.text.tertiary, height: 1, wrapMode: "none" }));
+  card.add(modalText);
+  card.add(new TextRenderable(renderer, { content: "", height: 1 }));
+  card.add(hintRow);
+  overlay.add(card);
+  root.add(overlay);
+
+  let modalResolve: ((v: boolean) => void) | null = null;
+  function confirm(message: string): Promise<boolean> {
+    return new Promise((resolve) => {
+      modalText.content = message;
+      overlay.visible = true;
+      modalResolve = resolve;
+    });
+  }
+  function closeModal(result: boolean): void {
+    overlay.visible = false;
+    const r = modalResolve;
+    modalResolve = null;
+    r?.(result);
+  }
+
   // ── views ─────────────────────────────────────────────────────────────────────────────────
-  const views: TabView[] = [createDashboard(renderer), createConfigEditor(renderer)];
+  const views: TabView[] = [createDashboard(renderer), createConfigEditor(renderer, confirm)];
   let current = -1;
   // Per-tab focus memory (session): whether each tab was last left at the top level (tab bar). The
   // within-tab section + field is remembered by each view (restoreFocus). Together these restore
@@ -109,6 +161,14 @@ export function createApp(renderer: CliRenderer): { currentTab: () => number; at
   renderer.on("destroy", shutdown);
 
   renderer.keyInput.on("keypress", (key: KeyEvent) => {
+    // A modal is open: capture only its answer keys; everything else is swallowed.
+    if (modalResolve) {
+      if (key.name === "y" || key.name === "return" || key.name === "enter") closeModal(true);
+      else if (key.name === "n" || key.name === "escape") closeModal(false);
+      key.preventDefault();
+      return;
+    }
+
     const view = views[current];
     const focused = renderer.currentFocusedRenderable;
     const editing = focused instanceof InputRenderable;

@@ -1,54 +1,34 @@
-// Config tab — two numbered sections: [1] a repo list, [2] a guided editor for the selected repo's
-// config.yml. Navigation follows the shell's lazygit model: number keys jump sections, arrows move
-// within one, Esc pops to the top level. The editor form has a browse/edit distinction: browsing
-// highlights a field (↑/↓ to move, ↵ to edit); editing focuses the field's input (type freely, ↵ =
-// next field). v1 edits the scalar knobs (repo block + all limits); work_sources and belts are
-// shown read-only. Saves round-trip through the `yaml` Document API (comments + the schema modeline
-// preserved) and validate against RepoConfigSchema before writing.
+// Config tab — two numbered sections: [1] a repo list, [2] a full editor for the selected repo's
+// config.yml. Section 2 renders a flat, browsable list of rows generated from a live `yaml` Document
+// (config-fields.ts). Array-of-object items (work_sources, belts, steps) render as collapsible
+// `group` rows — collapsed by default, toggled with ↵/Space/←→ or a mouse click — so long configs
+// stay scannable. Text fields, cyclable enums, bool toggles, source refs, and add/remove action
+// rows fill in when a group is expanded. Navigation follows the shell's lazygit model (↑↓ move, Esc
+// → top). Structural edits mutate the Document surgically so comments + the schema modeline are
+// preserved; save validates against RepoConfigSchema before writing.
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { BoxRenderable, InputRenderable, ScrollBoxRenderable, SelectRenderable, TextRenderable, type CliRenderer } from "@opentui/core";
 import type { KeyEvent, Renderable } from "@opentui/core";
-import { parseDocument } from "yaml";
+import { parseDocument, type Document } from "yaml";
 import { RepoConfigSchema, listConfiguredRepos, repoConfigDir } from "../config.ts";
 import { postReload } from "./api.ts";
+import { buildDescriptors, type ConfirmFn, type FieldDesc } from "./config-fields.ts";
 import { BORDER, theme } from "./theme.ts";
 import type { TabView } from "./types.ts";
 
-interface FieldDef {
-  path: (string | number)[];
-  label: string;
-  kind: "string" | "number";
-  placeholder: string;
-}
-
-// The scalar fields v1 edits. Placeholders show the engine default (see the limits schema in
-// config.ts) or an example, so an unset field reads as "unset → default" rather than blank.
-const FIELDS: FieldDef[] = [
-  { path: ["repo", "path"], label: "repo.path", kind: "string", placeholder: "~/dev/my-repo" },
-  { path: ["repo", "base_ref"], label: "repo.base_ref", kind: "string", placeholder: "origin/main" },
-  { path: ["repo", "github"], label: "repo.github", kind: "string", placeholder: "owner/name (optional)" },
-  { path: ["limits", "max_active"], label: "limits.max_active", kind: "number", placeholder: "3" },
-  { path: ["limits", "watch_hours"], label: "limits.watch_hours", kind: "number", placeholder: "7" },
-  { path: ["limits", "develop_budget_seconds"], label: "limits.develop_budget_seconds", kind: "number", placeholder: "5400" },
-  { path: ["limits", "stall_seconds"], label: "limits.stall_seconds", kind: "number", placeholder: "2700" },
-  { path: ["limits", "review_budget_seconds"], label: "limits.review_budget_seconds", kind: "number", placeholder: "1800" },
-  { path: ["limits", "pr_budget_seconds"], label: "limits.pr_budget_seconds", kind: "number", placeholder: "3600" },
-  { path: ["limits", "step_budget_seconds"], label: "limits.step_budget_seconds", kind: "number", placeholder: "3600" },
-  { path: ["limits", "tick_interval_seconds"], label: "limits.tick_interval_seconds", kind: "number", placeholder: "60" },
-  { path: ["limits", "layout_wait_seconds"], label: "limits.layout_wait_seconds", kind: "number", placeholder: "600" },
-];
-
 const LABEL_WIDTH = 28;
+const IND = (n?: number) => "  ".repeat(n ?? 0);
+const gut = (on: boolean) => (on ? "▶ " : "  ");
 
-interface Row {
-  container: BoxRenderable;
-  label: TextRenderable;
-  input: InputRenderable;
-  field: FieldDef;
+interface RowRef {
+  desc: FieldDesc;
+  container: Renderable;
+  input?: InputRenderable;
+  setHighlighted: (on: boolean) => void;
 }
 
-export function createConfigEditor(renderer: CliRenderer): TabView {
+export function createConfigEditor(renderer: CliRenderer, confirm: ConfirmFn): TabView {
   const repos = listConfiguredRepos();
 
   const root = new BoxRenderable(renderer, { flexDirection: "row", width: "100%", height: "100%", backgroundColor: theme.bg });
@@ -104,17 +84,19 @@ export function createConfigEditor(renderer: CliRenderer): TabView {
   // ── state ───────────────────────────────────────────────────────────────────────────────────
   let loadedRepo: string | null = null;
   let loadedText = "";
-  let rows: Row[] = [];
+  let draft: Document | null = null;
+  let focusRows: RowRef[] = [];
   let browseIndex = 0;
-  let lastSection = 1; // remembered section for restoreFocus (session focus memory)
+  let lastSection = 1;
   let errorNodes: Renderable[] = [];
+  let expandedNodes = new WeakSet<object>(); // which array-item nodes are expanded (view state)
 
   function setStatus(content: string, fg: string): void {
     status.content = content;
     status.fg = fg;
   }
+  const markUnsaved = () => setStatus("● unsaved changes — ^S to save", theme.status.warn);
 
-  /** Border + title reflect which section holds focus (active = accent, inactive = grey). */
   function setActiveSection(n: 1 | 2): void {
     repoPanel.borderColor = n === 1 ? theme.border.active : theme.border.inactive;
     repoPanel.titleColor = n === 1 ? theme.focusText.focused : theme.focusText.unfocused;
@@ -122,14 +104,11 @@ export function createConfigEditor(renderer: CliRenderer): TabView {
     form.titleColor = n === 2 ? theme.focusText.focused : theme.focusText.unfocused;
   }
 
-  function clearForm(): void {
+  function clearFormChildren(): void {
     for (const c of [...form.getChildren()]) {
       form.remove(c.id);
       c.destroy();
     }
-    rows = [];
-    errorNodes = [];
-    browseIndex = 0;
   }
 
   function clearErrors(): void {
@@ -144,186 +123,271 @@ export function createConfigEditor(renderer: CliRenderer): TabView {
     return new TextRenderable(renderer, { content, fg, width: "100%", height: 1, wrapMode: "none" });
   }
 
-  function addField(f: FieldDef, initial: string): void {
+  // Render one descriptor into the form; returns a RowRef for focusable ones, null for headers.
+  function renderDescriptor(d: FieldDesc): RowRef | null {
+    if (d.kind === "header") {
+      const fg = d.level === 1 ? theme.accent : theme.text.secondary;
+      form.add(new TextRenderable(renderer, { content: IND(d.indent) + d.label, fg, width: "100%", height: 1, wrapMode: "none" }));
+      return null;
+    }
+    if (d.kind === "group") {
+      const body = () => `${IND(d.indent)}${d.expanded ? "▾" : "▸"} ${d.label}`;
+      const t = new TextRenderable(renderer, { content: gut(false) + body(), fg: theme.text.primary, width: "100%", height: 1, wrapMode: "none" });
+      form.add(t);
+      return { desc: d, container: t, setHighlighted: (on) => { t.content = gut(on) + body(); t.fg = on ? theme.focusText.focused : theme.text.primary; } };
+    }
+    if (d.kind === "action") {
+      const t = new TextRenderable(renderer, { content: gut(false) + IND(d.indent) + d.label, fg: theme.accent, width: "100%", height: 1, wrapMode: "none" });
+      form.add(t);
+      return { desc: d, container: t, setHighlighted: (on) => { t.content = gut(on) + IND(d.indent) + d.label; t.fg = on ? theme.focusText.focused : theme.accent; } };
+    }
+
     const container = new BoxRenderable(renderer, { flexDirection: "row", width: "100%", height: 1, backgroundColor: theme.bg });
-    const label = new TextRenderable(renderer, {
-      content: "  " + f.label.padEnd(LABEL_WIDTH),
-      fg: theme.text.secondary,
-      width: LABEL_WIDTH + 3,
-      height: 1,
-      wrapMode: "none",
-    });
-    const input = new InputRenderable(renderer, {
-      value: initial,
-      placeholder: f.placeholder,
-      flexGrow: 1,
-      backgroundColor: theme.input.bg,
-      focusedBackgroundColor: theme.input.focusBg,
-      textColor: theme.input.fg,
-      focusedTextColor: theme.input.focusFg,
-      placeholderColor: theme.input.placeholder,
-    });
-    const idx = rows.length;
-    input.on("input", () => setStatus("● unsaved changes — ^S to save", theme.status.warn));
-    input.on("enter", () => onFieldEnter(idx)); // ↵ inside a field → next field
+    const labelText = IND(d.indent) + d.label.padEnd(LABEL_WIDTH);
+    const labelW = 2 + (d.indent ?? 0) * 2 + LABEL_WIDTH + 1;
+    const label = new TextRenderable(renderer, { content: gut(false) + labelText, fg: theme.text.secondary, width: labelW, height: 1, wrapMode: "none" });
     container.add(label);
-    container.add(input);
+
+    if (d.kind === "text") {
+      const v = draft?.getIn(d.path);
+      const input = new InputRenderable(renderer, {
+        value: v == null ? "" : String(v),
+        placeholder: d.placeholder ?? "",
+        flexGrow: 1,
+        backgroundColor: theme.input.bg,
+        focusedBackgroundColor: theme.input.focusBg,
+        textColor: theme.input.fg,
+        focusedTextColor: theme.input.focusFg,
+        placeholderColor: theme.input.placeholder,
+      });
+      input.on("input", markUnsaved);
+      input.on("enter", () => moveHighlight(browseIndex + 1, true));
+      container.add(input);
+      form.add(container);
+      return {
+        desc: d,
+        container,
+        input,
+        setHighlighted: (on) => {
+          label.content = gut(on) + labelText;
+          label.fg = on ? theme.focusText.focused : theme.text.secondary;
+          input.backgroundColor = on ? theme.input.focusBg : theme.input.bg;
+        },
+      };
+    }
+
+    // enum | ref | bool → a value chip
+    const display = d.kind === "bool" ? (d.value ? "[x] on" : "[ ] off") : `‹ ${d.value} ›`;
+    const val = new TextRenderable(renderer, { content: display, fg: theme.text.primary, flexGrow: 1, height: 1, wrapMode: "none" });
+    container.add(val);
     form.add(container);
-    rows.push({ container, label, input, field: f });
+    return {
+      desc: d,
+      container,
+      setHighlighted: (on) => {
+        label.content = gut(on) + labelText;
+        label.fg = on ? theme.focusText.focused : theme.text.secondary;
+        val.fg = on ? theme.accent : theme.text.primary;
+      },
+    };
   }
 
-  /** Paint the browse highlight on field `i` (marker + accent label + tinted field), clearing others. */
+  function render(): void {
+    clearFormChildren();
+    focusRows = [];
+    errorNodes = [];
+    if (!draft) return;
+    for (const d of buildDescriptors(draft, rebuild, confirm, expandedNodes)) {
+      const rr = renderDescriptor(d);
+      if (!rr) continue;
+      focusRows.push(rr);
+      const idx = focusRows.length - 1;
+      // Mouse: click any row to highlight it; click a group to toggle expand/collapse.
+      rr.container.onMouseDown = () => {
+        setHighlight(idx);
+        if (d.kind === "group") toggleGroup(d.node);
+      };
+    }
+  }
+
   function setHighlight(i: number): void {
-    if (rows.length === 0) return;
-    browseIndex = Math.max(0, Math.min(i, rows.length - 1));
-    rows.forEach((r, idx) => {
-      const on = idx === browseIndex;
-      r.label.content = (on ? "▶ " : "  ") + r.field.label.padEnd(LABEL_WIDTH);
-      r.label.fg = on ? theme.focusText.focused : theme.text.secondary;
-      r.input.backgroundColor = on ? theme.input.focusBg : theme.input.bg;
-    });
-    form.scrollChildIntoView(rows[browseIndex]!.container.id);
+    if (focusRows.length === 0) return;
+    browseIndex = Math.max(0, Math.min(i, focusRows.length - 1));
+    focusRows.forEach((r, idx) => r.setHighlighted(idx === browseIndex));
+    form.scrollChildIntoView(focusRows[browseIndex]!.container.id);
+  }
+
+  /** Commit every visible text field's value into the draft (so nothing is lost on rebuild/save). */
+  function flushInputs(): void {
+    if (!draft) return;
+    for (const r of focusRows) {
+      if (r.desc.kind === "text" && r.input) {
+        const raw = r.input.value.trim();
+        if (raw === "") continue;
+        const value = r.desc.numeric && Number.isFinite(Number(raw)) ? Number(raw) : raw;
+        draft.setIn(r.desc.path, value);
+      }
+    }
+  }
+
+  // Regenerate rows after a STRUCTURAL change (add/remove/type-switch). Callers flush BEFORE mutating
+  // the draft (see activate/cycle), so this must not flush again — paths have shifted.
+  function rebuild(): void {
+    const keep = browseIndex;
+    render();
+    setHighlight(keep);
+    form.focus();
+    markUnsaved();
+  }
+
+  // Expand/collapse a group. View-only (doesn't touch the config), so it flushes visible edits and
+  // re-renders without marking unsaved.
+  function toggleGroup(node: object): void {
+    flushInputs();
+    if (expandedNodes.has(node)) expandedNodes.delete(node);
+    else expandedNodes.add(node);
+    const keep = browseIndex;
+    render();
+    setHighlight(keep);
+    form.focus();
   }
 
   function enterEdit(i: number): void {
-    if (rows.length === 0) return;
     setHighlight(i);
-    rows[browseIndex]!.input.focus();
-    setStatus("editing — ↵ next field · Esc: top · ^S save", theme.text.secondary);
+    const row = focusRows[browseIndex];
+    if (row?.input) {
+      row.input.focus();
+      setStatus("editing — ↵ next · Esc: top · ^S save", theme.text.secondary);
+    }
   }
 
-  // Called by the shell (↑/↓) while a field is focused — hop to the adjacent field, staying in edit.
-  function editMove(dir: -1 | 1): void {
-    const next = browseIndex + dir;
-    if (next >= 0 && next < rows.length) enterEdit(next);
+  function moveHighlight(target: number, edit: boolean): void {
+    flushInputs();
+    if (focusRows.length === 0) return;
+    setHighlight(target);
+    const row = focusRows[browseIndex];
+    if (edit && row?.input) row.input.focus();
+    else form.focus();
   }
 
-  function onFieldEnter(i: number): void {
-    if (i < rows.length - 1) enterEdit(i + 1); // ↵ = next field; on the last field, stay put
+  function cycle(desc: Extract<FieldDesc, { kind: "enum" | "ref" }>, dir: 1 | -1): void {
+    flushInputs(); // capture typed edits before the mutation shifts draft paths
+    const cs = desc.choices;
+    if (cs.length === 0) return;
+    const i = cs.indexOf(desc.value);
+    const next = i < 0 ? cs[0]! : cs[(i + dir + cs.length) % cs.length]!;
+    desc.apply(next); // mutates draft → rebuild()
   }
 
-  // Browse-mode keys — only fire while the form itself is focused (a focused field gets keys
-  // directly, and the shell routes its ↑/↓ through editMove).
-  form.onKeyDown = (key: KeyEvent) => {
-    if (rows.length === 0) return;
-    if (key.name === "up") {
-      setHighlight(browseIndex - 1);
-      key.preventDefault();
-    } else if (key.name === "down") {
-      setHighlight(browseIndex + 1);
-      key.preventDefault();
-    } else if (key.name === "return" || key.name === "enter") {
+  function activate(row: RowRef | undefined): void {
+    if (!row) return;
+    const d = row.desc;
+    if (d.kind === "text") {
       enterEdit(browseIndex);
-      key.preventDefault();
+    } else if (d.kind === "enum" || d.kind === "ref") {
+      cycle(d, 1);
+    } else if (d.kind === "bool") {
+      flushInputs();
+      d.apply(!d.value);
+    } else if (d.kind === "action") {
+      flushInputs();
+      d.run();
+    } else if (d.kind === "group") {
+      toggleGroup(d.node);
+    }
+  }
+
+  // Browse-mode keys — only fire while the form itself is focused.
+  form.onKeyDown = (key: KeyEvent) => {
+    if (focusRows.length === 0) return;
+    const row = focusRows[browseIndex];
+    const cyclable = !!row && (row.desc.kind === "enum" || row.desc.kind === "ref");
+    const group = row && row.desc.kind === "group" ? row.desc : null;
+    switch (key.name) {
+      case "up":
+        moveHighlight(browseIndex - 1, false);
+        key.preventDefault();
+        break;
+      case "down":
+        moveHighlight(browseIndex + 1, false);
+        key.preventDefault();
+        break;
+      case "return":
+      case "enter":
+        activate(row);
+        key.preventDefault();
+        break;
+      case "space":
+        if (row && (cyclable || row.desc.kind === "bool" || row.desc.kind === "group")) {
+          activate(row);
+          key.preventDefault();
+        }
+        break;
+      case "left":
+        if (cyclable) cycle(row!.desc as Extract<FieldDesc, { kind: "enum" | "ref" }>, -1);
+        else if (group && expandedNodes.has(group.node)) toggleGroup(group.node);
+        else break;
+        key.preventDefault();
+        break;
+      case "right":
+        if (cyclable) cycle(row!.desc as Extract<FieldDesc, { kind: "enum" | "ref" }>, 1);
+        else if (group && !expandedNodes.has(group.node)) toggleGroup(group.node);
+        else break;
+        key.preventDefault();
+        break;
     }
   };
 
-  function renderSummary(obj: Record<string, unknown>): void {
-    const sources = Array.isArray(obj.work_sources) ? (obj.work_sources as Record<string, unknown>[]) : [];
-    const belts = Array.isArray(obj.belt) ? (obj.belt as Record<string, unknown>[]) : [];
-
-    form.add(textLine("", theme.text.tertiary));
-    form.add(textLine("work_sources  (view — inline editing next)", theme.accent));
-    if (sources.length === 0) form.add(textLine("  (none)", theme.text.tertiary));
-    for (const s of sources) {
-      const type = String(s.type ?? "?");
-      const name = String(s.name ?? type);
-      let detail = "";
-      if (type === "jira" && s.jira) {
-        const j = s.jira as Record<string, unknown>;
-        detail = `project ${j.project ?? "?"} · board ${j.board ?? "?"}`;
-      } else if (type === "local_markdown" && s.local_markdown) {
-        detail = `folder ${(s.local_markdown as Record<string, unknown>).folder ?? "?"}`;
-      }
-      form.add(textLine(`  • ${name} (${type})  ${detail}`, theme.text.primary));
-    }
-
-    form.add(textLine("", theme.text.tertiary));
-    form.add(textLine("belts  (view — inline editing next)", theme.accent));
-    if (belts.length === 0) form.add(textLine("  (none)", theme.text.tertiary));
-    for (const b of belts) {
-      const beltType = String(b.belt_type ?? "?");
-      form.add(textLine(`  • ${b.name ?? "?"} [${beltType}] source=${b.source ?? "?"} priority=${b.priority ?? 100}`, theme.text.primary));
-      if (beltType === "custom" && Array.isArray(b.steps)) {
-        const names = (b.steps as Record<string, unknown>[]).map((s) => String(s.name ?? "?")).join(" → ");
-        form.add(textLine(`      steps: ${names}`, theme.text.secondary));
-      } else if (beltType === "work_to_pull_request" && b.agents) {
-        form.add(textLine(`      agents: ${Object.keys(b.agents as object).join(", ")}`, theme.text.secondary));
-      }
-    }
-  }
-
   function loadRepo(name: string): void {
+    loadedRepo = null;
+    draft = null;
+    focusRows = [];
+    errorNodes = [];
+    browseIndex = 0;
+    expandedNodes = new WeakSet(); // fresh document → fresh collapse state (all collapsed)
+    clearFormChildren();
+
     const path = join(repoConfigDir(name), "config.yml");
-    clearForm();
     if (!existsSync(path)) {
       form.title = ` 2 · ${name} `;
       form.add(textLine(`no config.yml at ${path}`, theme.status.bad));
       setStatus("", theme.text.tertiary);
       return;
     }
-    loadedRepo = name;
     loadedText = readFileSync(path, "utf8");
     const doc = parseDocument(loadedText);
     form.title = ` 2 · ${name}/config.yml `;
-
     if (doc.errors.length > 0) {
       form.add(textLine(`✗ cannot parse YAML: ${doc.errors[0]?.message ?? "parse error"}`, theme.status.bad));
       setStatus("fix the YAML before editing", theme.status.bad);
       return;
     }
-
-    form.add(textLine("repo", theme.accent));
-    for (const f of FIELDS.filter((f) => f.path[0] === "repo")) {
-      const v = doc.getIn(f.path);
-      addField(f, v == null ? "" : String(v));
-    }
-    form.add(textLine("", theme.text.tertiary));
-    form.add(textLine("limits", theme.accent));
-    for (const f of FIELDS.filter((f) => f.path[0] === "limits")) {
-      const v = doc.getIn(f.path);
-      addField(f, v == null ? "" : String(v));
-    }
-
-    renderSummary(doc.toJS() as Record<string, unknown>);
+    loadedRepo = name;
+    draft = doc;
+    render();
     setHighlight(0);
-    setStatus("↵ open a field to edit · ^S save", theme.text.secondary);
+    setStatus("↑↓ move · ↵ open/edit/cycle · ^S save", theme.text.secondary);
   }
 
   function save(): void {
-    if (!loadedRepo) {
+    if (!loadedRepo || !draft) {
       setStatus("select a repo first", theme.text.tertiary);
       return;
     }
-    const path = join(repoConfigDir(loadedRepo), "config.yml");
-    // Re-parse the loaded text fresh so a rejected save never leaves partial edits behind.
-    const doc = parseDocument(loadedText);
-    if (doc.errors.length > 0) {
-      setStatus(`✗ cannot parse YAML: ${doc.errors[0]?.message ?? "parse error"}`, theme.status.bad);
-      return;
-    }
-
-    for (const { field, input } of rows) {
-      const raw = input.value.trim();
-      if (raw === "") continue; // empty = leave as-is (don't delete / don't force a default)
-      const val: string | number = field.kind === "number" && Number.isFinite(Number(raw)) ? Number(raw) : raw;
-      if (String(doc.getIn(field.path) ?? "") !== String(val)) doc.setIn(field.path, val);
-    }
-
+    flushInputs();
     clearErrors();
-    const parsed = RepoConfigSchema.safeParse(doc.toJS());
+    const parsed = RepoConfigSchema.safeParse(draft.toJS());
     if (!parsed.success) {
-      parsed.error.issues.slice(0, 6).forEach((i, idx) => {
-        const node = textLine(`  ✗ ${i.path.join(".") || "(root)"}: ${i.message}`, theme.status.bad);
+      parsed.error.issues.slice(0, 6).forEach((iss, idx) => {
+        const node = textLine(`  ✗ ${iss.path.join(".") || "(root)"}: ${iss.message}`, theme.status.bad);
         form.add(node, idx);
         errorNodes.push(node);
       });
       setStatus(`✗ ${parsed.error.issues.length} validation error(s) — not saved`, theme.status.bad);
       return;
     }
-
-    const text = doc.toString();
-    writeFileSync(path, text);
+    const text = draft.toString();
+    writeFileSync(join(repoConfigDir(loadedRepo), "config.yml"), text);
     loadedText = text;
     setStatus("✓ saved", theme.status.good);
     void postReload().then((ok) => {
@@ -348,7 +412,7 @@ export function createConfigEditor(renderer: CliRenderer): TabView {
       lastSection = 2;
       setActiveSection(2);
       form.focus();
-      if (rows.length > 0) setHighlight(Math.min(browseIndex, rows.length - 1));
+      if (focusRows.length > 0) setHighlight(Math.min(browseIndex, focusRows.length - 1));
     }
   }
 
@@ -367,6 +431,8 @@ export function createConfigEditor(renderer: CliRenderer): TabView {
       /* no timers to stop */
     },
     save,
-    editMove,
+    editMove(dir: -1 | 1) {
+      moveHighlight(browseIndex + dir, true);
+    },
   };
 }
