@@ -7,9 +7,9 @@
 // Structural edits (add/remove, type switch) mutate the Document surgically — setIn/addIn/deleteIn
 // (+ createNode for new nodes) preserve comments on untouched nodes — then call `rebuild`.
 import type { Document } from "yaml";
+import type { ConfirmFn } from "./types.ts";
 
 export type Path = (string | number)[];
-export type ConfirmFn = (message: string) => Promise<boolean>;
 
 export type FieldDesc =
   | { kind: "header"; label: string; level: 1 | 2; indent?: number }

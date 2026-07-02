@@ -258,9 +258,11 @@ tab, **arrows** move within the focused section, **`Esc`** pops back to the top 
 (then a number key dives into a section), and **`q`** quits. Each tab remembers where you left it for
 the session.
 
-- **Dashboard** — read-only, per-repo status pulled live from the running server's HTTP API
-  (`/health` + `/repos/{repo}/status`); auto-refreshes every 3s and shows a start hint when the
-  server is down.
+- **Dashboard** — per-repo status pulled live from the running server's HTTP API (`/health` +
+  `/repos/{repo}/status` + `/eligible`); auto-refreshes every 3s and shows a start hint when the
+  server is down. Rows are navigable (`↑↓`) and act on the highlighted row, each behind a
+  confirmation: **`t`** tick a repo, **`c`** claim an eligible item onto a belt (picks the belt when
+  the item's source has more than one), **`x`** teardown an active run, **`r`** refresh.
 - **Config** — section **1** is a repo list; `↵` opens a repo into section **2**, a full editor for
   its `config.yml`. `↑↓` move between rows; `↵` edits a text field (type freely, `↵` = next field),
   cycles an enum (`←→` also cycle — e.g. a source's `type` or a belt's `belt_type`), toggles a bool,

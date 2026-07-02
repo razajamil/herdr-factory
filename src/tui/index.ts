@@ -50,9 +50,9 @@ export function createApp(renderer: CliRenderer): { currentTab: () => number; at
   root.add(content);
   root.add(footer);
 
-  // ── confirmation modal ──────────────────────────────────────────────────────────────────────
-  // A full-screen overlay (absolute, high zIndex) shown for destructive actions. While it's open the
-  // keypress handler routes only y/n to it, so nothing else in the shell fires.
+  // ── modal ─────────────────────────────────────────────────────────────────────────────────
+  // A full-screen overlay (absolute, high zIndex) for confirmations and choice pickers. While it's
+  // open the keypress handler routes only its keys, so nothing else in the shell fires.
   const overlay = new BoxRenderable(renderer, {
     position: "absolute",
     top: 0,
@@ -76,34 +76,64 @@ export function createApp(renderer: CliRenderer): { currentTab: () => number; at
     paddingTop: 1,
     paddingBottom: 1,
   });
-  const modalText = new TextRenderable(renderer, { content: "", fg: theme.text.primary, height: 1, wrapMode: "none" });
-  // "yes" is red to underscore that it's the destructive choice.
-  const hintRow = new BoxRenderable(renderer, { flexDirection: "row", height: 1, backgroundColor: theme.bg });
-  hintRow.add(new TextRenderable(renderer, { content: "[y] yes", fg: theme.status.bad, height: 1, wrapMode: "none" }));
-  hintRow.add(new TextRenderable(renderer, { content: "      [n / Esc] no", fg: theme.text.tertiary, height: 1, wrapMode: "none" }));
-  card.add(modalText);
+  const modalTitle = new TextRenderable(renderer, { content: "", fg: theme.text.primary, height: 1, wrapMode: "none" });
+  const modalBody = new BoxRenderable(renderer, { flexDirection: "column", backgroundColor: theme.bg });
+  card.add(modalTitle);
   card.add(new TextRenderable(renderer, { content: "", height: 1 }));
-  card.add(hintRow);
+  card.add(modalBody);
   overlay.add(card);
   root.add(overlay);
 
-  let modalResolve: ((v: boolean) => void) | null = null;
+  type ModalState =
+    | { kind: "confirm"; resolve: (v: boolean) => void }
+    | { kind: "choose"; options: { label: string; value: string }[]; index: number; resolve: (v: string | null) => void };
+  let modal: ModalState | null = null;
+
+  function renderModalBody(): void {
+    for (const c of [...modalBody.getChildren()]) {
+      modalBody.remove(c.id);
+      c.destroy();
+    }
+    if (!modal) return;
+    if (modal.kind === "confirm") {
+      // "yes" is red to underscore that it's the destructive choice.
+      const row = new BoxRenderable(renderer, { flexDirection: "row", height: 1, backgroundColor: theme.bg });
+      row.add(new TextRenderable(renderer, { content: "[y] yes", fg: theme.status.bad, height: 1, wrapMode: "none" }));
+      row.add(new TextRenderable(renderer, { content: "      [n / Esc] no", fg: theme.text.tertiary, height: 1, wrapMode: "none" }));
+      modalBody.add(row);
+      return;
+    }
+    modal.options.forEach((o, i) => {
+      const on = i === (modal as { index: number }).index;
+      modalBody.add(new TextRenderable(renderer, { content: (on ? "▶ " : "  ") + o.label, fg: on ? theme.accent : theme.text.primary, height: 1, wrapMode: "none" }));
+    });
+    modalBody.add(new TextRenderable(renderer, { content: "", height: 1 }));
+    modalBody.add(new TextRenderable(renderer, { content: "↑↓ choose · ↵ select · Esc cancel", fg: theme.text.tertiary, height: 1, wrapMode: "none" }));
+  }
+
   function confirm(message: string): Promise<boolean> {
     return new Promise((resolve) => {
-      modalText.content = message;
+      modalTitle.content = message;
+      modal = { kind: "confirm", resolve };
+      renderModalBody();
       overlay.visible = true;
-      modalResolve = resolve;
     });
   }
-  function closeModal(result: boolean): void {
+  function choose(title: string, options: { label: string; value: string }[]): Promise<string | null> {
+    return new Promise((resolve) => {
+      modalTitle.content = title;
+      modal = { kind: "choose", options, index: 0, resolve };
+      renderModalBody();
+      overlay.visible = true;
+    });
+  }
+  function closeModal(): void {
     overlay.visible = false;
-    const r = modalResolve;
-    modalResolve = null;
-    r?.(result);
+    modal = null;
   }
 
   // ── views ─────────────────────────────────────────────────────────────────────────────────
-  const views: TabView[] = [createDashboard(renderer), createConfigEditor(renderer, confirm)];
+  const views: TabView[] = [createDashboard(renderer, { confirm, choose }), createConfigEditor(renderer, confirm)];
   let current = -1;
   // Per-tab focus memory (session): whether each tab was last left at the top level (tab bar). The
   // within-tab section + field is remembered by each view (restoreFocus). Together these restore
@@ -114,7 +144,7 @@ export function createApp(renderer: CliRenderer): { currentTab: () => number; at
     const tail = "   ·   Tab: switch view · Esc: top level · q: quit";
     return idx === 1
       ? " 1 repos · 2 fields   ·   ↑↓: move · ↵: open/edit" + tail
-      : " 1 status   ·   ↑↓: scroll · refreshes every 3s" + tail;
+      : " ↑↓: move · t: tick · c: claim · x: teardown · r: refresh" + tail;
   }
 
   /** Top of the hierarchy: focus the tab bar. From here numbers enter a section, ←→/Tab switch. */
@@ -161,10 +191,18 @@ export function createApp(renderer: CliRenderer): { currentTab: () => number; at
   renderer.on("destroy", shutdown);
 
   renderer.keyInput.on("keypress", (key: KeyEvent) => {
-    // A modal is open: capture only its answer keys; everything else is swallowed.
-    if (modalResolve) {
-      if (key.name === "y" || key.name === "return" || key.name === "enter") closeModal(true);
-      else if (key.name === "n" || key.name === "escape") closeModal(false);
+    // A modal is open: capture only its keys; everything else is swallowed.
+    if (modal) {
+      if (modal.kind === "confirm") {
+        if (key.name === "y" || key.name === "return" || key.name === "enter") { const m = modal; closeModal(); m.resolve(true); }
+        else if (key.name === "n" || key.name === "escape") { const m = modal; closeModal(); m.resolve(false); }
+      } else {
+        const n = modal.options.length;
+        if (key.name === "up") { modal.index = (modal.index - 1 + n) % n; renderModalBody(); }
+        else if (key.name === "down") { modal.index = (modal.index + 1) % n; renderModalBody(); }
+        else if (key.name === "return" || key.name === "enter") { const m = modal; const v = m.options[m.index]?.value ?? null; closeModal(); m.resolve(v); }
+        else if (key.name === "escape") { const m = modal; closeModal(); m.resolve(null); }
+      }
       key.preventDefault();
       return;
     }

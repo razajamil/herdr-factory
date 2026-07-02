@@ -13,9 +13,9 @@ import type { KeyEvent, Renderable } from "@opentui/core";
 import { parseDocument, type Document } from "yaml";
 import { RepoConfigSchema, listConfiguredRepos, repoConfigDir } from "../config.ts";
 import { postReload } from "./api.ts";
-import { buildDescriptors, type ConfirmFn, type FieldDesc } from "./config-fields.ts";
+import { buildDescriptors, type FieldDesc } from "./config-fields.ts";
 import { BORDER, theme } from "./theme.ts";
-import type { TabView } from "./types.ts";
+import type { ConfirmFn, TabView } from "./types.ts";
 
 const LABEL_WIDTH = 28;
 const IND = (n?: number) => "  ".repeat(n ?? 0);

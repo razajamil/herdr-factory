@@ -75,6 +75,51 @@ export function fetchStatus(repo: string): Promise<RepoStatus | null> {
   return getJson<RepoStatus>(`/repos/${encodeURIComponent(repo)}/status`);
 }
 
+export interface EligibleItem {
+  source: string;
+  key: string;
+  summary: string;
+  type: string;
+}
+
+export function fetchEligible(repo: string): Promise<{ eligible: EligibleItem[] } | null> {
+  return getJson<{ eligible: EligibleItem[] }>(`/repos/${encodeURIComponent(repo)}/eligible`);
+}
+
+/** Result of a mutating action: ok, or a reason to show the user. */
+export type ActionResult = { ok: true } | { ok: false; error: string };
+
+async function post(path: string, body?: unknown): Promise<ActionResult> {
+  const info = readInfo();
+  if (!info) return { ok: false, error: "server not running" };
+  try {
+    // Claim/tick can do real work, so allow a generous timeout (the UI stays responsive — the await
+    // doesn't block the event loop, and the banner shows progress).
+    const res = await fetch(`http://127.0.0.1:${info.port}${path}`, {
+      method: "POST",
+      signal: AbortSignal.timeout(120_000),
+      headers: body !== undefined ? { "content-type": "application/json" } : {},
+      body: body !== undefined ? JSON.stringify(body) : undefined,
+    });
+    const text = await res.text();
+    const json = text ? (JSON.parse(text) as Record<string, unknown>) : {};
+    if (!res.ok) return { ok: false, error: typeof json.error === "string" ? json.error : `server returned ${res.status}` };
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : String(e) };
+  }
+}
+
+export function postTick(repo: string): Promise<ActionResult> {
+  return post(`/repos/${encodeURIComponent(repo)}/tick`);
+}
+export function postClaim(repo: string, key: string, belt?: string): Promise<ActionResult> {
+  return post(`/repos/${encodeURIComponent(repo)}/claim`, belt ? { key, belt } : { key });
+}
+export function postTeardown(repo: string, key: string, source?: string | null): Promise<ActionResult> {
+  return post(`/repos/${encodeURIComponent(repo)}/teardown`, source ? { key, source } : { key });
+}
+
 /** Best-effort hot-reload nudge after a config save, so the running server re-reads config.yml
  *  without a restart. Silent on failure (no server / older server). */
 export async function postReload(): Promise<boolean> {
