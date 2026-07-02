@@ -1,0 +1,197 @@
+// herdr-factory TUI — entry point. Boots the opentui renderer and lays out a top-level tabbed
+// shell (lazygit-style navigation): Tab/Shift+Tab switch top tabs; number keys jump to a numbered
+// section within the active tab; arrows navigate inside the focused section; Esc pops to the top
+// level (the tab bar). Runs on Node >= 26 with --experimental-ffi (see bin/herdr-factory-tui).
+// Imperative opentui core API — no JSX.
+import { BoxRenderable, InputRenderable, TabSelectRenderable, TextRenderable, createCliRenderer, type CliRenderer } from "@opentui/core";
+import type { KeyEvent } from "@opentui/core";
+import { theme } from "./theme.ts";
+import type { TabView } from "./types.ts";
+import { createDashboard } from "./dashboard.ts";
+import { createConfigEditor } from "./config-editor.ts";
+
+/** Build the tabbed shell on an existing renderer (split out from bootstrap so it can be driven in
+ *  tests). Returns a few inspection getters. */
+export function createApp(renderer: CliRenderer): { currentTab: () => number; atTop: () => boolean; views: TabView[] } {
+  const root = renderer.root;
+
+  // ── chrome ────────────────────────────────────────────────────────────────────────────────
+  const header = new TextRenderable(renderer, {
+    content: " herdr-factory · factory control",
+    fg: theme.accent,
+    bg: theme.barBg,
+    height: 1,
+    wrapMode: "none",
+  });
+  // The tab bar doubles as the "top level" focus target (reached with Esc). It's driven by the
+  // shell (Tab/←→), so its selected tab uses selectedBackgroundColor (always visible) and it
+  // highlights via focusedBackgroundColor when it is the top-level focus.
+  const tabBar = new TabSelectRenderable(renderer, {
+    height: 1,
+    options: [
+      { name: "Dashboard", description: "" },
+      { name: "Config", description: "" },
+    ],
+    showDescription: false,
+    showUnderline: false,
+    tabWidth: 13,
+    backgroundColor: theme.barBg,
+    textColor: theme.focusText.unfocused,
+    selectedBackgroundColor: theme.accent,
+    selectedTextColor: theme.bg,
+    focusedBackgroundColor: theme.barFocusBg,
+    focusedTextColor: theme.text.primary,
+  });
+  const content = new BoxRenderable(renderer, { flexGrow: 1, width: "100%", backgroundColor: theme.bg });
+  const footer = new TextRenderable(renderer, { content: "", fg: theme.text.tertiary, bg: theme.barBg, height: 1, wrapMode: "none" });
+
+  root.add(header);
+  root.add(tabBar);
+  root.add(content);
+  root.add(footer);
+
+  // ── views ─────────────────────────────────────────────────────────────────────────────────
+  const views: TabView[] = [createDashboard(renderer), createConfigEditor(renderer)];
+  let current = -1;
+  // Per-tab focus memory (session): whether each tab was last left at the top level (tab bar). The
+  // within-tab section + field is remembered by each view (restoreFocus). Together these restore
+  // your place when switching tabs.
+  const leftAtTop: boolean[] = views.map(() => false);
+
+  function footerHints(idx: number): string {
+    const tail = "   ·   Tab: switch view · Esc: top level · q: quit";
+    return idx === 1
+      ? " 1 repos · 2 fields   ·   ↑↓: move · ↵: open/edit" + tail
+      : " 1 status   ·   ↑↓: scroll · refreshes every 3s" + tail;
+  }
+
+  /** Top of the hierarchy: focus the tab bar. From here numbers enter a section, ←→/Tab switch. */
+  function focusTop(): void {
+    tabBar.focus();
+  }
+
+  function showTab(idx: number): void {
+    if (idx === current) return;
+    const view = views[idx];
+    if (!view) return;
+    if (current >= 0) {
+      leftAtTop[current] = renderer.currentFocusedRenderable === tabBar;
+      views[current]!.deactivate();
+      content.remove(views[current]!.root.id);
+    }
+    current = idx;
+    tabBar.setSelectedIndex(idx);
+    content.add(view.root);
+    view.activate();
+    footer.content = footerHints(idx);
+    // Restore where this tab was left: the top level, or its remembered section.
+    if (leftAtTop[idx]) focusTop();
+    else view.restoreFocus();
+  }
+
+  function switchTab(dir: -1 | 1): void {
+    showTab((current + dir + views.length) % views.length);
+  }
+
+  let exiting = false;
+  function shutdown(): void {
+    if (exiting) return;
+    exiting = true;
+    for (const v of views) v.deactivate();
+    try {
+      renderer.destroy();
+    } catch {
+      /* already tearing down */
+    }
+    process.exit(0);
+  }
+  // Covers Ctrl-C (exitOnCtrlC destroys the renderer) so our poll timers don't keep Node alive.
+  renderer.on("destroy", shutdown);
+
+  renderer.keyInput.on("keypress", (key: KeyEvent) => {
+    const view = views[current];
+    const focused = renderer.currentFocusedRenderable;
+    const editing = focused instanceof InputRenderable;
+    const atTop = focused === tabBar;
+
+    // Global handlers run before the focused widget and can preventDefault to consume a key.
+    if (key.ctrl && key.name === "s") {
+      view?.save?.();
+      key.preventDefault();
+      return;
+    }
+    // Esc pops to the top level from any depth (editing a field, or in a section).
+    if (key.name === "escape") {
+      focusTop();
+      key.preventDefault();
+      return;
+    }
+    if (key.name === "tab" || key.name === "backtab") {
+      switchTab(key.shift ? -1 : 1);
+      key.preventDefault();
+      return;
+    }
+
+    // Editing a text field: keys belong to the input, except ↑/↓ (hop between fields). Digits,
+    // letters, ←/→ cursor, backspace, Enter (→ next field) all fall through to it.
+    if (editing) {
+      if (key.name === "up") {
+        view?.editMove?.(-1);
+        key.preventDefault();
+      } else if (key.name === "down") {
+        view?.editMove?.(1);
+        key.preventDefault();
+      }
+      return;
+    }
+
+    // Top level or a section: quit / number-jump work at both.
+    if (key.name === "q") {
+      shutdown();
+      key.preventDefault();
+      return;
+    }
+    if (key.name && /^[1-9]$/.test(key.name)) {
+      view?.focusSection(Number(key.name));
+      key.preventDefault();
+      return;
+    }
+
+    // At the top level, ←→ switch tabs and Enter dives into the first section.
+    if (atTop) {
+      if (key.name === "left") switchTab(-1);
+      else if (key.name === "right") switchTab(1);
+      else if (key.name === "return" || key.name === "enter") view?.focusSection(1);
+      else return;
+      key.preventDefault();
+      return;
+    }
+    // In a section: arrows / Enter fall through to the focused section widget.
+  });
+
+  showTab(0);
+
+  return {
+    currentTab: () => current,
+    atTop: () => renderer.currentFocusedRenderable === tabBar,
+    views,
+  };
+}
+
+async function main(): Promise<void> {
+  const renderer = await createCliRenderer({
+    exitOnCtrlC: true,
+    screenMode: "alternate-screen",
+    useMouse: true,
+    backgroundColor: theme.bg, // light canvas (lighter palette)
+  });
+  createApp(renderer);
+}
+
+// Only auto-run as the entry point (not when imported by a test harness).
+if (import.meta.main) {
+  main().catch((err) => {
+    console.error(err);
+    process.exit(1);
+  });
+}

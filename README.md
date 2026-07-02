@@ -248,6 +248,29 @@ OpenTelemetry traces and metrics are available when `HERDR_FACTORY_TELEMETRY=1` 
 testing, run the Grafana LGTM stack with `docker compose -f docker-compose.telemetry.yml up`; see
 [`docs/TELEMETRY.md`](docs/TELEMETRY.md).
 
+## TUI
+
+`herdr-factory-tui` (or `npm run tui`) opens a full-screen terminal UI as a front-end to the factory,
+built on [opentui](https://github.com/anomalyco/opentui). Navigation follows lazygit, with a
+three-level focus hierarchy — top level (the tab bar) → a numbered section → a field: **`Tab` /
+`Shift+Tab`** switch the top-level tabs, **number keys** jump to a numbered section within the current
+tab, **arrows** move within the focused section, **`Esc`** pops back to the top level from any depth
+(then a number key dives into a section), and **`q`** quits. Each tab remembers where you left it for
+the session.
+
+- **Dashboard** — read-only, per-repo status pulled live from the running server's HTTP API
+  (`/health` + `/repos/{repo}/status`); auto-refreshes every 3s and shows a start hint when the
+  server is down.
+- **Config** — section **1** is a repo list; `↵` opens a repo into section **2**, a guided editor
+  for its `config.yml`. In the editor, `↑↓` move between fields, `↵` starts editing the highlighted
+  field (type freely; `↵` = next field, `Esc` = back to browsing), and `^S` saves — validated against
+  the same schema as the engine, with comments preserved. v1 edits the `repo` block + all `limits`;
+  `work_sources` and `belt` are shown read-only for now.
+
+Unlike the engine (Node ≥ 24), the TUI renders through opentui's native core, so it needs **Node ≥ 26
+with FFI** — the launcher reaches for a Node 26 (active `node`, else `mise exec node@26`) and runs
+with `--experimental-ffi`. Nothing else in the project depends on it.
+
 ## What's repo-specific (all in `repos/<name>/config.yml`)
 
 repo checkout + base branch (repo-global) · `limits` incl. the global `max_active` cap · the

@@ -5,10 +5,12 @@
   "type": "module",
   "private": true,
   "bin": {
-    "herdr-factory": "bin/herdr-factory"
+    "herdr-factory": "bin/herdr-factory",
+    "herdr-factory-tui": "bin/herdr-factory-tui"
   },
   "scripts": {
     "cats": "node src/cli/index.ts",
+    "tui": "bin/herdr-factory-tui",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
@@ -32,6 +34,7 @@
     "@opentelemetry/sdk-trace-base": "^2.8.0",
     "@opentelemetry/sdk-trace-node": "^2.8.0",
     "@opentelemetry/semantic-conventions": "^1.41.1",
+    "@opentui/core": "^0.4.2",
     "commander": "^15.0.0",
     "effect": "^3.21.4",
     "hono": "^4.12.26",

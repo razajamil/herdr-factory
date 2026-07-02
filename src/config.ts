@@ -136,7 +136,7 @@ const CustomBeltSchema = z
   .strict();
 const BeltSchema = z.discriminatedUnion("belt_type", [WorkToPrBeltSchema, CustomBeltSchema]);
 
-const RepoConfigSchema = z
+export const RepoConfigSchema = z
   .object({
     repo: z.object({
       path: z.string(),
@@ -355,6 +355,14 @@ export function globalDbPath(): string {
  *  dependency at runtime. */
 export function nodePathFile(): string {
   return join(stateRoot(), "node-path");
+}
+
+/** A repo's config folder (`<configDir>/repos/<name>/`) — where its config.yml + env live.
+ *  Exposed for tools (e.g. the TUI config editor) that read/write the raw config.yml directly,
+ *  without going through loadConfig's parse+validate (so they can edit an as-yet-invalid file and
+ *  preserve YAML comments). */
+export function repoConfigDir(name: string): string {
+  return join(configDir(), "repos", name);
 }
 
 /** Every repo configured under `<configDir>/repos/<name>/config.yml`, sorted. The resident

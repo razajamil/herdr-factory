@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# Launcher for the herdr-factory TUI. Unlike the engine (Node >= 24), the TUI renders through
+# opentui's native core, which needs Node >= 26 with FFI enabled (`--experimental-ffi`). This repo's
+# .node-version pins Node 24 for the engine, so here we deliberately reach for a Node 26:
+#   1. the caller's active `node`, if it's already >= 26;
+#   2. else `mise exec node@26` (this repo's dev setup);
+#   3. else the Node path the engine baked on a prior run, if that happens to be >= 26.
+# Resolves its own location through symlinks and runs from the package dir so src/ resolves
+# regardless of caller cwd.
+set -euo pipefail
+
+src="${BASH_SOURCE[0]}"
+while [ -h "$src" ]; do
+  dir="$(cd -P "$(dirname "$src")" && pwd)"
+  src="$(readlink "$src")"
+  [[ "$src" != /* ]] && src="$dir/$src"
+done
+pkg="$(cd -P "$(dirname "$src")/.." && pwd)"
+
+cd "$pkg"
+
+entry="src/tui/index.ts"
+# --disable-warning keeps Node's experimental-FFI notice off the alternate screen.
+node_flags=(--experimental-ffi --disable-warning=ExperimentalWarning)
+
+node_major() { local v; v="$("$1" -v 2>/dev/null)" || return 1; v="${v#v}"; printf '%s' "${v%%.*}"; }
+
+# 1. Active node, if >= 26.
+m="$(node_major node || true)"
+if [ -n "$m" ] && [ "$m" -ge 26 ]; then
+  exec node "${node_flags[@]}" "$entry" "$@"
+fi
+
+# 2. mise-provided Node 26 (dev setup).
+if command -v mise >/dev/null 2>&1 && mise exec node@26 -- node -v >/dev/null 2>&1; then
+  exec mise exec node@26 -- node "${node_flags[@]}" "$entry" "$@"
+fi
+
+# 3. Baked engine node, if it's >= 26.
+baked="${HERDR_FACTORY_STATE_ROOT:-${HOME:-}/.local/state/herdr-factory}/node-path"
+if [ -r "$baked" ]; then
+  bnode="$(cat "$baked" 2>/dev/null || true)"
+  if [ -n "$bnode" ] && [ -x "$bnode" ]; then
+    bm="$(node_major "$bnode" || true)"
+    if [ -n "$bm" ] && [ "$bm" -ge 26 ]; then
+      exec "$bnode" "${node_flags[@]}" "$entry" "$@"
+    fi
+  fi
+fi
+
+echo "herdr-factory-tui requires Node >= 26 with FFI (opentui's native renderer)." >&2
+echo "Active node is '$(node -v 2>/dev/null || echo none)', and no Node 26 was found via mise or the" >&2
+echo "baked engine node path ($baked)." >&2
+echo "Fix: install Node 26 (e.g. \`mise use -g node@26\`) and retry." >&2
+exit 1
