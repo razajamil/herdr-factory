@@ -18,7 +18,7 @@ export const stepByName = (belt: BeltRuntime, name: string | null): StepConfig |
 /** The belt's first step (every belt has ≥1 — enforced by config). */
 export const firstStep = (belt: BeltRuntime): StepConfig => belt.steps[0]!;
 
-const indexOfStep = (belt: BeltRuntime, name: string): number => belt.steps.findIndex((s) => s.name === name);
+export const indexOfStep = (belt: BeltRuntime, name: string): number => belt.steps.findIndex((s) => s.name === name);
 
 /** The step before `name` in this belt, or undefined if it's the first. */
 export const priorStep = (belt: BeltRuntime, name: string): StepConfig | undefined => {
@@ -128,7 +128,15 @@ export async function materializeWork(deps: Deps, run: Run, src: SourceRuntime):
  *  agent, and the mandatory finish protocol (write a handoff note, then signal step-done). This is
  *  the "you're working in herdr, here are the other agents in this belt" wiring — the only thing the
  *  engine injects on top of the step's own prompt body. */
-function scaffold(belt: BeltRuntime, step: StepConfig, prior: RunStep | null, stepDoneCmd: string, askHumanCmd: string): string {
+function scaffold(
+  belt: BeltRuntime,
+  step: StepConfig,
+  prior: RunStep | null,
+  stepDoneCmd: string,
+  askHumanCmd: string,
+  bounceCmd: string,
+  bounceTarget: string | undefined,
+): string {
   const seq = belt.steps.map((s) => (s.name === step.name ? `**${s.name}** (you)` : s.name)).join(" → ");
   const inputs = prior
     ? `\n\n## Input from the previous step (${prior.step})\n` +
@@ -147,6 +155,14 @@ function scaffold(belt: BeltRuntime, step: StepConfig, prior: RunStep | null, st
     `Write a concise question to \`${MEMORY_DIR}/human-question-${step.name}.md\`, then run \`${askHumanCmd}\` and stop. ` +
     `The dispatcher will post the question through the work source, wait for a human reply, write the answer under \`${MEMORY_DIR}/human-replies/\`, and resume this same step automatically. ` +
     `If \`${MEMORY_DIR}/human-replies/\` already exists when you start or resume, read its files before continuing.\n` +
+    (bounceCmd && bounceTarget
+      ? `\n## Sending the work back for rework\n` +
+        `If your work on this step shows the previous work is NOT acceptable — e.g. evidence proves the issue isn't actually fixed, ` +
+        `the change is wrong, or a required behaviour is missing — do NOT run step-done and do NOT try to fix it here. Instead: ` +
+        `write concrete, actionable findings (what's wrong and what must change) to \`${MEMORY_DIR}/bounce-${step.name}.md\`, ` +
+        `then run \`${bounceCmd}\` and stop. This sends the run back to the **${bounceTarget}** step to do the work. ` +
+        `(There is a per-run bounce limit; repeated bounces escalate to a human.)\n`
+      : "") +
     `\n## Finishing this step (required)\n` +
     `1. Write your handoff note to \`${MEMORY_DIR}/handoff-${step.name}.md\` — what you did, key decisions and why, ` +
     `anything uncertain, and what the next step should verify.\n` +
@@ -211,6 +227,15 @@ function renderStepPromptImpl(
   // sources share a key (the worker only knows its key, via HERDR_FACTORY_TICKET).
   const stepDoneCmd = `${CLI_PATH} --repo ${deps.config.repoName} step-done ${run.ticketKey} ${step.name} --source ${src.name}`;
   const askHumanCmd = `${CLI_PATH} --repo ${deps.config.repoName} ask-human ${run.ticketKey} ${step.name} --source ${src.name} --question-file ${MEMORY_DIR}/human-question-${step.name}.md`;
+  // Publishes @@EVIDENCE_DIR@@ to S3/CloudFront and prints the public URLs (no-op if `evidence:` is
+  // unconfigured). Available to every step; the evidence step is the one that uses it.
+  const evidenceUploadCmd = `${CLI_PATH} --repo ${deps.config.repoName} evidence-upload ${run.ticketKey} --source ${src.name}`;
+  // For a step that may bounce (evidence/review), a ready-made command that returns the run to its
+  // first `canBounceTo` target with a findings file. Empty for steps that can't bounce.
+  const bounceTarget = step.canBounceTo[0];
+  const bounceCmd = bounceTarget
+    ? `${CLI_PATH} --repo ${deps.config.repoName} bounce ${run.ticketKey} ${bounceTarget} --source ${src.name} --reason-file ${MEMORY_DIR}/bounce-${step.name}.md`
+    : "";
   // Where the work item's spec lives + how to describe it. Jira → a single ticket.json.
   // local_markdown is either a single file (snapshotted to task.md) or a whole directory (copied
   // to task/); detect which from what materialize wrote into this worktree's .memory.
@@ -239,6 +264,9 @@ function renderStepPromptImpl(
     "@@WORK_DOC@@": workDoc,
     "@@WORK_DOC_KIND@@": workDocKind,
     "@@EVIDENCE_DIR@@": `${MEMORY_DIR}/evidence`,
+    "@@EVIDENCE_UPLOAD_CMD@@": evidenceUploadCmd,
+    "@@BOUNCE_CMD@@": bounceCmd,
+    "@@BOUNCE_TARGET@@": bounceTarget ?? "",
     "@@CLI@@": CLI_PATH,
     "@@HANDOFF_IN@@": prior ? `${MEMORY_DIR}/handoff-${prior.step}.md` : "(none — first step)",
     "@@HANDOFF_OUT@@": `${MEMORY_DIR}/handoff-${step.name}.md`,
@@ -249,7 +277,16 @@ function renderStepPromptImpl(
   let out = stepBody(deps, run, step);
   for (const [token, value] of Object.entries(sub)) out = out.replaceAll(token, () => value);
   if (deps.config.guidance) out += `\n\n## Repo-specific guidance\n\n${deps.config.guidance}\n`;
-  out += scaffold(belt, step, prior, stepDoneCmd, askHumanCmd);
+  out += scaffold(belt, step, prior, stepDoneCmd, askHumanCmd, bounceCmd, bounceTarget);
+  // If a later step bounced the run back to this step, a feedback note is waiting — surface it up
+  // top so the (re-dispatched) agent reads it before anything else.
+  if (existsSync(join(worktree, MEMORY_DIR, `feedback-${step.name}.md`))) {
+    out =
+      `## ⚠ Rework requested — READ THIS FIRST\n\n` +
+      `A later step sent this work back to you. Read \`${MEMORY_DIR}/feedback-${step.name}.md\` in this worktree ` +
+      `and address its findings before doing anything else, then finish this step as normal.\n\n---\n\n` +
+      out;
+  }
   const mem = join(worktree, MEMORY_DIR);
   mkdirSync(mem, { recursive: true });
   writeFileSync(join(mem, `prompt-${step.name}.md`), out);

@@ -5,7 +5,7 @@ import type { StepConfig } from "../config.ts";
 import type { HumanQuestion, MatchItem, Outcome, PrInfo, Run, RunStep, Ticket } from "../types.ts";
 import { outcomeToWorkState, ticketOf } from "../types.ts";
 import { branchName } from "./branch.ts";
-import { firstStep, materializeWork, MEMORY_DIR, nextStep, spawnStep, stepByName } from "./step.ts";
+import { firstStep, indexOfStep, materializeWork, MEMORY_DIR, nextStep, spawnStep, stepByName } from "./step.ts";
 import { wakeResolver } from "./watch.ts";
 import { recordTick, recordTickDuration, recordTickLockSkipped, telemetryEvent, telemetrySpan } from "../telemetry/index.ts";
 
@@ -42,6 +42,33 @@ export async function withTickLock(deps: Deps, fn: () => Promise<void>): Promise
     }
     return true;
   });
+}
+
+/**
+ * Acquire the per-repo tick lock, run `fn` under it, and return its result — retrying briefly if a
+ * tick is mid-flight rather than dropping the work (unlike the fire-and-forget nudge). This is for
+ * the `bounce` signal: unlike step-done (a single monotonic flag whose stale read only DEFERS an
+ * idempotent forward advance), a bounce rewinds `run.step` AND re-dispatches a pane, so a concurrent
+ * tick reconciling the run from its pre-bounce snapshot would respawn/double-spawn the wrong step.
+ * Serializing the whole bounce against the tick (both take this same lock) closes that window.
+ * Returns { ran: false } if the lock stays held past the bounded wait (~15s) — caller reports "busy".
+ */
+export async function withTickLockWaiting<T>(
+  deps: Deps,
+  fn: () => Promise<T>,
+  opts: { tries?: number; delayMs?: number } = {},
+): Promise<{ ran: boolean; result?: T }> {
+  const tries = opts.tries ?? 30;
+  const delayMs = opts.delayMs ?? 500;
+  for (let i = 0; i < tries; i++) {
+    let result: T | undefined;
+    const ran = await withTickLock(deps, async () => {
+      result = await fn();
+    });
+    if (ran) return { ran: true, result };
+    await deps.sleep(delayMs);
+  }
+  return { ran: false };
 }
 
 /** One reconcile pass: advance active runs, then claim new work up to the cap. */
@@ -480,6 +507,113 @@ async function resumeAfterHumanReply(deps: Deps, run: Run, belt: BeltRuntime, sr
 
   await spawnStep(deps, deps.store.getRun(run.id)!, belt, src, step);
   deps.log("info", `${run.ticketKey}: respawned ${step} after human reply #${q.id}`);
+}
+
+/** Persist a bounce's findings where the bounced-to step's agent will read them. Named by the
+ *  TARGET step (feedback-<toStep>.md, overwritten on each bounce) so the target's prompt can surface
+ *  it deterministically (see renderStepPromptImpl's rework banner). Returns the worktree-relative
+ *  path (for the event + re-dispatch prompt), or null if the run has no worktree. */
+function writeBounceNote(run: Run, fromStep: string, toStep: string, reason: string): string | null {
+  if (!run.worktreePath) return null;
+  const dir = join(run.worktreePath, MEMORY_DIR);
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(
+    join(dir, `feedback-${toStep}.md`),
+    [
+      `# Rework requested for ${run.ticketKey}`,
+      "",
+      `The **${fromStep}** step sent this work back to the **${toStep}** step. Address the findings`,
+      `below, then finish the ${toStep} step as normal (the pipeline will run forward from here again).`,
+      "",
+      "## Findings to address",
+      "",
+      reason.trim(),
+      "",
+    ].join("\n"),
+  );
+  return `${MEMORY_DIR}/feedback-${toStep}.md`;
+}
+
+/**
+ * Backward transition: the current (running) step sends the run BACK to an earlier step for rework.
+ * The counterpart to reconcileStep's forward `nextStep` advance and the analog of the ask-human
+ * park/resume — but re-pointed at an earlier step, with three things resumeAfterHumanReply does NOT
+ * do (each load-bearing):
+ *   1. CLEAR the target step's `done` (+ reset its heartbeat clocks) — else reconcileStep advances
+ *      the just-bounced step instantly on the next tick (it re-reads rs.done, reconcileStep §done).
+ *   2. Re-dispatch the TARGET step's own pane (getRunStep(toStep).paneId) — NOT run.paneId, which is
+ *      the bouncer's (latest-dispatched) pane.
+ *   3. Bump + cap a per-target bounce counter, escalating to attention past limits.maxBounces.
+ * Guarded: only from a `running` step, only to an earlier step the current step declares in
+ * `canBounceTo`. The bouncer does NOT step-done, so after the target re-completes the pipeline runs
+ * forward and re-enters the (still-not-done) bouncer cleanly.
+ */
+export async function bounceStep(
+  deps: Deps,
+  run: Run,
+  belt: BeltRuntime,
+  src: SourceRuntime,
+  toStep: string,
+  reason: string,
+): Promise<{ ok: boolean; escalated?: boolean; message?: string }> {
+  const fromStep = run.step;
+  if (run.phase !== "running" || !fromStep) return { ok: false, message: "no running step to bounce from" };
+  const from = stepByName(belt, fromStep);
+  const to = stepByName(belt, toStep);
+  if (!from || !to) return { ok: false, message: `step "${toStep}" is not in belt "${belt.name}"` };
+  const idxTo = indexOfStep(belt, toStep);
+  const idxFrom = indexOfStep(belt, fromStep);
+  if (idxTo >= idxFrom) {
+    return { ok: false, message: `${toStep} is not before ${fromStep} — bounces only go backward` };
+  }
+  if (!from.canBounceTo.includes(toStep)) {
+    return { ok: false, message: `the ${fromStep} step may not bounce to ${toStep}` };
+  }
+
+  const repo = deps.config.repoName;
+  const bounces = deps.store.bumpBounces(run.id, toStep);
+  if (bounces > deps.config.limits.maxBounces) {
+    await escalateAttention(deps, run, {
+      reason: "bounce_limit",
+      attentionReason: `bounced to ${toStep} ${bounces}× (max ${deps.config.limits.maxBounces})`,
+      body: `${run.ticketKey}: the work has been bounced back to the ${toStep} step ${bounces} times (from ${fromStep}), exceeding max_bounces (${deps.config.limits.maxBounces}). A human should look — the agents may be stuck in a rework loop.`,
+      detail: { fromStep, toStep, bounces },
+    });
+    return { ok: true, escalated: true, message: `bounce limit exceeded — escalated to attention` };
+  }
+
+  // (1) Clear done + reset heartbeat clocks for the TARGET *and every completed step between it and
+  //     the bouncer* — those intermediate steps must actually re-run on the forward pass, not be
+  //     skipped on their stale done=true (e.g. a review→fix bounce must force the evidence step to
+  //     re-capture the reworked change, not re-PR the pre-fix evidence). The bouncer (idxFrom) didn't
+  //     step-done, so it's excluded; its clocks reset when the forward pass respawns it.
+  for (let i = idxTo; i < idxFrom; i++) {
+    deps.store.upsertRunStep(run.id, belt.steps[i]!.name, { done: false, progressSig: null, progressAt: null });
+  }
+  const notePath = writeBounceNote(run, fromStep, toStep, reason);
+  // (5) Rewind the active-step pointer.
+  deps.store.updateRun(run.id, { phase: "running", step: toStep, attentionReason: null, focusPending: true });
+  deps.store.recordEvent({ runId: run.id, repo, ticketKey: run.ticketKey, type: "bounced", detail: { fromStep, toStep, bounces, notePath } });
+  deps.log("info", `${run.ticketKey}: ${fromStep} bounced work back to ${toStep} (#${bounces})`);
+
+  // (6) Re-dispatch the TARGET step. Prefer re-prompting its own live pane (keeps context); else
+  //     respawn. Reusing a live pane also needs started_at reset (spawnStep does this on respawn).
+  const target = deps.store.getRunStep(run.id, toStep);
+  if (target?.paneId && (await deps.herdr.paneAlive(target.paneId))) {
+    const prompt =
+      `The ${fromStep} step sent this work back for rework (${run.ticketKey}). ` +
+      (notePath ? `Read ${notePath} in this worktree, ` : "Read the latest feedback note in this worktree, ") +
+      `address the findings, and only run step-done when the ${toStep} step is genuinely complete.`;
+    await deps.herdr.agentSend(target.paneId, prompt);
+    await deps.herdr.paneSendKeys(target.paneId, "Enter");
+    deps.store.upsertRunStep(run.id, toStep, { startedAt: deps.now() });
+    deps.store.updateRun(run.id, { paneId: target.paneId });
+    deps.log("info", `${run.ticketKey}: re-prompted ${toStep} on live pane ${target.paneId}`);
+    return { ok: true };
+  }
+  await spawnStep(deps, deps.store.getRun(run.id)!, belt, src, toStep);
+  deps.log("info", `${run.ticketKey}: respawned ${toStep} for rework`);
+  return { ok: true };
 }
 
 async function reconcileWaitingForHuman(deps: Deps, run: Run, belt: BeltRuntime, src: SourceRuntime): Promise<void> {

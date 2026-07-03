@@ -30,6 +30,32 @@ const LocalMarkdownBlockSchema = z.object({
   folder: z.string(),
 });
 
+// ── Evidence upload: where the `evidence` step publishes captured screenshots/video (S3 + CloudFront).
+// Non-secret infra pointers ONLY — AWS credentials come from the ambient AWS CLI chain (~/.aws /
+// AWS_* env / the named `profile`), never stored in config or handed to an agent. Optional: a repo
+// that omits it still gets an evidence step (capture + assess + bounce), it just publishes nothing.
+const EvidenceBlockSchema = z
+  .object({
+    bucket: z.string().trim().min(1),
+    region: z.string().trim().min(1),
+    // Accept a bare host or a full URL; normalize to a bare host used to build https:// asset URLs.
+    cloudfront_domain: z
+      .string()
+      .trim()
+      .min(1)
+      .transform((s) => s.replace(/^https?:\/\//, "").replace(/\/+$/, "")),
+    // Optional S3 key prefix (leading/trailing slashes trimmed); evidence lands under
+    // <key_prefix>/<work_key>/<run>-<timestamp>/<file>.
+    key_prefix: z
+      .string()
+      .trim()
+      .default("")
+      .transform((s) => s.replace(/^\/+|\/+$/g, "")),
+    // Optional AWS CLI named profile (else the default credential chain).
+    profile: z.string().trim().min(1).optional(),
+  })
+  .strict();
+
 // A work source is just identity + a type-specific backend block. The OPTIONAL `name` (default =
 // type, unique within the repo) is what a belt's `source:` references and what each run records on
 // its `work_source` column.
@@ -64,16 +90,19 @@ const promptSourceRefine = [
   { message: "prompt_file_source is required when prompt_file is set", path: ["prompt_file_source"] as string[] },
 ] as const;
 
-// work_to_pull_request belts have exactly three engine-defined steps (fix → review → pr) whose
-// prompts the engine ships; an agent block picks the layout pane and may OPTIONALLY add a
-// `prompt_file` (with a required `prompt_file_source`) that AUGMENTS the engine prompt for that
-// step. All three required.
+// work_to_pull_request belts have engine-defined steps (fix → evidence → review → pr) whose prompts
+// the engine ships; an agent block picks the layout pane and may OPTIONALLY add a `prompt_file`
+// (with a required `prompt_file_source`) that AUGMENTS the engine prompt for that step. fix/review/pr
+// are required; `evidence` is OPTIONAL (backward-compatible with pre-evidence configs — when omitted
+// the evidence step just spawns its own dedicated pane).
 const PrAgentSchema = z
   .object({ ...layoutFields, ...promptFileFields })
   .strict()
   .refine(bothOrNeither, layoutRefine)
   .refine(...promptSourceRefine);
-const PrAgentsSchema = z.object({ fix: PrAgentSchema, review: PrAgentSchema, pr: PrAgentSchema }).strict();
+const PrAgentsSchema = z
+  .object({ fix: PrAgentSchema, evidence: PrAgentSchema.optional(), review: PrAgentSchema, pr: PrAgentSchema })
+  .strict();
 
 // Step names are used in file paths (prompt-<name>.md / handoff-<name>.md), pane labels, and the
 // step-done CLI arg — so keep them to a git/path-safe lowercase slug.
@@ -150,7 +179,12 @@ export const RepoConfigSchema = z
         develop_budget_seconds: z.coerce.number().int().positive().default(5400),
         stall_seconds: z.coerce.number().int().positive().default(2700),
         review_budget_seconds: z.coerce.number().int().positive().default(1800),
+        // The evidence step captures + (optionally) records video and uploads — generous by default.
+        evidence_budget_seconds: z.coerce.number().int().positive().default(2400),
         pr_budget_seconds: z.coerce.number().int().positive().default(3600),
+        // Max times a run may be bounced back to any one earlier step before escalating to attention
+        // (loop-safety for evidence/review → fix rework). 0 disables bouncing (first bounce escalates).
+        max_bounces: z.coerce.number().int().nonnegative().default(3),
         // Default budget for a custom belt's step when it sets no `budget_seconds` of its own.
         step_budget_seconds: z.coerce.number().int().positive().default(3600),
         tick_interval_seconds: z.coerce.number().int().positive().default(60),
@@ -166,6 +200,8 @@ export const RepoConfigSchema = z
     // Belts (≥1): each pairs a source with an ordered pipeline. At claim time belts are walked in
     // priority order and the first whose `match` accepts an item claims it (first match wins).
     belt: z.array(BeltSchema).min(1, "belt must list at least one belt"),
+    // Optional: where the evidence step publishes captured media (S3 + CloudFront). Repo-wide.
+    evidence: EvidenceBlockSchema.optional(),
   })
   .superRefine((cfg, ctx) => {
     // Work source names unique on the RESOLVED name (name ?? type), so two unnamed jira sources
@@ -248,6 +284,8 @@ export interface StepConfig {
   budgetSeconds: number;
   heartbeat: boolean; // commit-HEAD stall heartbeat applies to this step
   opensPr: boolean;
+  gathersEvidence: boolean; // this step captures + publishes visual evidence (surfaces evidence guidance)
+  canBounceTo: string[]; // earlier step names this step may send the run back to for rework (bounce)
 }
 
 /** One resolved belt: a (source + ordered steps) pairing with its lifecycle. `watchPr` true means
@@ -274,13 +312,23 @@ export interface Config {
     developBudgetSeconds: number;
     stallSeconds: number;
     reviewBudgetSeconds: number;
+    evidenceBudgetSeconds: number;
     prBudgetSeconds: number;
+    maxBounces: number;
     stepBudgetSeconds: number;
     tickIntervalSeconds: number;
     layoutWaitSeconds: number;
   };
   sources: WorkSourceConfig[];
   belts: BeltConfig[]; // sorted by priority asc (ties: config order)
+  /** Where the evidence step publishes captured media (S3 + CloudFront). Undefined ⇒ no upload. */
+  evidence?: {
+    bucket: string;
+    region: string;
+    cloudfrontDomain: string;
+    keyPrefix: string;
+    profile?: string;
+  };
   guidance?: string;
   paths: {
     configDir: string;
@@ -513,12 +561,21 @@ export function loadConfig(repoName: string): Loaded {
     if (source === "config") resolveFile(belt, label, promptFile);
   };
 
-  // The three engine steps of a work_to_pull_request belt (order = pipeline order).
+  // The engine steps of a work_to_pull_request belt (order = pipeline order):
+  //   fix → evidence → review → pr
+  // `evidence` captures + publishes visual proof and can bounce back to fix; `review` is a strict
+  // read-only gate that passes forward or bounces back to fix; `pr` opens the PR + rides CI.
   const PR_STEPS = [
     { name: "fix", budget: parsed.limits.develop_budget_seconds, heartbeat: true, opensPr: false },
+    { name: "evidence", budget: parsed.limits.evidence_budget_seconds, heartbeat: false, opensPr: false },
     { name: "review", budget: parsed.limits.review_budget_seconds, heartbeat: false, opensPr: false },
     { name: "pr", budget: parsed.limits.pr_budget_seconds, heartbeat: true, opensPr: true },
   ] as const;
+  // Per-step capabilities for the w2pr pipeline (kept beside PR_STEPS so the pipeline shape lives in
+  // one place; `bounce`/evidence are belt-agnostic once resolved onto StepConfig, so custom belts
+  // can grow them later). evidence + review may send the run back to fix for rework.
+  const PR_CAN_BOUNCE_TO: Record<string, string[]> = { evidence: ["fix"], review: ["fix"] };
+  const PR_GATHERS_EVIDENCE = new Set<string>(["evidence"]);
 
   const belts: BeltConfig[] = parsed.belt.map((b) => {
     const sourceType = sourceTypeByName.get(b.source)!; // existence guaranteed by superRefine
@@ -532,7 +589,9 @@ export function loadConfig(repoName: string): Loaded {
     };
     if (b.belt_type === "work_to_pull_request") {
       const steps: StepConfig[] = PR_STEPS.map((d) => {
-        const agent = b.agents[d.name];
+        // `evidence` is an optional agent block (backward-compatible) — default to an empty block so
+        // an unconfigured evidence step just spawns its own dedicated pane.
+        const agent = b.agents[d.name] ?? {};
         // schema guarantees prompt_file_source is present when prompt_file is.
         if (agent.prompt_file) checkConfigPromptFile(b.name, `${d.name} prompt_file`, agent.prompt_file_source!, agent.prompt_file);
         return {
@@ -545,6 +604,8 @@ export function loadConfig(repoName: string): Loaded {
           budgetSeconds: d.budget,
           heartbeat: d.heartbeat,
           opensPr: d.opensPr,
+          gathersEvidence: PR_GATHERS_EVIDENCE.has(d.name),
+          canBounceTo: PR_CAN_BOUNCE_TO[d.name] ?? [],
         };
       });
       return { ...base, steps, watchPr: true };
@@ -560,6 +621,8 @@ export function loadConfig(repoName: string): Loaded {
         budgetSeconds: s.budget_seconds ?? parsed.limits.step_budget_seconds,
         heartbeat: s.heartbeat, // schema default: false
         opensPr: false,
+        gathersEvidence: false, // custom steps don't (yet) declare evidence/bounce — a fast-follow
+        canBounceTo: [],
       };
     });
     return { ...base, steps, watchPr: false };
@@ -579,13 +642,24 @@ export function loadConfig(repoName: string): Loaded {
       developBudgetSeconds: parsed.limits.develop_budget_seconds,
       stallSeconds: parsed.limits.stall_seconds,
       reviewBudgetSeconds: parsed.limits.review_budget_seconds,
+      evidenceBudgetSeconds: parsed.limits.evidence_budget_seconds,
       prBudgetSeconds: parsed.limits.pr_budget_seconds,
+      maxBounces: parsed.limits.max_bounces,
       stepBudgetSeconds: parsed.limits.step_budget_seconds,
       tickIntervalSeconds: parsed.limits.tick_interval_seconds,
       layoutWaitSeconds: parsed.limits.layout_wait_seconds,
     },
     sources,
     belts,
+    evidence: parsed.evidence
+      ? {
+          bucket: parsed.evidence.bucket,
+          region: parsed.evidence.region,
+          cloudfrontDomain: parsed.evidence.cloudfront_domain,
+          keyPrefix: parsed.evidence.key_prefix,
+          profile: parsed.evidence.profile,
+        }
+      : undefined,
     guidance,
     paths: {
       configDir: cfgDir,

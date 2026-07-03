@@ -10,11 +10,12 @@ import { VERSION } from "../version.ts";
 import { withExtractedTelemetryContext } from "../telemetry/index.ts";
 import { annotateCurrentSpan, recordHttpServerDurationEffect, withHttpServerSpan } from "../telemetry/effect.ts";
 import { runEffect } from "../runtime/effect.ts";
-import { claimTicket, reconcileRepo, reconcileRun, requestHumanInput, teardownTicket, withTickLock } from "../core/reconcile.ts";
+import { bounceStep, claimTicket, reconcileRepo, reconcileRun, requestHumanInput, teardownTicket, withTickLock, withTickLockWaiting } from "../core/reconcile.ts";
 import { stepByName } from "../core/step.ts";
 import { resolveActiveRun, resolveBeltName } from "../resolve.ts";
 import type { Deps } from "../core/deps.ts";
 import {
+  bounceRoute,
   claimRoute,
   askHumanRoute,
   eligibleRoute,
@@ -215,6 +216,23 @@ export function createApp(ctx: ServerContext): OpenAPIHono {
     const result = await requestHumanInput(rt.deps, run, step, question);
     const advanced = await withTickLock(rt.deps, () => reconcileRun(rt.deps, rt.deps.store.getRun(run.id)!));
     return c.json({ ...result, message: result.message ?? (advanced ? undefined : `${key}: tick busy — next tick will poll`) }, 200);
+  });
+
+  app.openapi(bounceRoute, async (c) => {
+    const { repo } = c.req.valid("param");
+    const { key, toStep, source, reason } = c.req.valid("json");
+    const rt = ctx.getRepo(repo);
+    if (!rt) return c.json({ error: notConfigured(repo) }, 404);
+    const run = resolveActiveRun(rt.deps, key, source);
+    if (!run) return c.json({ ok: false, message: `${key}: no active run` }, 200);
+    const belt = rt.deps.resolveBelt(run.belt);
+    if (!belt) return c.json({ ok: false, message: `${key}: run has no configured belt` }, 200);
+    const src = rt.deps.resolveSource(run.workSource);
+    if (!src) return c.json({ ok: false, message: `${key}: run has no configured work source` }, 200);
+    // Serialize the bounce (step rewind + pane re-dispatch) against the periodic tick.
+    const { ran, result } = await withTickLockWaiting(rt.deps, () => bounceStep(rt.deps, rt.deps.store.getRun(run.id)!, belt, src, toStep, reason));
+    if (!ran) return c.json({ ok: false, message: `${key}: dispatcher busy — retry the bounce` }, 200);
+    return c.json(result!, 200);
   });
 
   app.openapi(claimRoute, async (c) => {

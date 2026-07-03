@@ -43,6 +43,7 @@ const StepDoneResponse = z
 const AskHumanResponse = z
   .object({ ok: z.boolean(), questionId: z.number().optional(), posted: z.boolean().optional(), message: z.string().optional() })
   .openapi("AskHuman");
+const BounceResponse = z.object({ ok: z.boolean(), escalated: z.boolean().optional(), message: z.string().optional() }).openapi("Bounce");
 
 const RunSchema = z
   .object({
@@ -121,6 +122,11 @@ export const StepDoneBody = z
 export const AskHumanBody = z
   .object({ key: z.string(), step: z.string(), source: z.string().optional(), question: z.string().min(1) })
   .openapi("AskHumanBody");
+// `toStep` is validated against the run's resolved belt in the handler (must be an earlier step the
+// current step is allowed to bounce to) — like `step` on step-done, the valid set is belt-specific.
+export const BounceBody = z
+  .object({ key: z.string(), toStep: z.string(), source: z.string().optional(), reason: z.string().min(1) })
+  .openapi("BounceBody");
 export const ClaimBody = z.object({ key: z.string(), belt: z.string().optional() }).openapi("ClaimBody");
 export const TeardownBody = z.object({ key: z.string(), source: z.string().optional() }).openapi("TeardownBody");
 
@@ -185,6 +191,18 @@ export const askHumanRoute = createRoute({
   request: { params: RepoParam, ...jsonBody(AskHumanBody) },
   responses: {
     200: { description: "Question recorded", content: { "application/json": { schema: AskHumanResponse } } },
+    ...repoErrors,
+  },
+});
+
+export const bounceRoute = createRoute({
+  method: "post",
+  path: "/repos/{repo}/bounce",
+  tags: ["repo"],
+  summary: "A belt agent sends the run back to an earlier step for rework",
+  request: { params: RepoParam, ...jsonBody(BounceBody) },
+  responses: {
+    200: { description: "Bounce recorded", content: { "application/json": { schema: BounceResponse } } },
     ...repoErrors,
   },
 });

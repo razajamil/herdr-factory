@@ -1,13 +1,13 @@
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { dirname, join, sep } from "node:path";
 import { Command } from "commander";
 import { configJsonSchema, configSchemaPath, globalDbPath, nodePathFile, writeConfigSchema } from "../config.ts";
 import { openDb } from "../db/index.ts";
 import { Store } from "../db/store.ts";
 import { systemClock, type Run } from "../types.ts";
 import type { Deps } from "../core/deps.ts";
-import { claimTicket, reconcileRepo, reconcileRun, requestHumanInput, teardownTicket, withTickLock } from "../core/reconcile.ts";
-import { stepByName } from "../core/step.ts";
+import { bounceStep, claimTicket, reconcileRepo, reconcileRun, requestHumanInput, teardownTicket, withTickLock, withTickLockWaiting } from "../core/reconcile.ts";
+import { MEMORY_DIR, stepByName } from "../core/step.ts";
 import { run } from "../clients/exec.ts";
 import * as launchd from "../watchers/launchd.ts";
 import { buildDeps, today } from "../build-deps.ts";
@@ -72,6 +72,13 @@ function humanQuestionText(opts: { question?: string; questionFile?: string }): 
   if (opts.question && opts.questionFile) fail("ask-human: pass either --question or --question-file, not both");
   const text = opts.questionFile ? readFileSync(opts.questionFile, "utf8") : opts.question;
   if (!text?.trim()) fail("ask-human: provide a non-empty --question or --question-file");
+  return text.trim();
+}
+
+function bounceReasonText(opts: { reason?: string; reasonFile?: string }): string {
+  if (opts.reason && opts.reasonFile) fail("bounce: pass either --reason or --reason-file, not both");
+  const text = opts.reasonFile ? readFileSync(opts.reasonFile, "utf8") : opts.reason;
+  if (!text?.trim()) fail("bounce: provide a non-empty --reason or --reason-file (the findings the earlier step must address)");
   return text.trim();
 }
 
@@ -345,6 +352,51 @@ program
   }));
 
 program
+  .command("bounce <key> <toStep>")
+  .description("a belt agent sends the work back to an earlier step for rework (with findings)")
+  .option("--source <name>", "the work source the run belongs to (passed by the agent)")
+  .option("--reason <text>", "why it's being sent back (the findings the earlier step must address)")
+  .option("--reason-file <path>", "file containing the reason/findings")
+  .action(cliAction("bounce", async (key: string, toStep: string, opts: { source?: string; reason?: string; reasonFile?: string }) => {
+    try {
+      const repo = requireRepo();
+      const reason = bounceReasonText(opts);
+      const { data } = await viaServerOrLocal(
+        { method: "POST", path: `/repos/${encodeURIComponent(repo)}/bounce`, body: { key, toStep, source: opts.source, reason } },
+        async () => {
+          const deps = await buildDeps(repo);
+          const run = resolveActiveRun(deps, key, opts.source);
+          if (!run) {
+            deps.log("warn", `${key}: no active run to bounce`);
+            return { ok: false, message: "no active run" };
+          }
+          const belt = deps.resolveBelt(run.belt);
+          if (!belt) return { ok: false, message: `run has no configured belt "${run.belt}"` };
+          const src = deps.resolveSource(run.workSource);
+          if (!src) return { ok: false, message: `run has no configured work source "${run.workSource}"` };
+          // The bounce rewinds the step + re-dispatches a pane, so it must run UNDER the tick lock
+          // (serialized against the periodic tick), not as a fire-and-forget nudge.
+          const { ran, result } = await withTickLockWaiting(deps, () => bounceStep(deps, deps.store.getRun(run.id)!, belt, src, toStep, reason));
+          if (!ran) return { ok: false, message: "dispatcher busy — retry the bounce in a moment" };
+          return result!;
+        },
+      );
+      const d = data as { ok?: boolean; escalated?: boolean; message?: string };
+      if (d.ok === false) {
+        console.log(`${key}: ${d.message ?? "bounce failed"}`);
+        return;
+      }
+      if (d.escalated) {
+        console.log(`${key}: ${d.message}`); // bounce limit hit → parked for attention, NOT sent back
+        return;
+      }
+      console.log(`${key}: bounced to ${toStep}${d.message ? ` — ${d.message}` : ""}`);
+    } catch (e) {
+      fail(e);
+    }
+  }));
+
+program
   .command("runs")
   .description("list runs for the repo")
   .option("--all", "include finished runs")
@@ -398,6 +450,54 @@ program
         console.log(`capture lock released by ${owner}`);
       } else {
         fail("capture-lock: acquire|release <owner>");
+      }
+    } catch (e) {
+      fail(e);
+    }
+  }));
+
+program
+  .command("evidence-upload <key>")
+  .description("publish this run's captured evidence to S3 + print the CloudFront URLs (reads the repo's `evidence:` config; uses the ambient AWS credential chain)")
+  .option("--source <name>", "the work source the run belongs to (passed by the agent)")
+  .action(cliAction("evidence-upload", async (key: string, opts: { source?: string }) => {
+    try {
+      const repo = requireRepo();
+      const deps = await buildDeps(repo);
+      const ev = deps.config.evidence;
+      if (!ev) {
+        console.log("evidence-upload: no `evidence:` block configured for this repo — skipping upload (no URLs produced)");
+        return;
+      }
+      const activeRun = resolveActiveRun(deps, key, opts.source);
+      if (!activeRun?.worktreePath) {
+        console.log(`${key}: no active run with a worktree — nothing to upload`);
+        return;
+      }
+      const dir = join(activeRun.worktreePath, MEMORY_DIR, "evidence");
+      // Enumerate the tree RECURSIVELY (posix-normalized relative paths) to match `aws s3 cp
+      // --recursive` below — otherwise a nested asset (e.g. a video in a subdir) would be uploaded
+      // with no URL, or an all-nested dir would look empty and upload nothing.
+      const files = (existsSync(dir) ? (readdirSync(dir, { recursive: true }) as string[]) : [])
+        .map((r) => r.split(sep).join("/"))
+        .filter((r) => statSync(join(dir, r)).isFile())
+        .sort();
+      if (files.length === 0) {
+        console.log("evidence-upload: no files in the evidence dir — nothing to upload");
+        return;
+      }
+      // Namespace by work key + run id + timestamp so a re-capture (e.g. after a bounce) never
+      // overwrites an earlier upload; the pr step embeds whatever the latest evidence handoff cites.
+      const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+      const prefix = [ev.keyPrefix, activeRun.ticketKey, `${activeRun.id}-${stamp}`].filter(Boolean).join("/");
+      const args = ["s3", "cp", dir, `s3://${ev.bucket}/${prefix}/`, "--recursive", "--region", ev.region];
+      if (ev.profile) args.push("--profile", ev.profile);
+      await run("aws", args); // shells to the AWS CLI (ambient credential chain) — no creds stored/logged
+      console.log(`uploaded ${files.length} evidence file(s) to s3://${ev.bucket}/${prefix}/`);
+      console.log("public URLs:");
+      for (const f of files) {
+        const encoded = f.split("/").map(encodeURIComponent).join("/"); // safe for spaces/specials in names
+        console.log(`https://${ev.cloudfrontDomain}/${prefix}/${encoded}`);
       }
     } catch (e) {
       fail(e);

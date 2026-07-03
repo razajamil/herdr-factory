@@ -53,10 +53,22 @@
           "exclusiveMinimum": 0,
           "maximum": 9007199254740991
         },
+        "evidence_budget_seconds": {
+          "default": 2400,
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991
+        },
         "pr_budget_seconds": {
           "default": 3600,
           "type": "integer",
           "exclusiveMinimum": 0,
+          "maximum": 9007199254740991
+        },
+        "max_bounces": {
+          "default": 3,
+          "type": "integer",
+          "minimum": 0,
           "maximum": 9007199254740991
         },
         "step_budget_seconds": {
@@ -233,6 +245,28 @@
                     },
                     "additionalProperties": false
                   },
+                  "evidence": {
+                    "type": "object",
+                    "properties": {
+                      "tab": {
+                        "type": "string"
+                      },
+                      "pane": {
+                        "type": "string"
+                      },
+                      "prompt_file": {
+                        "type": "string"
+                      },
+                      "prompt_file_source": {
+                        "type": "string",
+                        "enum": [
+                          "repo",
+                          "config"
+                        ]
+                      }
+                    },
+                    "additionalProperties": false
+                  },
                   "review": {
                     "type": "object",
                     "properties": {
@@ -376,6 +410,37 @@
           }
         ]
       }
+    },
+    "evidence": {
+      "type": "object",
+      "properties": {
+        "bucket": {
+          "type": "string",
+          "minLength": 1
+        },
+        "region": {
+          "type": "string",
+          "minLength": 1
+        },
+        "cloudfront_domain": {
+          "type": "string",
+          "minLength": 1
+        },
+        "key_prefix": {
+          "default": "",
+          "type": "string"
+        },
+        "profile": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "bucket",
+        "region",
+        "cloudfront_domain"
+      ],
+      "additionalProperties": false
     }
   },
   "required": [

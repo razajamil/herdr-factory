@@ -80,6 +80,7 @@ interface RunStepRow {
   done: number;
   started_at: number | null;
   done_at: number | null;
+  bounces: number;
 }
 
 function toRunStep(r: RunStepRow): RunStep {
@@ -94,6 +95,7 @@ function toRunStep(r: RunStepRow): RunStep {
     done: r.done !== 0,
     startedAt: r.started_at,
     doneAt: r.done_at,
+    bounces: r.bounces,
   };
 }
 
@@ -424,6 +426,17 @@ export class Store {
   markStepDone(runId: number, step: StepName): void {
     this.upsertRunStep(runId, step, { done: true });
     telemetryEvent("store.run_step.done", { "run.id": runId, step });
+  }
+
+  /** Increment (and return) the bounce count for a step — how many times a LATER step has sent the
+   *  run back to it for rework. Ensures the row exists first (so it's safe to bounce to a step whose
+   *  row somehow isn't materialized yet). The reconciler escalates once this exceeds limits.maxBounces. */
+  bumpBounces(runId: number, step: StepName): number {
+    this.upsertRunStep(runId, step); // ensure the row exists
+    this.db.prepare("UPDATE run_steps SET bounces = bounces + 1 WHERE run_id = ? AND step = ?").run(runId, step);
+    const row = this.getRunStep(runId, step)!;
+    telemetryEvent("store.run_step.bounce", { "run.id": runId, step, "step.bounces": row.bounces });
+    return row.bounces;
   }
 
   // --- human-in-the-loop questions ------------------------------------------

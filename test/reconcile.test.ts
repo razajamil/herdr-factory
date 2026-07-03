@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openDb } from "../src/db/index.ts";
 import { Store } from "../src/db/store.ts";
-import { applyPendingFocus, reconcileRepo, reconcileRun, requestHumanInput, withTickLock } from "../src/core/reconcile.ts";
+import { applyPendingFocus, bounceStep, reconcileRepo, reconcileRun, requestHumanInput, withTickLock } from "../src/core/reconcile.ts";
 import type { BeltRuntime, Deps, GitApi, GitHubApi, HerdrApi, SourceRuntime, WorkSource } from "../src/core/deps.ts";
 import type { Config, Secrets, StepConfig } from "../src/config.ts";
 import type { FocusedPane, HumanAskInput, HumanPollInput, HumanReply, MatchItem, Phase, PrInfo, ReviewSig, Ticket, WorkState } from "../src/types.ts";
@@ -40,6 +40,8 @@ const stepCfg = (name: string, opts: Partial<StepConfig> = {}): StepConfig => ({
   budgetSeconds: name === "fix" ? 5400 : name === "review" ? 1800 : 3600,
   heartbeat: name === "fix" || name === "pr",
   opensPr: name === "pr",
+  gathersEvidence: name === "evidence",
+  canBounceTo: name === "evidence" || name === "review" ? ["fix"] : [],
   ...opts,
 });
 const prSteps = (): StepConfig[] => [stepCfg("fix"), stepCfg("review"), stepCfg("pr")];
@@ -134,7 +136,7 @@ function build(opts: { multi?: boolean } = {}) {
   const config: Config = {
     repoName: "demo",
     repo: { path: "/main-checkout", baseRef: "origin/master" },
-    limits: { maxActive: 3, watchHours: 7, developBudgetSeconds: 5400, stallSeconds: 2700, reviewBudgetSeconds: 1800, prBudgetSeconds: 3600, stepBudgetSeconds: 3600, tickIntervalSeconds: 60, layoutWaitSeconds: 600 },
+    limits: { maxActive: 3, watchHours: 7, developBudgetSeconds: 5400, stallSeconds: 2700, reviewBudgetSeconds: 1800, evidenceBudgetSeconds: 2400, prBudgetSeconds: 3600, maxBounces: 3, stepBudgetSeconds: 3600, tickIntervalSeconds: 60, layoutWaitSeconds: 600 },
     sources: sources.map((s) => ({ name: s.name, type: s.type })),
     belts,
     guidance: undefined,
@@ -350,6 +352,113 @@ describe("reconcile pipeline (work_to_pull_request belt)", () => {
     expect(got.step).toBe("pr");
     expect(store.getRunStep(run.id, "pr")?.paneId).toBe("w1:p1");
     expect(calls.agentSend.length).toBe(1);
+  });
+
+  it("running review + bounce fix → back to running fix (clears fix's done, writes feedback, re-prompts fix's own pane)", async () => {
+    const { deps, store, worktree, calls, shipBelt } = build();
+    const run = seed(store, worktree, "K-B1", "running", "review");
+    // fix already completed earlier, on its OWN pane (distinct from the review pane w1:p1).
+    store.upsertRunStep(run.id, "fix", { paneId: "w1:pfix", done: true });
+    const src = deps.resolveSource("jira")!;
+    const res = await bounceStep(deps, store.getRun(run.id)!, shipBelt, src, "fix", "The submit button still 500s — the evidence video shows the error toast.");
+    expect(res.ok).toBe(true);
+    const got = store.getRun(run.id)!;
+    expect(got.phase).toBe("running");
+    expect(got.step).toBe("fix");
+    // MUST be cleared, else reconcileStep re-advances the just-bounced step instantly.
+    expect(store.getRunStep(run.id, "fix")!.done).toBe(false);
+    expect(store.getRunStep(run.id, "fix")!.bounces).toBe(1);
+    // targets fix's OWN pane (w1:pfix), NOT run.paneId (the review pane w1:p1).
+    expect(got.paneId).toBe("w1:pfix");
+    expect(calls.agentSend.some(([p]) => p === "w1:pfix")).toBe(true);
+    // feedback note written where the fix agent's rework banner points.
+    const fb = join(worktree, ".memory/herdr-factory/feedback-fix.md");
+    expect(existsSync(fb)).toBe(true);
+    expect(readFileSync(fb, "utf8")).toContain("still 500s");
+    expect(store.timeline("demo", "K-B1").some((e) => e.type === "bounced")).toBe(true);
+  });
+
+  it("bounce whose target pane is dead respawns it — the re-rendered prompt carries the rework banner + feedback pointer", async () => {
+    const { deps, store, state, worktree, shipBelt } = build();
+    const run = seed(store, worktree, "K-B1b", "running", "review");
+    store.upsertRunStep(run.id, "fix", { paneId: "w1:pfix", done: true });
+    state.deadPanes.add("w1:pfix"); // fix's original pane is gone → respawn (which re-renders the prompt)
+    const src = deps.resolveSource("jira")!;
+    await bounceStep(deps, store.getRun(run.id)!, shipBelt, src, "fix", "the modal never opens on click");
+    const body = readFileSync(join(worktree, ".memory/herdr-factory/prompt-fix.md"), "utf8");
+    expect(body).toContain("Rework requested"); // engine-injected banner, up top
+    expect(body).toContain("feedback-fix.md"); // points the fix agent at the findings
+  });
+
+  it("bounce clears `done` on the target AND every completed step between it and the bouncer", async () => {
+    const { deps, store, worktree } = build();
+    // A 4-step belt (fix → evidence → review → pr) so there IS an intermediate step between the
+    // bouncer (review) and the target (fix).
+    const belt: BeltRuntime = { name: "ship", beltType: "work_to_pull_request", source: "jira", priority: 1, watchPr: true, steps: [stepCfg("fix"), stepCfg("evidence"), stepCfg("review"), stepCfg("pr")] };
+    const run = seed(store, worktree, "K-B6", "running", "review");
+    store.upsertRunStep(run.id, "fix", { paneId: "w1:pfix", done: true });
+    store.upsertRunStep(run.id, "evidence", { paneId: "w1:pev", done: true, progressSig: "sha-x", progressAt: 5 });
+    const src = deps.resolveSource("jira")!;
+    await bounceStep(deps, store.getRun(run.id)!, belt, src, "fix", "the fix isn't proven");
+    expect(store.getRun(run.id)!.step).toBe("fix");
+    expect(store.getRunStep(run.id, "fix")!.done).toBe(false);
+    // The intermediate evidence step MUST be cleared too, or the forward re-run skips its re-capture
+    // and the PR embeds stale, pre-fix evidence.
+    expect(store.getRunStep(run.id, "evidence")!.done).toBe(false);
+    expect(store.getRunStep(run.id, "evidence")!.progressSig).toBe(null); // heartbeat clock reset
+  });
+
+  it("after a bounce, fix re-completing runs the pipeline forward again (review re-runs, still not done)", async () => {
+    const { deps, store, worktree, shipBelt } = build();
+    const run = seed(store, worktree, "K-B2", "running", "review");
+    store.upsertRunStep(run.id, "fix", { paneId: "w1:pfix", done: true });
+    store.markStepDone(run.id, "review"); // review had (hypothetically) also completed — bounce must not leave it done
+    const src = deps.resolveSource("jira")!;
+    await bounceStep(deps, store.getRun(run.id)!, shipBelt, src, "fix", "needs rework");
+    // the bouncer (review) did NOT step-done; only fix's done was cleared — but here review WAS marked
+    // done above, so confirm the forward re-entry still lands on review by clearing it as a real
+    // bounce-from-review would (review calls bounce, never step-done). Simulate that:
+    store.upsertRunStep(run.id, "review", { done: false });
+    store.markStepDone(run.id, "fix"); // fix reworks + signals done
+    await reconcileRun(deps, store.getRun(run.id)!);
+    const got = store.getRun(run.id)!;
+    expect(got.step).toBe("review"); // forward flow resumes: fix → review
+    expect(store.getRunStep(run.id, "review")!.done).toBe(false); // review re-runs fresh
+  });
+
+  it("exceeding max_bounces escalates to attention instead of bouncing again", async () => {
+    const { deps, store, worktree, calls, shipBelt } = build();
+    const run = seed(store, worktree, "K-B3", "running", "review");
+    store.upsertRunStep(run.id, "fix", { paneId: "w1:pfix", done: true });
+    const src = deps.resolveSource("jira")!;
+    // max_bounces = 3 → the first 3 bounces proceed; the 4th escalates.
+    for (let i = 0; i < 3; i++) {
+      store.updateRun(run.id, { phase: "running", step: "review" });
+      const r = await bounceStep(deps, store.getRun(run.id)!, shipBelt, src, "fix", `round ${i}`);
+      expect(r.ok).toBe(true);
+      expect(store.getRun(run.id)!.phase).toBe("running");
+    }
+    store.updateRun(run.id, { phase: "running", step: "review" });
+    await bounceStep(deps, store.getRun(run.id)!, shipBelt, src, "fix", "round 4");
+    const got = store.getRun(run.id)!;
+    expect(got.phase).toBe("attention");
+    expect(got.attentionReason).toContain("max");
+    expect(calls.notify).toBeGreaterThan(0);
+  });
+
+  it("rejects a bounce that isn't strictly backward, isn't allowed, or isn't from a running step", async () => {
+    const { deps, store, worktree, shipBelt } = build();
+    const run = seed(store, worktree, "K-B4", "running", "review");
+    const src = deps.resolveSource("jira")!;
+    // pr is AFTER review → not backward.
+    expect((await bounceStep(deps, store.getRun(run.id)!, shipBelt, src, "pr", "x")).ok).toBe(false);
+    expect(store.getRun(run.id)!.step).toBe("review"); // unchanged
+    // fix's canBounceTo is [] and it's the first step → nothing to bounce to.
+    store.updateRun(run.id, { step: "fix" });
+    expect((await bounceStep(deps, store.getRun(run.id)!, shipBelt, src, "fix", "x")).ok).toBe(false);
+    // not in a running step (reviewing PHASE) → rejected.
+    store.updateRun(run.id, { phase: "reviewing", step: null });
+    expect((await bounceStep(deps, store.getRun(run.id)!, shipBelt, src, "fix", "x")).ok).toBe(false);
   });
 
   it("running pr + PR open + step-done pr → reviewing (review transition + deadline)", async () => {

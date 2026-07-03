@@ -58,6 +58,7 @@ export type EventType =
   | "review_done"
   | "step_spawned"
   | "step_done"
+  | "bounced"
   | "human_question"
   | "human_reply"
   | "focus_applied"
@@ -114,7 +115,9 @@ export type RunPatch = Partial<
   >
 >;
 
-/** One agent step of a run's pipeline (fix/review/pr), each in its own herdr pane. */
+/** One agent step of a run's pipeline (fix/evidence/review/pr for work_to_pull_request), each in its
+ *  own herdr pane. `bounces` counts how many times a LATER step sent the run back to this step for
+ *  rework — the loop-safety counter the reconciler escalates on past `limits.maxBounces`. */
 export interface RunStep {
   id: number;
   runId: number;
@@ -126,6 +129,7 @@ export interface RunStep {
   done: boolean;
   startedAt: number | null;
   doneAt: number | null;
+  bounces: number; // times a later step bounced work back to this step (loop-safety counter)
 }
 
 /** Fields the reconciler may patch on a run step. */

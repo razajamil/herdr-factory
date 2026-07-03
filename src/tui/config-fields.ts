@@ -30,7 +30,8 @@ const jiraBlock = () => ({
 });
 const localMarkdownBlock = () => ({ folder: "" });
 const defaultStep = (name: string) => ({ name, prompt_file: "", prompt_file_source: "config" });
-const prAgents = () => ({ fix: {}, review: {}, pr: {} }); // empty agent blocks are valid by default
+// empty agent blocks are valid by default; `evidence` is optional but shown so it's discoverable.
+const prAgents = () => ({ fix: {}, evidence: {}, review: {}, pr: {} });
 
 const LIMITS: [string, string][] = [
   ["max_active", "3"],
@@ -38,7 +39,9 @@ const LIMITS: [string, string][] = [
   ["develop_budget_seconds", "5400"],
   ["stall_seconds", "2700"],
   ["review_budget_seconds", "1800"],
+  ["evidence_budget_seconds", "2400"],
   ["pr_budget_seconds", "3600"],
+  ["max_bounces", "3"],
   ["step_budget_seconds", "3600"],
   ["tick_interval_seconds", "60"],
   ["layout_wait_seconds", "600"],
@@ -169,7 +172,7 @@ export function buildDescriptors(draft: Document, rebuild: () => void, confirm: 
     d.push({ kind: "text", label: "match", path: ["belt", i, "match"], placeholder: "match.ts (optional)", indent: 2 });
 
     if (beltType === "work_to_pull_request") {
-      for (const step of ["fix", "review", "pr"] as const) {
+      for (const step of ["fix", "evidence", "review", "pr"] as const) {
         d.push({ kind: "header", label: `agents.${step}`, level: 2, indent: 2 });
         d.push({ kind: "text", label: "tab", path: ["belt", i, "agents", step, "tab"], placeholder: "(optional; set with pane)", indent: 3 });
         d.push({ kind: "text", label: "pane", path: ["belt", i, "agents", step, "pane"], placeholder: "(optional; set with tab)", indent: 3 });
@@ -205,6 +208,25 @@ export function buildDescriptors(draft: Document, rebuild: () => void, confirm: 
       rebuild();
     },
   });
+
+  // ── evidence (optional top-level block — where the evidence step publishes captured media) ──
+  // Non-secret pointers only; AWS creds come from the ambient AWS CLI chain (no secret rows here).
+  // Modelled as an add/remove optional block (like a work source): when absent, an "add" action
+  // creates it; when present, its fields + a "remove" action are shown — so a block the user no
+  // longer wants can always be cleared (flushInputs never deletes keys, so a plain text field for an
+  // optional block would otherwise be unclearable). bucket/region/cloudfront_domain are required
+  // together once the block exists.
+  d.push({ kind: "header", label: "evidence (optional — S3 + CloudFront upload)", level: 1 });
+  if (cfg.evidence == null) {
+    d.push({ kind: "action", label: "+ add evidence upload config", indent: 1, run: () => { draft.setIn(["evidence"], draft.createNode({ bucket: "", region: "", cloudfront_domain: "" })); rebuild(); } });
+  } else {
+    d.push({ kind: "text", label: "bucket", path: ["evidence", "bucket"], placeholder: "my-evidence-bucket", indent: 1 });
+    d.push({ kind: "text", label: "region", path: ["evidence", "region"], placeholder: "us-east-1", indent: 1 });
+    d.push({ kind: "text", label: "cloudfront_domain", path: ["evidence", "cloudfront_domain"], placeholder: "d123abc.cloudfront.net", indent: 1 });
+    d.push({ kind: "text", label: "key_prefix", path: ["evidence", "key_prefix"], placeholder: "(optional)", indent: 1 });
+    d.push({ kind: "text", label: "profile", path: ["evidence", "profile"], placeholder: "(optional AWS CLI profile)", indent: 1 });
+    d.push({ kind: "action", label: "‹ remove evidence config ›", indent: 1, run: () => { void confirm("Remove the evidence upload config?").then((ok) => { if (ok) { draft.deleteIn(["evidence"]); rebuild(); } }); } });
+  }
 
   return d;
 }

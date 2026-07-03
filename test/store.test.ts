@@ -157,12 +157,17 @@ describe("Store", () => {
   it("migration v6 backfills pre-existing runs to 'jira' and adds work_items (idempotent)", () => {
     const db = new DatabaseSync(":memory:");
     // Simulate a pre-v6 DB: schema_version=5, a runs table WITHOUT work_source, one in-flight row.
+    // Also seed run_steps (created back in v4) so later migrations that ALTER it (v9) apply cleanly —
+    // a genuine v5 DB always has this table.
     db.exec(`
       CREATE TABLE schema_version (version INTEGER NOT NULL);
       INSERT INTO schema_version (version) VALUES (5);
       CREATE TABLE runs (id INTEGER PRIMARY KEY AUTOINCREMENT, repo TEXT, ticket_key TEXT, phase TEXT,
         created_at INTEGER, updated_at INTEGER, ended_at INTEGER);
       INSERT INTO runs (repo, ticket_key, phase, created_at, updated_at) VALUES ('r','OLD-1','fixing',1,1);
+      CREATE TABLE run_steps (id INTEGER PRIMARY KEY AUTOINCREMENT, run_id INTEGER NOT NULL, step TEXT NOT NULL,
+        pane_id TEXT, session_id TEXT, progress_sig TEXT, progress_at INTEGER,
+        done INTEGER NOT NULL DEFAULT 0, started_at INTEGER, done_at INTEGER);
     `);
     migrate(db);
     const v = db.prepare("SELECT MAX(version) AS v FROM schema_version").get() as { v: number };

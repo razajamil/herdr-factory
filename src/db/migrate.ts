@@ -162,6 +162,14 @@ const MIGRATIONS: { version: number; sql: string }[] = [
       CREATE UNIQUE INDEX idx_human_questions_one_pending_run ON human_questions(run_id) WHERE status = 'pending';
     `,
   },
+  {
+    version: 9,
+    // Bounce loop-safety counter. A later belt step can send the run BACK to an earlier step for
+    // rework (evidence/review → fix); each such bounce increments the target step's `bounces`, and
+    // the reconciler escalates to attention once it exceeds limits.max_bounces. NOT NULL DEFAULT 0
+    // backfills every existing run_steps row (in-flight runs across the upgrade start at zero).
+    sql: `ALTER TABLE run_steps ADD COLUMN bounces INTEGER NOT NULL DEFAULT 0;`,
+  },
 ];
 
 /** Apply pending migrations in a transaction. Idempotent. */

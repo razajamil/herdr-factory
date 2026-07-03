@@ -16,7 +16,9 @@ limits:
   develop_budget_seconds: 5400 # work_to_pull_request fix-step budget
   stall_seconds: 2700 # no new commits for this long → stalled → attention
   review_budget_seconds: 1800 # work_to_pull_request review-step budget
+  evidence_budget_seconds: 2400 # work_to_pull_request evidence-step budget (capture + video + upload)
   pr_budget_seconds: 3600 # work_to_pull_request pr-step budget (open PR + CI/bot round)
+  max_bounces: 3 # times a run may be bounced back to a step (evidence/review → fix) before → attention
   step_budget_seconds: 3600 # default budget for a custom belt step (override per-step)
   tick_interval_seconds: 60
 
@@ -47,11 +49,14 @@ work_sources:
 # this folder) to a .ts module whose default export is `(ctx) => boolean` — ctx = { item, source }.
 # Each belt owns its own `workspace_name` branch template (the worktree name reflects the belt).
 belt:
-  # ── work_to_pull_request: the classic fix → review → pr flow with the "walk away" PR watch. ──
-  # The engine owns the three steps + their prompts and rides the PR through CI/review to merge,
-  # then tears the worktree down. An `agents.{fix,review,pr}` block picks each step's layout pane
-  # (set tab+pane together for a layout your herdr setup provisions; omit both to have herdr-factory
-  # spawn its own dedicated pane). Each agent may OPTIONALLY add a `prompt_file` (+ a required
+  # ── work_to_pull_request: the fix → evidence → review → pr flow with the "walk away" PR watch. ──
+  # The engine owns the steps + their prompts and rides the PR through CI/review to merge, then tears
+  # the worktree down. fix implements; evidence captures visual proof (dev server + playwright) and
+  # can bounce back to fix if the fix isn't proven; review is a strict read-only gate that passes or
+  # bounces back to fix; pr opens the PR (embedding the evidence URLs) + rides CI. An
+  # `agents.{fix,evidence,review,pr}` block picks each step's layout pane (set tab+pane together for a
+  # layout your herdr setup provisions; omit both — or omit the whole `evidence` key — to have
+  # herdr-factory spawn a dedicated pane). Each agent may OPTIONALLY add a `prompt_file` (+ a required
   # `prompt_file_source`: `config` = this folder, `repo` = the target repo checkout, read from the
   # worktree at run time) that AUGMENTS that step's engine prompt with repo-specific instructions —
   # e.g. `fix: { tab: fix, pane: agent, prompt_file: .herdr/fix-notes.md, prompt_file_source: repo }`.
@@ -63,6 +68,7 @@ belt:
     workspace_name: "{{semantic_work_prefix}}/{{work_id}}-{{work_slug}}"
     agents:
       fix: { tab: fix, pane: agent }
+      evidence: { tab: evidence, pane: agent } # optional; omit to spawn a dedicated pane
       review: { tab: review, pane: agent }
       pr: { tab: pr, pane: agent }
 
@@ -94,5 +100,17 @@ belt:
           prompt_file: prompts/work_generation/create-jira-ticket.md,
           prompt_file_source: config,
         }
+
+# ── evidence: where the evidence step publishes captured screenshots/video (S3 + CloudFront). ──
+# OPTIONAL — omit it and the evidence step still captures + assesses (and can bounce), it just
+# publishes nothing. Non-secret infra pointers ONLY: AWS credentials come from the ambient AWS CLI
+# credential chain (~/.aws / AWS_* env / the named `profile`), never stored here or handed to an
+# agent. bucket + region + cloudfront_domain are required together.
+# evidence:
+#   bucket: my-evidence-bucket
+#   region: us-east-1
+#   cloudfront_domain: d123abc.cloudfront.net   # bare host (or a full URL); builds https asset URLs
+#   key_prefix: herdr-factory                   # optional S3 key prefix
+#   profile: my-aws-profile                     # optional AWS CLI named profile
 
 # guidelines-prompt.md in this folder (if present) is appended to EVERY step prompt of EVERY belt.

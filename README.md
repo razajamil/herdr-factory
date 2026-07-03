@@ -8,7 +8,7 @@ define one or more **belts** that say what to *do* with the work, then walk away
 claims an item, spins up a herdr worktree, and runs it through the belt's pipeline of agent steps.
 A **belt** pairs a source with an ordered list of steps. Two belt types ship today:
 
-- **`work_to_pull_request`** — the classic fix → review → pr flow. The engine owns the steps,
+- **`work_to_pull_request`** — the `fix → evidence → review → pr` flow. The engine owns the steps,
   rides the PR through CI + human review to merge, and tears the worktree down. "Walk away."
 - **`custom`** — your own ordered, agent-driven steps (e.g. research → propose →
   create_jira_ticket). Each step owns its prompt; the run ends when the last step signals done.
@@ -104,12 +104,18 @@ how several belts can share one source (e.g. route Jira bugs to one belt, storie
 
 **Belt types.**
 
-- **`work_to_pull_request`** — the classic fix → review → pr flow. The engine owns the three steps
-  *and* ships their prompts and rides the PR through CI + human review to merge ("walk away"). Its
-  `agents.{fix,review,pr}` block picks each step's layout pane (see below) and may OPTIONALLY add a
-  `prompt_file` (+ a required `prompt_file_source`) that **augments** that step's engine prompt with
-  repo-specific instructions. (`guidelines-prompt.md` still augments every step, and the worker
-  reads the repo's own `CLAUDE.md`/skills natively.)
+- **`work_to_pull_request`** — the `fix → evidence → review → pr` flow. The engine owns the steps
+  *and* ships their prompts and rides the PR through CI + human review to merge ("walk away").
+  **fix** implements + commits; **evidence** captures visual proof of the running app (dev server +
+  `playwright-cli` screenshots/video), publishes it to S3/CloudFront (see `evidence:` below), and
+  **can bounce the work back to fix** if the evidence shows the issue isn't actually fixed;
+  **review** is a strict read-only gate that either passes forward or **bounces back to fix** with
+  findings (it never edits code — the bulk of the work stays in fix); **pr** opens the PR (embedding
+  the evidence URLs) and rides CI. Its `agents.{fix,evidence,review,pr}` block picks each step's
+  layout pane (see below) and may OPTIONALLY add a `prompt_file` (+ a required `prompt_file_source`)
+  that **augments** that step's engine prompt. `evidence` is optional in the block (omit it and that
+  step just spawns its own pane); fix/review/pr are required. (`guidelines-prompt.md` still augments
+  every step, and the worker reads the repo's own `CLAUDE.md`/skills natively.)
 - **`custom`** — your own ordered `steps[]`, fully agent-driven. Each step has a `name` (a
   lowercase slug), a **required** `prompt_file` + `prompt_file_source` (the whole step body), an
   optional layout `tab`/`pane`, and optional `budget_seconds` / `heartbeat` (commit-stall detection,
@@ -223,6 +229,8 @@ herdr-factory --repo <name> tick|status|eligible|runs [--all]|timeline <KEY>|log
 herdr-factory --repo <name> claim <KEY> [--belt <name>]|teardown <KEY> [--source <name>]
 herdr-factory --repo <name> step-done <KEY> <step> [--source <name>]   # agent → dispatcher (event-nudge)
 herdr-factory --repo <name> ask-human <KEY> <step> [--source <name>] --question-file <path>
+herdr-factory --repo <name> bounce <KEY> <toStep> [--source <name>] --reason-file <path>  # send work back for rework
+herdr-factory --repo <name> evidence-upload <KEY> [--source <name>]   # publish evidence to S3 → print CloudFront URLs
 herdr-factory serve|ensure-up [--restart]|restart|reload|update   # the server + its supervisor (no --repo)
 herdr-factory install|uninstall|start|stop             # the one supervisor launchd job (no --repo)
 herdr-factory schema [--stdout]                        # write the config.yml JSON Schema for editors (no --repo)
@@ -237,7 +245,12 @@ across all sources; `doctor` runs a per-source health check plus server liveness
 the belt step name and `--source` to disambiguate; `teardown` takes `--source` to disambiguate a
 key active in more than one source. `ask-human` is the agent escape hatch for uncertainty: it records
 a source-agnostic pending question, posts it through the work source, and pauses the run until a human
-reply arrives.
+reply arrives. `bounce` is the reverse of `step-done`: a step sends the run **back** to an earlier
+step for rework (evidence/review → fix), passing findings via `--reason-file`; the engine clears the
+target step's completion, drops the findings into the worktree for the fix agent, and re-dispatches
+it — escalating to attention after `limits.max_bounces` bounces. `evidence-upload` publishes a run's
+captured evidence dir to S3 and prints the CloudFront URLs (reads the repo's `evidence:` block; uses
+the ambient AWS credential chain — nothing is stored or handed to the agent).
 
 `serve` exposes a local HTTP API on `127.0.0.1:8765` (Hono) with the OpenAPI spec at `/doc` and
 Swagger UI at `/ui`. `update` pulls the latest code (hard reset to the branch's upstream) and
