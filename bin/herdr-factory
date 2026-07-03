@@ -12,6 +12,13 @@ done
 pkg="$(cd -P "$(dirname "$src")/.." && pwd)"
 
 cd "$pkg"
+
+# With no arguments, launch the TUI instead of the CLI. It has its own launcher because it renders
+# through opentui's native core (Node >= 26 + --experimental-ffi), unlike the Node 24 engine.
+if [ "$#" -eq 0 ]; then
+  exec "$pkg/bin/herdr-factory-tui"
+fi
+
 # herdr-factory must run on Node >= 24 (native type-stripping + node:sqlite). Prefer the caller's
 # active `node` when it's new enough; otherwise re-exec with the Node path the CLI baked on a prior
 # >= 24 run (config.nodePathFile / cli bakeNodePath). So herdr-factory always runs on its own

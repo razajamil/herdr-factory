@@ -250,8 +250,9 @@ testing, run the Grafana LGTM stack with `docker compose -f docker-compose.telem
 
 ## TUI
 
-`herdr-factory-tui` (or `npm run tui`) opens a full-screen terminal UI as a front-end to the factory,
-built on [opentui](https://github.com/anomalyco/opentui). Navigation follows lazygit, with a
+Running `herdr-factory` with **no arguments** opens a full-screen terminal UI as a front-end to the
+factory (equivalently `herdr-factory-tui` or `npm run tui`), built on
+[opentui](https://github.com/anomalyco/opentui). Navigation follows lazygit, with a
 three-level focus hierarchy — top level (the tab bar) → a numbered section → a field: **`Tab` /
 `Shift+Tab`** switch the top-level tabs, **number keys** jump to a numbered section within the current
 tab, **arrows** move within the focused section, **`Esc`** pops back to the top level from any depth
