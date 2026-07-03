@@ -262,15 +262,19 @@ the session.
   `/repos/{repo}/status` + `/eligible`); auto-refreshes every 3s and shows a start hint when the
   server is down. Rows are navigable (`↑↓`) and act on the highlighted row, each behind a
   confirmation: **`t`** tick a repo, **`c`** claim an eligible item onto a belt (picks the belt when
-  the item's source has more than one), **`x`** teardown an active run, **`r`** refresh.
+  the item's source has more than one), **`x`** teardown an active run, **`r`** refresh, and **`↵`**
+  on a run opens its event timeline.
 - **Config** — section **1** is a repo list; `↵` opens a repo into section **2**, a full editor for
   its `config.yml`. `↑↓` move between rows; `↵` edits a text field (type freely, `↵` = next field),
   cycles an enum (`←→` also cycle — e.g. a source's `type` or a belt's `belt_type`), toggles a bool,
   or runs an add/remove action row (removes pop a confirmation); `^S` saves. Each work source, belt,
   and step is a **collapsible group** — collapsed by default, labeled by its name, expanded with
-  `↵`/`Space`/`→` or a click — so long configs stay scannable. It covers the whole file — `repo`,
-  `limits`, and adding/editing/removing `work_sources` and `belt`s including their union type and
-  nested steps/agents — validated against the engine's own schema, writing back with comments preserved.
+  `↵`/`Space`/`→` or a click, and reordered within its list with **`Shift+↑/↓`** (or `[` / `]`) — so
+  long configs stay scannable. It covers the whole file — the repo's Jira credentials (a masked
+  `secrets (env)` section written to `repos/<name>/env`, chmod 600; the token is replace-only and
+  never shown), `repo`, `limits`, and adding/editing/removing `work_sources` and `belt`s including
+  their union type and nested steps/agents — validated against the engine's own schema, writing back
+  with comments preserved.
 
 Unlike the engine (Node ≥ 24), the TUI renders through opentui's native core, so it needs **Node ≥ 26
 with FFI** — the launcher reaches for a Node 26 (active `node`, else `mise exec node@26`) and runs

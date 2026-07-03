@@ -13,8 +13,8 @@ export type Path = (string | number)[];
 
 export type FieldDesc =
   | { kind: "header"; label: string; level: 1 | 2; indent?: number }
-  | { kind: "group"; label: string; node: object; expanded: boolean; indent?: number }
-  | { kind: "text"; label: string; path: Path; placeholder?: string; numeric?: boolean; indent?: number }
+  | { kind: "group"; label: string; node: object; expanded: boolean; indent?: number; moveUp?: () => void; moveDown?: () => void }
+  | { kind: "text"; label: string; path?: Path; env?: string; masked?: boolean; placeholder?: string; numeric?: boolean; indent?: number }
   | { kind: "enum"; label: string; value: string; choices: string[]; apply: (next: string) => void; indent?: number }
   | { kind: "bool"; label: string; value: boolean; apply: (next: boolean) => void; indent?: number }
   | { kind: "ref"; label: string; value: string; choices: string[]; apply: (next: string) => void; indent?: number }
@@ -57,6 +57,19 @@ export function buildDescriptors(draft: Document, rebuild: () => void, confirm: 
   const node = (path: Path) => draft.getIn(path) as object; // stable yaml node — the collapse key
   const isOpen = (path: Path) => expanded.has(node(path));
   const open = (path: Path) => { const n = node(path); if (n) expanded.add(n); };
+  // Reorder an array item by swapping the parent YAMLSeq's item nodes (preserves comments + node
+  // identity, so collapse state follows the moved item).
+  const swap = (arrayPath: Path, i: number, j: number) => {
+    const seq = draft.getIn(arrayPath) as { items?: unknown[] } | undefined;
+    if (!seq?.items) return;
+    const it = seq.items;
+    [it[i], it[j]] = [it[j], it[i]];
+    rebuild();
+  };
+  const mover = (arrayPath: Path, i: number, count: number) => ({
+    moveUp: i > 0 ? () => swap(arrayPath, i, i - 1) : undefined,
+    moveDown: i < count - 1 ? () => swap(arrayPath, i, i + 1) : undefined,
+  });
 
   // ── repo (a singleton object — always shown, not collapsible) ──
   d.push({ kind: "header", label: "repo", level: 1 });
@@ -74,7 +87,7 @@ export function buildDescriptors(draft: Document, rebuild: () => void, confirm: 
   const sourceNames = sources.map((s, i) => String(s?.name ?? s?.type ?? `source${i}`));
   sources.forEach((s, i) => {
     const type = String(s?.type ?? "jira");
-    d.push({ kind: "group", label: `${sourceNames[i]} (${type})`, node: node(["work_sources", i]), expanded: isOpen(["work_sources", i]), indent: 1 });
+    d.push({ kind: "group", label: `${sourceNames[i]} (${type})`, node: node(["work_sources", i]), expanded: isOpen(["work_sources", i]), indent: 1, ...mover(["work_sources"], i, sources.length) });
     if (!isOpen(["work_sources", i])) return;
     d.push({ kind: "text", label: "name", path: ["work_sources", i, "name"], placeholder: type, indent: 2 });
     d.push({
@@ -125,7 +138,7 @@ export function buildDescriptors(draft: Document, rebuild: () => void, confirm: 
   const beltNames = belts.map((b, i) => String(b?.name ?? `belt${i}`));
   belts.forEach((b, i) => {
     const beltType = String(b?.belt_type ?? "custom");
-    d.push({ kind: "group", label: `${beltNames[i]} [${beltType}]`, node: node(["belt", i]), expanded: isOpen(["belt", i]), indent: 1 });
+    d.push({ kind: "group", label: `${beltNames[i]} [${beltType}]`, node: node(["belt", i]), expanded: isOpen(["belt", i]), indent: 1, ...mover(["belt"], i, belts.length) });
     if (!isOpen(["belt", i])) return;
     d.push({ kind: "text", label: "name", path: ["belt", i, "name"], placeholder: "my_belt", indent: 2 });
     d.push({
@@ -167,7 +180,7 @@ export function buildDescriptors(draft: Document, rebuild: () => void, confirm: 
       const steps: any[] = Array.isArray(b?.steps) ? b.steps : [];
       const stepNames = steps.map((s, j) => String(s?.name ?? `step${j}`));
       steps.forEach((st, j) => {
-        d.push({ kind: "group", label: stepNames[j]!, node: node(["belt", i, "steps", j]), expanded: isOpen(["belt", i, "steps", j]), indent: 2 });
+        d.push({ kind: "group", label: stepNames[j]!, node: node(["belt", i, "steps", j]), expanded: isOpen(["belt", i, "steps", j]), indent: 2, ...mover(["belt", i, "steps"], j, steps.length) });
         if (!isOpen(["belt", i, "steps", j])) return;
         d.push({ kind: "text", label: "name", path: ["belt", i, "steps", j, "name"], placeholder: "research", indent: 3 });
         d.push({ kind: "text", label: "prompt_file", path: ["belt", i, "steps", j, "prompt_file"], placeholder: "prompts/step.md", indent: 3 });

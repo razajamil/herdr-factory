@@ -3,6 +3,7 @@ import type { Renderable } from "@opentui/core";
 /** Shell-provided modal helpers passed into views. */
 export type ConfirmFn = (message: string) => Promise<boolean>;
 export type ChooseFn = (title: string, options: { label: string; value: string }[]) => Promise<string | null>;
+export type ShowInfoFn = (title: string, lines: string[]) => void;
 
 /** A top-level tab (lazygit-style navigation). The shell (index.ts) shows one view at a time and
  *  owns a three-level focus hierarchy: top level (the tab bar) → a numbered section → editing a

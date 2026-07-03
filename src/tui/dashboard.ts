@@ -12,9 +12,14 @@
 import { BoxRenderable, ScrollBoxRenderable, TextRenderable, type CliRenderer } from "@opentui/core";
 import type { KeyEvent } from "@opentui/core";
 import { listConfiguredRepos } from "../config.ts";
-import { fetchEligible, fetchHealth, fetchStatus, postClaim, postTeardown, postTick, type ActiveRun, type EligibleItem, type RepoStatus } from "./api.ts";
+import { fetchEligible, fetchHealth, fetchStatus, fetchTimeline, postClaim, postTeardown, postTick, type ActiveRun, type EligibleItem, type RepoStatus } from "./api.ts";
 import { BORDER, theme } from "./theme.ts";
-import type { ChooseFn, ConfirmFn, TabView } from "./types.ts";
+import type { ChooseFn, ConfirmFn, ShowInfoFn, TabView } from "./types.ts";
+
+function fmtTime(ts: number): string {
+  const ms = ts < 1e12 ? ts * 1000 : ts; // tolerate seconds or milliseconds
+  return new Date(ms).toLocaleString();
+}
 
 const REFRESH_MS = 3000;
 
@@ -32,8 +37,9 @@ function fmtDuration(sec: number): string {
 function runColor(run: ActiveRun): string {
   const o = (run.outcome ?? "").toLowerCase();
   const p = (run.phase ?? "").toLowerCase();
-  if (/fail|error|abandon|block/.test(o) || /fail|error|block/.test(p)) return theme.status.bad;
-  if (/attention|stall|wait|human/.test(p)) return theme.status.warn;
+  // "attention" is the engine's needs-a-human state (stalled / over-budget / asked a human) — color
+  // it (and failed/abandoned outcomes) red so it stands out as needing action.
+  if (p === "attention" || /attention|stall|wait|human/.test(p) || /fail|error|abandon|block/.test(o) || /fail|error|block/.test(p)) return theme.status.bad;
   if (/review|pr|ci|merg/.test(p)) return theme.accent;
   return theme.text.primary;
 }
@@ -59,8 +65,8 @@ interface LineNode {
   baseFg: string;
 }
 
-export function createDashboard(renderer: CliRenderer, actions: { confirm: ConfirmFn; choose: ChooseFn }): TabView {
-  const { confirm, choose } = actions;
+export function createDashboard(renderer: CliRenderer, actions: { confirm: ConfirmFn; choose: ChooseFn; showInfo: ShowInfoFn }): TabView {
+  const { confirm, choose, showInfo } = actions;
 
   const root = new BoxRenderable(renderer, { flexDirection: "column", width: "100%", height: "100%", backgroundColor: theme.bg, paddingLeft: 1, paddingRight: 1 });
   const banner = new TextRenderable(renderer, { content: "loading…", fg: theme.text.secondary, height: 1, wrapMode: "none" });
@@ -241,6 +247,16 @@ export function createDashboard(renderer: CliRenderer, actions: { confirm: Confi
     void refresh();
   }
 
+  async function openTimeline(t: Target): Promise<void> {
+    if (!serverUp || !t.key) return;
+    setAction(`loading timeline for ${t.key}…`, theme.text.secondary);
+    const res = await fetchTimeline(t.repo, t.key);
+    if (!res) return setAction(`✗ could not load timeline for ${t.key}`, theme.status.bad);
+    const linesOut = res.timeline.map((e) => `${fmtTime(e.ts)}  ${e.type}${e.detail ? "  " + e.detail : ""}`);
+    setAction("", theme.text.tertiary);
+    showInfo(`${t.key} — timeline`, linesOut);
+  }
+
   list.onKeyDown = (key: KeyEvent) => {
     if (rows.length === 0) return;
     const t = rows[hi]?.target;
@@ -251,6 +267,11 @@ export function createDashboard(renderer: CliRenderer, actions: { confirm: Confi
         break;
       case "down":
         setHighlight(hi + 1);
+        key.preventDefault();
+        break;
+      case "return":
+      case "enter":
+        if (t?.kind === "run") void openTimeline(t);
         key.preventDefault();
         break;
       case "t":

@@ -86,6 +86,16 @@ export function fetchEligible(repo: string): Promise<{ eligible: EligibleItem[] 
   return getJson<{ eligible: EligibleItem[] }>(`/repos/${encodeURIComponent(repo)}/eligible`);
 }
 
+export interface TimelineEvent {
+  ts: number;
+  type: string;
+  detail: string | null;
+}
+
+export function fetchTimeline(repo: string, key: string): Promise<{ timeline: TimelineEvent[] } | null> {
+  return getJson<{ timeline: TimelineEvent[] }>(`/repos/${encodeURIComponent(repo)}/timeline?key=${encodeURIComponent(key)}`);
+}
+
 /** Result of a mutating action: ok, or a reason to show the user. */
 export type ActionResult = { ok: true } | { ok: false; error: string };
 

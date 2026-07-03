@@ -11,7 +11,7 @@ import { join } from "node:path";
 import { BoxRenderable, InputRenderable, ScrollBoxRenderable, SelectRenderable, TextRenderable, type CliRenderer } from "@opentui/core";
 import type { KeyEvent, Renderable } from "@opentui/core";
 import { parseDocument, type Document } from "yaml";
-import { RepoConfigSchema, listConfiguredRepos, repoConfigDir } from "../config.ts";
+import { RepoConfigSchema, listConfiguredRepos, loadSecrets, repoConfigDir, saveSecrets } from "../config.ts";
 import { postReload } from "./api.ts";
 import { buildDescriptors, type FieldDesc } from "./config-fields.ts";
 import { BORDER, theme } from "./theme.ts";
@@ -90,6 +90,19 @@ export function createConfigEditor(renderer: CliRenderer, confirm: ConfirmFn): T
   let lastSection = 1;
   let errorNodes: Renderable[] = [];
   let expandedNodes = new WeakSet<object>(); // which array-item nodes are expanded (view state)
+  // Per-repo Jira credentials (separate `env` file). `secrets` is live (updated by flush);
+  // `loadedSecrets` is the on-disk snapshot, so save only writes when they differ.
+  let secrets = { jiraEmail: "", jiraApiToken: "" };
+  let loadedSecrets = { jiraEmail: "", jiraApiToken: "" };
+  const secretGet = (envKey: string) => (envKey === "JIRA_EMAIL" ? secrets.jiraEmail : secrets.jiraApiToken);
+  const secretSet = (envKey: string, v: string) => { if (envKey === "JIRA_EMAIL") secrets.jiraEmail = v; else secrets.jiraApiToken = v; };
+
+  // The env-backed credential fields, prepended above the config.yml form.
+  const secretDescriptors = (): FieldDesc[] => [
+    { kind: "header", label: "secrets (env)", level: 1 },
+    { kind: "text", label: "JIRA_EMAIL", env: "JIRA_EMAIL", placeholder: "you@org.com", indent: 1 },
+    { kind: "text", label: "JIRA_API_TOKEN", env: "JIRA_API_TOKEN", masked: true, indent: 1 },
+  ];
 
   function setStatus(content: string, fg: string): void {
     status.content = content;
@@ -149,10 +162,19 @@ export function createConfigEditor(renderer: CliRenderer, confirm: ConfirmFn): T
     container.add(label);
 
     if (d.kind === "text") {
-      const v = draft?.getIn(d.path);
+      let initial = "";
+      let placeholder = d.placeholder ?? "";
+      if (d.env) {
+        // env-backed credential: token is replace-only (never render the stored value).
+        if (d.masked) placeholder = secretGet(d.env) ? "•••••••• (set — type to replace)" : "not set";
+        else initial = secretGet(d.env);
+      } else {
+        const v = draft?.getIn(d.path!);
+        initial = v == null ? "" : String(v);
+      }
       const input = new InputRenderable(renderer, {
-        value: v == null ? "" : String(v),
-        placeholder: d.placeholder ?? "",
+        value: initial,
+        placeholder,
         flexGrow: 1,
         backgroundColor: theme.input.bg,
         focusedBackgroundColor: theme.input.focusBg,
@@ -197,7 +219,7 @@ export function createConfigEditor(renderer: CliRenderer, confirm: ConfirmFn): T
     focusRows = [];
     errorNodes = [];
     if (!draft) return;
-    for (const d of buildDescriptors(draft, rebuild, confirm, expandedNodes)) {
+    for (const d of [...secretDescriptors(), ...buildDescriptors(draft, rebuild, confirm, expandedNodes)]) {
       const rr = renderDescriptor(d);
       if (!rr) continue;
       focusRows.push(rr);
@@ -221,12 +243,18 @@ export function createConfigEditor(renderer: CliRenderer, confirm: ConfirmFn): T
   function flushInputs(): void {
     if (!draft) return;
     for (const r of focusRows) {
-      if (r.desc.kind === "text" && r.input) {
-        const raw = r.input.value.trim();
-        if (raw === "") continue;
-        const value = r.desc.numeric && Number.isFinite(Number(raw)) ? Number(raw) : raw;
-        draft.setIn(r.desc.path, value);
+      if (r.desc.kind !== "text" || !r.input) continue;
+      const d = r.desc;
+      const raw = r.input.value;
+      if (d.env) {
+        // token (masked) is replace-only: blank keeps the existing one; email always applies.
+        if (d.masked) { if (raw.trim() !== "") secretSet(d.env, raw.trim()); } else secretSet(d.env, raw.trim());
+        continue;
       }
+      const t = raw.trim();
+      if (t === "") continue;
+      const value = d.numeric && Number.isFinite(Number(t)) ? Number(t) : t;
+      draft.setIn(d.path!, value);
     }
   }
 
@@ -303,6 +331,18 @@ export function createConfigEditor(renderer: CliRenderer, confirm: ConfirmFn): T
     const row = focusRows[browseIndex];
     const cyclable = !!row && (row.desc.kind === "enum" || row.desc.kind === "ref");
     const group = row && row.desc.kind === "group" ? row.desc : null;
+    // Reorder a group within its array: Shift+↑/↓ or [ / ].
+    if (group) {
+      const up = (key.name === "up" && key.shift) || key.name === "[";
+      const down = (key.name === "down" && key.shift) || key.name === "]";
+      if (up || down) {
+        flushInputs();
+        if (up) group.moveUp?.();
+        else group.moveDown?.();
+        key.preventDefault();
+        return;
+      }
+    }
     switch (key.name) {
       case "up":
         moveHighlight(browseIndex - 1, false);
@@ -364,6 +404,8 @@ export function createConfigEditor(renderer: CliRenderer, confirm: ConfirmFn): T
     }
     loadedRepo = name;
     draft = doc;
+    loadedSecrets = { ...loadSecrets(repoConfigDir(name)) };
+    secrets = { ...loadedSecrets };
     render();
     setHighlight(0);
     setStatus("↑↓ move · ↵ open/edit/cycle · ^S save", theme.text.secondary);
@@ -375,6 +417,12 @@ export function createConfigEditor(renderer: CliRenderer, confirm: ConfirmFn): T
       return;
     }
     flushInputs();
+    // Credentials live in a separate `env` file (no schema validation) — save them independently
+    // of config validity when they've changed.
+    if (secrets.jiraEmail !== loadedSecrets.jiraEmail || secrets.jiraApiToken !== loadedSecrets.jiraApiToken) {
+      saveSecrets(repoConfigDir(loadedRepo), { jiraEmail: secrets.jiraEmail, jiraApiToken: secrets.jiraApiToken });
+      loadedSecrets = { ...secrets };
+    }
     clearErrors();
     const parsed = RepoConfigSchema.safeParse(draft.toJS());
     if (!parsed.success) {

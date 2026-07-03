@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -403,6 +403,20 @@ export function loadSecrets(repoDir: string): Secrets {
     jiraEmail: env.JIRA_EMAIL ?? "",
     jiraApiToken: env.JIRA_API_TOKEN ?? "",
   };
+}
+
+/** Write Jira auth to `<repoDir>/env` (chmod 600), merging into any existing keys. Only the fields
+ *  provided are updated; others in the file are preserved. Counterpart to loadSecrets, used by the
+ *  TUI config editor so credentials don't have to be hand-created. */
+export function saveSecrets(repoDir: string, secrets: { jiraEmail?: string; jiraApiToken?: string }): void {
+  mkdirSync(repoDir, { recursive: true });
+  const path = join(repoDir, "env");
+  const env = parseEnvFile(path);
+  if (secrets.jiraEmail !== undefined) env.JIRA_EMAIL = secrets.jiraEmail;
+  if (secrets.jiraApiToken !== undefined) env.JIRA_API_TOKEN = secrets.jiraApiToken;
+  const content = Object.entries(env).map(([k, v]) => `${k}=${v}`).join("\n") + "\n";
+  writeFileSync(path, content, { mode: 0o600 });
+  chmodSync(path, 0o600); // ensure 600 even if the file already existed
 }
 
 /** The config.yml JSON Schema — derived from `RepoConfigSchema` (single source of truth) so editors
