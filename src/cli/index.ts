@@ -129,25 +129,34 @@ type Check = (name: string, fn: () => Promise<unknown>) => Promise<void>;
  *  the auto-update-readiness check inspects the factory's own checkout. */
 const PKG_ROOT = fileURLToPath(new URL("../../", import.meta.url));
 
-/** Machine-wide checks: the external tools the factory drives, the runtime it runs on, the
- *  supervisor, and auto-update readiness. No repo needed — shared by `doctor` and `--repo … doctor`. */
+/** Machine-wide checks, grouped by ownership: what herdr-factory provisions & maintains itself vs
+ *  the external tools + auth the user supplies. Each is a ✓/✗. No repo needed — shared by `doctor`
+ *  and `--repo … doctor`. */
 async function baseDoctor(check: Check): Promise<void> {
   const herdrBin = process.env.HERDR_BIN_PATH ?? "herdr";
-  await check(`node >= 26 (v${process.versions.node}${isManagedNode(process.execPath) ? ", vendored" : ""})`, async () => {
+
+  console.log("managed by herdr-factory:");
+  await check(`node runtime >= 26 (v${process.versions.node}, ${isManagedNode(process.execPath) ? "vendored" : "ambient"})`, async () => {
     if (Number(process.versions.node.split(".")[0]) < 26) throw new Error(`v${process.versions.node} is too old`);
   });
-  await check("git on PATH", () => run("git", ["--version"]));
-  await check("herdr socket", () => run(herdrBin, ["workspace", "list"]));
-  await check("gh auth", () => run("gh", ["auth", "status"]));
-  await check("claude on PATH", () => run("claude", ["--version"]));
-  await check("auto-update ready (git checkout + upstream)", () => run("git", ["rev-parse", "--abbrev-ref", "@{u}"], { cwd: PKG_ROOT }));
+  await check("auto-update (git checkout + upstream)", () => run("git", ["rev-parse", "--abbrev-ref", "@{u}"], { cwd: PKG_ROOT }));
   await check("supervisor service loaded", async () => {
     if (!(await service.isLoaded())) throw new Error("run `herdr-factory install`");
   });
   const info = readServerInfo();
   const running = info ? await pingHealth(info.port).catch(() => false) : false;
-  console.log(`  server: ${running && info ? `running on :${info.port} (v${info.version})` : "not running"}`);
-  console.log(`  db: ${globalDbPath()}`);
+  await check(running && info ? `server running on :${info.port} (v${info.version})` : "server", async () => {
+    if (!running) throw new Error(info ? "registered but not responding" : "not running (run `herdr-factory start`)");
+  });
+  await check(`database (${globalDbPath()})`, async () => {
+    if (!existsSync(globalDbPath())) throw new Error("not initialized yet (created on the first `serve`)");
+  });
+
+  console.log("\nyou provide (install + auth):");
+  await check("git", () => run("git", ["--version"]));
+  await check("herdr", () => run(herdrBin, ["workspace", "list"]));
+  await check("gh (authenticated)", () => run("gh", ["auth", "status"]));
+  await check("claude", () => run("claude", ["--version"]));
 }
 
 /** Repo-specific checks: config validity, the repo checkout, origin, each work source's health, and
@@ -794,7 +803,6 @@ program
       }
     };
 
-    console.log("machine:");
     await baseDoctor(check);
 
     const repo = (program.opts() as { repo?: string }).repo;
