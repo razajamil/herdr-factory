@@ -1,19 +1,18 @@
 import { createReadStream, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join, sep } from "node:path";
-import { fileURLToPath } from "node:url";
 import { Command } from "commander";
 import { S3Client } from "@aws-sdk/client-s3";
 import { Upload } from "@aws-sdk/lib-storage";
 import { fromNodeProviderChain } from "@aws-sdk/credential-providers";
 import { lookup as mimeLookup } from "mime-types";
-import { assertMainCheckout, configJsonSchema, configSchemaPath, globalDbPath, isManagedNode, managedNodePath, nodePathFile, writeConfigSchema } from "../config.ts";
+import { configJsonSchema, configSchemaPath, globalDbPath, isManagedNode, managedNodePath, nodePathFile, writeConfigSchema } from "../config.ts";
+import { baseGroups, repoGroup, type DoctorGroup } from "../doctor.ts";
 import { openDb } from "../db/index.ts";
 import { Store } from "../db/store.ts";
 import { systemClock, type Run } from "../types.ts";
 import type { Deps } from "../core/deps.ts";
 import { bounceStep, claimTicket, reconcileRepo, reconcileRun, requestHumanInput, teardownTicket, withTickLock, withTickLockWaiting } from "../core/reconcile.ts";
 import { MEMORY_DIR, stepByName } from "../core/step.ts";
-import { run } from "../clients/exec.ts";
 import * as service from "../watchers/service.ts";
 import { buildDeps, today } from "../build-deps.ts";
 import { resolveActiveRun, resolveBeltName } from "../resolve.ts";
@@ -122,68 +121,15 @@ function cliAction<Args extends unknown[]>(name: string, fn: (...args: Args) => 
   };
 }
 
-// ── doctor: prints `✓/✗ <name>` per check; a failure flips process.exitCode so CI can gate on it. ──
-type Check = (name: string, fn: () => Promise<unknown>) => Promise<void>;
-
-/** THIS package's dir (never the caller's cwd — a worker invokes the CLI from other worktrees), so
- *  the auto-update-readiness check inspects the factory's own checkout. */
-const PKG_ROOT = fileURLToPath(new URL("../../", import.meta.url));
-
-/** Machine-wide checks, grouped by ownership: what herdr-factory provisions & maintains itself vs
- *  the external tools + auth the user supplies. Each is a ✓/✗. No repo needed — shared by `doctor`
- *  and `--repo … doctor`. */
-async function baseDoctor(check: Check): Promise<void> {
-  const herdrBin = process.env.HERDR_BIN_PATH ?? "herdr";
-
-  console.log("managed by herdr-factory:");
-  await check(`node runtime >= 26 (v${process.versions.node}, ${isManagedNode(process.execPath) ? "vendored" : "ambient"})`, async () => {
-    if (Number(process.versions.node.split(".")[0]) < 26) throw new Error(`v${process.versions.node} is too old`);
-  });
-  await check("auto-update (git checkout + upstream)", () => run("git", ["rev-parse", "--abbrev-ref", "@{u}"], { cwd: PKG_ROOT }));
-  await check("supervisor service loaded", async () => {
-    if (!(await service.isLoaded())) throw new Error("run `herdr-factory install`");
-  });
-  const info = readServerInfo();
-  const running = info ? await pingHealth(info.port).catch(() => false) : false;
-  await check(running && info ? `server running on :${info.port} (v${info.version})` : "server", async () => {
-    if (!running) throw new Error(info ? "registered but not responding" : "not running (run `herdr-factory start`)");
-  });
-  await check(`database (${globalDbPath()})`, async () => {
-    if (!existsSync(globalDbPath())) throw new Error("not initialized yet (created on the first `serve`)");
-  });
-
-  console.log("\nyou provide (install + auth):");
-  await check("git", () => run("git", ["--version"]));
-  await check("herdr", () => run(herdrBin, ["workspace", "list"]));
-  await check("gh (authenticated)", () => run("gh", ["auth", "status"]));
-  await check("claude", () => run("claude", ["--version"]));
-}
-
-/** Repo-specific checks: config validity, the repo checkout, origin, each work source's health, and
- *  Jira auth. Reports a config-load failure as a failed check rather than throwing (so the base
- *  results still print). */
-async function repoDoctor(check: Check, repo: string): Promise<void> {
-  let deps: Deps | undefined;
-  await check("config loads + valid", async () => {
-    deps = await buildDeps(repo);
-  });
-  if (!deps) return; // config is broken — everything below depends on it
-  const d = deps;
-  await check("repo.path is a main git checkout", async () => assertMainCheckout(d.config.repo.path));
-  await check("git origin resolved", async () => {
-    if (!d.ghRepo) throw new Error("no origin — set repo.github or add a git remote");
-  });
-  for (const src of d.sources) {
-    await check(`source ${src.name} (${src.type})`, () => src.client.health());
-    if (src.type === "jira") {
-      await check(`jira auth for ${src.name}`, async () => {
-        if (!d.secrets.jiraEmail || !d.secrets.jiraApiToken) throw new Error("JIRA_EMAIL / JIRA_API_TOKEN missing in the repo env file");
-      });
-    }
+/** Print one doctor group as `✓/✗ <name> — <detail>` lines. Returns whether any check failed. */
+function printDoctorGroup(g: DoctorGroup): boolean {
+  let failed = false;
+  console.log(`${g.title}:`);
+  for (const c of g.checks) {
+    if (!c.ok) failed = true;
+    console.log(`  ${c.ok ? "✓" : "✗"} ${c.name}${c.detail ? ` — ${c.detail}` : ""}`);
   }
-  const ev = d.config.evidence;
-  console.log(`  evidence: ${ev ? `s3://${ev.bucket} (${ev.region}) → ${ev.cloudfrontDomain}` : "not configured"}`);
-  console.log(`  db: ${d.config.paths.dbPath}`);
+  return failed;
 }
 
 program
@@ -791,28 +737,15 @@ program
   .command("doctor")
   .description("machine-wide health check (node, herdr, gh, claude, git, supervisor, server); pass --repo <name> to also run repo-specific checks (config, sources, origin)")
   .action(cliAction("doctor", async () => {
-    let failed = false;
-    const check: Check = async (name, fn) => {
-      try {
-        await fn();
-        console.log(`  ✓ ${name}`);
-      } catch (e) {
-        failed = true;
-        const why = e instanceof Error && e.message ? ` — ${e.message}` : "";
-        console.log(`  ✗ ${name}${why}`);
-      }
-    };
-
-    await baseDoctor(check);
-
     const repo = (program.opts() as { repo?: string }).repo;
-    if (repo) {
-      console.log(`\nrepo ${repo}:`);
-      await repoDoctor(check, repo);
-    } else {
-      console.log("\n(run `herdr-factory --repo <name> doctor` to add repo-specific checks)");
-    }
-
+    const groups = await baseGroups();
+    if (repo) groups.push(await repoGroup(repo));
+    let failed = false;
+    groups.forEach((g, i) => {
+      if (i > 0) console.log("");
+      failed = printDoctorGroup(g) || failed;
+    });
+    if (!repo) console.log("\n(run `herdr-factory --repo <name> doctor` to add repo-specific checks)");
     if (failed) process.exitCode = 1; // so scripts/CI can gate on a clean doctor
   }));
 

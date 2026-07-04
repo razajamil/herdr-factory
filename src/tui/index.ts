@@ -9,6 +9,7 @@ import { BORDER, theme } from "./theme.ts";
 import type { TabView } from "./types.ts";
 import { createDashboard } from "./dashboard.ts";
 import { createConfigEditor } from "./config-editor.ts";
+import { createDoctor } from "./doctor.ts";
 
 /** Build the tabbed shell on an existing renderer (split out from bootstrap so it can be driven in
  *  tests). Returns a few inspection getters. */
@@ -31,6 +32,7 @@ export function createApp(renderer: CliRenderer): { currentTab: () => number; at
     options: [
       { name: "Dashboard", description: "" },
       { name: "Config", description: "" },
+      { name: "Doctor", description: "" },
     ],
     showDescription: false,
     showUnderline: false,
@@ -173,7 +175,7 @@ export function createApp(renderer: CliRenderer): { currentTab: () => number; at
   }
 
   // ── views ─────────────────────────────────────────────────────────────────────────────────
-  const views: TabView[] = [createDashboard(renderer, { confirm, choose, showInfo }), createConfigEditor(renderer, confirm)];
+  const views: TabView[] = [createDashboard(renderer, { confirm, choose, showInfo }), createConfigEditor(renderer, confirm), createDoctor(renderer)];
   let current = -1;
   // Per-tab focus memory (session): whether each tab was last left at the top level (tab bar). The
   // within-tab section + field is remembered by each view (restoreFocus). Together these restore
@@ -182,9 +184,9 @@ export function createApp(renderer: CliRenderer): { currentTab: () => number; at
 
   function footerHints(idx: number): string {
     const tail = "   ·   Tab: switch view · Esc: top level · q: quit";
-    return idx === 1
-      ? " 1 repos · 2 fields   ·   ↑↓: move · ↵: open/edit · [ ]: reorder" + tail
-      : " ↑↓: move · ↵: timeline · t: tick · c: claim · x: teardown · r: refresh" + tail;
+    if (idx === 1) return " 1 repos · 2 fields   ·   ↑↓: move · ↵: open/edit · [ ]: reorder" + tail;
+    if (idx === 2) return " ↑↓: scroll · r: re-run checks" + tail;
+    return " ↑↓: move · ↵: timeline · t: tick · c: claim · x: teardown · r: refresh" + tail;
   }
 
   /** Top of the hierarchy: focus the tab bar. From here numbers enter a section, ←→/Tab switch. */
