@@ -22,6 +22,11 @@ entry="src/tui/index.ts"
 # --disable-warning keeps Node's experimental-FFI notice off the alternate screen.
 node_flags=(--experimental-ffi --disable-warning=ExperimentalWarning)
 
+# opentui can't auto-detect libc — on musl it needs OPENTUI_LIBC=musl to resolve its native lib.
+if [ -z "${OPENTUI_LIBC:-}" ] && { ls /lib/ld-musl-* >/dev/null 2>&1 || { command -v ldd >/dev/null 2>&1 && ldd --version 2>&1 | grep -qi musl; }; }; then
+  export OPENTUI_LIBC=musl
+fi
+
 node_major() { local v; v="$("$1" -v 2>/dev/null)" || return 1; v="${v#v}"; printf '%s' "${v%%.*}"; }
 
 # 1. Active node, if >= 26.

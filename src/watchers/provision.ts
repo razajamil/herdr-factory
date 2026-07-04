@@ -212,6 +212,15 @@ async function provisionNodeImpl(version: string, log: Log): Promise<ProvisionRe
         else throw e;
       }
     }
+    // Verify the provisioned Node actually starts before pointing `current` at it. A bumped Node
+    // that links a system lib the box lacks (libatomic on arm64 glibc, libgcc/libstdc++ on musl)
+    // would otherwise wedge the daemon; throwing here keeps the existing runtime (the caller logs
+    // the failure and carries on).
+    try {
+      await run(nodeBin, ["-v"]);
+    } catch {
+      throw new Error(`vendored Node ${version} was provisioned but cannot start — a required system library is missing (e.g. libatomic1 on arm64 glibc, libstdc++ on musl)`);
+    }
     const changed = finalizeCurrent(versionDir, log);
     log("info", `provision: Node ${version} ready at ${versionDir}${changed ? " (current → this)" : ""}`);
     return { version, changed, nodePath: managedNodePath() };

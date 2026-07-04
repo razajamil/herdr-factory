@@ -18,8 +18,11 @@
 # After install, the app self-updates: a git pull that bumps .node-version re-provisions Node, and a
 # lockfile change re-runs pnpm install — automatically, on the supervisor tick.
 #
-# The only irreducible prerequisites are git, curl and tar (self-update is git-based). Everything
-# else — Node, SQLite (built into Node), pnpm, the AWS SDK — is provided here.
+# Prerequisites: git, curl, tar (self-update is git-based). Everything else — Node, SQLite (built
+# into Node), pnpm, the AWS SDK — is provided here. On MINIMAL Linux images the vendored Node also
+# links a couple of system libs the base image may omit (Debian/arm64: libatomic1; Alpine/musl:
+# libstdc++), and the launcher shims need bash — the installer verifies the Node it downloaded can
+# start and, if not, tells you exactly which package to add.
 #
 # Uninstall:  curl -fsSL <public-url>/install.sh | sh -s -- --uninstall
 set -eu
@@ -127,7 +130,7 @@ provision_node() {
     *) die ".node-version must pin an exact x.y.z (got '$ver')" ;;
   esac
   vdir="$RUNTIME_ROOT/$ver" ; nodebin="$RUNTIME_ROOT/$ver/bin/node"
-  if [ -x "$nodebin" ]; then say "Node $ver already provisioned"; link_current "$ver"; return 0; fi
+  if [ -x "$nodebin" ]; then verify_node "$nodebin"; say "Node $ver already provisioned"; link_current "$ver"; return 0; fi
 
   if [ "$LIBC" = musl ]; then
     dirname_="node-v$ver-linux-$ARCH-musl"
@@ -158,8 +161,23 @@ provision_node() {
   tar -xzf "$tarball" -C "$tmp" --strip-components=1
   [ -x "$tmp/bin/node" ] || die "extracted tarball has no bin/node"
   rm -rf "$vdir" ; mv "$tmp" "$vdir"
+  verify_node "$vdir/bin/node"   # fail early + actionable if a system lib is missing
   link_current "$ver"
   say "Node $ver ready at $vdir"
+}
+
+# The vendored Node dynamically links a few system libs bare distros may omit (libatomic on arm64
+# glibc; libgcc/libstdc++ on musl). Verify it actually starts and, if not, name the fix — far better
+# than a cryptic loader crash deeper in the install (e.g. mid `pnpm install`).
+verify_node() {
+  node_out="$("$1" -v 2>&1)" && return 0
+  printf '%s\n' "$node_out" | sed 's/^/    /' >&2
+  case "$node_out" in
+    *libatomic*) fix="install libatomic — Debian/Ubuntu: sudo apt-get install libatomic1 · Fedora/RHEL: sudo dnf install libatomic" ;;
+    *libgcc*|*libstdc*) fix="install the C++ runtime — Alpine: sudo apk add libstdc++ · Debian/Ubuntu: sudo apt-get install libstdc++6" ;;
+    *) fix="install the missing system library shown above" ;;
+  esac
+  die "the vendored Node ($1) could not start. Fix: $fix — then re-run install.sh."
 }
 
 # Point runtime/current at a version dir, and write the stable node-path the app + service read.
@@ -191,6 +209,8 @@ install_shims() {
     *":$BIN_DIR:"*) : ;;
     *) warn "$BIN_DIR is not on your PATH — add it: export PATH=\"$BIN_DIR:\$PATH\"" ;;
   esac
+  # The launcher shims are bash scripts; a busybox-only box (Alpine) needs bash to run them.
+  command -v bash >/dev/null 2>&1 || warn "the herdr-factory launchers need bash (not found) — install it (Alpine: sudo apk add bash)."
 }
 
 # ── Service (launchd / systemd) ────────────────────────────────────────────────────────────────
