@@ -30,7 +30,8 @@ const jiraBlock = () => ({
 });
 const localMarkdownBlock = () => ({ folder: "" });
 const defaultStep = (name: string) => ({ name, prompt_file: "", prompt_file_source: "config" });
-// empty agent blocks are valid by default; `evidence` is optional but shown so it's discoverable.
+// empty agent blocks are valid by default; `evidence` is shown so its tab/pane is discoverable, but
+// it only RUNS when its tab+pane are set (else the evidence step is skipped: fix → review → pr).
 const prAgents = () => ({ fix: {}, evidence: {}, review: {}, pr: {} });
 
 const LIMITS: [string, string][] = [
@@ -173,9 +174,12 @@ export function buildDescriptors(draft: Document, rebuild: () => void, confirm: 
 
     if (beltType === "work_to_pull_request") {
       for (const step of ["fix", "evidence", "review", "pr"] as const) {
+        // evidence runs ONLY when tab+pane are set (delivers to that pane's existing agent); blank ⇒ skipped.
+        const tabHint = step === "evidence" ? "(evidence runs only if tab+pane set; else skipped)" : "(optional; set with pane)";
+        const paneHint = step === "evidence" ? "(evidence runs only if tab+pane set; else skipped)" : "(optional; set with tab)";
         d.push({ kind: "header", label: `agents.${step}`, level: 2, indent: 2 });
-        d.push({ kind: "text", label: "tab", path: ["belt", i, "agents", step, "tab"], placeholder: "(optional; set with pane)", indent: 3 });
-        d.push({ kind: "text", label: "pane", path: ["belt", i, "agents", step, "pane"], placeholder: "(optional; set with tab)", indent: 3 });
+        d.push({ kind: "text", label: "tab", path: ["belt", i, "agents", step, "tab"], placeholder: tabHint, indent: 3 });
+        d.push({ kind: "text", label: "pane", path: ["belt", i, "agents", step, "pane"], placeholder: paneHint, indent: 3 });
         d.push({ kind: "text", label: "prompt_file", path: ["belt", i, "agents", step, "prompt_file"], placeholder: "(optional)", indent: 3 });
         d.push(optionalSource(["belt", i, "agents", step, "prompt_file_source"], b?.agents?.[step]?.prompt_file_source, draft, rebuild, 3));
       }

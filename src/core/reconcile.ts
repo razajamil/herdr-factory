@@ -571,12 +571,15 @@ export async function bounceStep(
   }
 
   const repo = deps.config.repoName;
+  // Safety backstop only: the loop is meant to end when the later step passes (aligned) or the fix
+  // agent asks a human — this cap just catches oscillation. Per-belt override wins over the repo limit.
+  const maxBounces = belt.maxBounces ?? deps.config.limits.maxBounces;
   const bounces = deps.store.bumpBounces(run.id, toStep);
-  if (bounces > deps.config.limits.maxBounces) {
+  if (bounces > maxBounces) {
     await escalateAttention(deps, run, {
       reason: "bounce_limit",
-      attentionReason: `bounced to ${toStep} ${bounces}× (max ${deps.config.limits.maxBounces})`,
-      body: `${run.ticketKey}: the work has been bounced back to the ${toStep} step ${bounces} times (from ${fromStep}), exceeding max_bounces (${deps.config.limits.maxBounces}). A human should look — the agents may be stuck in a rework loop.`,
+      attentionReason: `bounced to ${toStep} ${bounces}× (max ${maxBounces})`,
+      body: `${run.ticketKey}: the work has been bounced back to the ${toStep} step ${bounces} times (from ${fromStep}), exceeding max_bounces (${maxBounces}). A human should look — the agents may be stuck in a rework loop.`,
       detail: { fromStep, toStep, bounces },
     });
     return { ok: true, escalated: true, message: `bounce limit exceeded — escalated to attention` };

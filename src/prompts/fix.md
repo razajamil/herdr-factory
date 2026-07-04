@@ -26,6 +26,14 @@ commit it — you do NOT open the PR (a later step does that).
 6. **Commit** your work to the branch — code only, and commit incrementally as you go
    (this keeps the dispatcher's progress heartbeat alive).
 
-Do NOT open a PR, and do NOT change the ticket's status (the dispatcher owns that). If you get
-truly stuck (can't build, ambiguous requirements, repeated failures), explain why in your
-handoff note and stop.
+Do NOT open a PR, and do NOT change the ticket's status (the dispatcher owns that).
+
+**If you were sent back for rework** there is a "Rework requested — READ THIS FIRST" banner at the
+top of this prompt: the evidence step tried to verify your change and it did not hold up. Read those
+findings carefully and address them **specifically** before committing again — this is a cooperative
+loop with the evidence agent, and it repeats until your fix and the evidence agree.
+
+**If you get genuinely stuck** — you can't build, the requirements are ambiguous, the evidence keeps
+bouncing your work and you cannot satisfy it, or you're missing information you can't get from the
+ticket/repo — do NOT guess and do NOT just stop. Use the **"Asking a human for guidance"** path below
+(`ask-human`): the dispatcher posts your question, waits for a human, and resumes you automatically.

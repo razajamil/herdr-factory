@@ -103,36 +103,68 @@ describe("loadConfig — work sources + belts", () => {
     expect(secrets.jiraApiToken).toBe("tok");
   });
 
-  it("resolves a work_to_pull_request belt's engine steps (fix → evidence → review → pr; prompts, budgets, opensPr, bounce/evidence caps)", () => {
-    setup(cfg(JIRA_SRC, SHIP_BELT), { prompts: {} });
-    const steps = loadConfig("demo").config.belts[0]!.steps;
-    expect(steps.map((s) => s.name)).toEqual(["fix", "evidence", "review", "pr"]);
-    const [fix, evidence, review, pr] = steps;
+  it("SKIPS the evidence step when it has no tab/pane (fix → review → pr) — evidence never self-spawns", () => {
+    setup(cfg(JIRA_SRC, SHIP_BELT), { prompts: {} }); // SHIP_BELT configures no evidence tab/pane
+    const belt = loadConfig("demo").config.belts[0]!;
+    const steps = belt.steps;
+    expect(steps.map((s) => s.name)).toEqual(["fix", "review", "pr"]); // evidence dropped entirely
+    const [fix, review, pr] = steps;
     expect(fix!.tab).toBe("fix");
     expect(fix!.pane).toBe("agent");
     expect(fix!.enginePrompt).toContain("Fix agent"); // shipped engine prompt (src/prompts/fix.md)
     expect(fix!.heartbeat).toBe(true);
     expect(fix!.opensPr).toBe(false);
     expect(fix!.budgetSeconds).toBe(5400); // develop_budget_seconds
-    expect(fix!.gathersEvidence).toBe(false);
     expect(fix!.canBounceTo).toEqual([]);
-    // `evidence` isn't in SHIP_BELT's agents block — it's optional, so it resolves with no layout
-    // pane (self-spawn) but full engine wiring: captures evidence and may bounce back to fix.
-    expect(evidence!.tab).toBeUndefined();
-    expect(evidence!.pane).toBeUndefined();
-    expect(evidence!.enginePrompt).toContain("Evidence agent"); // src/prompts/evidence.md
-    expect(evidence!.heartbeat).toBe(false);
-    expect(evidence!.opensPr).toBe(false);
-    expect(evidence!.budgetSeconds).toBe(2400); // evidence_budget_seconds
-    expect(evidence!.gathersEvidence).toBe(true);
-    expect(evidence!.canBounceTo).toEqual(["fix"]);
     expect(review!.enginePrompt).toContain("fresh-eyes");
     expect(review!.heartbeat).toBe(false);
     expect(review!.budgetSeconds).toBe(1800);
-    expect(review!.canBounceTo).toEqual(["fix"]); // review is a gate: pass forward or bounce to fix
+    expect(review!.canBounceTo).toEqual(["fix"]); // review still bounces back to fix
     expect(pr!.enginePrompt).toContain("PR agent");
     expect(pr!.opensPr).toBe(true); // only the pr step watches GitHub
     expect(pr!.budgetSeconds).toBe(3600);
+    expect(belt.maxBounces).toBeUndefined(); // no per-belt override → falls back to limits.maxBounces
+  });
+
+  it("INCLUDES the evidence step only when its tab/pane are set (fix → evidence → review → pr)", () => {
+    setup(
+      cfg(JIRA_SRC, `  - name: ship
+    belt_type: work_to_pull_request
+    source: jira
+    agents:
+      fix:      { tab: fix,      pane: agent }
+      evidence: { tab: evidence, pane: agent }
+      review:   { tab: review,   pane: agent }
+      pr:       { tab: pr,       pane: agent }
+`),
+      { prompts: {} },
+    );
+    const steps = loadConfig("demo").config.belts[0]!.steps;
+    expect(steps.map((s) => s.name)).toEqual(["fix", "evidence", "review", "pr"]);
+    const evidence = steps.find((s) => s.name === "evidence")!;
+    expect(evidence.tab).toBe("evidence"); // delivers to that pane's existing agent (no self-spawn)
+    expect(evidence.pane).toBe("agent");
+    expect(evidence.enginePrompt).toContain("Evidence agent"); // src/prompts/evidence.md
+    expect(evidence.heartbeat).toBe(false);
+    expect(evidence.opensPr).toBe(false);
+    expect(evidence.budgetSeconds).toBe(2400); // evidence_budget_seconds
+    expect(evidence.gathersEvidence).toBe(true);
+    expect(evidence.canBounceTo).toEqual(["fix"]);
+  });
+
+  it("max_bounces defaults to 6 and a per-belt max_bounces overrides the repo limit", () => {
+    setup(
+      cfg(JIRA_SRC, `  - name: ship
+    belt_type: work_to_pull_request
+    source: jira
+    max_bounces: 2
+    agents: { fix: { tab: fix, pane: agent }, review: { tab: review, pane: agent }, pr: { tab: pr, pane: agent } }
+`),
+      { prompts: {} },
+    );
+    const { config } = loadConfig("demo");
+    expect(config.limits.maxBounces).toBe(6); // raised safety-backstop default
+    expect(config.belts[0]!.maxBounces).toBe(2); // per-belt override
   });
 
   it("a work_to_pull_request belt on a local_markdown source uses the per-type built-in fix prompt", () => {

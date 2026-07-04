@@ -148,6 +148,9 @@ const beltBase = {
   priority: z.coerce.number().int().default(100),
   workspace_name: WorkspaceNameSchema,
   match: z.string().optional(),
+  // Optional per-belt override of the repo-wide max_bounces safety cap (the loop-safety backstop for
+  // the fix↔evidence/review rework loop). Unset ⇒ falls back to limits.max_bounces.
+  max_bounces: z.coerce.number().int().nonnegative().optional(),
 };
 
 // `.strict()` so a w2pr belt can't carry `steps`, a custom belt can't carry `agents`, and typos in
@@ -182,9 +185,12 @@ export const RepoConfigSchema = z
         // The evidence step captures + (optionally) records video and uploads — generous by default.
         evidence_budget_seconds: z.coerce.number().int().positive().default(2400),
         pr_budget_seconds: z.coerce.number().int().positive().default(3600),
-        // Max times a run may be bounced back to any one earlier step before escalating to attention
-        // (loop-safety for evidence/review → fix rework). 0 disables bouncing (first bounce escalates).
-        max_bounces: z.coerce.number().int().nonnegative().default(3),
+        // SAFETY BACKSTOP for the fix↔evidence/review rework loop — not the intended terminator. The
+        // loop is meant to end when evidence/review pass (aligned) or the fix agent asks a human; this
+        // cap only catches genuine oscillation. Max times a run may bounce back to any ONE earlier step
+        // before escalating to attention. 0 disables bouncing (first bounce escalates). Per-belt
+        // `max_bounces` overrides this.
+        max_bounces: z.coerce.number().int().nonnegative().default(6),
         // Default budget for a custom belt's step when it sets no `budget_seconds` of its own.
         step_budget_seconds: z.coerce.number().int().positive().default(3600),
         tick_interval_seconds: z.coerce.number().int().positive().default(60),
@@ -301,6 +307,8 @@ export interface BeltConfig {
   matchFile?: string;
   steps: StepConfig[];
   watchPr: boolean;
+  /** Per-belt override of the repo-wide bounce safety cap; undefined ⇒ use limits.maxBounces. */
+  maxBounces?: number;
 }
 
 export interface Config {
@@ -637,13 +645,16 @@ export function loadConfig(repoName: string): Loaded {
       matchFile: b.match ? resolveFile(b.name, "match", b.match) : undefined,
     };
     if (b.belt_type === "work_to_pull_request") {
-      const steps: StepConfig[] = PR_STEPS.map((d) => {
-        // `evidence` is an optional agent block (backward-compatible) — default to an empty block so
-        // an unconfigured evidence step just spawns its own dedicated pane.
+      const steps: StepConfig[] = PR_STEPS.flatMap((d) => {
         const agent = b.agents[d.name] ?? {};
+        // `evidence` is opt-in + cooperative: it verifies fix's work using an EXISTING agent in the
+        // user's layout, so it runs ONLY when a tab/pane targets that agent. With no tab/pane it is
+        // SKIPPED entirely (fix → review → pr) — evidence never spawns its own agent. fix/review/pr
+        // always run (they spawn a dedicated pane when unconfigured).
+        if (d.name === "evidence" && !(agent.tab && agent.pane)) return [];
         // schema guarantees prompt_file_source is present when prompt_file is.
         if (agent.prompt_file) checkConfigPromptFile(b.name, `${d.name} prompt_file`, agent.prompt_file_source!, agent.prompt_file);
-        return {
+        return [{
           name: d.name,
           tab: agent.tab,
           pane: agent.pane,
@@ -655,9 +666,9 @@ export function loadConfig(repoName: string): Loaded {
           opensPr: d.opensPr,
           gathersEvidence: PR_GATHERS_EVIDENCE.has(d.name),
           canBounceTo: PR_CAN_BOUNCE_TO[d.name] ?? [],
-        };
+        }];
       });
-      return { ...base, steps, watchPr: true };
+      return { ...base, steps, watchPr: true, maxBounces: b.max_bounces };
     }
     const steps: StepConfig[] = b.steps.map((s) => {
       checkConfigPromptFile(b.name, `step "${s.name}" prompt_file`, s.prompt_file_source, s.prompt_file);
@@ -674,7 +685,7 @@ export function loadConfig(repoName: string): Loaded {
         canBounceTo: [],
       };
     });
-    return { ...base, steps, watchPr: false };
+    return { ...base, steps, watchPr: false, maxBounces: b.max_bounces };
   });
   // Stable sort: equal priorities keep config order (V8 Array.sort is stable on Node >=24).
   belts.sort((a, b) => a.priority - b.priority);

@@ -161,7 +161,8 @@ function scaffold(
         `the change is wrong, or a required behaviour is missing — do NOT run step-done and do NOT try to fix it here. Instead: ` +
         `write concrete, actionable findings (what's wrong and what must change) to \`${MEMORY_DIR}/bounce-${step.name}.md\`, ` +
         `then run \`${bounceCmd}\` and stop. This sends the run back to the **${bounceTarget}** step to do the work. ` +
-        `(There is a per-run bounce limit; repeated bounces escalate to a human.)\n`
+        `Write specific, reproducible findings so the loop converges quickly. ` +
+        `(A per-run bounce cap is only a safety backstop against endless oscillation — once exceeded the run parks for a human.)\n`
       : "") +
     `\n## Finishing this step (required)\n` +
     `1. Write your handoff note to \`${MEMORY_DIR}/handoff-${step.name}.md\` — what you did, key decisions and why, ` +
