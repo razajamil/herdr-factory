@@ -3,7 +3,7 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { run } from "../clients/exec.ts";
-import { listConfiguredRepos, serverLogsDir } from "../config.ts";
+import { listConfiguredRepos, resolvedNodePath, serverLogsDir } from "../config.ts";
 
 const PKG_ROOT = fileURLToPath(new URL("../../", import.meta.url));
 const CLI_ENTRY = join(PKG_ROOT, "src", "cli", "index.ts");
@@ -62,7 +62,7 @@ function plistXml(): string {
   <key>WorkingDirectory</key><string>${PKG_ROOT}</string>
   <key>ProgramArguments</key>
   <array>
-    <string>${process.execPath}</string>
+    <string>${xmlEscape(resolvedNodePath(process.execPath))}</string>
     <string>${CLI_ENTRY}</string>
     <string>ensure-up</string>
   </array>

@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { rmSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { serverInfoPath } from "../config.ts";
+import { resolvedNodePath, serverInfoPath } from "../config.ts";
 import { pingHealth, readServerInfo } from "../server/client.ts";
 import { VERSION } from "../version.ts";
 import { autoUpdateEnabled, selfUpdate } from "./updater.ts";
@@ -43,14 +43,18 @@ const signal = (pid: number, sig: NodeJS.Signals) => {
   }
 };
 
-/** Spawn a fully-detached `serve` that outlives this (one-shot) supervisor process. */
+/** Spawn a fully-detached `serve` that outlives this (one-shot) supervisor process. Uses the baked
+ *  node-path (the vendored `runtime/current/bin/node` in a managed install) rather than this
+ *  process's execPath, so a `.node-version` bump that provisioning just applied takes effect on the
+ *  very next spawn — falling back to our own execPath in a plain dev checkout. */
 function spawnServe(): void {
   const env: NodeJS.ProcessEnv = { HOME: process.env.HOME, PATH: process.env.PATH };
   for (const key of SERVE_ENV_KEYS) {
     const value = process.env[key];
     if (value !== undefined) env[key] = value;
   }
-  const child = spawn(process.execPath, [CLI_ENTRY, "serve"], { detached: true, env, stdio: "ignore" });
+  const node = resolvedNodePath(process.execPath);
+  const child = spawn(node, [CLI_ENTRY, "serve"], { detached: true, env, stdio: "ignore" });
   child.unref();
 }
 

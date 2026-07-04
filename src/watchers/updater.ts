@@ -12,6 +12,7 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 import type { Log } from "./supervisor.ts";
+import { pinnedNodeVersion, provisionNode } from "./provision.ts";
 import { recordDependencyDuration, telemetrySpan } from "../telemetry/index.ts";
 
 const execFileP = promisify(execFile);
@@ -44,13 +45,22 @@ async function git(args: string[]): Promise<string> {
   });
 }
 
-/** Did package.json / pnpm-lock.yaml change between two commits? */
-async function depsChanged(from: string, to: string): Promise<boolean> {
+interface ManifestChanges {
+  deps: boolean; // package.json / pnpm-lock.yaml
+  node: boolean; // .node-version (the pinned Node runtime)
+}
+
+/** Which provisioning-relevant manifests changed between two commits — so we know whether to
+ *  re-run `pnpm install` and/or re-provision the vendored Node runtime. */
+async function manifestChanges(from: string, to: string): Promise<ManifestChanges> {
   try {
-    const changed = await git(["diff", "--name-only", from, to]);
-    return changed.split("\n").some((f) => f === "package.json" || f === "pnpm-lock.yaml");
+    const files = (await git(["diff", "--name-only", from, to])).split("\n");
+    return {
+      deps: files.some((f) => f === "package.json" || f === "pnpm-lock.yaml"),
+      node: files.some((f) => f === ".node-version"),
+    };
   } catch {
-    return false;
+    return { deps: false, node: false };
   }
 }
 
@@ -119,7 +129,21 @@ async function selfUpdateImpl(log: Log): Promise<UpdateResult> {
   }
   log("info", `self-update: ${before.slice(0, 12)} → ${after.slice(0, 12)} (hard reset to ${upstream})`);
 
-  if (await depsChanged(before, after)) await installDeps(log);
+  const changes = await manifestChanges(before, after);
+  // A .node-version bump: fetch + verify + extract the new official Node and flip the runtime
+  // symlink. Best-effort — a failure leaves the old runtime in place and the launchers fall back to
+  // it, so the box keeps running rather than breaking on a bad network. A Node bump also implies a
+  // reinstall (the @opentui/core-<platform> optional dep may need re-resolving for the new ABI),
+  // so force the pnpm install path even if the lockfile itself was untouched.
+  if (changes.node) {
+    try {
+      const res = await provisionNode(pinnedNodeVersion(), log);
+      if (res.changed) log("info", `self-update: vendored Node → ${res.version}`);
+    } catch (e) {
+      log("warn", `self-update: Node provisioning failed — ${msg(e)} (continuing on the existing runtime)`);
+    }
+  }
+  if (changes.deps || changes.node) await installDeps(log);
 
   return { updated: true, from: before, to: after };
 }

@@ -1,6 +1,6 @@
 import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, isAbsolute, join } from "node:path";
+import { dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parse as parseYaml } from "yaml";
 import { z } from "zod";
@@ -31,8 +31,8 @@ const LocalMarkdownBlockSchema = z.object({
 });
 
 // ── Evidence upload: where the `evidence` step publishes captured screenshots/video (S3 + CloudFront).
-// Non-secret infra pointers ONLY — AWS credentials come from the ambient AWS CLI chain (~/.aws /
-// AWS_* env / the named `profile`), never stored in config or handed to an agent. Optional: a repo
+// Non-secret infra pointers ONLY — AWS credentials come from the ambient AWS credential chain (~/.aws /
+// AWS_* env / SSO / the named `profile`), never stored in config or handed to an agent. Optional: a repo
 // that omits it still gets an evidence step (capture + assess + bounce), it just publishes nothing.
 const EvidenceBlockSchema = z
   .object({
@@ -352,7 +352,11 @@ function configDir(): string {
   return process.env.HERDR_FACTORY_CONFIG_DIR?.trim() || join(homedir(), ".config", "herdr-factory");
 }
 function stateRoot(): string {
-  return process.env.HERDR_FACTORY_STATE_ROOT?.trim() || join(homedir(), ".local", "state", "herdr-factory");
+  // resolve() so a relative HERDR_FACTORY_STATE_ROOT override becomes absolute (a no-op for the
+  // absolute default): the vendored-runtime `current` symlink stores its target verbatim, and a
+  // relative target would resolve against the LINK's own dir, not cwd — dangling it. The launchers
+  // + service run from the package dir, so cwd is stable for the relative case anyway.
+  return resolve(process.env.HERDR_FACTORY_STATE_ROOT?.trim() || join(homedir(), ".local", "state", "herdr-factory"));
 }
 
 /** Expand a leading `~`/`~/` and any `$HOME`/`${HOME}` to the home directory. Absolute paths and
@@ -403,6 +407,51 @@ export function globalDbPath(): string {
  *  dependency at runtime. */
 export function nodePathFile(): string {
   return join(stateRoot(), "node-path");
+}
+
+// ── Vendored Node runtime (managed installs only — a plain dev checkout uses the ambient node). ──
+// A `curl | install.sh` install downloads the pinned official Node (see .node-version) into
+// `<state>/runtime/<version>/` and points a STABLE `current` symlink at it. Everything that spawns
+// node (the launchers, the launchd/systemd service, the supervisor's spawnServe) invokes node
+// through that symlink, so re-provisioning a bumped Node is one atomic symlink flip — no service
+// rewrite. `provisionNode()` (src/watchers/provision.ts) creates/flips it; the self-updater calls
+// it whenever `.node-version` changes.
+
+/** Root of the vendored Node runtimes: `<state>/runtime`. */
+export function runtimeRoot(): string {
+  return join(stateRoot(), "runtime");
+}
+/** A specific vendored Node version dir: `<state>/runtime/<version>`. */
+export function runtimeVersionDir(version: string): string {
+  return join(runtimeRoot(), version);
+}
+/** Stable symlink pointing at the active vendored Node version dir: `<state>/runtime/current`. */
+export function runtimeCurrentLink(): string {
+  return join(runtimeRoot(), "current");
+}
+/** Stable path to the vendored `node` binary, through the `current` symlink. This is what the
+ *  node-path file / service point at, so a Node bump only moves the symlink. */
+export function managedNodePath(): string {
+  return join(runtimeCurrentLink(), "bin", "node");
+}
+/** Is the given node binary the vendored one (i.e. living under `<state>/runtime`)? Used to decide
+ *  whether to bake the stable symlink path vs the concrete execPath. */
+export function isManagedNode(execPath: string): boolean {
+  const root = runtimeRoot();
+  return execPath === root || execPath.startsWith(root + sep);
+}
+/** The node binary to (re)spawn/schedule with: the baked node-path if it resolves to a real binary
+ *  (the vendored `runtime/current/bin/node` in a managed install — so a Node bump that flips the
+ *  symlink propagates without rewriting anything), else the caller's own execPath (dev checkout).
+ *  Falls back to execPath if the baked path is missing/stale so we never spawn a vanished node. */
+export function resolvedNodePath(fallback: string): string {
+  try {
+    const baked = readFileSync(nodePathFile(), "utf8").trim();
+    if (baked && existsSync(baked)) return baked;
+  } catch {
+    /* no baked path yet */
+  }
+  return fallback;
 }
 
 /** A repo's config folder (`<configDir>/repos/<name>/`) — where its config.yml + env live.

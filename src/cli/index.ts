@@ -1,7 +1,11 @@
-import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { createReadStream, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join, sep } from "node:path";
 import { Command } from "commander";
-import { configJsonSchema, configSchemaPath, globalDbPath, nodePathFile, writeConfigSchema } from "../config.ts";
+import { S3Client } from "@aws-sdk/client-s3";
+import { Upload } from "@aws-sdk/lib-storage";
+import { fromNodeProviderChain } from "@aws-sdk/credential-providers";
+import { lookup as mimeLookup } from "mime-types";
+import { configJsonSchema, configSchemaPath, globalDbPath, isManagedNode, managedNodePath, nodePathFile, writeConfigSchema } from "../config.ts";
 import { openDb } from "../db/index.ts";
 import { Store } from "../db/store.ts";
 import { systemClock, type Run } from "../types.ts";
@@ -9,12 +13,13 @@ import type { Deps } from "../core/deps.ts";
 import { bounceStep, claimTicket, reconcileRepo, reconcileRun, requestHumanInput, teardownTicket, withTickLock, withTickLockWaiting } from "../core/reconcile.ts";
 import { MEMORY_DIR, stepByName } from "../core/step.ts";
 import { run } from "../clients/exec.ts";
-import * as launchd from "../watchers/launchd.ts";
+import * as service from "../watchers/service.ts";
 import { buildDeps, today } from "../build-deps.ts";
 import { resolveActiveRun, resolveBeltName } from "../resolve.ts";
 import { serve } from "../server/serve.ts";
 import { ensureUp, stopServer, type Log } from "../watchers/supervisor.ts";
 import { selfUpdate } from "../watchers/updater.ts";
+import { pinnedNodeVersion, provisionNode } from "../watchers/provision.ts";
 import { NoServerError, pingHealth, readServerInfo, serverFetch, viaServerOrLocal } from "../server/client.ts";
 import { VERSION } from "../version.ts";
 import { initTelemetry, recordCliDuration, shutdownTelemetry, telemetryEnabled, telemetryEvent, telemetrySpan } from "../telemetry/index.ts";
@@ -25,20 +30,40 @@ function fail(e: unknown): never {
   process.exit(1);
 }
 
-/** Record this node binary so `bin/herdr-factory` can re-exec with a known Node >=24 from any cwd
- *  (see config.nodePathFile). Best-effort + guarded to >=24 so we never bake an unusable path (the
- *  CLI effectively only ever runs under >=24 anyway — type-stripping + node:sqlite require it).
- *  Runs on every invocation, so it self-heals as the pinned node is upgraded. */
+/** Record this node binary so `bin/herdr-factory` can re-exec with a known Node >=26 from any cwd
+ *  (see config.nodePathFile). Best-effort + guarded to >=26 so we never bake an unusable path (the
+ *  CLI effectively only ever runs under >=26 anyway — type-stripping + node:sqlite + the TUI's FFI
+ *  require it). Runs on every invocation, so it self-heals as the pinned node is upgraded.
+ *  When running under the vendored runtime (a managed install), bake the STABLE
+ *  `<state>/runtime/current/bin/node` symlink path rather than this concrete version dir — so a
+ *  later `.node-version` bump (which just flips that symlink) needs no re-bake. */
 function bakeNodePath(): void {
   try {
-    if (Number(process.versions.node.split(".")[0]) < 24) return;
+    if (Number(process.versions.node.split(".")[0]) < 26) return;
     const file = nodePathFile();
-    if (existsSync(file) && readFileSync(file, "utf8") === process.execPath) return;
+    let target: string;
+    if (isManagedNode(process.execPath)) {
+      target = managedNodePath();
+    } else {
+      // Never DEMOTE a vendored-runtime path to a concrete system/nvm binary. A worker agent may run
+      // the CLI under some ambient Node >=26 (the launcher prefers the active node); if a managed node
+      // is already baked and still present, keep it — so `.node-version` bumps keep propagating via the
+      // `current` symlink and the service's ExecStart never gets pinned to a volatile system node.
+      let existing = "";
+      try {
+        existing = readFileSync(file, "utf8").trim();
+      } catch {
+        /* nothing baked yet */
+      }
+      if (existing && isManagedNode(existing) && existsSync(existing)) return;
+      target = process.execPath;
+    }
+    if (existsSync(file) && readFileSync(file, "utf8") === target) return;
     mkdirSync(dirname(file), { recursive: true });
     // Atomic publish (write sibling temp, then rename) so a concurrent launcher `cat` never reads a
     // torn/empty file — writeFileSync truncates first, and multiple workers can bake at once.
     const tmp = `${file}.${process.pid}`;
-    writeFileSync(tmp, process.execPath);
+    writeFileSync(tmp, target);
     renameSync(tmp, file);
   } catch {
     /* best-effort: a read-only / uncreatable state dir must never break the CLI */
@@ -209,7 +234,7 @@ program
       console.log(
         `server: ${healthy ? `running (pid ${info!.pid}, port ${info!.port}, v${info!.version})` : info ? "advertised but not responding" : "not running"}`,
       );
-      console.log(`supervisor: ${(await launchd.isLoaded()) ? "loaded" : "not loaded"}`);
+      console.log(`supervisor: ${(await service.isLoaded()) ? "loaded" : "not loaded"}`);
     } catch (e) {
       fail(e);
     }
@@ -490,9 +515,28 @@ program
       // overwrites an earlier upload; the pr step embeds whatever the latest evidence handoff cites.
       const stamp = new Date().toISOString().replace(/[:.]/g, "-");
       const prefix = [ev.keyPrefix, activeRun.ticketKey, `${activeRun.id}-${stamp}`].filter(Boolean).join("/");
-      const args = ["s3", "cp", dir, `s3://${ev.bucket}/${prefix}/`, "--recursive", "--region", ev.region];
-      if (ev.profile) args.push("--profile", ev.profile);
-      await run("aws", args); // shells to the AWS CLI (ambient credential chain) — no creds stored/logged
+      // Upload via the AWS SDK (was `aws s3 cp --recursive`) — so AWS is a pnpm dep the self-updater
+      // manages, not an unmanaged system binary. No `credentials` ⇒ the SDK's default provider chain
+      // (env → SSO → ~/.aws → process → IMDS/role) — the SAME ambient chain the CLI read; a named
+      // `profile` resolves through that chain (handles the SSO/assume-role case a bare fromIni misses).
+      // No creds are stored or logged. `Upload` does multipart automatically for large evidence video.
+      const s3 = new S3Client({
+        region: ev.region,
+        ...(ev.profile ? { credentials: fromNodeProviderChain({ profile: ev.profile }) } : {}),
+      });
+      for (const rel of files) {
+        // ContentType is load-bearing: `aws s3 cp` guessed MIME on upload; the SDK defaults to
+        // application/octet-stream, which makes CloudFront serve screenshots/video as downloads.
+        await new Upload({
+          client: s3,
+          params: {
+            Bucket: ev.bucket,
+            Key: `${prefix}/${rel}`, // posix `rel` ⇒ keys match the CloudFront URLs printed below
+            Body: createReadStream(join(dir, rel)),
+            ContentType: mimeLookup(rel) || "application/octet-stream",
+          },
+        }).done();
+      }
       console.log(`uploaded ${files.length} evidence file(s) to s3://${ev.bucket}/${prefix}/`);
       console.log("public URLs:");
       for (const f of files) {
@@ -560,6 +604,18 @@ program
   }));
 
 program
+  .command("provision-node")
+  .description("download + verify the pinned Node (from .node-version) into <state>/runtime and point `current` at it")
+  .action(cliAction("provision-node", async () => {
+    try {
+      const res = await provisionNode(pinnedNodeVersion(), consoleLog);
+      console.log(`node ${res.version} ${res.changed ? "provisioned (current → this)" : "already current"} at ${res.nodePath}`);
+    } catch (e) {
+      fail(e);
+    }
+  }));
+
+program
   .command("reload")
   .description("hot-reload config: the running server re-reads every repo's config + re-discovers repos (no restart)")
   .action(cliAction("reload", async () => {
@@ -600,9 +656,9 @@ program
   .action(cliAction("install", async () => {
     try {
       writeConfigSchema(); // keep the editor schema current with this version's config shape
-      await launchd.install();
+      await service.install();
       await ensureUp({}, consoleLog);
-      console.log(`installed + loaded ${launchd.label()} — scheduled ensure-up keeps the server serving all configured repos`);
+      console.log(`installed + loaded ${service.label()} — scheduled ensure-up keeps the server serving all configured repos`);
       console.log(`config schema at ${configSchemaPath()} (reference it with: # yaml-language-server: $schema=../../config.schema.json)`);
     } catch (e) {
       fail(e);
@@ -614,9 +670,9 @@ program
   .description("remove the supervisor job and stop the server (in-flight workers untouched)")
   .action(cliAction("uninstall", async () => {
     try {
-      await launchd.uninstall();
+      await service.uninstall();
       await stopServer(consoleLog);
-      console.log(`uninstalled ${launchd.label()}`);
+      console.log(`uninstalled ${service.label()}`);
     } catch (e) {
       fail(e);
     }
@@ -627,9 +683,9 @@ program
   .description("load the supervisor job (and bring the server up)")
   .action(cliAction("start", async () => {
     try {
-      await launchd.start();
+      await service.start();
       await ensureUp({}, consoleLog);
-      console.log(`started ${launchd.label()}`);
+      console.log(`started ${service.label()}`);
     } catch (e) {
       fail(e);
     }
@@ -640,9 +696,9 @@ program
   .description("unload the supervisor job and stop the server (workers keep running)")
   .action(cliAction("stop", async () => {
     try {
-      await launchd.stop();
+      await service.stop();
       await stopServer(consoleLog);
-      console.log(`stopped ${launchd.label()}`);
+      console.log(`stopped ${service.label()}`);
     } catch (e) {
       fail(e);
     }

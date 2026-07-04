@@ -19,15 +19,16 @@ if [ "$#" -eq 0 ]; then
   exec "$pkg/bin/herdr-factory-tui"
 fi
 
-# herdr-factory must run on Node >= 24 (native type-stripping + node:sqlite). Prefer the caller's
-# active `node` when it's new enough; otherwise re-exec with the Node path the CLI baked on a prior
-# >= 24 run (config.nodePathFile / cli bakeNodePath). So herdr-factory always runs on its own
-# Node 24 regardless of the caller's cwd (worker agents invoke it from other repos' worktrees that
-# activate an older node) — with no version-manager dependency at runtime.
+# herdr-factory must run on Node >= 26 (native type-stripping + node:sqlite; the TUI additionally
+# needs FFI). Prefer the caller's active `node` when it's new enough; otherwise re-exec with the
+# Node path the CLI baked on a prior >= 26 run (config.nodePathFile / cli bakeNodePath) — in a
+# managed install that's the vendored `<state>/runtime/current/bin/node`. So herdr-factory always
+# runs on a good Node regardless of the caller's cwd (worker agents invoke it from other repos'
+# worktrees that activate an older node) — with no version-manager dependency at runtime.
 node_major() { local v; v="$("$1" -v 2>/dev/null)" || return 1; v="${v#v}"; printf '%s' "${v%%.*}"; }
 
 m="$(node_major node || true)"
-if [ -n "$m" ] && [ "$m" -ge 24 ]; then
+if [ -n "$m" ] && [ "$m" -ge 26 ]; then
   exec node src/cli/index.ts "$@"
 fi
 
@@ -36,14 +37,14 @@ if [ -r "$baked" ]; then
   bnode="$(cat "$baked" 2>/dev/null || true)"
   if [ -n "$bnode" ] && [ -x "$bnode" ]; then
     bm="$(node_major "$bnode" || true)"
-    if [ -n "$bm" ] && [ "$bm" -ge 24 ]; then
+    if [ -n "$bm" ] && [ "$bm" -ge 26 ]; then
       exec "$bnode" src/cli/index.ts "$@"
     fi
   fi
 fi
 
-echo "herdr-factory requires Node >= 24, but the active node is '$(node -v 2>/dev/null || echo none)'" >&2
+echo "herdr-factory requires Node >= 26, but the active node is '$(node -v 2>/dev/null || echo none)'" >&2
 echo "and no usable baked Node path was found ($baked)." >&2
-echo "Fix: run any herdr-factory command once with Node >= 24 active (e.g. from this repo's dir, or" >&2
-echo "via your version manager) to bake the path; afterwards it works from any directory." >&2
+echo "Fix: run install.sh (which vendors a pinned Node), or run any herdr-factory command once with" >&2
+echo "Node >= 26 active to bake the path; afterwards it works from any directory." >&2
 exit 1

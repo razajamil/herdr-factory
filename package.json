@@ -17,9 +17,12 @@
     "schema": "node src/cli/index.ts schema --stdout > config.schema.json"
   },
   "engines": {
-    "node": ">=24"
+    "node": ">=26.3.0"
   },
   "dependencies": {
+    "@aws-sdk/client-s3": "^3.716.0",
+    "@aws-sdk/credential-providers": "^3.716.0",
+    "@aws-sdk/lib-storage": "^3.716.0",
     "@effect/opentelemetry": "^0.63.0",
     "@effect/platform": "^0.96.2",
     "@hono/node-server": "^2.0.5",
@@ -38,10 +41,12 @@
     "commander": "^15.0.0",
     "effect": "^3.21.4",
     "hono": "^4.12.26",
+    "mime-types": "^3.0.1",
     "yaml": "^2.9.0",
     "zod": "^4.4.3"
   },
   "devDependencies": {
+    "@types/mime-types": "^3.0.1",
     "@types/node": "^25.9.3",
     "typescript": "^6.0.3",
     "vitest": "^4.1.9"

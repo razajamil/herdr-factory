@@ -210,7 +210,7 @@ export function buildDescriptors(draft: Document, rebuild: () => void, confirm: 
   });
 
   // ── evidence (optional top-level block — where the evidence step publishes captured media) ──
-  // Non-secret pointers only; AWS creds come from the ambient AWS CLI chain (no secret rows here).
+  // Non-secret pointers only; AWS creds come from the ambient AWS credential chain (no secret rows here).
   // Modelled as an add/remove optional block (like a work source): when absent, an "add" action
   // creates it; when present, its fields + a "remove" action are shown — so a block the user no
   // longer wants can always be cleared (flushInputs never deletes keys, so a plain text field for an

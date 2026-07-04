@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
-# Launcher for the herdr-factory TUI. Unlike the engine (Node >= 24), the TUI renders through
-# opentui's native core, which needs Node >= 26 with FFI enabled (`--experimental-ffi`). This repo's
-# .node-version pins Node 24 for the engine, so here we deliberately reach for a Node 26:
+# Launcher for the herdr-factory TUI. It renders through opentui's native core, which needs
+# Node >= 26 with FFI enabled (`--experimental-ffi`). The engine and TUI now share one pinned Node
+# (.node-version = 26.x), so this resolves the same Node the engine does:
 #   1. the caller's active `node`, if it's already >= 26;
-#   2. else `mise exec node@26` (this repo's dev setup);
-#   3. else the Node path the engine baked on a prior run, if that happens to be >= 26.
+#   2. else the baked Node path (in a managed install, the vendored `runtime/current/bin/node`).
 # Resolves its own location through symlinks and runs from the package dir so src/ resolves
 # regardless of caller cwd.
 set -euo pipefail
@@ -31,12 +30,7 @@ if [ -n "$m" ] && [ "$m" -ge 26 ]; then
   exec node "${node_flags[@]}" "$entry" "$@"
 fi
 
-# 2. mise-provided Node 26 (dev setup).
-if command -v mise >/dev/null 2>&1 && mise exec node@26 -- node -v >/dev/null 2>&1; then
-  exec mise exec node@26 -- node "${node_flags[@]}" "$entry" "$@"
-fi
-
-# 3. Baked engine node, if it's >= 26.
+# 2. Baked node, if it's >= 26 (in a managed install, the vendored runtime/current/bin/node).
 baked="${HERDR_FACTORY_STATE_ROOT:-${HOME:-}/.local/state/herdr-factory}/node-path"
 if [ -r "$baked" ]; then
   bnode="$(cat "$baked" 2>/dev/null || true)"
@@ -49,7 +43,6 @@ if [ -r "$baked" ]; then
 fi
 
 echo "herdr-factory-tui requires Node >= 26 with FFI (opentui's native renderer)." >&2
-echo "Active node is '$(node -v 2>/dev/null || echo none)', and no Node 26 was found via mise or the" >&2
-echo "baked engine node path ($baked)." >&2
-echo "Fix: install Node 26 (e.g. \`mise use -g node@26\`) and retry." >&2
+echo "Active node is '$(node -v 2>/dev/null || echo none)', and no usable baked Node path was found ($baked)." >&2
+echo "Fix: run install.sh (which vendors a pinned Node 26), or activate Node >= 26 and retry." >&2
 exit 1
