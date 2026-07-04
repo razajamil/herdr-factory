@@ -1,8 +1,9 @@
 // Doctor tab — machine-wide health (the same `baseGroups()` the `doctor` CLI command prints),
 // rendered as green ✓ / red ✗ rows grouped by ownership (managed by herdr-factory vs you provide).
-// The checks shell out to git/gh/claude/herdr and probe the server, so they run LAZILY: only when
-// the tab receives focus (activate), and again on `r`. A generation counter drops the render if you
-// leave the tab mid-run, so a slow check never paints onto another tab.
+// The checks run LAZILY: only when the tab receives focus (activate), and again on `r`. On focus it
+// runs the SHALLOW checks (local, side-effect-free); `d` runs the deep ones (gh auth, herdr daemon —
+// network) on demand. A generation counter drops the render if you leave the tab mid-run, so a slow
+// check never paints onto another tab.
 import { BoxRenderable, ScrollBoxRenderable, TextRenderable, type CliRenderer } from "@opentui/core";
 import type { KeyEvent } from "@opentui/core";
 import { baseGroups } from "../doctor.ts";
@@ -49,13 +50,13 @@ export function createDoctor(renderer: CliRenderer): TabView {
     list.add(row);
   }
 
-  async function run(): Promise<void> {
+  async function run(deep = false): Promise<void> {
     const token = ++gen;
-    banner.content = "running checks…";
+    banner.content = deep ? "running deep checks (gh auth, herdr daemon)…" : "running checks…";
     banner.fg = theme.text.secondary;
     let groups;
     try {
-      groups = await baseGroups();
+      groups = await baseGroups(deep);
     } catch (e) {
       if (token !== gen) return;
       clearList();
@@ -78,7 +79,9 @@ export function createDoctor(renderer: CliRenderer): TabView {
       }
     });
     list.scrollTop = 0;
-    banner.content = failures === 0 ? "● all checks passed · r: re-run" : `⚠ ${failures} check(s) failing · r: re-run`;
+    const mode = deep ? "deep" : "shallow";
+    const hint = "r: re-run · d: deep";
+    banner.content = failures === 0 ? `● all checks passed (${mode}) · ${hint}` : `⚠ ${failures} check(s) failing (${mode}) · ${hint}`;
     banner.fg = failures === 0 ? theme.status.good : theme.status.warn;
   }
 
@@ -93,7 +96,11 @@ export function createDoctor(renderer: CliRenderer): TabView {
         key.preventDefault();
         break;
       case "r":
-        void run();
+        void run(false);
+        key.preventDefault();
+        break;
+      case "d":
+        void run(true); // deep: interacts with gh/herdr (network) — on demand only
         key.preventDefault();
         break;
     }

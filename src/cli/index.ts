@@ -735,17 +735,20 @@ program
 
 program
   .command("doctor")
-  .description("machine-wide health check (node, herdr, gh, claude, git, supervisor, server); pass --repo <name> to also run repo-specific checks (config, sources, origin)")
-  .action(cliAction("doctor", async () => {
+  .description("health check: local + presence by default; --deep also interacts with services (gh auth, work-source health, evidence-bucket write). Add --repo <name> for repo-specific checks")
+  .option("--deep", "also interact with external services: gh auth, work-source health, and an evidence-bucket write probe (network + a tiny S3 write)")
+  .action(cliAction("doctor", async (opts: { deep?: boolean }) => {
+    const deep = opts.deep ?? false;
     const repo = (program.opts() as { repo?: string }).repo;
-    const groups = await baseGroups();
-    if (repo) groups.push(await repoGroup(repo));
+    const groups = await baseGroups(deep);
+    if (repo) groups.push(await repoGroup(repo, deep));
     let failed = false;
     groups.forEach((g, i) => {
       if (i > 0) console.log("");
       failed = printDoctorGroup(g) || failed;
     });
-    if (!repo) console.log("\n(run `herdr-factory --repo <name> doctor` to add repo-specific checks)");
+    if (!deep) console.log("\n(shallow — add `--deep` to verify gh auth, work-source health, and evidence-bucket writes)");
+    else if (!repo) console.log("\n(run `herdr-factory --repo <name> doctor --deep` to add repo-specific checks)");
     if (failed) process.exitCode = 1; // so scripts/CI can gate on a clean doctor
   }));
 

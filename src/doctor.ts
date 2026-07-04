@@ -5,6 +5,8 @@
 // separate group behind `--repo`.
 import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import { PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
+import { fromNodeProviderChain } from "@aws-sdk/credential-providers";
 import { run } from "./clients/exec.ts";
 import { assertMainCheckout, globalDbPath, isManagedNode } from "./config.ts";
 import { buildDeps } from "./build-deps.ts";
@@ -37,8 +39,15 @@ async function attempt(name: string, fn: () => Promise<string | void>): Promise<
   }
 }
 
-/** Machine-wide checks, grouped by ownership. No repo needed. */
-export async function baseGroups(): Promise<DoctorGroup[]> {
+/** Is a tool on PATH? Presence only — doesn't invoke it (so no network/side effects). */
+async function onPath(tool: string): Promise<void> {
+  await run("sh", ["-c", `command -v ${JSON.stringify(tool)} >/dev/null 2>&1`]);
+}
+
+/** Machine-wide checks, grouped by ownership. No repo needed.
+ *  `deep` = also interact with external services (gh auth, herdr daemon); the default is local-only
+ *  and side-effect-free (tool presence, no network calls). */
+export async function baseGroups(deep = false): Promise<DoctorGroup[]> {
   const herdrBin = process.env.HERDR_BIN_PATH ?? "herdr";
   const info = readServerInfo();
   const running = info ? await pingHealth(info.port).catch(() => false) : false;
@@ -63,11 +72,17 @@ export async function baseGroups(): Promise<DoctorGroup[]> {
     }),
   ]);
 
+  // Default: presence on PATH (local, no network). Deep: actually interact (gh auth verifies the
+  // GitHub token; herdr `workspace list` verifies the daemon responds).
   const provided = await Promise.all([
-    attempt("git", async () => void (await run("git", ["--version"]))),
-    attempt("herdr", async () => void (await run(herdrBin, ["workspace", "list"]))),
-    attempt("gh (authenticated)", async () => void (await run("gh", ["auth", "status"]))),
-    attempt("claude", async () => void (await run("claude", ["--version"]))),
+    attempt("git", () => onPath("git")),
+    deep
+      ? attempt("herdr (daemon responds)", async () => void (await run(herdrBin, ["workspace", "list"])))
+      : attempt("herdr", () => onPath(herdrBin)),
+    deep
+      ? attempt("gh (authenticated)", async () => void (await run("gh", ["auth", "status"])))
+      : attempt("gh", () => onPath("gh")),
+    attempt("claude", () => onPath("claude")),
   ]);
 
   return [
@@ -76,10 +91,11 @@ export async function baseGroups(): Promise<DoctorGroup[]> {
   ];
 }
 
-/** Repo-specific checks: config validity, the repo checkout, origin, each work source's health, and
- *  Jira auth. A config-load failure is a ✗ (not a throw), so the caller can still show the base
- *  groups. Evidence is reported as an always-ok info line (it's optional). */
-export async function repoGroup(repo: string): Promise<DoctorGroup> {
+/** Repo-specific checks: config validity, the repo checkout, origin, work sources, and evidence.
+ *  A config-load failure is a ✗ (not a throw), so the caller can still show the base groups.
+ *  `deep` = also interact with services (work-source health endpoints, an evidence-bucket write
+ *  probe); the default only inspects local config. */
+export async function repoGroup(repo: string, deep = false): Promise<DoctorGroup> {
   const checks: DoctorCheck[] = [];
   let deps: Deps | undefined;
   checks.push(
@@ -97,17 +113,77 @@ export async function repoGroup(repo: string): Promise<DoctorGroup> {
       }),
     );
     for (const src of d.sources) {
-      checks.push(await attempt(`source ${src.name} (${src.type})`, async () => void (await src.client.health())));
+      // Default: it's configured (local). Deep: hit the backend's health endpoint (network).
+      if (deep) {
+        checks.push(await attempt(`source ${src.name} (${src.type})`, async () => void (await src.client.health())));
+      } else {
+        checks.push({ name: `source ${src.name} (${src.type})`, ok: true, detail: "configured (--deep to health-check)" });
+      }
+      // Jira secrets present is a cheap local check — keep in both modes; deep's health() proves they work.
       if (src.type === "jira") {
         checks.push(
-          await attempt(`jira auth for ${src.name}`, async () => {
+          await attempt(`jira secrets for ${src.name}`, async () => {
             if (!d.secrets.jiraEmail || !d.secrets.jiraApiToken) throw new Error("JIRA_EMAIL / JIRA_API_TOKEN missing in the repo env file");
           }),
         );
       }
     }
     const ev = d.config.evidence;
-    checks.push({ name: "evidence", ok: true, detail: ev ? `s3://${ev.bucket} (${ev.region}) → ${ev.cloudfrontDomain}` : "not configured" });
+    // Default: report it's configured (local). Deep: PutObject write-probe (network + a tiny S3 write).
+    if (!ev) {
+      checks.push({ name: "evidence", ok: true, detail: "not configured (optional)" });
+    } else if (deep) {
+      checks.push(await attempt(`evidence bucket (s3://${ev.bucket})`, () => probeEvidenceBucket(ev)));
+    } else {
+      checks.push({ name: "evidence", ok: true, detail: `configured: s3://${ev.bucket}/${ev.keyPrefix || ""} (${ev.region}) — --deep to write-probe` });
+    }
   }
   return { title: `repo ${repo}`, checks };
+}
+
+/** Verify the evidence upload can actually reach AND write the bucket: PUT a 0-byte probe object at
+ *  `<key_prefix>/.herdr-doctor` (a fixed key, overwritten each run so nothing accumulates) using the
+ *  SAME ambient credential chain the real upload uses. This exercises the exact s3:PutObject
+ *  permission — not just reachability. Returns a success detail or throws a concise, actionable
+ *  reason. NOTE: this writes one tiny object to the bucket (by design). */
+async function probeEvidenceBucket(ev: NonNullable<Deps["config"]["evidence"]>): Promise<string> {
+  // Silence the SDK's own console warnings (ambient-credential-source notes, body-length hints) so
+  // they don't leak into the doctor output — the check reports the outcome itself.
+  const silent = { debug() {}, info() {}, warn() {}, error() {} };
+  const s3 = new S3Client({
+    region: ev.region,
+    maxAttempts: 1, // a doctor should fail fast, not retry a broken config for ~20s
+    logger: silent,
+    ...(ev.profile ? { credentials: fromNodeProviderChain({ profile: ev.profile, logger: silent }) } : {}),
+  });
+  const key = [ev.keyPrefix, ".herdr-doctor"].filter(Boolean).join("/");
+  try {
+    // A short known-length body (avoids the SDK's "stream of unknown length" PutObject warning).
+    await s3.send(new PutObjectCommand({ Bucket: ev.bucket, Key: key, Body: "herdr-factory doctor probe\n", ContentType: "text/plain" }), {
+      abortSignal: AbortSignal.timeout(8000),
+    });
+    return `writable — wrote s3://${ev.bucket}/${key} (${ev.region})`;
+  } catch (e) {
+    throw new Error(explainS3Error(e));
+  } finally {
+    s3.destroy();
+  }
+}
+
+/** Map an AWS SDK error to a short, actionable doctor reason. */
+function explainS3Error(e: unknown): string {
+  const err = e as { name?: string; message?: string; $metadata?: { httpStatusCode?: number } };
+  const name = err.name ?? "";
+  const status = err.$metadata?.httpStatusCode;
+  const msg = err.message ?? String(e);
+  if (/Credential|Token/i.test(name) || /could not load credentials|credential/i.test(msg)) {
+    return "no AWS credentials resolved (checked env, SSO, ~/.aws, IMDS) — configure creds or the `profile`";
+  }
+  if (name === "NoSuchBucket") return "bucket does not exist";
+  if (name === "PermanentRedirect" || /AuthorizationHeaderMalformed|the bucket is in this region|expecting.*region/i.test(msg)) {
+    return "wrong region — the bucket is in a different AWS region";
+  }
+  if (status === 403 || /AccessDenied|Forbidden/i.test(name)) return "access denied — credentials lack s3:PutObject on this bucket/prefix";
+  if (/Timeout|Abort/i.test(name) || /timed out|aborted/i.test(msg)) return "timed out reaching S3";
+  return `${name || "error"}: ${msg}`.slice(0, 160);
 }

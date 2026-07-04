@@ -185,7 +185,7 @@ export function createApp(renderer: CliRenderer): { currentTab: () => number; at
   function footerHints(idx: number): string {
     const tail = "   ·   Tab: switch view · Esc: top level · q: quit";
     if (idx === 1) return " 1 repos · 2 fields   ·   ↑↓: move · ↵: open/edit · [ ]: reorder" + tail;
-    if (idx === 2) return " ↑↓: scroll · r: re-run checks" + tail;
+    if (idx === 2) return " ↑↓: scroll · r: re-run · d: deep (gh auth, herdr daemon)" + tail;
     return " ↑↓: move · ↵: timeline · t: tick · c: claim · x: teardown · r: refresh" + tail;
   }
 
