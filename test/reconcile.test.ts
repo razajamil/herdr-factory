@@ -7,7 +7,7 @@ import { Store } from "../src/db/store.ts";
 import { applyPendingFocus, bounceStep, flushTransitionOutbox, reconcileRepo, reconcileRun, requestHumanInput, resumeRun, withRunLock, withRunLockWaiting, withTickLock } from "../src/core/reconcile.ts";
 import { HerdrUnreachableError, type BeltRuntime, type Deps, type GitApi, type GitHubApi, type HerdrApi, type SourceRuntime, type WorkSource } from "../src/core/deps.ts";
 import type { Config, Secrets, StepConfig } from "../src/config.ts";
-import type { FocusedPane, HumanAskInput, HumanPollInput, HumanReply, MatchItem, Phase, PrInfo, ReviewSig, Ticket, WorkState } from "../src/types.ts";
+import type { FocusedPane, HumanAskInput, HumanPollInput, HumanReply, MatchItem, Phase, PrInfo, PrSnapshot, ReviewSig, Ticket, WorkState } from "../src/types.ts";
 
 const tmps: string[] = [];
 afterEach(() => {
@@ -68,6 +68,8 @@ function build(opts: { multi?: boolean } = {}) {
     humanAsk: [] as HumanAskInput[],
     humanPoll: [] as HumanPollInput[],
     postNotes: [] as [string, string][],
+    prSnapshots: [] as number[][],
+    reviewSig: 0,
     agentStart: 0,
     notify: 0,
   };
@@ -139,7 +141,18 @@ function build(opts: { multi?: boolean } = {}) {
   const github: GitHubApi = {
     prForBranch: async () => state.pr,
     prByNumber: async () => (state.prByNumber === undefined ? state.pr : state.prByNumber),
-    reviewSignature: async () => state.sig,
+    reviewSignature: async () => {
+      calls.reviewSig += 1;
+      return state.sig;
+    },
+    // Loose fake (like prByNumber): every requested number resolves from the PR template.
+    prSnapshots: async (_repo, numbers) => {
+      calls.prSnapshots.push([...numbers]);
+      const pr = state.prByNumber === undefined ? state.pr : state.prByNumber;
+      const map = new Map<number, PrSnapshot>();
+      for (const n of numbers) if (pr) map.set(n, { ...pr, number: n, sig: state.sig });
+      return map;
+    },
     currentLogin: async () => "test-user",
   };
   const git: GitApi = {
@@ -153,7 +166,7 @@ function build(opts: { multi?: boolean } = {}) {
   const config: Config = {
     repoName: "demo",
     repo: { path: "/main-checkout", baseRef: "origin/master" },
-    limits: { maxActive: 3, watchHours: 7, attentionRenotifySeconds: 3600, developBudgetSeconds: 5400, stallSeconds: 2700, reviewBudgetSeconds: 1800, evidenceBudgetSeconds: 2400, prBudgetSeconds: 3600, maxBounces: 3, stepBudgetSeconds: 3600, tickIntervalSeconds: 60, reconcileConcurrency: 8, layoutWaitSeconds: 600 },
+    limits: { maxActive: 3, watchHours: 7, attentionRenotifySeconds: 3600, developBudgetSeconds: 5400, stallSeconds: 2700, reviewBudgetSeconds: 1800, evidenceBudgetSeconds: 2400, prBudgetSeconds: 3600, maxBounces: 3, stepBudgetSeconds: 3600, tickIntervalSeconds: 60, reconcileConcurrency: 8, maxClaimsPerTick: 10, layoutWaitSeconds: 600 },
     sources: sources.map((s) => ({ name: s.name, type: s.type })),
     belts,
     guidance: undefined,
@@ -304,7 +317,7 @@ describe("reconcile pipeline (work_to_pull_request belt)", () => {
   });
 
   it("ask-human parks a step, polls the source, then automatically resumes with the reply", async () => {
-    const { deps, store, state, worktree, calls } = build();
+    const { deps, store, state, worktree, calls, setNow } = build();
     const run = seed(store, worktree, "K-HITL", "running", "fix");
 
     const asked = await requestHumanInput(deps, run, "fix", "Which behavior should win when the flags conflict?");
@@ -319,7 +332,12 @@ describe("reconcile pipeline (work_to_pull_request belt)", () => {
     expect(store.getRun(run.id)!.phase).toBe("waiting_for_human");
     expect(store.getRun(run.id)!.step).toBe("fix");
 
+    // The miss backed the next poll off — a tick inside the window doesn't poll again.
+    await reconcileRun(deps, store.getRun(run.id)!);
+    expect(calls.humanPoll).toHaveLength(1);
+
     state.humanReply = { body: "Prefer the new flag and keep the legacy behavior as fallback.", externalId: "answer-1", author: "PM" };
+    setNow(1000 + 61); // past the first backoff (60s)
     await reconcileRun(deps, store.getRun(run.id)!);
 
     const got = store.getRun(run.id)!;
@@ -1165,5 +1183,52 @@ describe("per-run locks — nudges land while a tick is mid-pass", () => {
     await reconcileRepo(deps);
     expect(store.activeRunForTicket("demo", "jira", "K-M4")).toBeDefined();
     expect(store.countActive("demo")).toBe(4);
+  });
+});
+
+describe("rate limiting — batched PR polling, claim admission, poll backoff", () => {
+  it("a tick batches PR state for all reviewing runs and acts on it (no per-run gh calls)", async () => {
+    const { deps, store, state, worktree, calls } = build();
+    seed(store, worktree, "K-R1", "reviewing", null, { watchDeadline: 99999, prNumber: 41 });
+    seed(store, worktree, "K-R2", "reviewing", null, { watchDeadline: 99999, prNumber: 42 });
+    state.prByNumber = { number: 41, state: "OPEN", url: "u" }; // fake snapshot source
+    await reconcileRepo(deps);
+    expect(calls.prSnapshots).toHaveLength(1); // ONE batched fetch for the whole pass
+    expect(calls.prSnapshots[0]!.sort()).toEqual([41, 42]);
+    expect(calls.reviewSig).toBe(0); // signature came from the batch, not per-run calls
+  });
+
+  it("a merged PR detected via the batch tears the run down", async () => {
+    const { deps, store, state, worktree } = build();
+    const run = seed(store, worktree, "K-R3", "reviewing", null, { watchDeadline: 99999, prNumber: 55 });
+    state.prByNumber = { number: 55, state: "MERGED", url: "u" };
+    await reconcileRepo(deps);
+    const got = store.getRun(run.id)!;
+    expect(got.phase).toBe("done");
+    expect(got.outcome).toBe("merged");
+  });
+
+  it("claims per tick are capped (max_claims_per_tick), remaining backlog fills next passes", async () => {
+    const { deps, store, state } = build();
+    deps.config.limits.maxActive = 20;
+    deps.config.limits.maxClaimsPerTick = 2;
+    state.eligible = [ticket("K-C1"), ticket("K-C2"), ticket("K-C3"), ticket("K-C4"), ticket("K-C5")];
+    await reconcileRepo(deps);
+    expect(store.countActive("demo")).toBe(2); // capped
+    await reconcileRepo(deps);
+    expect(store.countActive("demo")).toBe(4); // next pass continues
+    await reconcileRepo(deps);
+    expect(store.countActive("demo")).toBe(5); // backlog drained
+  });
+
+  it("human-reply poll misses back off exponentially and cap at 5min", () => {
+    const { store } = build();
+    const run = store.createRun({ repo: "demo", workSource: "jira", belt: "ship", ticketKey: "K-B1", branch: "b" });
+    const q = store.createHumanQuestion({ runId: run.id, repo: "demo", workSource: "jira", ticketKey: "K-B1", question: "?" });
+    expect(store.recordHumanPollMiss(q.id).nextPollAt).toBe(1000 + 60);
+    expect(store.recordHumanPollMiss(q.id).nextPollAt).toBe(1000 + 120);
+    expect(store.recordHumanPollMiss(q.id).nextPollAt).toBe(1000 + 240);
+    expect(store.recordHumanPollMiss(q.id).nextPollAt).toBe(1000 + 300); // capped
+    expect(store.recordHumanPollMiss(q.id).nextPollAt).toBe(1000 + 300);
   });
 });

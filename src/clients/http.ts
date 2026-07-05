@@ -5,8 +5,9 @@
 // requests are exposed as Effects (composable) with a thin Promise wrapper for the clients.
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
+import * as Schedule from "effect/Schedule";
 import { runEffectPromise } from "../runtime/effect.ts";
-import { withTelemetrySpan } from "../telemetry/effect.ts";
+import { telemetryEventEffect, withTelemetrySpan } from "../telemetry/effect.ts";
 
 /** Default budget for a JSON API round-trip. Media downloads pass their own larger budget. */
 export const DEFAULT_HTTP_TIMEOUT_MS = 30_000;
@@ -120,13 +121,114 @@ export function httpExpectOk(req: HttpRequest, as: "text" | "bytes" = "text"): E
   );
 }
 
+// --- client-side rate limiting + retry ---------------------------------------
+
+/**
+ * A shared token bucket: `ratePerSec` sustained, `burst` peak. Guards a backend (one bucket per
+ * JiraClient) so OUR OWN fan-out — a cold start claiming dozens of tickets, dozens of parked
+ * runs polling for replies — can't stampede it into 429s. Time-based refill; no timers to manage.
+ */
+export class TokenBucket {
+  // NOTE: no constructor parameter properties — the CLI runs this file via Node's strip-only
+  // type-stripping, which doesn't support them.
+  private readonly ratePerSec: number;
+  private readonly burst: number;
+  private tokens: number;
+  private lastRefill: number;
+  constructor(ratePerSec: number, burst: number) {
+    this.ratePerSec = ratePerSec;
+    this.burst = burst;
+    this.tokens = burst;
+    this.lastRefill = Date.now();
+  }
+
+  private refill(): void {
+    const now = Date.now();
+    this.tokens = Math.min(this.burst, this.tokens + ((now - this.lastRefill) / 1000) * this.ratePerSec);
+    this.lastRefill = now;
+  }
+
+  /** Take a token if one is available right now. */
+  tryTake(): boolean {
+    this.refill();
+    if (this.tokens >= 1) {
+      this.tokens -= 1;
+      return true;
+    }
+    return false;
+  }
+
+  /** How long until the next token matures (0 = one is available now). */
+  msUntilAvailable(): number {
+    this.refill();
+    return this.tokens >= 1 ? 0 : Math.ceil(((1 - this.tokens) / this.ratePerSec) * 1000);
+  }
+}
+
+/** Wait for (then take) a token. Stack-safe recursive Effect — sleeps exactly until the next
+ *  token matures rather than busy-polling. */
+export function acquireToken(bucket: TokenBucket): Effect.Effect<void> {
+  return Effect.suspend(() =>
+    bucket.tryTake()
+      ? Effect.void
+      : Effect.sleep(Duration.millis(bucket.msUntilAvailable() + 5)).pipe(Effect.flatMap(() => acquireToken(bucket))),
+  );
+}
+
+/** Retry only what can plausibly succeed on retry: transport failures, timeouts, 429 and 5xx.
+ *  4xx (auth, bad request, missing transition) fails fast. */
+function isRetryable(e: HttpError): boolean {
+  if (e instanceof HttpStatusError) return e.status === 429 || e.status >= 500;
+  return true; // timeout / network
+}
+
+/** Cap on how long a server-sent Retry-After is honored — a pathological header must not park
+ *  a reconcile fiber for minutes. */
+const MAX_RETRY_AFTER_MS = 60_000;
+
+export interface HttpPolicy {
+  /** Shared per-backend bucket; every attempt (including retries) takes a token. */
+  bucket?: TokenBucket;
+  /** Extra attempts after the first (default 3). */
+  retries?: number;
+}
+
+/**
+ * The full outbound pipeline: token from the bucket → request → non-2xx as typed failure →
+ * retry with exponential backoff + jitter (Schedule) for retryable failures, honoring a 429/503
+ * Retry-After by sleeping it BEFORE the schedule's own delay. This is the item-6 seam layered on
+ * item 1's timeout-bounded attempts.
+ */
+export function httpWithPolicy(req: HttpRequest, policy: HttpPolicy = {}, as: "text" | "bytes" = "text"): Effect.Effect<HttpResponse, HttpError> {
+  const attempt = (policy.bucket ? acquireToken(policy.bucket) : Effect.void).pipe(
+    Effect.flatMap(() => httpExpectOk(req, as)),
+    Effect.catchAll((e) =>
+      e instanceof HttpStatusError && e.retryAfterMs != null && isRetryable(e)
+        ? telemetryEventEffect("http.retry_after_honored", { "url.full": req.url, "http.response.status_code": e.status, "retry_after.ms": e.retryAfterMs }).pipe(
+            Effect.flatMap(() => Effect.sleep(Duration.millis(Math.min(e.retryAfterMs!, MAX_RETRY_AFTER_MS)))),
+            Effect.flatMap(() => Effect.fail(e)),
+          )
+        : Effect.fail(e),
+    ),
+  );
+  return attempt.pipe(
+    Effect.retry({
+      while: isRetryable,
+      schedule: Schedule.exponential(Duration.millis(500), 2).pipe(
+        Schedule.jittered,
+        Schedule.intersect(Schedule.recurs(policy.retries ?? 3)),
+      ),
+    }),
+  );
+}
+
 /** Promise convenience for clients that aren't Effect-shaped yet. */
-export function httpOk(req: HttpRequest): Promise<HttpResponse> {
-  return runEffectPromise(httpExpectOk(req));
+export function httpOk(req: HttpRequest, policy?: HttpPolicy): Promise<HttpResponse> {
+  return runEffectPromise(policy ? httpWithPolicy(req, policy) : httpExpectOk(req));
 }
 
 /** As httpOk, but the body is returned as raw bytes (attachment downloads). */
-export async function httpOkBytes(req: HttpRequest): Promise<HttpResponse & { bytes: Buffer }> {
-  const res = await runEffectPromise(httpExpectOk(req, "bytes"));
+export async function httpOkBytes(req: HttpRequest, policy?: HttpPolicy): Promise<HttpResponse & { bytes: Buffer }> {
+  const res = await runEffectPromise(policy ? httpWithPolicy(req, policy, "bytes") : httpExpectOk(req, "bytes"));
   return { ...res, bytes: res.bytes! };
 }

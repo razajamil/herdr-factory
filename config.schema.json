@@ -95,6 +95,12 @@
           "exclusiveMinimum": 0,
           "maximum": 9007199254740991
         },
+        "max_claims_per_tick": {
+          "default": 10,
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991
+        },
         "layout_wait_seconds": {
           "default": 600,
           "type": "integer",

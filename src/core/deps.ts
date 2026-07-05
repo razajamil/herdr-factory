@@ -10,6 +10,7 @@ import type {
   HumanReply,
   MatchItem,
   PrInfo,
+  PrSnapshot,
   ReviewSig,
   SourceType,
   Ticket,
@@ -111,6 +112,9 @@ export interface GitHubApi {
   prForBranch(repo: string, branch: string): Promise<PrInfo | null>;
   prByNumber(repo: string, prNumber: number): Promise<PrInfo | null>;
   reviewSignature(repo: string, prNumber: number): Promise<ReviewSig>;
+  /** Batched state + review signature for many PRs (one GraphQL request per ~25) — the per-tick
+   *  bulk fetch for every reviewing/attention run. Unresolvable PRs are absent from the map. */
+  prSnapshots(repo: string, prNumbers: number[]): Promise<Map<number, PrSnapshot>>;
   /** The authenticated gh user's login (memoized); null if it can't be determined. */
   currentLogin(): Promise<string | null>;
 }

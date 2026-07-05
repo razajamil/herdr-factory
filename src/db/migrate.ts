@@ -217,6 +217,18 @@ const MIGRATIONS: { version: number; sql: string }[] = [
     // limits.attention_renotify_seconds while a run stays parked, tracked here.
     sql: `ALTER TABLE runs ADD COLUMN attention_notified_at INTEGER;`,
   },
+  {
+    version: 13,
+    // Human-reply poll backoff. Waiting runs used to poll their source (a Jira listComments call
+    // each) EVERY tick indefinitely — sustained per-minute load that scales with the parked-run
+    // count for a reply that takes a human minutes-to-hours. Misses now back the next poll off
+    // (60s doubling, capped at 5min), tracked per question. DEFAULT 0 = pre-existing questions
+    // are immediately due.
+    sql: `
+      ALTER TABLE human_questions ADD COLUMN poll_attempts INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE human_questions ADD COLUMN next_poll_at INTEGER NOT NULL DEFAULT 0;
+    `,
+  },
 ];
 
 /** Apply pending migrations in a transaction. Idempotent. */

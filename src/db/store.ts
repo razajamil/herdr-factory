@@ -161,6 +161,8 @@ interface HumanQuestionRow {
   answer: string | null;
   answer_external_id: string | null;
   answer_author: string | null;
+  poll_attempts: number;
+  next_poll_at: number;
   created_at: number;
   updated_at: number;
   answered_at: number | null;
@@ -181,6 +183,8 @@ function toHumanQuestion(r: HumanQuestionRow): HumanQuestion {
     answer: r.answer,
     answerExternalId: r.answer_external_id,
     answerAuthor: r.answer_author,
+    pollAttempts: r.poll_attempts,
+    nextPollAt: r.next_poll_at,
     createdAt: r.created_at,
     updatedAt: r.updated_at,
     answeredAt: r.answered_at,
@@ -659,6 +663,21 @@ export class Store {
       "question.status": q?.status,
       "patch.fields": patchFields(patch),
     });
+  }
+
+  /** Record a poll that found no reply: back the next poll off (60s doubling, capped at 5min).
+   *  Human replies take minutes-to-hours; per-tick polling of every waiting run was pure
+   *  source-API load for no latency benefit. */
+  recordHumanPollMiss(id: number): HumanQuestion {
+    const q = this.getHumanQuestion(id);
+    if (!q) throw new Error(`recordHumanPollMiss: no question ${id}`);
+    const attempts = q.pollAttempts + 1;
+    const delay = Math.min(60 * 2 ** (attempts - 1), 300);
+    const t = this.now();
+    this.db
+      .prepare("UPDATE human_questions SET poll_attempts = ?, next_poll_at = ?, updated_at = ? WHERE id = ?")
+      .run(attempts, t + delay, t, id);
+    return this.getHumanQuestion(id)!;
   }
 
   answerHumanQuestion(

@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { run, runJson } from "./exec.ts";
-import type { PrInfo, PrState, ReviewSig } from "../types.ts";
+import type { PrInfo, PrSnapshot, PrState, ReviewSig } from "../types.ts";
 
 interface ThreadsResp {
   data?: {
@@ -56,6 +56,72 @@ export class GitHubClient {
       { allowFail: true },
     ).catch(() => null);
     return pr && pr.number ? { number: pr.number, state: pr.state as PrState, url: pr.url } : null;
+  }
+
+  /**
+   * State + review signature for MANY PRs in one GraphQL request (chunked at 25/query, aliased
+   * `pr<n>` fields). This is what keeps the reviewing watch inside GitHub's rate budget at scale:
+   * per tick it replaces 3 `gh` calls per watched PR with ~1 call total. PRs that don't resolve
+   * are simply absent from the returned map. The signature hash is bit-identical to
+   * reviewSignature's, so runs freely mix batched and direct polling.
+   */
+  async prSnapshots(repo: string, prNumbers: number[]): Promise<Map<number, PrSnapshot>> {
+    const slash = repo.indexOf("/");
+    const owner = repo.slice(0, slash);
+    const name = repo.slice(slash + 1);
+    const out = new Map<number, PrSnapshot>();
+
+    const CHUNK = 25;
+    for (let i = 0; i < prNumbers.length; i += CHUNK) {
+      const chunk = prNumbers.slice(i, i + CHUNK);
+      const fields = chunk
+        .map(
+          (n) =>
+            `pr${n}: pullRequest(number: ${n}) { number state url ` +
+            `reviewThreads(first: 100) { nodes { isResolved comments(last: 1) { nodes { id } } } } ` +
+            `commits(last: 1) { nodes { commit { statusCheckRollup { contexts(first: 100) { nodes { ` +
+            `__typename ... on CheckRun { name conclusion } ... on StatusContext { context state } } } } } } } }`,
+        )
+        .join(" ");
+      const query = `query($owner:String!,$name:String!){ repository(owner:$owner,name:$name){ ${fields} } }`;
+      interface BatchPr {
+        number: number;
+        state: string;
+        url: string;
+        reviewThreads?: { nodes?: { isResolved: boolean; comments?: { nodes?: { id: string }[] } }[] };
+        commits?: {
+          nodes?: {
+            commit?: {
+              statusCheckRollup?: { contexts?: { nodes?: { name?: string; conclusion?: string; context?: string; state?: string }[] } } | null;
+            };
+          }[];
+        };
+      }
+      // allowFail: a missing PR makes gh exit non-zero while still printing the partial data —
+      // use whatever resolved and let absent entries stay absent.
+      const resp = await runJson<{ data?: { repository?: Record<string, BatchPr | null> } }>(
+        this.gh,
+        ["api", "graphql", "-f", `query=${query}`, "-F", `owner=${owner}`, "-F", `name=${name}`],
+        { allowFail: true },
+      ).catch(() => ({}) as { data?: { repository?: Record<string, BatchPr | null> } });
+      for (const pr of Object.values(resp.data?.repository ?? {})) {
+        if (!pr || typeof pr.number !== "number") continue;
+        const unresolvedIds = (pr.reviewThreads?.nodes ?? [])
+          .filter((t) => t.isResolved === false)
+          .map((t) => t.comments?.nodes?.[0]?.id ?? "x");
+        const failing = (pr.commits?.nodes?.[0]?.commit?.statusCheckRollup?.contexts?.nodes ?? [])
+          .filter((c) => FAILING.test(c.conclusion ?? c.state ?? ""))
+          .map((c) => c.name ?? c.context ?? "check");
+        const sig = createHash("sha1").update(JSON.stringify({ t: unresolvedIds, c: failing })).digest("hex");
+        out.set(pr.number, {
+          number: pr.number,
+          state: pr.state as PrState,
+          url: pr.url,
+          sig: { unresolved: unresolvedIds.length, failing: failing.length, sig },
+        });
+      }
+    }
+    return out;
   }
 
   async reviewSignature(repo: string, prNumber: number): Promise<ReviewSig> {

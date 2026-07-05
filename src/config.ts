@@ -223,6 +223,10 @@ export const RepoConfigSchema = z
         // subprocess/network wait, so parallelism keeps tick wall-clock roughly flat as the
         // active-run count grows; each run still holds its own run lock.
         reconcile_concurrency: z.coerce.number().int().positive().default(8),
+        // Max NEW claims per tick (each claim ≈ worktree checkout + materialize + ~5 source
+        // calls). Smooths a big-backlog cold start over successive ticks instead of one
+        // source-hammering mega-tick; remaining slots fill on the next passes.
+        max_claims_per_tick: z.coerce.number().int().positive().default(10),
         // How long to wait for a step's configured tab/pane to come up (with an idle agent)
         // before flagging the item for attention. Generous by default to allow the user's
         // layout setup + dev-server startup to finish; only applies to steps with a tab/pane.
@@ -356,6 +360,7 @@ export interface Config {
     stepBudgetSeconds: number;
     tickIntervalSeconds: number;
     reconcileConcurrency: number;
+    maxClaimsPerTick: number;
     layoutWaitSeconds: number;
   };
   sources: WorkSourceConfig[];
@@ -741,6 +746,7 @@ export function loadConfig(repoName: string): Loaded {
       stepBudgetSeconds: parsed.limits.step_budget_seconds,
       tickIntervalSeconds: parsed.limits.tick_interval_seconds,
       reconcileConcurrency: parsed.limits.reconcile_concurrency,
+      maxClaimsPerTick: parsed.limits.max_claims_per_tick,
       layoutWaitSeconds: parsed.limits.layout_wait_seconds,
     },
     sources,

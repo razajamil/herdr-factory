@@ -4,7 +4,7 @@ import * as Effect from "effect/Effect";
 import { runEffect } from "../runtime/effect.ts";
 import { HerdrUnreachableError, type BeltRuntime, type Deps, type SourceRuntime } from "./deps.ts";
 import type { StepConfig } from "../config.ts";
-import type { HumanQuestion, MatchItem, Outcome, PrInfo, Run, RunStep, Ticket, TransitionIntent, WorkState } from "../types.ts";
+import type { HumanQuestion, MatchItem, Outcome, PrInfo, PrSnapshot, Run, RunStep, Ticket, TransitionIntent, WorkState } from "../types.ts";
 import { outcomeToWorkState, ticketOf } from "../types.ts";
 import { branchName } from "./branch.ts";
 import { firstStep, indexOfStep, materializeWork, MEMORY_DIR, nextStep, spawnStep, stepByName } from "./step.ts";
@@ -203,6 +203,31 @@ export async function withRunLockWaiting<T>(
   return { ran: false };
 }
 
+/** Per-tick shared context. `prSnapshots` is the batched GitHub fetch for every watched PR
+ *  (reviewing/attention) — one GraphQL request replaces 3 gh calls per run per tick. Undefined ⇒
+ *  the batch fetch failed or the caller is a single-run nudge; per-run fallback polling applies. */
+export interface TickCtx {
+  prSnapshots?: Map<number, PrSnapshot>;
+}
+
+/** Bulk-fetch PR state + review signatures for every run that watches a PR by number. */
+async function fetchPrSnapshots(deps: Deps, runs: Run[]): Promise<Map<number, PrSnapshot> | undefined> {
+  const numbers = [
+    ...new Set(
+      runs
+        .filter((r) => (r.phase === "reviewing" || r.phase === "attention") && r.prNumber != null)
+        .map((r) => r.prNumber!),
+    ),
+  ];
+  if (numbers.length === 0) return new Map();
+  try {
+    return await deps.github.prSnapshots(deps.ghRepo, numbers);
+  } catch (e) {
+    deps.log("warn", `batched PR fetch failed (${numbers.length} PRs) — falling back to per-run polling: ${err(e)}`);
+    return undefined;
+  }
+}
+
 /** One reconcile pass: advance active runs, then claim new work up to the cap. */
 export async function reconcileRepo(deps: Deps): Promise<void> {
   return telemetrySpan("reconcile.repo", { repo: deps.config.repoName }, () => reconcileRepoImpl(deps));
@@ -225,13 +250,15 @@ async function reconcileRepoImpl(deps: Deps): Promise<void> {
   // linearly with the active-run count). Each run is guarded by its own run lock: an event nudge
   // (step-done/bounce/ask-human/resume) holding a run just skips it this pass — that run is
   // being advanced anyway — and nudges for OTHER runs land mid-pass unimpeded.
+  const activeRuns = deps.store.activeRuns(repo);
+  const ctx: TickCtx = { prSnapshots: await fetchPrSnapshots(deps, activeRuns) };
   await runEffect(
     Effect.forEach(
-      deps.store.activeRuns(repo),
+      activeRuns,
       (run) =>
         Effect.tryPromise({
           try: async () => {
-            const ran = await withRunLock(deps, run.id, () => reconcileRun(deps, run));
+            const ran = await withRunLock(deps, run.id, () => reconcileRun(deps, run, ctx));
             if (!ran) deps.log("info", `${run.ticketKey}: busy (nudge in flight) — skipped this pass`);
           },
           catch: (cause) => cause,
@@ -260,6 +287,10 @@ async function reconcileRepoImpl(deps: Deps): Promise<void> {
     deps.store.touchTick(repo);
     return;
   }
+  // Admission control: each claim is a burst of real work (worktree checkout, ticket + attachment
+  // materialize, status transition ≈ 5+ source calls). Capping claims per pass smooths a cold
+  // start with a big backlog into successive ticks instead of one source-hammering mega-tick.
+  if (slots > deps.config.limits.maxClaimsPerTick) slots = deps.config.limits.maxClaimsPerTick;
 
   // One eligible query per source per pass (a source feeding several belts is fetched once).
   const eligibleCache = new Map<string, MatchItem[]>();
@@ -353,7 +384,7 @@ async function claimImpl(deps: Deps, belt: BeltRuntime, src: SourceRuntime, tick
   await withRunLock(deps, run.id, () => reconcileRun(deps, run));
 }
 
-export async function reconcileRun(deps: Deps, run: Run): Promise<void> {
+export async function reconcileRun(deps: Deps, run: Run, ctx: TickCtx = {}): Promise<void> {
   return telemetrySpan(
     "reconcile.run",
     {
@@ -365,11 +396,11 @@ export async function reconcileRun(deps: Deps, run: Run): Promise<void> {
       phase: run.phase,
       step: run.step ?? undefined,
     },
-    () => reconcileRunImpl(deps, run),
+    () => reconcileRunImpl(deps, run, ctx),
   );
 }
 
-async function reconcileRunImpl(deps: Deps, run: Run): Promise<void> {
+async function reconcileRunImpl(deps: Deps, run: Run, ctx: TickCtx): Promise<void> {
   // Resolve the run's source + belt ONCE and thread them down. The belt carries the step sequence
   // + lifecycle; the source materializes the work doc and owns the lifecycle write-back.
   const src = deps.resolveSource(run.workSource);
@@ -392,7 +423,7 @@ async function reconcileRunImpl(deps: Deps, run: Run): Promise<void> {
     }
     return;
   }
-  await dispatchPhase(deps, run, belt, src);
+  await dispatchPhase(deps, run, belt, src, ctx);
   // Then, on every pass for every active run, try to apply any deferred focus shift. Doing
   // it here (not only on the tick that transitioned) is what lets a transition in an
   // unfocused worktree be picked up later, once the user navigates to it.
@@ -400,7 +431,7 @@ async function reconcileRunImpl(deps: Deps, run: Run): Promise<void> {
   if (fresh) await applyPendingFocus(deps, fresh);
 }
 
-async function dispatchPhase(deps: Deps, run: Run, belt: BeltRuntime, src: SourceRuntime): Promise<void> {
+async function dispatchPhase(deps: Deps, run: Run, belt: BeltRuntime, src: SourceRuntime, ctx: TickCtx): Promise<void> {
   return telemetrySpan(
     `reconcile.phase.${run.phase}`,
     {
@@ -430,11 +461,11 @@ async function dispatchPhase(deps: Deps, run: Run, belt: BeltRuntime, src: Sourc
         case "waiting_for_human":
           return reconcileWaitingForHuman(deps, run, belt, src);
         case "reviewing":
-          return reconcileReviewing(deps, run, src);
+          return reconcileReviewing(deps, run, src, ctx);
         case "tearing_down":
           return teardown(deps, run, run.outcome ?? "abandoned", src);
         case "attention":
-          return reconcileAttention(deps, run, belt, src);
+          return reconcileAttention(deps, run, belt, src, ctx);
         case "done":
           return;
       }
@@ -827,6 +858,10 @@ async function reconcileWaitingForHuman(deps: Deps, run: Run, belt: BeltRuntime,
   const externalId = q.externalId;
   if (!externalId) return;
 
+  // Poll backoff: humans answer in minutes-to-hours; per-tick polling of every waiting run was
+  // sustained source-API load for nothing. Misses double the interval (60s → 5min cap).
+  if (deps.now() < q.nextPollAt) return;
+
   const reply = await src.client.pollHumanReply({
     key: run.ticketKey,
     questionId: q.id,
@@ -834,7 +869,8 @@ async function reconcileWaitingForHuman(deps: Deps, run: Run, belt: BeltRuntime,
     externalCreatedAt: q.externalCreatedAt,
   });
   if (!reply) {
-    deps.log("info", `${run.ticketKey}: waiting for human reply to question #${q.id}`);
+    const missed = deps.store.recordHumanPollMiss(q.id);
+    deps.log("info", `${run.ticketKey}: waiting for human reply to question #${q.id} (next poll in ${missed.nextPollAt - deps.now()}s)`);
     return;
   }
 
@@ -1027,9 +1063,12 @@ async function enterReviewing(deps: Deps, run: Run, src: SourceRuntime, prNumber
   deps.log("info", `${run.ticketKey}: PR #${prNumber} -> reviewing`);
 }
 
-async function reconcileReviewing(deps: Deps, run: Run, src: SourceRuntime): Promise<void> {
+async function reconcileReviewing(deps: Deps, run: Run, src: SourceRuntime, ctx: TickCtx): Promise<void> {
   const repo = deps.config.repoName;
-  const pr = await currentPr(deps, run);
+  // Prefer the tick's batched snapshot (state + signature in one shared GraphQL request);
+  // fall back to per-run polling for nudge callers or when the batch fetch failed.
+  const snap = run.prNumber != null ? ctx.prSnapshots?.get(run.prNumber) : undefined;
+  const pr = snap ?? (await currentPr(deps, run));
   if (!pr) return;
   if (run.prNumber !== pr.number) deps.store.updateRun(run.id, { prNumber: pr.number });
 
@@ -1045,7 +1084,7 @@ async function reconcileReviewing(deps: Deps, run: Run, src: SourceRuntime): Pro
     return;
   }
 
-  const sig = await deps.github.reviewSignature(deps.ghRepo, pr.number);
+  const sig = snap?.sig ?? (await deps.github.reviewSignature(deps.ghRepo, pr.number));
   if (sig.unresolved === 0 && sig.failing === 0) return; // nothing actionable
   if (sig.sig === run.lastThreadSig) return; // already handled this state
 
@@ -1078,9 +1117,9 @@ async function reconcileReviewing(deps: Deps, run: Run, src: SourceRuntime): Pro
  * While parked, the operator is re-notified periodically — the one-shot escalation notify is easy
  * to miss, and a parked run must never go silently stale.
  */
-async function reconcileAttention(deps: Deps, run: Run, belt: BeltRuntime, src: SourceRuntime): Promise<void> {
+async function reconcileAttention(deps: Deps, run: Run, belt: BeltRuntime, src: SourceRuntime, ctx: TickCtx): Promise<void> {
   if (belt.watchPr && run.prNumber) {
-    const pr = await currentPr(deps, run);
+    const pr = ctx.prSnapshots?.get(run.prNumber) ?? (await currentPr(deps, run));
     if (pr?.state === "MERGED") return teardown(deps, run, "merged", src);
   }
   if (deps.now() - (run.attentionNotifiedAt ?? 0) >= deps.config.limits.attentionRenotifySeconds) {

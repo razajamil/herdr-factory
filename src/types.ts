@@ -193,6 +193,8 @@ export interface HumanQuestion {
   answer: string | null;
   answerExternalId: string | null;
   answerAuthor: string | null;
+  pollAttempts: number; // polls that found no reply yet (drives the backoff)
+  nextPollAt: number; // don't poll the source again before this (epoch seconds; 0 = due now)
   createdAt: number;
   updatedAt: number;
   answeredAt: number | null;
@@ -300,6 +302,12 @@ export interface ReviewSig {
   unresolved: number;
   failing: number;
   sig: string;
+}
+
+/** One PR's state + review signature, as fetched by the per-tick BATCHED GraphQL query (state,
+ *  threads and check rollup for every watched PR in one request instead of 3 gh calls per run). */
+export interface PrSnapshot extends PrInfo {
+  sig: ReviewSig;
 }
 
 // --- belt routing (the `match` predicate) -----------------------------------

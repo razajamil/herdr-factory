@@ -1,12 +1,19 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { JiraIssue } from "../types.ts";
-import { httpOk, httpOkBytes } from "./http.ts";
+import { httpOk, httpOkBytes, TokenBucket } from "./http.ts";
 
 /** Time budget for a JSON API round-trip; media downloads get a larger one. Both are HARD
  *  bounds — a black-holed Jira connection must never wedge a reconcile tick. */
 const JIRA_TIMEOUT_MS = 30_000;
 const JIRA_MEDIA_TIMEOUT_MS = 120_000;
+
+// Client-side ceiling on our Jira load: 5 req/s sustained with a burst of 10, shared by every
+// call this client makes (a claim burst is ~5 calls per ticket; parked runs poll comments). Jira
+// Cloud's per-user budget is comfortably above this — the point is to smooth OUR spikes so we
+// never trip 429s in the first place; the retry policy (Retry-After-aware) handles the rest.
+const JIRA_RATE_PER_SEC = 5;
+const JIRA_BURST = 10;
 
 /** A board-search result with the fields a belt's match predicate routes on. `fields` is the raw
  *  Jira issue.fields object (summary/issuetype/status/labels) fetched by the board query. */
@@ -39,11 +46,13 @@ function adfDoc(text: string): unknown {
   };
 }
 
-/** Jira Cloud REST via fetch + API-token basic auth. */
+/** Jira Cloud REST via fetch + API-token basic auth. All calls share one token bucket and a
+ *  Retry-After-honoring retry policy (see clients/http.ts). */
 export class JiraClient {
   private readonly baseUrl: string;
   private readonly email: string;
   private readonly token: string;
+  private readonly bucket = new TokenBucket(JIRA_RATE_PER_SEC, JIRA_BURST);
   constructor(baseUrl: string, email: string, token: string) {
     this.baseUrl = baseUrl;
     this.email = email;
@@ -66,18 +75,24 @@ export class JiraClient {
   }
 
   private async getJson<T>(path: string): Promise<T> {
-    const res = await httpOk({ url: this.baseUrl + path, headers: this.headers(), timeoutMs: JIRA_TIMEOUT_MS });
+    const res = await httpOk({ url: this.baseUrl + path, headers: this.headers(), timeoutMs: JIRA_TIMEOUT_MS }, { bucket: this.bucket });
     return JSON.parse(res.text) as T;
   }
 
+  // POST retries are bounded to 1: a 429 was definitively not processed (safe), but a timed-out
+  // or 5xx write may have landed — a rare duplicate comment is acceptable noise, a retry storm
+  // of writes is not.
   private async postJson<T>(path: string, body: unknown): Promise<T> {
-    const res = await httpOk({
-      url: this.baseUrl + path,
-      method: "POST",
-      headers: { ...this.headers(), "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-      timeoutMs: JIRA_TIMEOUT_MS,
-    });
+    const res = await httpOk(
+      {
+        url: this.baseUrl + path,
+        method: "POST",
+        headers: { ...this.headers(), "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+        timeoutMs: JIRA_TIMEOUT_MS,
+      },
+      { bucket: this.bucket, retries: 1 },
+    );
     return JSON.parse(res.text) as T;
   }
 
@@ -137,13 +152,16 @@ export class JiraClient {
     const match = (tr.transitions ?? []).find((t) => t.to?.name?.toLowerCase() === targetName.toLowerCase());
     if (!match) throw new Error(`${key}: no transition from "${current}" to "${targetName}"`);
     // The transition POST returns 204 with an empty body — httpOk (not postJson, which parses).
-    await httpOk({
-      url: `${this.baseUrl}/rest/api/3/issue/${key}/transitions`,
-      method: "POST",
-      headers: { ...this.headers(), "Content-Type": "application/json" },
-      body: JSON.stringify({ transition: { id: match.id } }),
-      timeoutMs: JIRA_TIMEOUT_MS,
-    });
+    await httpOk(
+      {
+        url: `${this.baseUrl}/rest/api/3/issue/${key}/transitions`,
+        method: "POST",
+        headers: { ...this.headers(), "Content-Type": "application/json" },
+        body: JSON.stringify({ transition: { id: match.id } }),
+        timeoutMs: JIRA_TIMEOUT_MS,
+      },
+      { bucket: this.bucket, retries: 1 },
+    );
     return true;
   }
 
@@ -174,7 +192,12 @@ export class JiraClient {
     for (const a of media) {
       let buf: Buffer;
       try {
-        buf = (await httpOkBytes({ url: a.content, headers: this.headers(), timeoutMs: JIRA_MEDIA_TIMEOUT_MS })).bytes;
+        buf = (
+          await httpOkBytes(
+            { url: a.content, headers: this.headers(), timeoutMs: JIRA_MEDIA_TIMEOUT_MS },
+            { bucket: this.bucket, retries: 1 },
+          )
+        ).bytes;
       } catch {
         continue; // one bad attachment (4xx/timeout) shouldn't sink the rest
       }
