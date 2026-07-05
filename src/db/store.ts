@@ -10,6 +10,7 @@ import type {
   RunStep,
   RunStepPatch,
   StepName,
+  TransitionIntent,
   WorkItem,
   WorkState,
 } from "../types.ts";
@@ -127,6 +128,21 @@ function toWorkItem(r: WorkItemRow): WorkItem {
     createdAt: r.created_at,
     updatedAt: r.updated_at,
   };
+}
+
+interface TransitionIntentRow {
+  id: number;
+  run_id: number;
+  repo: string;
+  work_source: string;
+  ticket_key: string;
+  to_state: string;
+  attempts: number;
+  next_attempt_at: number;
+  last_error: string | null;
+  created_at: number;
+  updated_at: number;
+  delivered_at: number | null;
 }
 
 interface HumanQuestionRow {
@@ -449,6 +465,110 @@ export class Store {
     const row = this.getRunStep(runId, step)!;
     telemetryEvent("store.run_step.bounce", { "run.id": runId, step, "step.bounces": row.bounces });
     return row.bounces;
+  }
+
+  // --- transition outbox (source status write-backs, retried until delivered) --
+
+  private toTransitionIntent(r: TransitionIntentRow): TransitionIntent {
+    return {
+      id: r.id,
+      runId: r.run_id,
+      repo: r.repo,
+      workSource: r.work_source,
+      ticketKey: r.ticket_key,
+      toState: r.to_state as WorkState,
+      attempts: r.attempts,
+      nextAttemptAt: r.next_attempt_at,
+      lastError: r.last_error,
+      createdAt: r.created_at,
+      updatedAt: r.updated_at,
+      deliveredAt: r.delivered_at,
+    };
+  }
+
+  getTransitionIntent(id: number): TransitionIntent | undefined {
+    const row = this.db.prepare("SELECT * FROM transition_outbox WHERE id = ?").get(id) as TransitionIntentRow | undefined;
+    return row ? this.toTransitionIntent(row) : undefined;
+  }
+
+  /** Record the INTENT to move a work item to `toState`. Idempotent per (run, state): re-enqueueing
+   *  a delivered intent re-opens it for delivery (the transition itself is idempotent at the
+   *  source), re-enqueueing a pending one just makes it due now. */
+  enqueueTransition(input: { runId: number; repo: string; workSource: string; ticketKey: string; toState: WorkState }): TransitionIntent {
+    const t = this.now();
+    this.db
+      .prepare(
+        `INSERT INTO transition_outbox (run_id, repo, work_source, ticket_key, to_state, attempts, next_attempt_at, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?)
+         ON CONFLICT(run_id, to_state) DO UPDATE SET next_attempt_at = excluded.next_attempt_at, delivered_at = NULL, updated_at = excluded.updated_at`,
+      )
+      .run(input.runId, input.repo, input.workSource, input.ticketKey, input.toState, t, t, t);
+    const row = this.db
+      .prepare("SELECT * FROM transition_outbox WHERE run_id = ? AND to_state = ?")
+      .get(input.runId, input.toState) as TransitionIntentRow | undefined;
+    if (!row) throw new Error("enqueueTransition: row vanished after upsert");
+    telemetryEvent("store.transition.enqueue", { repo: input.repo, "run.id": input.runId, "work.key": input.ticketKey, "work.state": input.toState });
+    return this.toTransitionIntent(row);
+  }
+
+  /** Undelivered intents due for a delivery attempt, ordered (run, id) so a run's transitions
+   *  are always attempted in the order they were intended. */
+  dueTransitions(repo: string, limit = 25): TransitionIntent[] {
+    const rows = this.db
+      .prepare(
+        "SELECT * FROM transition_outbox WHERE repo = ? AND delivered_at IS NULL AND next_attempt_at <= ? ORDER BY run_id, id LIMIT ?",
+      )
+      .all(repo, this.now(), limit) as unknown as TransitionIntentRow[];
+    return rows.map((r) => this.toTransitionIntent(r));
+  }
+
+  /** Is an EARLIER intent for this run still undelivered? Delivery must be in-order per run (a
+   *  retried in_development firing after in_review landed would walk the source backward). */
+  undeliveredTransitionBefore(runId: number, beforeId: number): boolean {
+    const row = this.db
+      .prepare("SELECT 1 AS x FROM transition_outbox WHERE run_id = ? AND id < ? AND delivered_at IS NULL LIMIT 1")
+      .get(runId, beforeId) as { x: number } | undefined;
+    return row !== undefined;
+  }
+
+  markTransitionDelivered(id: number): void {
+    const t = this.now();
+    // last_error is left as-is: with delivered_at set it reads as history ("delivered after N
+    // failed attempts, last of which was …"), and the source-removed close-out relies on it.
+    this.db.prepare("UPDATE transition_outbox SET delivered_at = ?, updated_at = ? WHERE id = ?").run(t, t, id);
+    const e = this.getTransitionIntent(id);
+    telemetryEvent("store.transition.delivered", { repo: e?.repo, "run.id": e?.runId, "work.key": e?.ticketKey, "work.state": e?.toState });
+  }
+
+  /** Record a failed delivery attempt: bump the counter and push next_attempt_at out with
+   *  exponential backoff (60s doubling, capped at 1h). Never gives up — the intent stays visible
+   *  and retried until the source accepts it or the entry is superseded by an operator. */
+  recordTransitionAttempt(id: number, error: string): TransitionIntent {
+    const t = this.now();
+    const current = this.getTransitionIntent(id);
+    const attempts = (current?.attempts ?? 0) + 1;
+    const delay = Math.min(60 * 2 ** (attempts - 1), 3600);
+    this.db
+      .prepare("UPDATE transition_outbox SET attempts = ?, next_attempt_at = ?, last_error = ?, updated_at = ? WHERE id = ?")
+      .run(attempts, t + delay, error.slice(0, 500), t, id);
+    const e = this.getTransitionIntent(id)!;
+    telemetryEvent("store.transition.attempt_failed", {
+      repo: e.repo,
+      "run.id": e.runId,
+      "work.key": e.ticketKey,
+      "work.state": e.toState,
+      "transition.attempts": attempts,
+    });
+    return e;
+  }
+
+  /** Does this work item have any undelivered status write-back? While it does, the item's
+   *  source status is known-stale — Phase B must not trust an "eligible" listing for it. */
+  pendingTransitionForKey(repo: string, source: string, key: string): boolean {
+    const row = this.db
+      .prepare("SELECT 1 AS x FROM transition_outbox WHERE repo = ? AND work_source = ? AND ticket_key = ? AND delivered_at IS NULL LIMIT 1")
+      .get(repo, source, key) as { x: number } | undefined;
+    return row !== undefined;
   }
 
   // --- human-in-the-loop questions ------------------------------------------

@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openDb } from "../src/db/index.ts";
 import { Store } from "../src/db/store.ts";
-import { applyPendingFocus, bounceStep, reconcileRepo, reconcileRun, requestHumanInput, withTickLock } from "../src/core/reconcile.ts";
+import { applyPendingFocus, bounceStep, flushTransitionOutbox, reconcileRepo, reconcileRun, requestHumanInput, withTickLock } from "../src/core/reconcile.ts";
 import { HerdrUnreachableError, type BeltRuntime, type Deps, type GitApi, type GitHubApi, type HerdrApi, type SourceRuntime, type WorkSource } from "../src/core/deps.ts";
 import type { Config, Secrets, StepConfig } from "../src/config.ts";
 import type { FocusedPane, HumanAskInput, HumanPollInput, HumanReply, MatchItem, Phase, PrInfo, ReviewSig, Ticket, WorkState } from "../src/types.ts";
@@ -29,6 +29,8 @@ interface FakeState {
   focusedPane: FocusedPane | null; // the pane the user is currently looking at
   humanReply: HumanReply | null; // source-native reply to a pending human question
   herdrUnreachable: boolean; // liveness queries throw HerdrUnreachableError (herdr can't be asked)
+  failTransitions: boolean; // the jira source's transition() throws (backend down / 429 / workflow)
+  failTransitionStates: Set<string>; // …or throws only for these target states
 }
 
 /** A resolved belt step for the fakes. Budgets/heartbeat/opensPr mirror what config.ts derives for
@@ -53,7 +55,7 @@ function build(opts: { multi?: boolean } = {}) {
   let now = 1000;
   let uidN = 0; // deterministic per-claim branch suffix (u1, u2, …) so re-claims get distinct branches
   const store = new Store(openDb(":memory:"), () => now);
-  const state: FakeState = { eligible: [], eligible2: [], pr: null, sig: { unresolved: 0, failing: 0, sig: "s0" }, paneState: "idle", deadPanes: new Set(), headSha: "sha0", sessionId: "sess-1", workspaceExists: false, focusedPane: { paneId: "w1:p1", workspaceId: "w1", tabId: "w1:t1", label: "agent" }, humanReply: null, herdrUnreachable: false };
+  const state: FakeState = { eligible: [], eligible2: [], pr: null, sig: { unresolved: 0, failing: 0, sig: "s0" }, paneState: "idle", deadPanes: new Set(), headSha: "sha0", sessionId: "sess-1", workspaceExists: false, focusedPane: { paneId: "w1:p1", workspaceId: "w1", tabId: "w1:t1", label: "agent" }, humanReply: null, herdrUnreachable: false, failTransitions: false, failTransitionStates: new Set() };
   const calls = {
     transitions: [] as [string, WorkState][],
     agentSend: [] as [string, string][],
@@ -75,7 +77,11 @@ function build(opts: { multi?: boolean } = {}) {
   const jiraClient: WorkSource = {
     listEligible: async () => state.eligible.map(wrapJira),
     describe: async (key) => ({ key, summary: "Fix the thing", type: "Bug" }),
-    transition: async (key, to) => { calls.transitions.push([key, to]); return true; },
+    transition: async (key, to) => {
+      if (state.failTransitions || state.failTransitionStates.has(to)) throw new Error(`transition to ${to} failed (fake)`);
+      calls.transitions.push([key, to]);
+      return true;
+    },
     materialize: async (_key, memDir) => { mkdirSync(memDir, { recursive: true }); writeFileSync(join(memDir, "ticket.json"), "{}"); },
     askHuman: async (input) => { calls.humanAsk.push(input); return { externalId: `q-${input.questionId}`, externalCreatedAt: "2026-06-28T00:00:00.000+0000" }; },
     pollHumanReply: async (input) => { calls.humanPoll.push(input); return state.humanReply; },
@@ -935,5 +941,97 @@ describe("applyPendingFocus — focus follows the active step", () => {
     await applyPendingFocus(deps, store.getRun(run.id)!);
     expect(calls.agentFocus).toEqual([]);
     expect(store.getRun(run.id)!.focusPending).toBe(false);
+  });
+});
+
+describe("transition outbox — source write-backs retried until delivered", () => {
+  it("claim survives a failed in-development write-back; the outbox delivers it on a later tick", async () => {
+    const { deps, store, state, calls, setNow } = build();
+    state.eligible = [ticket("K-T1")];
+    state.failTransitions = true;
+    await reconcileRepo(deps);
+    const run = store.activeRunForTicket("demo", "jira", "K-T1")!;
+    expect(run.phase).toBe("running"); // a flaky source never blocks the pipeline
+    expect(calls.transitions).toEqual([]); // nothing delivered yet
+    expect(store.pendingTransitionForKey("demo", "jira", "K-T1")).toBe(true);
+
+    state.failTransitions = false;
+    setNow(1000 + 61); // past the first backoff (60s)
+    await reconcileRepo(deps);
+    expect(calls.transitions).toContainEqual(["K-T1", "in_development"]);
+    expect(store.pendingTransitionForKey("demo", "jira", "K-T1")).toBe(false);
+  });
+
+  it("failed attempts back off exponentially (not due again immediately)", async () => {
+    const { deps, store, state, calls, setNow } = build();
+    state.eligible = [ticket("K-T2")];
+    state.failTransitions = true;
+    await reconcileRepo(deps); // attempt 1 fails → next due at +60s
+    state.failTransitions = false;
+    setNow(1000 + 30);
+    await flushTransitionOutbox(deps); // not due yet
+    expect(calls.transitions).toEqual([]);
+    setNow(1000 + 61);
+    await flushTransitionOutbox(deps); // due → delivered
+    expect(calls.transitions).toContainEqual(["K-T2", "in_development"]);
+  });
+
+  it("an item whose write-back is still pending is NOT re-claimed (no duplicate work)", async () => {
+    const { deps, store, state, worktree, calls, setNow } = build();
+    const run = seed(store, worktree, "K-T3", "reviewing", null, { watchDeadline: 99999, prNumber: 7 });
+    state.pr = { number: 7, state: "MERGED", url: "u" };
+    state.failTransitions = true;
+    await reconcileRun(deps, store.getRun(run.id)!);
+    expect(store.getRun(run.id)!.phase).toBe("done"); // teardown never blocks on the write-back
+    expect(store.pendingTransitionForKey("demo", "jira", "K-T3")).toBe(true);
+
+    // The source still lists it (our write-back never landed) — it must NOT be claimed again.
+    state.eligible = [ticket("K-T3")];
+    await reconcileRepo(deps);
+    expect(store.activeRunForTicket("demo", "jira", "K-T3")).toBeUndefined();
+
+    // Once the write-back delivers, the guard lifts.
+    state.failTransitions = false;
+    state.eligible = [];
+    setNow(1000 + 61);
+    await reconcileRepo(deps);
+    expect(calls.transitions).toContainEqual(["K-T3", "merged"]);
+    expect(store.pendingTransitionForKey("demo", "jira", "K-T3")).toBe(false);
+  });
+
+  it("per-run delivery is strictly in-order: a later intent waits behind an undelivered earlier one", async () => {
+    const { deps, store, state, calls } = build();
+    const run = store.createRun({ repo: "demo", workSource: "jira", belt: "ship", ticketKey: "K-T4", branch: "b" });
+    state.failTransitionStates.add("in_development");
+    store.enqueueTransition({ runId: run.id, repo: "demo", workSource: "jira", ticketKey: "K-T4", toState: "in_development" });
+    store.enqueueTransition({ runId: run.id, repo: "demo", workSource: "jira", ticketKey: "K-T4", toState: "in_review" });
+
+    await flushTransitionOutbox(deps);
+    // in_development failed → in_review must NOT have been attempted (it would walk Jira backward
+    // when the retried in_development eventually lands).
+    expect(calls.transitions).toEqual([]);
+
+    state.failTransitionStates.clear();
+    // in_development is now backed off; force both due by flushing at a later clock.
+    const intents = store.dueTransitions("demo", 10);
+    expect(intents.length).toBe(1); // only in_review is technically "due"; it stays blocked per-run
+    await flushTransitionOutbox(deps);
+    expect(calls.transitions).toEqual([]); // still blocked behind the backed-off in_development
+  });
+
+  it("delivers a run's intents in order once all are due", async () => {
+    const { deps, store, state, calls, setNow } = build();
+    const run = store.createRun({ repo: "demo", workSource: "jira", belt: "ship", ticketKey: "K-T5", branch: "b" });
+    state.failTransitions = true;
+    store.enqueueTransition({ runId: run.id, repo: "demo", workSource: "jira", ticketKey: "K-T5", toState: "in_development" });
+    store.enqueueTransition({ runId: run.id, repo: "demo", workSource: "jira", ticketKey: "K-T5", toState: "in_review" });
+    await flushTransitionOutbox(deps); // both attempted? no — first fails, second blocked
+    state.failTransitions = false;
+    setNow(1000 + 61);
+    await flushTransitionOutbox(deps);
+    expect(calls.transitions).toEqual([
+      ["K-T5", "in_development"],
+      ["K-T5", "in_review"],
+    ]);
   });
 });

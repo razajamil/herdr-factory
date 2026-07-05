@@ -2,7 +2,7 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { HerdrUnreachableError, type BeltRuntime, type Deps, type SourceRuntime } from "./deps.ts";
 import type { StepConfig } from "../config.ts";
-import type { HumanQuestion, MatchItem, Outcome, PrInfo, Run, RunStep, Ticket } from "../types.ts";
+import type { HumanQuestion, MatchItem, Outcome, PrInfo, Run, RunStep, Ticket, TransitionIntent, WorkState } from "../types.ts";
 import { outcomeToWorkState, ticketOf } from "../types.ts";
 import { branchName } from "./branch.ts";
 import { firstStep, indexOfStep, materializeWork, MEMORY_DIR, nextStep, spawnStep, stepByName } from "./step.ts";
@@ -17,6 +17,81 @@ function err(e: unknown): string {
  *  confirmed observations at least this far apart are required — long enough to ride out a herdr
  *  daemon restart, short enough that a genuinely dead pane restarts within ~a tick. */
 const PANE_ABSENCE_CONFIRM_SECONDS = 45;
+
+// --- source status write-backs (the transition outbox) -----------------------
+// A transition is an INTENT persisted until the source confirms it, not a one-shot call: run
+// phases advance regardless (a flaky Jira must never wedge the pipeline), and the outbox retries
+// with backoff until the status of record converges. Without this, a dropped in_development
+// transition left the ticket To Do — and since eligibility queries by status, the ticket would be
+// claimed AGAIN after teardown and the merged work re-done.
+
+/** One delivery attempt for an intent. Marks delivered on success (including source-side no-ops:
+ *  already there / unmapped state); on failure records the attempt + backoff and returns false. */
+async function deliverTransition(deps: Deps, src: SourceRuntime, intent: TransitionIntent): Promise<boolean> {
+  try {
+    const moved = await src.client.transition(intent.ticketKey, intent.toState);
+    deps.store.markTransitionDelivered(intent.id);
+    if (moved) {
+      deps.store.recordEvent({
+        runId: intent.runId,
+        repo: intent.repo,
+        ticketKey: intent.ticketKey,
+        type: "transition",
+        detail: { to: intent.toState, attempts: intent.attempts },
+      });
+    }
+    return true;
+  } catch (e) {
+    const after = deps.store.recordTransitionAttempt(intent.id, err(e));
+    deps.log(
+      "warn",
+      `${intent.ticketKey}: ${intent.toState} transition deferred (attempt ${after.attempts}, retry in ${after.nextAttemptAt - deps.now()}s): ${err(e)}`,
+    );
+    return false;
+  }
+}
+
+/** Enqueue a transition intent and try to deliver it immediately (the common, healthy path — the
+ *  status moves on the same tick it used to). Skips the immediate attempt when an EARLIER intent
+ *  for the run is still undelivered: per-run delivery is strictly in-order, else a retried
+ *  in_development could fire after in_review already landed and walk the source backward. */
+async function requestTransition(deps: Deps, run: Run, src: SourceRuntime, to: WorkState): Promise<void> {
+  const intent = deps.store.enqueueTransition({
+    runId: run.id,
+    repo: deps.config.repoName,
+    workSource: src.name,
+    ticketKey: run.ticketKey,
+    toState: to,
+  });
+  if (deps.store.undeliveredTransitionBefore(run.id, intent.id)) {
+    deps.log("warn", `${run.ticketKey}: ${to} transition queued behind an undelivered earlier transition`);
+    return;
+  }
+  await deliverTransition(deps, src, intent);
+}
+
+/** Retry every due undelivered intent (in per-run order, stopping a run's chain at its first
+ *  failure). Runs at the top of each tick so write-backs converge even while the repo is at
+ *  capacity or the affected runs are parked/ended. */
+export async function flushTransitionOutbox(deps: Deps): Promise<void> {
+  const due = deps.store.dueTransitions(deps.config.repoName);
+  for (const intent of due) {
+    const src = deps.resolveSource(intent.workSource);
+    if (!src) {
+      // Source removed from config — the intent can never deliver; close it out loudly rather
+      // than retrying forever against nothing.
+      deps.store.recordTransitionAttempt(intent.id, `work source "${intent.workSource}" no longer configured`);
+      deps.store.markTransitionDelivered(intent.id);
+      deps.log("warn", `${intent.ticketKey}: dropping ${intent.toState} write-back — source "${intent.workSource}" is gone`);
+      continue;
+    }
+    // In-order per run, checked against the DB (not just this pass): an earlier sibling that is
+    // undelivered but backed off (not due) must still block this one — delivering out of order
+    // would let a retried in_development land after in_review and walk the source backward.
+    if (deps.store.undeliveredTransitionBefore(intent.runId, intent.id)) continue;
+    await deliverTransition(deps, src, intent);
+  }
+}
 
 /**
  * Run `fn` under the per-repo single-instance tick lock; returns true if it ran, false if
@@ -85,6 +160,14 @@ async function reconcileRepoImpl(deps: Deps): Promise<void> {
   const repo = deps.config.repoName;
   deps.store.upsertRepo(repo, deps.config.repo.path, deps.config.repo.baseRef, deps.ghRepo);
 
+  // Phase 0 — retry undelivered source status write-backs (before anything else, so they
+  // converge even at capacity and for already-ended runs).
+  try {
+    await flushTransitionOutbox(deps);
+  } catch (e) {
+    deps.log("error", `transition outbox flush failed: ${err(e)}`);
+  }
+
   // Phase A — advance everything in flight.
   for (const run of deps.store.activeRuns(repo)) {
     try {
@@ -136,6 +219,13 @@ async function reconcileRepoImpl(deps: Deps): Promise<void> {
       // Dedup is per (source, key): once any belt has an active run for the item, no other belt
       // claims it — which is exactly what makes "first matching belt wins" hold across the pass.
       if (deps.store.activeRunForTicket(repo, src.name, item.key)) continue;
+      // An undelivered write-back means this item's source status is known-stale — its "eligible"
+      // listing can't be trusted (e.g. a merged run whose transition never landed would be
+      // re-claimed here and the work re-done). Let the outbox converge first.
+      if (deps.store.pendingTransitionForKey(repo, src.name, item.key)) {
+        deps.log("warn", `${item.key}: skipping claim — a status write-back to "${src.name}" is still pending`);
+        continue;
+      }
       if (belt.match) {
         let accepted: boolean;
         try {
@@ -352,19 +442,13 @@ async function reconcileClaiming(deps: Deps, run: Run, belt: BeltRuntime, src: S
     run = deps.store.getRun(run.id)!;
   }
 
-  // 3. Advance to running FIRST, then attempt the in-development transition best-effort. Gating
-  //    the phase on the transition would pin the run in `claiming` forever if the transition
-  //    keeps failing (auth/workflow) while its first agent runs and finishes unobserved.
+  // 3. Advance to running FIRST, then request the in-development transition. Gating the phase on
+  //    the transition would pin the run in `claiming` forever if the transition keeps failing
+  //    (auth/workflow) while its first agent runs and finishes unobserved. The outbox owns the
+  //    write-back from here: a failed attempt is retried each tick until the source confirms.
   deps.store.updateRun(run.id, { phase: "running", step: first.name });
   deps.log("info", `${run.ticketKey}: running ${first.name} on ${branch}`);
-  try {
-    const moved = await src.client.transition(run.ticketKey, "in_development");
-    if (moved) {
-      deps.store.recordEvent({ runId: run.id, repo, ticketKey: run.ticketKey, type: "transition", detail: { to: "in_development" } });
-    }
-  } catch (e) {
-    deps.log("warn", `${run.ticketKey}: in-development transition deferred: ${err(e)}`);
-  }
+  await requestTransition(deps, run, src, "in_development");
 }
 
 /** Advance the active step's heartbeat when the branch HEAD moves; returns the fresh
@@ -849,14 +933,7 @@ async function reconcileStep(deps: Deps, run: Run, belt: BeltRuntime, src: Sourc
  *  work_to_pull_request belts only — reached after the PR step opens a PR. */
 async function enterReviewing(deps: Deps, run: Run, src: SourceRuntime, prNumber: number): Promise<void> {
   const repo = deps.config.repoName;
-  try {
-    const moved = await src.client.transition(run.ticketKey, "in_review");
-    if (moved) {
-      deps.store.recordEvent({ runId: run.id, repo, ticketKey: run.ticketKey, type: "transition", detail: { to: "in_review" } });
-    }
-  } catch (e) {
-    deps.log("warn", `${run.ticketKey}: review transition deferred: ${err(e)}`);
-  }
+  await requestTransition(deps, run, src, "in_review");
   // Clear the active step: in `reviewing` there's no belt step running (the engine watches the PR
   // by number). Record prNumber here too so the watch is self-sufficient even if step-adoption was
   // skipped.
@@ -946,19 +1023,12 @@ async function teardownImpl(deps: Deps, run: Run, outcome: Outcome, src: SourceR
   const repo = deps.config.repoName;
   deps.store.updateRun(run.id, { phase: "tearing_down", outcome });
 
-  // Write the terminal lifecycle state back to the source (best-effort, never blocks cleanup).
-  // No-op for Jira (merged/aborted/done are unmapped → no network); records merged/aborted/done
-  // for local_markdown so the file is never re-listed. Skipped entirely if the source is gone.
+  // Write the terminal lifecycle state back to the source (never blocks cleanup — the outbox
+  // keeps retrying after the run ends). No-op for Jira (merged/aborted/done are unmapped → no
+  // network); records merged/aborted/done for local_markdown so the file is never re-listed.
+  // Skipped entirely if the source is gone.
   if (src) {
-    const finalState = outcomeToWorkState(outcome);
-    try {
-      const moved = await src.client.transition(run.ticketKey, finalState);
-      if (moved) {
-        deps.store.recordEvent({ runId: run.id, repo, ticketKey: run.ticketKey, type: "transition", detail: { to: finalState } });
-      }
-    } catch (e) {
-      deps.log("warn", `${run.ticketKey}: terminal (${finalState}) transition skipped: ${err(e)}`);
-    }
+    await requestTransition(deps, run, src, outcomeToWorkState(outcome));
   }
 
   if (run.workspaceId) {

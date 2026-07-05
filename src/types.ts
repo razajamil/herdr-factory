@@ -155,6 +155,24 @@ export interface WorkItem {
   updatedAt: number;
 }
 
+/** One intended source status write-back, persisted until confirmed delivered (the transition
+ *  outbox). `attempts`/`nextAttemptAt` drive the reconciler's exponential retry; `deliveredAt`
+ *  set = the source accepted it (or reported it a no-op — already there / unmapped state). */
+export interface TransitionIntent {
+  id: number;
+  runId: number;
+  repo: string;
+  workSource: string;
+  ticketKey: string;
+  toState: WorkState;
+  attempts: number;
+  nextAttemptAt: number;
+  lastError: string | null;
+  createdAt: number;
+  updatedAt: number;
+  deliveredAt: number | null;
+}
+
 export type HumanQuestionStatus = "pending" | "answered";
 
 /** A source-agnostic human-in-the-loop question parked by an agent and resumed by the reconciler. */

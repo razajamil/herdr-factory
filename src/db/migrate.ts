@@ -179,6 +179,37 @@ const MIGRATIONS: { version: number; sql: string }[] = [
     // spawning a duplicate agent into a worktree whose original agent is still working.
     sql: `ALTER TABLE run_steps ADD COLUMN absent_at INTEGER;`,
   },
+  {
+    version: 11,
+    // Transition outbox: source status write-backs are now INTENTS that persist until confirmed
+    // delivered, not one-shot best-effort calls. A failed Jira transition used to be logged as
+    // "deferred" and then dropped forever — the board's status of record diverged (To Do while a
+    // PR was up), and because eligibility queries by status, a torn-down run's still-todo ticket
+    // could be claimed AGAIN and merged work re-done. Every intended transition lands here first;
+    // the reconciler retries undelivered rows each tick with exponential backoff (attempts /
+    // next_attempt_at), in per-run id order so an old intent can't fire after a newer one.
+    // UNIQUE(run_id, to_state) makes enqueue idempotent across retried claiming/teardown ticks.
+    sql: `
+      CREATE TABLE transition_outbox (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        run_id INTEGER NOT NULL REFERENCES runs(id),
+        repo TEXT NOT NULL,
+        work_source TEXT NOT NULL,
+        ticket_key TEXT NOT NULL,
+        to_state TEXT NOT NULL
+          CHECK (to_state IN ('todo','in_development','in_review','merged','aborted','done')),
+        attempts INTEGER NOT NULL DEFAULT 0,
+        next_attempt_at INTEGER NOT NULL,
+        last_error TEXT,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        delivered_at INTEGER,
+        UNIQUE(run_id, to_state)
+      );
+      CREATE INDEX idx_transition_outbox_pending ON transition_outbox(repo, next_attempt_at) WHERE delivered_at IS NULL;
+      CREATE INDEX idx_transition_outbox_key ON transition_outbox(repo, work_source, ticket_key) WHERE delivered_at IS NULL;
+    `,
+  },
 ];
 
 /** Apply pending migrations in a transaction. Idempotent. */
