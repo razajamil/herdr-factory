@@ -130,23 +130,29 @@ export async function repoGroup(repo: string, deep = false): Promise<DoctorGroup
     }
     const ev = d.config.evidence;
     // Default: report it's configured (local). Deep: PutObject write-probe (network + a tiny S3 write).
+    // Uploads land under herdr-factory/<github_username>/<key_prefix>/… ; show that base.
     if (!ev) {
       checks.push({ name: "evidence", ok: true, detail: "not configured (optional)" });
     } else if (deep) {
-      checks.push(await attempt(`evidence bucket (s3://${ev.bucket})`, () => probeEvidenceBucket(ev)));
+      // Resolve the real per-user folder (override, else gh login) so the probe writes where uploads do.
+      const username = ev.githubUsername ?? (await d.github.currentLogin()) ?? undefined;
+      checks.push(await attempt(`evidence bucket (s3://${ev.bucket})`, () => probeEvidenceBucket(ev, username)));
     } else {
-      checks.push({ name: "evidence", ok: true, detail: `configured: s3://${ev.bucket}/${ev.keyPrefix || ""} (${ev.region}) — --deep to write-probe` });
+      // Shallow = no network, so show the override or a <gh-login> placeholder rather than resolving it.
+      const folder = ["herdr-factory", ev.githubUsername ?? "<gh-login>", ev.keyPrefix].filter(Boolean).join("/");
+      checks.push({ name: "evidence", ok: true, detail: `configured: s3://${ev.bucket}/${folder}/ (${ev.region}) — --deep to write-probe` });
     }
   }
   return { title: `repo ${repo}`, checks };
 }
 
 /** Verify the evidence upload can actually reach AND write the bucket: PUT a 0-byte probe object at
- *  `<key_prefix>/.herdr-doctor` (a fixed key, overwritten each run so nothing accumulates) using the
- *  SAME ambient credential chain the real upload uses. This exercises the exact s3:PutObject
- *  permission — not just reachability. Returns a success detail or throws a concise, actionable
- *  reason. NOTE: this writes one tiny object to the bucket (by design). */
-async function probeEvidenceBucket(ev: NonNullable<Deps["config"]["evidence"]>): Promise<string> {
+ *  the real upload base `herdr-factory/<github_username>/<key_prefix>/.herdr-doctor` (a fixed key,
+ *  overwritten each run so nothing accumulates) using the SAME ambient credential chain the real
+ *  upload uses. This exercises the exact s3:PutObject permission at the exact prefix uploads land in
+ *  — not just reachability. Returns a success detail or throws a concise, actionable reason.
+ *  NOTE: this writes one tiny object to the bucket (by design). */
+async function probeEvidenceBucket(ev: NonNullable<Deps["config"]["evidence"]>, username?: string): Promise<string> {
   // Silence the SDK's own console warnings (ambient-credential-source notes, body-length hints) so
   // they don't leak into the doctor output — the check reports the outcome itself.
   const silent = { debug() {}, info() {}, warn() {}, error() {} };
@@ -156,7 +162,7 @@ async function probeEvidenceBucket(ev: NonNullable<Deps["config"]["evidence"]>):
     logger: silent,
     ...(ev.profile ? { credentials: fromNodeProviderChain({ profile: ev.profile, logger: silent }) } : {}),
   });
-  const key = [ev.keyPrefix, ".herdr-doctor"].filter(Boolean).join("/");
+  const key = ["herdr-factory", username, ev.keyPrefix, ".herdr-doctor"].filter(Boolean).join("/");
   try {
     // A short known-length body (avoids the SDK's "stream of unknown length" PutObject warning).
     await s3.send(new PutObjectCommand({ Bucket: ev.bucket, Key: key, Body: "herdr-factory doctor probe\n", ContentType: "text/plain" }), {
