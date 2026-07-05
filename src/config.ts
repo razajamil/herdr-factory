@@ -53,8 +53,27 @@ const EvidenceBlockSchema = z
       .transform((s) => s.replace(/^\/+|\/+$/g, "")),
     // Optional AWS CLI named profile (else the default credential chain).
     profile: z.string().trim().min(1).optional(),
+    // Optional override for the per-user evidence folder. Evidence lands under
+    // `herdr-factory/<github_username>/<key_prefix>/…`; when unset, <github_username> is derived from
+    // the gh CLI's authenticated login at upload time.
+    github_username: z.string().trim().min(1).optional(),
   })
   .strict();
+
+/** The S3 key prefix for one evidence capture:
+ *  `herdr-factory / <github_username> / <key_prefix> / <ticketKey> / <runId>-<timestamp>`.
+ *  Empty segments (unset username or key_prefix) are dropped, so the base is always `herdr-factory/`. */
+export function evidenceKeyPrefix(opts: {
+  githubUsername?: string;
+  keyPrefix?: string;
+  ticketKey: string;
+  runId: number | string;
+  stamp: string;
+}): string {
+  return ["herdr-factory", opts.githubUsername, opts.keyPrefix, opts.ticketKey, `${opts.runId}-${opts.stamp}`]
+    .filter(Boolean)
+    .join("/");
+}
 
 // A work source is just identity + a type-specific backend block. The OPTIONAL `name` (default =
 // type, unique within the repo) is what a belt's `source:` references and what each run records on
@@ -335,6 +354,7 @@ export interface Config {
     region: string;
     cloudfrontDomain: string;
     keyPrefix: string;
+    githubUsername?: string;
     profile?: string;
   };
   guidance?: string;
@@ -717,6 +737,7 @@ export function loadConfig(repoName: string): Loaded {
           region: parsed.evidence.region,
           cloudfrontDomain: parsed.evidence.cloudfront_domain,
           keyPrefix: parsed.evidence.key_prefix,
+          githubUsername: parsed.evidence.github_username,
           profile: parsed.evidence.profile,
         }
       : undefined,

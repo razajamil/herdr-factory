@@ -443,6 +443,10 @@
         "profile": {
           "type": "string",
           "minLength": 1
+        },
+        "github_username": {
+          "type": "string",
+          "minLength": 1
         }
       },
       "required": [

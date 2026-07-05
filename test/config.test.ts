@@ -3,7 +3,7 @@ import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from "nod
 import { tmpdir, homedir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { loadConfig, assertMainCheckout, expandHome, configJsonSchema } from "../src/config.ts";
+import { loadConfig, assertMainCheckout, expandHome, configJsonSchema, evidenceKeyPrefix } from "../src/config.ts";
 
 const cleanups: (() => void)[] = [];
 afterEach(() => {
@@ -475,6 +475,38 @@ describe("loadConfig — work sources + belts", () => {
     expect(() => loadConfig("nope")).toThrow(/no config for repo/);
   });
 
+  it("resolves the evidence block incl. the optional github_username override (+ trims key_prefix, normalizes cloudfront)", () => {
+    setup(
+      `repo:\n  path: __REPO__\nwork_sources:\n${JIRA_SRC}belt:\n${SHIP_BELT}evidence:
+  bucket: my-bucket
+  region: us-east-1
+  cloudfront_domain: https://d1.cloudfront.net/
+  key_prefix: /sub/
+  github_username: alice
+`,
+      { prompts: {} },
+    );
+    const ev = loadConfig("demo").config.evidence!;
+    expect(ev.bucket).toBe("my-bucket");
+    expect(ev.cloudfrontDomain).toBe("d1.cloudfront.net"); // scheme + trailing slash stripped
+    expect(ev.keyPrefix).toBe("sub"); // leading/trailing slashes trimmed
+    expect(ev.githubUsername).toBe("alice");
+  });
+
+  it("leaves githubUsername undefined when the evidence block omits it (derived from gh at upload time)", () => {
+    setup(
+      `repo:\n  path: __REPO__\nwork_sources:\n${JIRA_SRC}belt:\n${SHIP_BELT}evidence:
+  bucket: my-bucket
+  region: us-east-1
+  cloudfront_domain: d1.cloudfront.net
+`,
+      { prompts: {} },
+    );
+    const ev = loadConfig("demo").config.evidence!;
+    expect(ev.githubUsername).toBeUndefined();
+    expect(ev.keyPrefix).toBe(""); // default
+  });
+
   it("maps a per-belt workspace_name through", () => {
     setup(
       cfg(JIRA_SRC, `  - name: ship
@@ -526,6 +558,15 @@ describe("configJsonSchema", () => {
     const repoRoot = fileURLToPath(new URL("../", import.meta.url)); // test/ → repo root
     const committed = JSON.parse(readFileSync(join(repoRoot, "config.schema.json"), "utf8"));
     expect(committed, "config.schema.json is stale — regenerate with `npm run schema`").toEqual(configJsonSchema());
+  });
+});
+
+describe("evidenceKeyPrefix", () => {
+  it("builds herdr-factory / user / key_prefix / ticket / run-stamp, dropping empty segments", () => {
+    expect(evidenceKeyPrefix({ githubUsername: "alice", keyPrefix: "proj", ticketKey: "RWR-1", runId: 5, stamp: "T" })).toBe("herdr-factory/alice/proj/RWR-1/5-T");
+    expect(evidenceKeyPrefix({ keyPrefix: "proj", ticketKey: "RWR-1", runId: 5, stamp: "T" })).toBe("herdr-factory/proj/RWR-1/5-T"); // no username
+    expect(evidenceKeyPrefix({ githubUsername: "alice", ticketKey: "RWR-1", runId: 5, stamp: "T" })).toBe("herdr-factory/alice/RWR-1/5-T"); // no key_prefix
+    expect(evidenceKeyPrefix({ ticketKey: "RWR-1", runId: 5, stamp: "T" })).toBe("herdr-factory/RWR-1/5-T"); // neither → base only
   });
 });
 

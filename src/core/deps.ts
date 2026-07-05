@@ -86,6 +86,8 @@ export interface GitHubApi {
   prForBranch(repo: string, branch: string): Promise<PrInfo | null>;
   prByNumber(repo: string, prNumber: number): Promise<PrInfo | null>;
   reviewSignature(repo: string, prNumber: number): Promise<ReviewSig>;
+  /** The authenticated gh user's login (memoized); null if it can't be determined. */
+  currentLogin(): Promise<string | null>;
 }
 
 export interface GitApi {

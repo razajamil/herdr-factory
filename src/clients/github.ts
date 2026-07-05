@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { runJson } from "./exec.ts";
+import { run, runJson } from "./exec.ts";
 import type { PrInfo, PrState, ReviewSig } from "../types.ts";
 
 interface ThreadsResp {
@@ -20,8 +20,18 @@ const FAILING = /FAIL|ERROR|TIMED_OUT|CANCELLED|FAILURE/;
 /** Read-only GitHub queries via the `gh` CLI (uses the user's gh auth). */
 export class GitHubClient {
   private readonly gh: string;
+  private login?: string | null; // memoized authenticated login (null = looked up, unavailable)
   constructor(gh: string = "gh") {
     this.gh = gh;
+  }
+
+  /** The authenticated gh user's login (e.g. for the per-user evidence folder). Memoized; returns
+   *  null when it can't be determined (gh missing / not authenticated). */
+  async currentLogin(): Promise<string | null> {
+    if (this.login !== undefined) return this.login;
+    const r = await run(this.gh, ["api", "user", "--jq", ".login"], { allowFail: true });
+    this.login = r.code === 0 ? r.stdout.trim() || null : null;
+    return this.login;
   }
 
   /** Discover a PR by its head branch. Used only for the FIRST sighting of a run's PR (before we've

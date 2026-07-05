@@ -227,7 +227,8 @@ export function buildDescriptors(draft: Document, rebuild: () => void, confirm: 
     d.push({ kind: "text", label: "bucket", path: ["evidence", "bucket"], placeholder: "my-evidence-bucket", indent: 1 });
     d.push({ kind: "text", label: "region", path: ["evidence", "region"], placeholder: "us-east-1", indent: 1 });
     d.push({ kind: "text", label: "cloudfront_domain", path: ["evidence", "cloudfront_domain"], placeholder: "d123abc.cloudfront.net", indent: 1 });
-    d.push({ kind: "text", label: "key_prefix", path: ["evidence", "key_prefix"], placeholder: "(optional)", indent: 1 });
+    d.push({ kind: "text", label: "github_username", path: ["evidence", "github_username"], placeholder: "(optional; default = gh login)", indent: 1 });
+    d.push({ kind: "text", label: "key_prefix", path: ["evidence", "key_prefix"], placeholder: "(optional; after herdr-factory/<user>/)", indent: 1 });
     d.push({ kind: "text", label: "profile", path: ["evidence", "profile"], placeholder: "(optional AWS CLI profile)", indent: 1 });
     d.push({ kind: "action", label: "‹ remove evidence config ›", indent: 1, run: () => { void confirm("Remove the evidence upload config?").then((ok) => { if (ok) { draft.deleteIn(["evidence"]); rebuild(); } }); } });
   }

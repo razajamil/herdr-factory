@@ -5,7 +5,7 @@ import { S3Client } from "@aws-sdk/client-s3";
 import { Upload } from "@aws-sdk/lib-storage";
 import { fromNodeProviderChain } from "@aws-sdk/credential-providers";
 import { lookup as mimeLookup } from "mime-types";
-import { configJsonSchema, configSchemaPath, globalDbPath, isManagedNode, managedNodePath, nodePathFile, writeConfigSchema } from "../config.ts";
+import { configJsonSchema, configSchemaPath, evidenceKeyPrefix, globalDbPath, isManagedNode, managedNodePath, nodePathFile, writeConfigSchema } from "../config.ts";
 import { baseGroups, repoGroup, type DoctorGroup } from "../doctor.ts";
 import { openDb } from "../db/index.ts";
 import { Store } from "../db/store.ts";
@@ -522,10 +522,16 @@ program
         console.log("evidence-upload: no files in the evidence dir — nothing to upload");
         return;
       }
-      // Namespace by work key + run id + timestamp so a re-capture (e.g. after a bounce) never
-      // overwrites an earlier upload; the pr step embeds whatever the latest evidence handoff cites.
+      // Key layout: herdr-factory / <github_username> / <key_prefix> / <ticketKey> / <runId>-<timestamp>.
+      // The per-user folder namespaces operators in a shared bucket; username = the evidence config
+      // override, else the gh-authenticated login (best-effort — omitted if gh can't resolve it). The
+      // run id + timestamp mean a re-capture (e.g. after a bounce) never overwrites an earlier upload.
       const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-      const prefix = [ev.keyPrefix, activeRun.ticketKey, `${activeRun.id}-${stamp}`].filter(Boolean).join("/");
+      const githubUsername = ev.githubUsername ?? (await deps.github.currentLogin()) ?? undefined;
+      if (!githubUsername) {
+        console.log("evidence-upload: could not resolve github_username (set evidence.github_username or authenticate gh) — uploading under herdr-factory/ with no per-user folder");
+      }
+      const prefix = evidenceKeyPrefix({ githubUsername, keyPrefix: ev.keyPrefix, ticketKey: activeRun.ticketKey, runId: activeRun.id, stamp });
       // Upload via the AWS SDK (was `aws s3 cp --recursive`) — so AWS is a pnpm dep the self-updater
       // manages, not an unmanaged system binary. No `credentials` ⇒ the SDK's default provider chain
       // (env → SSO → ~/.aws → process → IMDS/role) — the SAME ambient chain the CLI read; a named

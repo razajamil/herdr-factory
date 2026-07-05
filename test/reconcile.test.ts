@@ -124,6 +124,7 @@ function build(opts: { multi?: boolean } = {}) {
     prForBranch: async () => state.pr,
     prByNumber: async () => (state.prByNumber === undefined ? state.pr : state.prByNumber),
     reviewSignature: async () => state.sig,
+    currentLogin: async () => "test-user",
   };
   const git: GitApi = {
     branchExists: async () => false,
