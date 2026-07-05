@@ -1,4 +1,4 @@
-import type { BeltConfig, Config, Secrets } from "../config.ts";
+import type { BeltConfig, Config } from "../config.ts";
 import type { Store } from "../db/store.ts";
 import type {
   Agent,
@@ -226,7 +226,9 @@ export type Logger = (level: "info" | "warn" | "error", msg: string) => void;
 
 export interface Deps {
   config: Config;
-  secrets: Secrets;
+  /** The per-repo env file (auth secrets etc.) as a raw map; which keys matter is declared by
+   *  each source descriptor's secrets manifest. */
+  env: Readonly<Record<string, string>>;
   store: Store;
   ghRepo: string; // resolved owner/name
   herdr: HerdrApi;

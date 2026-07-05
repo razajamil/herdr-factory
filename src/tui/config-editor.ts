@@ -11,7 +11,8 @@ import { join } from "node:path";
 import { BoxRenderable, InputRenderable, ScrollBoxRenderable, SelectRenderable, TextRenderable, type CliRenderer } from "@opentui/core";
 import type { KeyEvent, Renderable } from "@opentui/core";
 import { parseDocument, type Document } from "yaml";
-import { RepoConfigSchema, listConfiguredRepos, loadSecrets, repoConfigDir, saveSecrets } from "../config.ts";
+import { RepoConfigSchema, listConfiguredRepos, loadEnvMap, repoConfigDir, saveEnvValues } from "../config.ts";
+import { SOURCE_DESCRIPTORS } from "../sources/registry.ts";
 import { postReload } from "./api.ts";
 import { buildDescriptors, type FieldDesc } from "./config-fields.ts";
 import { BORDER, theme } from "./theme.ts";
@@ -90,19 +91,28 @@ export function createConfigEditor(renderer: CliRenderer, confirm: ConfirmFn): T
   let lastSection = 1;
   let errorNodes: Renderable[] = [];
   let expandedNodes = new WeakSet<object>(); // which array-item nodes are expanded (view state)
-  // Per-repo Jira credentials (separate `env` file). `secrets` is live (updated by flush);
-  // `loadedSecrets` is the on-disk snapshot, so save only writes when they differ.
-  let secrets = { jiraEmail: "", jiraApiToken: "" };
-  let loadedSecrets = { jiraEmail: "", jiraApiToken: "" };
-  const secretGet = (envKey: string) => (envKey === "JIRA_EMAIL" ? secrets.jiraEmail : secrets.jiraApiToken);
-  const secretSet = (envKey: string, v: string) => { if (envKey === "JIRA_EMAIL") secrets.jiraEmail = v; else secrets.jiraApiToken = v; };
+  // Per-repo credentials (separate `env` file). `envValues` is live (updated by flush);
+  // `loadedEnv` is the on-disk snapshot, so save only writes when they differ. Which keys are
+  // shown comes from the source descriptors' secrets manifests — not hardcoded per backend.
+  let envValues: Record<string, string> = {};
+  let loadedEnv: Record<string, string> = {};
+  const secretGet = (envKey: string) => envValues[envKey] ?? "";
+  const secretSet = (envKey: string, v: string) => { envValues[envKey] = v; };
 
-  // The env-backed credential fields, prepended above the config.yml form.
-  const secretDescriptors = (): FieldDesc[] => [
-    { kind: "header", label: "secrets (env)", level: 1 },
-    { kind: "text", label: "JIRA_EMAIL", env: "JIRA_EMAIL", placeholder: "you@org.com", indent: 1 },
-    { kind: "text", label: "JIRA_API_TOKEN", env: "JIRA_API_TOKEN", masked: true, indent: 1 },
-  ];
+  // The env-backed credential fields, prepended above the config.yml form: every source type's
+  // manifest, deduped by env key (a key two types share renders once).
+  const secretDescriptors = (): FieldDesc[] => {
+    const rows: FieldDesc[] = [{ kind: "header", label: "secrets (env)", level: 1 }];
+    const seen = new Set<string>();
+    for (const d of SOURCE_DESCRIPTORS) {
+      for (const s of d.secrets) {
+        if (seen.has(s.envKey)) continue;
+        seen.add(s.envKey);
+        rows.push({ kind: "text", label: s.envKey, env: s.envKey, masked: s.masked, placeholder: s.placeholder ?? (s.required ? undefined : "(optional)"), indent: 1 });
+      }
+    }
+    return rows;
+  };
 
   function setStatus(content: string, fg: string): void {
     status.content = content;
@@ -404,8 +414,8 @@ export function createConfigEditor(renderer: CliRenderer, confirm: ConfirmFn): T
     }
     loadedRepo = name;
     draft = doc;
-    loadedSecrets = { ...loadSecrets(repoConfigDir(name)) };
-    secrets = { ...loadedSecrets };
+    loadedEnv = loadEnvMap(repoConfigDir(name));
+    envValues = { ...loadedEnv };
     render();
     setHighlight(0);
     setStatus("↑↓ move · ↵ open/edit/cycle · ^S save", theme.text.secondary);
@@ -419,9 +429,10 @@ export function createConfigEditor(renderer: CliRenderer, confirm: ConfirmFn): T
     flushInputs();
     // Credentials live in a separate `env` file (no schema validation) — save them independently
     // of config validity when they've changed.
-    if (secrets.jiraEmail !== loadedSecrets.jiraEmail || secrets.jiraApiToken !== loadedSecrets.jiraApiToken) {
-      saveSecrets(repoConfigDir(loadedRepo), { jiraEmail: secrets.jiraEmail, jiraApiToken: secrets.jiraApiToken });
-      loadedSecrets = { ...secrets };
+    const changed = Object.entries(envValues).filter(([k, v]) => v !== (loadedEnv[k] ?? ""));
+    if (changed.length > 0) {
+      saveEnvValues(repoConfigDir(loadedRepo), Object.fromEntries(changed));
+      loadedEnv = { ...loadedEnv, ...Object.fromEntries(changed) };
     }
     clearErrors();
     const parsed = RepoConfigSchema.safeParse(draft.toJS());

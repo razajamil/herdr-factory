@@ -1,6 +1,5 @@
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import type { JiraSourceCfg } from "../config.ts";
 import { bearsHerdrMarker, HERDR_MARKER, type Logger, type WorkSource, type WorkSourceSpec } from "../core/deps.ts";
 import type {
   HumanAskInput,
@@ -24,6 +23,17 @@ const MAX_VIDEO_BYTES = 50 * 1024 * 1024; // 50 MB
 const isMedia = (mime: string): boolean => mime.startsWith("image/") || mime.startsWith("video/");
 
 const QUESTION_MARKER = `${HERDR_MARKER} question:`;
+
+/** Resolved Jira-source config (the client owns its config shape; the descriptor maps YAML onto it). */
+export interface JiraSourceCfg {
+  baseUrl: string;
+  project: string;
+  board: string;
+  label: string;
+  statusTodo: string;
+  statusInDev: string;
+  statusReview: string;
+}
 
 function bodyText(node: unknown): string {
   if (!node || typeof node !== "object") return "";

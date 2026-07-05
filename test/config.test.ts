@@ -4,6 +4,8 @@ import { tmpdir, homedir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { loadConfig, assertMainCheckout, expandHome, configJsonSchema, evidenceKeyPrefix } from "../src/config.ts";
+import type { JiraSourceCfg } from "../src/clients/jira-source.ts";
+import type { LocalMarkdownSourceCfg } from "../src/sources/local-markdown/descriptor.ts";
 
 const cleanups: (() => void)[] = [];
 afterEach(() => {
@@ -68,22 +70,23 @@ describe("loadConfig — work sources + belts", () => {
 `, SHIP_BELT),
       { guidance: "- use the X skill" },
     );
-    const { config, secrets } = loadConfig("demo");
+    const { config, env } = loadConfig("demo");
     expect(config.repo.path).toBe(repoPath);
     expect(config.sources.length).toBe(1);
     const s = config.sources[0]!;
     expect(s.name).toBe("jira"); // default name = type
     expect(s.type).toBe("jira");
-    expect(s.jira!.baseUrl).toBe("https://x.atlassian.net"); // trailing slash stripped
-    expect(s.jira!.project).toBe("RWR");
-    expect(s.jira!.board).toBe("254"); // coerced number → string
-    expect(s.jira!.label).toBe("agent"); // default
-    expect(s.jira!.statusInDev).toBe("In development");
+    const jira = s.cfg as JiraSourceCfg; // resolved by the jira descriptor
+    expect(jira.baseUrl).toBe("https://x.atlassian.net"); // trailing slash stripped
+    expect(jira.project).toBe("RWR");
+    expect(jira.board).toBe("254"); // coerced number → string
+    expect(jira.label).toBe("agent"); // default
+    expect(jira.statusInDev).toBe("In development");
     expect(config.limits.stallSeconds).toBe(2700); // default
     expect(config.limits.maxActive).toBe(3); // default
     expect(config.limits.stepBudgetSeconds).toBe(3600); // default
     expect(config.guidance).toContain("use the X skill");
-    expect(secrets.jiraEmail).toBe("me@x.com"); // auth still global
+    expect(env.JIRA_EMAIL).toBe("me@x.com"); // auth still per-repo env
     expect(config.paths.dbPath).toContain("herdr-factory.db");
 
     const belt = config.belts[0]!;
@@ -94,13 +97,13 @@ describe("loadConfig — work sources + belts", () => {
     expect(belt.watchPr).toBe(true);
   });
 
-  it("loads Jira secrets strictly from the per-repo env (a shared global env is ignored)", () => {
+  it("loads secrets strictly from the per-repo env (a shared global env is ignored)", () => {
     setup(cfg(JIRA_SRC, SHIP_BELT), { prompts: {} }); // setup writes repos/demo/env: me@x.com / tok
     // A global <configDir>/env must NOT be consulted — secrets are per-repo only.
     writeFileSync(join(process.env.HERDR_FACTORY_CONFIG_DIR!, "env"), "JIRA_EMAIL=global@x.com\nJIRA_API_TOKEN=global-tok\n");
-    const { secrets } = loadConfig("demo");
-    expect(secrets.jiraEmail).toBe("me@x.com"); // per-repo, not the global
-    expect(secrets.jiraApiToken).toBe("tok");
+    const { env } = loadConfig("demo");
+    expect(env.JIRA_EMAIL).toBe("me@x.com"); // per-repo, not the global
+    expect(env.JIRA_API_TOKEN).toBe("tok");
   });
 
   it("SKIPS the evidence step when it has no tab/pane (fix → review → pr) — evidence never self-spawns", () => {
@@ -181,7 +184,7 @@ describe("loadConfig — work sources + belts", () => {
     );
     const { config } = loadConfig("demo");
     expect(config.sources[0]!.type).toBe("local_markdown");
-    expect(config.sources[0]!.localMarkdown!.folder).toBe(join(homedir(), "work"));
+    expect((config.sources[0]!.cfg as LocalMarkdownSourceCfg).folder).toBe(join(homedir(), "work"));
     const fix = config.belts[0]!.steps.find((s) => s.name === "fix")!;
     // the local_markdown fix prompt references the markdown task doc, not Jira
     expect(fix.enginePrompt).toContain("@@WORK_DOC@@");

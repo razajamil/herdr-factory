@@ -7,6 +7,8 @@
 // Structural edits (add/remove, type switch) mutate the Document surgically — setIn/addIn/deleteIn
 // (+ createNode for new nodes) preserve comments on untouched nodes — then call `rebuild`.
 import type { Document } from "yaml";
+import { SOURCE_DESCRIPTORS, descriptorFor } from "../sources/registry.ts";
+import type { SourceType } from "../types.ts";
 import type { ConfirmFn } from "./types.ts";
 
 export type Path = (string | number)[];
@@ -21,14 +23,13 @@ export type FieldDesc =
   | { kind: "action"; label: string; run: () => void; indent?: number };
 
 // ── defaults for newly-created nodes ────────────────────────────────────────────────────────────
-const jiraBlock = () => ({
-  base_url: "",
-  project: "",
-  board: "",
-  label: "agent",
-  status: { todo: "To Do", in_development: "In Progress", review: "In Review" },
+// Source-type blocks come from the registry (descriptor.tui.defaultBlock); belts stay local.
+const SOURCE_TYPE_CHOICES = SOURCE_DESCRIPTORS.map((d) => d.type);
+const sourceNode = (type: SourceType, name?: unknown) => ({
+  type,
+  ...(name != null ? { name } : {}),
+  [type]: descriptorFor(type).tui.defaultBlock(),
 });
-const localMarkdownBlock = () => ({ folder: "" });
 const defaultStep = (name: string) => ({ name, prompt_file: "", prompt_file_source: "config" });
 // empty agent blocks are valid by default; `evidence` is shown so its tab/pane is discoverable, but
 // it only RUNS when its tab+pane are set (else the evidence step is skipped: fix → review → pr).
@@ -98,30 +99,21 @@ export function buildDescriptors(draft: Document, rebuild: () => void, confirm: 
       kind: "enum",
       label: "type",
       value: type,
-      choices: ["jira", "local_markdown"],
+      choices: SOURCE_TYPE_CHOICES,
       indent: 2,
       apply: (next) => {
         if (next === type) return;
         const name = draft.getIn(["work_sources", i, "name"]);
-        const built =
-          next === "jira"
-            ? { type: "jira", ...(name != null ? { name } : {}), jira: jiraBlock() }
-            : { type: "local_markdown", ...(name != null ? { name } : {}), local_markdown: localMarkdownBlock() };
-        draft.setIn(["work_sources", i], draft.createNode(built));
+        draft.setIn(["work_sources", i], draft.createNode(sourceNode(next as SourceType, name)));
         open(["work_sources", i]); // keep expanded after switching type
         rebuild();
       },
     });
-    if (type === "jira") {
-      d.push({ kind: "text", label: "jira.base_url", path: ["work_sources", i, "jira", "base_url"], placeholder: "https://org.atlassian.net", indent: 2 });
-      d.push({ kind: "text", label: "jira.project", path: ["work_sources", i, "jira", "project"], placeholder: "PROJ", indent: 2 });
-      d.push({ kind: "text", label: "jira.board", path: ["work_sources", i, "jira", "board"], placeholder: "123", indent: 2 });
-      d.push({ kind: "text", label: "jira.label", path: ["work_sources", i, "jira", "label"], placeholder: "agent", indent: 2 });
-      d.push({ kind: "text", label: "status.todo", path: ["work_sources", i, "jira", "status", "todo"], placeholder: "To Do", indent: 2 });
-      d.push({ kind: "text", label: "status.in_development", path: ["work_sources", i, "jira", "status", "in_development"], placeholder: "In Progress", indent: 2 });
-      d.push({ kind: "text", label: "status.review", path: ["work_sources", i, "jira", "status", "review"], placeholder: "In Review", indent: 2 });
-    } else {
-      d.push({ kind: "text", label: "folder", path: ["work_sources", i, "local_markdown", "folder"], placeholder: "~/dev/work-items", indent: 2 });
+    // The type block's fields come from the type's descriptor (an unknown type — hand-edited
+    // YAML — falls back to no fields; the schema validation on save reports it properly).
+    const descriptor = SOURCE_DESCRIPTORS.find((x) => x.type === type);
+    for (const f of descriptor?.tui.fields ?? []) {
+      d.push({ kind: "text", label: f.label, path: ["work_sources", i, ...f.path], placeholder: f.placeholder, numeric: f.numeric, indent: 2 });
     }
     d.push({ kind: "action", label: "‹ remove source ›", indent: 2, run: () => { void confirm(`Remove work source "${sourceNames[i]}"?`).then((ok) => { if (ok) { draft.deleteIn(["work_sources", i]); rebuild(); } }); } });
   });
@@ -130,7 +122,8 @@ export function buildDescriptors(draft: Document, rebuild: () => void, confirm: 
     label: "+ add work source",
     indent: 1,
     run: () => {
-      draft.addIn(["work_sources"], draft.createNode({ type: "jira", name: uniqueName("jira", sourceNames), jira: jiraBlock() }));
+      const type = SOURCE_TYPE_CHOICES[0]!; // jira first (the registry's canonical order)
+      draft.addIn(["work_sources"], draft.createNode({ ...sourceNode(type), name: uniqueName(type, sourceNames) }));
       open(["work_sources", sources.length]);
       rebuild();
     },

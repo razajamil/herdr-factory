@@ -2,8 +2,7 @@ import { describe, it, expect, afterEach, beforeEach } from "vitest";
 import { mkdtempSync, rmSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { JiraSource } from "../src/clients/jira-source.ts";
-import type { JiraSourceCfg } from "../src/config.ts";
+import { JiraSource, type JiraSourceCfg } from "../src/clients/jira-source.ts";
 
 const CFG: JiraSourceCfg = {
   baseUrl: "https://x.atlassian.net",

@@ -5,30 +5,11 @@ import { fileURLToPath } from "node:url";
 import { parse as parseYaml } from "yaml";
 import { z } from "zod";
 import type { SourceType } from "./types.ts";
+import { SOURCE_DESCRIPTORS, descriptorFor } from "./sources/registry.ts";
 
 // ── Work sources: where to poll work from (no agents/pipeline here anymore — that's a belt). ──
-
-// The Jira source's where-to-poll block. base_url is the Atlassian site (not a secret; auth —
-// email + token — stays in the shared env).
-const JiraBlockSchema = z.object({
-  base_url: z.url().transform((s) => s.replace(/\/+$/, "")),
-  project: z.string(),
-  board: z.coerce.string(),
-  label: z.string().default("agent"),
-  status: z
-    .object({
-      todo: z.string().default("To Do"),
-      in_development: z.string().default("In Progress"),
-      review: z.string().default("In Review"),
-    })
-    .prefault({}),
-});
-
-// The local_markdown source's config: a folder of *.md files, each one work item. Lifecycle is
-// tracked internally in the work_items table (herdr-factory owns the status of record here).
-const LocalMarkdownBlockSchema = z.object({
-  folder: z.string(),
-});
+// Each type's block schema + resolution lives on its descriptor (src/sources/<type>/descriptor.ts);
+// this file only joins them into the discriminated union and drives the generic resolve loop.
 
 // ── Evidence upload: where the `evidence` step publishes captured screenshots/video (S3 + CloudFront).
 // Non-secret infra pointers ONLY — AWS credentials come from the ambient AWS credential chain (~/.aws /
@@ -78,14 +59,21 @@ export function evidenceKeyPrefix(opts: {
 // A work source is just identity + a type-specific backend block. The OPTIONAL `name` (default =
 // type, unique within the repo) is what a belt's `source:` references and what each run records on
 // its `work_source` column.
-// `.strict()` on the union members: an unknown key (a typo, or the wrong type's block) is rejected
-// at parse time with a clear "Unrecognized key" rather than being silently dropped.
-const sourceName = z.string().trim().min(1).optional();
-const JiraSourceSchema = z.object({ type: z.literal("jira"), name: sourceName, jira: JiraBlockSchema }).strict();
-const LocalMarkdownSourceSchema = z
-  .object({ type: z.literal("local_markdown"), name: sourceName, local_markdown: LocalMarkdownBlockSchema })
-  .strict();
-const WorkSourceSchema = z.discriminatedUnion("type", [JiraSourceSchema, LocalMarkdownSourceSchema]);
+// `.strict()` on the union members (each descriptor's configSchema): an unknown key (a typo, or
+// the wrong type's block) is rejected at parse time with a clear "Unrecognized key" rather than
+// being silently dropped. The union is assembled from the registry so a new source type never
+// edits this file.
+/** The minimal shape every parsed source object shares; the type-specific block rides along as
+ *  unknown keys and is interpreted by its descriptor's resolveConfig. */
+interface ParsedWorkSource {
+  type: SourceType;
+  name?: string;
+  [key: string]: unknown;
+}
+const WorkSourceSchema = z.discriminatedUnion(
+  "type",
+  SOURCE_DESCRIPTORS.map((d) => d.configSchema) as unknown as Parameters<typeof z.discriminatedUnion>[1],
+) as unknown as z.ZodType<ParsedWorkSource>;
 
 // ── Belts: a (source + ordered steps) pairing. The belt is the unit of work flow. ──
 
@@ -276,35 +264,14 @@ export const RepoConfigSchema = z
     });
   });
 
-export interface Secrets {
-  jiraEmail: string;
-  jiraApiToken: string;
-}
-
 export type BeltType = "work_to_pull_request" | "custom";
 
-/** Resolved Jira-source config (present iff type === "jira"). */
-export interface JiraSourceCfg {
-  baseUrl: string;
-  project: string;
-  board: string;
-  label: string;
-  statusTodo: string;
-  statusInDev: string;
-  statusReview: string;
-}
-
-/** Resolved local_markdown-source config (present iff type === "local_markdown"). */
-export interface LocalMarkdownSourceCfg {
-  folder: string; // ~ / $HOME expanded
-}
-
-/** One configured work source: identity + the type-specific backend block. No pipeline here. */
+/** One configured work source: identity + its resolved type-specific block. `cfg` is opaque to
+ *  everything except the type's own descriptor (whose create() gets it back, typed). */
 export interface WorkSourceConfig {
   name: string;
   type: SourceType;
-  jira?: JiraSourceCfg;
-  localMarkdown?: LocalMarkdownSourceCfg;
+  cfg: unknown;
 }
 
 /** One resolved belt step. The body the agent gets is assembled at RENDER time (step.ts): the
@@ -387,7 +354,9 @@ export interface Config {
 
 export interface Loaded {
   config: Config;
-  secrets: Secrets;
+  /** The per-repo env file as a raw key/value map. Which keys matter is declared by each source
+   *  descriptor's secrets manifest — the engine never interprets them. */
+  env: Record<string, string>;
 }
 
 // `?.trim() ||` (not `??`): treat an empty/whitespace override as unset, so a stray
@@ -537,25 +506,23 @@ export function serverLogsDir(): string {
   return join(stateRoot(), "logs");
 }
 
-/** Load Jira auth (email + token) for a repo. Secrets are strictly PER-REPO — read only from
- *  `<configDir>/repos/<name>/env`. There is no shared/global secrets file. */
-export function loadSecrets(repoDir: string): Secrets {
-  const env = parseEnvFile(join(repoDir, "env"));
-  return {
-    jiraEmail: env.JIRA_EMAIL ?? "",
-    jiraApiToken: env.JIRA_API_TOKEN ?? "",
-  };
+/** Load a repo's env file (auth secrets etc.) as a raw map. Strictly PER-REPO — read only from
+ *  `<configDir>/repos/<name>/env`. There is no shared/global secrets file. Same file + keys as the
+ *  old Jira-shaped loader (JIRA_EMAIL/JIRA_API_TOKEN keep working verbatim); which keys a source
+ *  needs is declared on its descriptor's secrets manifest. */
+export function loadEnvMap(repoDir: string): Record<string, string> {
+  return parseEnvFile(join(repoDir, "env"));
 }
 
-/** Write Jira auth to `<repoDir>/env` (chmod 600), merging into any existing keys. Only the fields
- *  provided are updated; others in the file are preserved. Counterpart to loadSecrets, used by the
- *  TUI config editor so credentials don't have to be hand-created. */
-export function saveSecrets(repoDir: string, secrets: { jiraEmail?: string; jiraApiToken?: string }): void {
+/** Merge key/values into `<repoDir>/env` (chmod 600). Only the keys provided are updated (a
+ *  `undefined` value leaves the existing entry alone); others in the file are preserved.
+ *  Counterpart to loadEnvMap, used by the TUI config editor so credentials don't have to be
+ *  hand-created. */
+export function saveEnvValues(repoDir: string, values: Record<string, string | undefined>): void {
   mkdirSync(repoDir, { recursive: true });
   const path = join(repoDir, "env");
   const env = parseEnvFile(path);
-  if (secrets.jiraEmail !== undefined) env.JIRA_EMAIL = secrets.jiraEmail;
-  if (secrets.jiraApiToken !== undefined) env.JIRA_API_TOKEN = secrets.jiraApiToken;
+  for (const [k, v] of Object.entries(values)) if (v !== undefined) env[k] = v;
   const content = Object.entries(env).map(([k, v]) => `${k}=${v}`).join("\n") + "\n";
   writeFileSync(path, content, { mode: 0o600 });
   chmodSync(path, 0o600); // ensure 600 even if the file already existed
@@ -615,24 +582,11 @@ export function loadConfig(repoName: string): Loaded {
   const guidancePath = join(repoDir, "guidelines-prompt.md");
   const guidance = existsSync(guidancePath) ? readFileSync(guidancePath, "utf8") : undefined;
 
-  const sources: WorkSourceConfig[] = parsed.work_sources.map((s) => {
-    const base = { name: s.name ?? s.type, type: s.type };
-    if (s.type === "jira") {
-      return {
-        ...base,
-        jira: {
-          baseUrl: s.jira.base_url,
-          project: s.jira.project,
-          board: s.jira.board,
-          label: s.jira.label,
-          statusTodo: s.jira.status.todo,
-          statusInDev: s.jira.status.in_development,
-          statusReview: s.jira.status.review,
-        },
-      };
-    }
-    return { ...base, localMarkdown: { folder: expandHome(s.local_markdown.folder) } };
-  });
+  const sources: WorkSourceConfig[] = parsed.work_sources.map((s) => ({
+    name: s.name ?? s.type,
+    type: s.type,
+    cfg: descriptorFor(s.type).resolveConfig(s),
+  }));
   const sourceTypeByName = new Map(sources.map((s) => [s.name, s.type]));
 
   // The engine's built-in prompt for a (sourceType, step): prompts/<type>/<step>.md if present,
@@ -772,5 +726,5 @@ export function loadConfig(repoName: string): Loaded {
     },
   };
 
-  return { config, secrets: loadSecrets(repoDir) };
+  return { config, env: loadEnvMap(repoDir) };
 }

@@ -6,7 +6,7 @@ import { openDb } from "../src/db/index.ts";
 import { Store } from "../src/db/store.ts";
 import { applyPendingFocus, bounceStep, claimTicket, flushTransitionOutbox, reconcileRepo, reconcileRun, requestHumanInput, resumeRun, withRunLock, withRunLockWaiting, withTickLock } from "../src/core/reconcile.ts";
 import { HerdrUnreachableError, type BeltRuntime, type Deps, type GitApi, type GitHubApi, type HerdrApi, type SourceRuntime, type WorkSource } from "../src/core/deps.ts";
-import type { Config, Secrets, StepConfig } from "../src/config.ts";
+import type { Config, StepConfig } from "../src/config.ts";
 import type { FocusedPane, HumanAskInput, HumanPollInput, HumanReply, JiraMatchItem, LocalMarkdownMatchItem, Phase, PrInfo, PrSnapshot, ReviewSig, Ticket, WorkState } from "../src/types.ts";
 import { StaleItemError } from "../src/types.ts";
 
@@ -174,19 +174,19 @@ function build(opts: { multi?: boolean } = {}) {
     originUrl: async () => "git@github.com:o/n.git",
     headSha: async () => state.headSha,
   };
-  const secrets: Secrets = { jiraEmail: "e", jiraApiToken: "t" };
+  const env = { JIRA_EMAIL: "e", JIRA_API_TOKEN: "t" };
   const config: Config = {
     repoName: "demo",
     repo: { path: "/main-checkout", baseRef: "origin/master" },
     limits: { maxActive: 3, watchHours: 7, attentionRenotifySeconds: 3600, developBudgetSeconds: 5400, stallSeconds: 2700, reviewBudgetSeconds: 1800, evidenceBudgetSeconds: 2400, prBudgetSeconds: 3600, maxBounces: 3, stepBudgetSeconds: 3600, tickIntervalSeconds: 60, reconcileConcurrency: 8, maxClaimsPerTick: 10, layoutWaitSeconds: 600 },
-    sources: sources.map((s) => ({ name: s.name, type: s.type })),
+    sources: sources.map((s) => ({ name: s.name, type: s.type, cfg: {} })),
     belts,
     guidance: undefined,
     paths: { configDir: "/c", repoDir: "/c/repos/demo", stateRoot: "/s", stateDir: "/s/demo", dbPath: "/s/db", logsDir: join(worktree, "logs") },
   };
   const deps: Deps = {
     config,
-    secrets,
+    env,
     store,
     ghRepo: "o/n",
     herdr,

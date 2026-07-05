@@ -9,8 +9,7 @@ import { Store } from "./db/store.ts";
 import { systemClock } from "./types.ts";
 import type { BeltMatch } from "./types.ts";
 import { HerdrClient } from "./clients/herdr.ts";
-import { JiraSource } from "./clients/jira-source.ts";
-import { LocalMarkdownSource } from "./clients/local-markdown-source.ts";
+import { descriptorFor } from "./sources/registry.ts";
 import { GitHubClient } from "./clients/github.ts";
 import { GitClient, parseGhRepo } from "./clients/git.ts";
 import type { BeltRuntime, Deps, Logger, SourceRuntime } from "./core/deps.ts";
@@ -51,26 +50,19 @@ export function makeLogger(config: Config): Logger {
  *  fallback path AND by the resident server (once per repo it serves). */
 export async function buildDeps(repoName: string): Promise<Deps> {
   return telemetrySpan("deps.build", { repo: repoName }, async () => {
-    const { config, secrets } = loadConfig(repoName);
+    const { config, env } = loadConfig(repoName);
     mkdirSync(config.paths.stateDir, { recursive: true });
     const store = new Store(openDb(config.paths.dbPath), systemClock);
     const log = makeLogger(config);
     const git = instrumentObject(new GitClient(), "git");
     const ghRepo = config.repo.github ?? parseGhRepo(await git.originUrl(config.repo.path)) ?? "";
-    // Build a live client per work source (backends only — the pipeline lives on belts).
+    // Build a live client per work source via its registry descriptor (backends only — the
+    // pipeline lives on belts). A descriptor's create() may throw on an unbuildable config —
+    // startup fails loudly rather than at claim time.
     const sources: SourceRuntime[] = config.sources.map((s) => {
       const sourceAttrs = { repo: repoName, "work.source": s.name, "source.type": s.type };
-      return {
-        name: s.name,
-        type: s.type,
-        client: instrumentObject(
-          s.type === "jira"
-            ? new JiraSource(s.jira!, secrets.jiraEmail, secrets.jiraApiToken)
-            : new LocalMarkdownSource(s.localMarkdown!.folder, store, repoName, s.name, log),
-          "source",
-          sourceAttrs,
-        ),
-      };
+      const client = descriptorFor(s.type).create({ repoName, sourceName: s.name, cfg: s.cfg, env, store, ghRepo, log });
+      return { name: s.name, type: s.type, client: instrumentObject(client, "source", sourceAttrs) };
     });
     const sourceByName = new Map(sources.map((s) => [s.name, s]));
     // config.belts is already priority-ordered; load each belt's match predicate (if any).
@@ -80,7 +72,7 @@ export async function buildDeps(repoName: string): Promise<Deps> {
     const beltByName = new Map(belts.map((b) => [b.name, b]));
     return {
       config,
-      secrets,
+      env,
       store,
       ghRepo,
       herdr: instrumentObject(new HerdrClient(process.env.HERDR_BIN_PATH ?? "herdr"), "herdr", { repo: repoName }),

@@ -9,6 +9,7 @@ import { PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
 import { fromNodeProviderChain } from "@aws-sdk/credential-providers";
 import { run } from "./clients/exec.ts";
 import { assertMainCheckout, globalDbPath, isManagedNode } from "./config.ts";
+import { descriptorFor } from "./sources/registry.ts";
 import { buildDeps } from "./build-deps.ts";
 import type { Deps } from "./core/deps.ts";
 import { pingHealth, readServerInfo } from "./server/client.ts";
@@ -119,11 +120,16 @@ export async function repoGroup(repo: string, deep = false): Promise<DoctorGroup
       } else {
         checks.push({ name: `source ${src.name} (${src.type})`, ok: true, detail: "configured (--deep to health-check)" });
       }
-      // Jira secrets present is a cheap local check — keep in both modes; deep's health() proves they work.
-      if (src.type === "jira") {
+      // Required secrets present is a cheap local check (driven by the type's descriptor
+      // manifest) — keep in both modes; deep's health() proves they actually work.
+      const required = descriptorFor(src.type).secrets.filter((s) => s.required);
+      if (required.length > 0) {
         checks.push(
-          await attempt(`jira secrets for ${src.name}`, async () => {
-            if (!d.secrets.jiraEmail || !d.secrets.jiraApiToken) throw new Error("JIRA_EMAIL / JIRA_API_TOKEN missing in the repo env file");
+          await attempt(`${src.type} secrets for ${src.name}`, async () => {
+            const missing = required.filter((s) => !d.env[s.envKey]);
+            if (missing.length > 0) {
+              throw new Error(missing.map((s) => `${s.envKey} missing in the repo env file — ${s.hint}`).join("; "));
+            }
           }),
         );
       }
