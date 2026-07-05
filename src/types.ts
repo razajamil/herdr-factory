@@ -130,11 +130,14 @@ export interface RunStep {
   startedAt: number | null;
   doneAt: number | null;
   bounces: number; // times a later step bounced work back to this step (loop-safety counter)
+  /** When this step's pane was first CONFIRMED absent (herdr answered without it); null = believed
+   *  alive. Respawn requires a second confirmed absence past the confirmation window. */
+  absentAt: number | null;
 }
 
 /** Fields the reconciler may patch on a run step. */
 export type RunStepPatch = Partial<
-  Pick<RunStep, "paneId" | "sessionId" | "progressSig" | "progressAt" | "done" | "startedAt">
+  Pick<RunStep, "paneId" | "sessionId" | "progressSig" | "progressAt" | "done" | "startedAt" | "absentAt">
 >;
 
 /** A local_markdown work item's internally-tracked lifecycle row (the `work_items` table).

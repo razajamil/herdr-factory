@@ -1,6 +1,6 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import type { BeltRuntime, Deps, SourceRuntime } from "./deps.ts";
+import { HerdrUnreachableError, type BeltRuntime, type Deps, type SourceRuntime } from "./deps.ts";
 import type { StepConfig } from "../config.ts";
 import type { HumanQuestion, MatchItem, Outcome, PrInfo, Run, RunStep, Ticket } from "../types.ts";
 import { outcomeToWorkState, ticketOf } from "../types.ts";
@@ -12,6 +12,11 @@ import { recordTick, recordTickDuration, recordTickLockSkipped, telemetryEvent, 
 function err(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
 }
+
+/** How long a step's pane must stay CONFIRMED absent before the reconciler respawns it. Two
+ *  confirmed observations at least this far apart are required — long enough to ride out a herdr
+ *  daemon restart, short enough that a genuinely dead pane restarts within ~a tick. */
+const PANE_ABSENCE_CONFIRM_SECONDS = 45;
 
 /**
  * Run `fn` under the per-repo single-instance tick lock; returns true if it ran, false if
@@ -776,7 +781,18 @@ async function reconcileStep(deps: Deps, run: Run, belt: BeltRuntime, src: Sourc
   const overBudget = active.startedAt != null && deps.now() - active.startedAt > step.budgetSeconds;
 
   if (stalled || overBudget) {
-    const ws = active.paneId ? await deps.herdr.paneState(active.paneId) : "gone";
+    let ws: string;
+    try {
+      ws = active.paneId ? await deps.herdr.paneState(active.paneId) : "gone";
+    } catch (e) {
+      if (e instanceof HerdrUnreachableError) {
+        // Can't judge the worker while herdr is unreachable — a false "gone" here would park a
+        // healthy run in attention. Defer the whole watchdog to a later tick.
+        deps.log("warn", `${run.ticketKey}: ${step.name} watchdog deferred — ${e.message}`);
+        return;
+      }
+      throw e;
+    }
     if (!stalled && ws === "working") {
       deps.log("info", `${run.ticketKey}: ${step.name} past budget but still working — extending`);
       return;
@@ -792,15 +808,40 @@ async function reconcileStep(deps: Deps, run: Run, belt: BeltRuntime, src: Sourc
     return;
   }
 
-  // Agent pane died before signalling → re-spawn (idempotent recovery). Re-check `done`
-  // first: it may have flipped (step-done) after our earlier read, in which case the agent
-  // finished and exited — don't relaunch a completed step into a duplicate agent.
-  if (!(await deps.herdr.paneAlive(rs.paneId))) {
-    if (deps.store.getRunStep(run.id, step.name)?.done) return; // finished; the next tick advances
-    deps.log("info", `${run.ticketKey}: ${step.name} pane gone — re-spawning`);
+  // Agent pane died before signalling → re-spawn (idempotent recovery). Guarded three ways,
+  // because the respawn of a NOT-actually-dead pane puts a duplicate agent into the worktree:
+  //  1. herdr unreachable ≠ pane dead — HerdrUnreachableError defers the check to a later tick.
+  //  2. A memoized "absent" is re-checked with a FRESH `herdr agent list` before it counts.
+  //  3. Two-strike confirmation: the first confirmed absence only records `absentAt`; only a
+  //     second confirmed absence past the confirmation window respawns (a herdr-daemon restart
+  //     that briefly drops every pane from the list heals in between).
+  let alive: boolean;
+  try {
+    alive = await deps.herdr.paneAlive(rs.paneId);
+    if (!alive) alive = await deps.herdr.paneAlive(rs.paneId, { fresh: true });
+  } catch (e) {
+    if (e instanceof HerdrUnreachableError) {
+      deps.log("warn", `${run.ticketKey}: ${step.name} liveness check deferred — ${e.message}`);
+      return;
+    }
+    throw e;
+  }
+  if (!alive) {
+    // Re-check `done` first: it may have flipped (step-done) after our earlier read, in which
+    // case the agent finished and exited — don't relaunch a completed step into a duplicate agent.
+    const freshRow = deps.store.getRunStep(run.id, step.name);
+    if (freshRow?.done) return; // finished; the next tick advances
+    if (freshRow?.absentAt == null) {
+      deps.store.upsertRunStep(run.id, step.name, { absentAt: deps.now() });
+      deps.log("info", `${run.ticketKey}: ${step.name} pane ${rs.paneId} not listed — confirming before re-spawn`);
+      return;
+    }
+    if (deps.now() - freshRow.absentAt < PANE_ABSENCE_CONFIRM_SECONDS) return; // within the window — wait
+    deps.log("info", `${run.ticketKey}: ${step.name} pane gone (confirmed twice) — re-spawning`);
     await spawnStep(deps, run, belt, src, step.name);
     return;
   }
+  if (rs.absentAt != null) deps.store.upsertRunStep(run.id, step.name, { absentAt: null }); // seen alive again
   deps.log("info", `${run.ticketKey}: awaiting step-done ${step.name} (pane ${rs.paneId})`);
 }
 
@@ -846,7 +887,13 @@ async function reconcileReviewing(deps: Deps, run: Run, src: SourceRuntime): Pro
   if (sig.unresolved === 0 && sig.failing === 0) return; // nothing actionable
   if (sig.sig === run.lastThreadSig) return; // already handled this state
 
-  const wstate = run.paneId ? await deps.herdr.paneState(run.paneId) : "gone";
+  let wstate: string;
+  try {
+    wstate = run.paneId ? await deps.herdr.paneState(run.paneId) : "gone";
+  } catch (e) {
+    if (e instanceof HerdrUnreachableError) return; // can't tell if the resolver is mid-fix — retry next tick
+    throw e;
+  }
   if (wstate === "working") return; // don't pile on mid-fix
 
   // Only record the signature as handled if the resolver actually launched — otherwise a

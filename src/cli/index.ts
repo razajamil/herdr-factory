@@ -229,7 +229,7 @@ program
       for (const r of active) {
         // live worker status from herdr (what the cat is actually doing), vs the
         // ledger phase (where the loop thinks it is).
-        const worker = r.paneId ? await deps.herdr.paneState(r.paneId) : "no-pane";
+        const worker = r.paneId ? await deps.herdr.paneState(r.paneId).catch(() => "unknown") : "no-pane";
         console.log(fmt(r, `worker:${worker}`));
         const steps = deps.store.runStepsFor(r.id);
         if (steps.length) console.log(`      steps: ${steps.map((s) => `${s.step}${s.done ? "✓" : "●"}`).join(" ")}`);

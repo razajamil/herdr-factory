@@ -1,4 +1,5 @@
 import { run, runJson } from "./exec.ts";
+import { HerdrUnreachableError, type LivenessOpts } from "../core/deps.ts";
 import type { Agent, FocusedPane, WorktreeResult } from "../types.ts";
 
 interface RawAgent {
@@ -89,11 +90,27 @@ export class HerdrClient {
     return r.code === 0;
   }
 
-  async agents(): Promise<Agent[]> {
-    const j = await runJson<AgentListResp>(this.bin, ["agent", "list"], { allowFail: true }).catch(
-      () => ({}) as AgentListResp,
-    );
-    return (j.result?.agents ?? []).map((a) => ({
+  // One `herdr agent list` answers every liveness question for ~all runs in a tick, so the
+  // result is memoized briefly — at 50-100 active runs this collapses O(runs) subprocess spawns
+  // per tick into ~one, and it's what makes the fresh-read confirmation below meaningful.
+  private static readonly AGENTS_MEMO_MS = 5_000;
+  private agentsMemo: { at: number; agents: Agent[] } | null = null;
+
+  /** Agents herdr currently tracks. THROWS HerdrUnreachableError when herdr can't be queried —
+   *  an empty list is a real "no agents", never a masked failure (that masking is exactly what
+   *  used to make a herdr hiccup look like mass pane death). */
+  async agents(opts: LivenessOpts = {}): Promise<Agent[]> {
+    if (!opts.fresh && this.agentsMemo && Date.now() - this.agentsMemo.at < HerdrClient.AGENTS_MEMO_MS) {
+      return this.agentsMemo.agents;
+    }
+    let j: AgentListResp;
+    try {
+      j = await runJson<AgentListResp>(this.bin, ["agent", "list"]);
+    } catch (e) {
+      this.agentsMemo = null;
+      throw new HerdrUnreachableError(e);
+    }
+    const agents = (j.result?.agents ?? []).map((a) => ({
       paneId: a.pane_id,
       workspaceId: a.workspace_id,
       tabId: a.tab_id,
@@ -102,10 +119,12 @@ export class HerdrClient {
       cwd: a.cwd,
       sessionId: a.agent_session?.value ?? null,
     }));
+    this.agentsMemo = { at: Date.now(), agents };
+    return agents;
   }
 
-  async paneState(paneId: string): Promise<string> {
-    const a = (await this.agents()).find((x) => x.paneId === paneId);
+  async paneState(paneId: string, opts: LivenessOpts = {}): Promise<string> {
+    const a = (await this.agents(opts)).find((x) => x.paneId === paneId);
     return a?.agentStatus ?? "gone";
   }
 
@@ -114,8 +133,8 @@ export class HerdrClient {
     return (await this.agents()).find((x) => x.paneId === paneId)?.sessionId ?? null;
   }
 
-  async paneAlive(paneId: string): Promise<boolean> {
-    return (await this.agents()).some((x) => x.paneId === paneId);
+  async paneAlive(paneId: string, opts: LivenessOpts = {}): Promise<boolean> {
+    return (await this.agents(opts)).some((x) => x.paneId === paneId);
   }
 
   /** Resolve the pane with `paneLabel` inside the tab labelled `tabLabel` (or null). */
@@ -145,6 +164,7 @@ export class HerdrClient {
     const j = await runJson<AgentStartResp>(this.bin, args, { allowFail: true }).catch(
       () => ({}) as AgentStartResp,
     );
+    this.agentsMemo = null; // the agent set just changed — don't serve a pre-spawn snapshot
     return j.result?.agent?.pane_id ?? null;
   }
 

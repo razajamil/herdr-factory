@@ -20,14 +20,36 @@ import type {
 // Interfaces the core depends on (concrete clients satisfy them structurally;
 // tests provide fakes). Keeping these here is what makes the reconciler testable.
 
+/**
+ * herdr could not be queried (CLI failure, timeout, daemon restart). Deliberately DISTINCT from
+ * "herdr answered and the pane is absent": conflating the two is what used to make one herdr
+ * hiccup look like every pane dying at once — and the recovery action (respawn) would put a
+ * duplicate agent into a worktree whose original agent was still working. Liveness callers must
+ * treat this as "unknown — defer", never as "dead".
+ */
+export class HerdrUnreachableError extends Error {
+  constructor(cause: unknown) {
+    super(`herdr unreachable: ${cause instanceof Error ? cause.message : String(cause)}`);
+    this.name = "HerdrUnreachableError";
+  }
+}
+
+/** Liveness lookups accept `fresh: true` to bypass the client's short memo — used to CONFIRM an
+ *  absence before acting on it (a stale cached list must never trigger a respawn). */
+export interface LivenessOpts {
+  fresh?: boolean;
+}
+
 export interface HerdrApi {
   worktreeCreate(repoCwd: string, branch: string, baseRef: string): Promise<WorktreeResult>;
   worktreeOpen(repoCwd: string, branch: string): Promise<WorktreeResult>;
   worktreeRemove(workspaceId: string): Promise<void>;
   workspaceClose(workspaceId: string): Promise<void>;
   workspaceExists(workspaceId: string): Promise<boolean>;
-  paneState(paneId: string): Promise<string>;
-  paneAlive(paneId: string): Promise<boolean>;
+  /** THROWS HerdrUnreachableError when herdr can't be queried; "gone" means confirmed absent. */
+  paneState(paneId: string, opts?: LivenessOpts): Promise<string>;
+  /** THROWS HerdrUnreachableError when herdr can't be queried; false means confirmed absent. */
+  paneAlive(paneId: string, opts?: LivenessOpts): Promise<boolean>;
   agentSessionId(paneId: string): Promise<string | null>;
   tabPaneByLabel(workspaceId: string, tabLabel: string, paneLabel: string): Promise<string | null>;
   agentStart(opts: { workspaceId: string; cwd: string; argv: string[]; env?: Record<string, string> }): Promise<string | null>;

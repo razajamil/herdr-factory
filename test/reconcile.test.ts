@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { openDb } from "../src/db/index.ts";
 import { Store } from "../src/db/store.ts";
 import { applyPendingFocus, bounceStep, reconcileRepo, reconcileRun, requestHumanInput, withTickLock } from "../src/core/reconcile.ts";
-import type { BeltRuntime, Deps, GitApi, GitHubApi, HerdrApi, SourceRuntime, WorkSource } from "../src/core/deps.ts";
+import { HerdrUnreachableError, type BeltRuntime, type Deps, type GitApi, type GitHubApi, type HerdrApi, type SourceRuntime, type WorkSource } from "../src/core/deps.ts";
 import type { Config, Secrets, StepConfig } from "../src/config.ts";
 import type { FocusedPane, HumanAskInput, HumanPollInput, HumanReply, MatchItem, Phase, PrInfo, ReviewSig, Ticket, WorkState } from "../src/types.ts";
 
@@ -28,6 +28,7 @@ interface FakeState {
   workspaceExists: boolean; // does the workspace still exist after a worktree remove?
   focusedPane: FocusedPane | null; // the pane the user is currently looking at
   humanReply: HumanReply | null; // source-native reply to a pending human question
+  herdrUnreachable: boolean; // liveness queries throw HerdrUnreachableError (herdr can't be asked)
 }
 
 /** A resolved belt step for the fakes. Budgets/heartbeat/opensPr mirror what config.ts derives for
@@ -52,7 +53,7 @@ function build(opts: { multi?: boolean } = {}) {
   let now = 1000;
   let uidN = 0; // deterministic per-claim branch suffix (u1, u2, …) so re-claims get distinct branches
   const store = new Store(openDb(":memory:"), () => now);
-  const state: FakeState = { eligible: [], eligible2: [], pr: null, sig: { unresolved: 0, failing: 0, sig: "s0" }, paneState: "idle", deadPanes: new Set(), headSha: "sha0", sessionId: "sess-1", workspaceExists: false, focusedPane: { paneId: "w1:p1", workspaceId: "w1", tabId: "w1:t1", label: "agent" }, humanReply: null };
+  const state: FakeState = { eligible: [], eligible2: [], pr: null, sig: { unresolved: 0, failing: 0, sig: "s0" }, paneState: "idle", deadPanes: new Set(), headSha: "sha0", sessionId: "sess-1", workspaceExists: false, focusedPane: { paneId: "w1:p1", workspaceId: "w1", tabId: "w1:t1", label: "agent" }, humanReply: null, herdrUnreachable: false };
   const calls = {
     transitions: [] as [string, WorkState][],
     agentSend: [] as [string, string][],
@@ -107,8 +108,14 @@ function build(opts: { multi?: boolean } = {}) {
     worktreeRemove: async (id) => { calls.worktreeRemove.push(id); },
     workspaceClose: async (id) => { calls.workspaceClose.push(id); },
     workspaceExists: async () => state.workspaceExists,
-    paneState: async () => state.paneState,
-    paneAlive: async (id) => !state.deadPanes.has(id),
+    paneState: async () => {
+      if (state.herdrUnreachable) throw new HerdrUnreachableError("agent list failed");
+      return state.paneState;
+    },
+    paneAlive: async (id) => {
+      if (state.herdrUnreachable) throw new HerdrUnreachableError("agent list failed");
+      return !state.deadPanes.has(id);
+    },
     agentSessionId: async () => state.sessionId,
     tabPaneByLabel: async () => "w1:p1",
     agentStart: async () => { calls.agentStart += 1; return "w1:p2"; },
@@ -547,14 +554,61 @@ describe("reconcile pipeline (work_to_pull_request belt)", () => {
     expect(calls.notify).toBe(0);
   });
 
-  it("step pane dead before signalling → re-spawns the agent", async () => {
-    const { deps, store, state, worktree, calls } = build();
+  it("step pane dead before signalling → confirmed absence across two ticks, THEN re-spawns", async () => {
+    const { deps, store, state, worktree, calls, setNow } = build();
     const run = seed(store, worktree, "K-D1", "running", "fix", { paneId: "w1:dead" });
     store.upsertRunStep(run.id, "fix", { paneId: "w1:dead" });
     state.deadPanes.add("w1:dead"); // the fix pane is gone; the layout pane (w1:p1) is alive
+
+    // First confirmed absence: recorded, NOT respawned (guard against transient herdr blips).
+    await reconcileRun(deps, store.getRun(run.id)!);
+    expect(store.getRun(run.id)!.phase).toBe("running");
+    expect(calls.agentSend.length).toBe(0);
+    expect(store.getRunStep(run.id, "fix")!.absentAt).toBe(1000);
+
+    // Second confirmed absence past the confirmation window: re-dispatched.
+    setNow(1000 + 46);
     await reconcileRun(deps, store.getRun(run.id)!);
     expect(store.getRun(run.id)!.phase).toBe("running"); // still gating
     expect(calls.agentSend.length).toBe(1); // re-dispatched into the live layout pane
+    expect(store.getRunStep(run.id, "fix")!.absentAt).toBeNull(); // reset on dispatch
+  });
+
+  it("pane back in the list after a first absence mark → absence cleared, no re-spawn", async () => {
+    const { deps, store, state, worktree, calls, setNow } = build();
+    const run = seed(store, worktree, "K-D2", "running", "fix", { paneId: "w1:flap" });
+    store.upsertRunStep(run.id, "fix", { paneId: "w1:flap" });
+    state.deadPanes.add("w1:flap");
+    await reconcileRun(deps, store.getRun(run.id)!);
+    expect(store.getRunStep(run.id, "fix")!.absentAt).toBe(1000);
+
+    state.deadPanes.delete("w1:flap"); // herdr lists it again (daemon restart healed)
+    setNow(1000 + 60);
+    await reconcileRun(deps, store.getRun(run.id)!);
+    expect(store.getRunStep(run.id, "fix")!.absentAt).toBeNull();
+    expect(calls.agentSend.length).toBe(0); // never respawned
+  });
+
+  it("herdr unreachable → liveness deferred: no re-spawn, no attention, absence NOT recorded", async () => {
+    const { deps, store, state, worktree, calls } = build();
+    const run = seed(store, worktree, "K-D3", "running", "fix", { paneId: "w1:p1" });
+    state.herdrUnreachable = true;
+    await reconcileRun(deps, store.getRun(run.id)!);
+    const got = store.getRun(run.id)!;
+    expect(got.phase).toBe("running");
+    expect(calls.agentSend.length).toBe(0);
+    expect(calls.notify).toBe(0);
+    expect(store.getRunStep(run.id, "fix")!.absentAt).toBeNull();
+  });
+
+  it("herdr unreachable while over budget → watchdog deferred (no false attention)", async () => {
+    const { deps, store, state, worktree, calls, setNow } = build();
+    const run = seed(store, worktree, "K-D4", "running", "review");
+    state.herdrUnreachable = true;
+    setNow(1000 + 1801); // past review budget
+    await reconcileRun(deps, store.getRun(run.id)!);
+    expect(store.getRun(run.id)!.phase).toBe("running");
+    expect(calls.notify).toBe(0);
   });
 
   it("reviewing + merged PR → teardown (worktree remove + branch delete, ended merged)", async () => {

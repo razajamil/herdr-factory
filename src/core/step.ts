@@ -329,11 +329,12 @@ async function spawnStepImpl(
   if (!step) throw new Error(`${run.ticketKey}: belt "${belt.name}" has no step "${stepName}"`);
 
   // Capture the prior step's session id at handoff time (herdr only knows it once the
-  // prior agent has reported in) so this step's prompt can point at it.
+  // prior agent has reported in) so this step's prompt can point at it. Best-effort
+  // enrichment — herdr being briefly unreachable must not abort the dispatch itself.
   const prev = priorStep(belt, stepName);
   let prior = prev ? (deps.store.getRunStep(run.id, prev.name) ?? null) : null;
   if (prior && !prior.sessionId && prior.paneId) {
-    const sid = await deps.herdr.agentSessionId(prior.paneId);
+    const sid = await deps.herdr.agentSessionId(prior.paneId).catch(() => null);
     if (sid) prior = deps.store.upsertRunStep(run.id, prev!.name, { sessionId: sid });
   }
 
@@ -356,8 +357,9 @@ async function spawnStepImpl(
   if (result.status === "waiting") return result; // still waiting on the user's layout pane
 
   // Dispatched. Reset started_at so the per-step budget is measured from now (per attempt,
-  // not cumulatively across crash-recovery re-spawns or the preceding layout wait).
-  deps.store.upsertRunStep(run.id, stepName, { paneId: result.paneId, startedAt: deps.now() });
+  // not cumulatively across crash-recovery re-spawns or the preceding layout wait), and clear
+  // any pending absence confirmation — this pane is definitionally alive right now.
+  deps.store.upsertRunStep(run.id, stepName, { paneId: result.paneId, startedAt: deps.now(), absentAt: null });
   deps.store.updateRun(run.id, { paneId: result.paneId }); // latest active pane (reviewing/resolver reuse it)
   deps.store.recordEvent({
     runId: run.id,

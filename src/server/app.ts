@@ -76,7 +76,7 @@ async function statusPayload(rt: RepoRuntime) {
     prNumber: r.prNumber,
     summary: r.summary,
     outcome: r.outcome as string | null,
-    worker: r.paneId ? await rt.deps.herdr.paneState(r.paneId) : null,
+    worker: r.paneId ? await rt.deps.herdr.paneState(r.paneId).catch(() => "unknown") : null,
     steps: rt.deps.store.runStepsFor(r.id).map((s) => ({ step: s.step as string, done: s.done })),
   });
   return {

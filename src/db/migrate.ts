@@ -170,6 +170,15 @@ const MIGRATIONS: { version: number; sql: string }[] = [
     // backfills every existing run_steps row (in-flight runs across the upgrade start at zero).
     sql: `ALTER TABLE run_steps ADD COLUMN bounces INTEGER NOT NULL DEFAULT 0;`,
   },
+  {
+    version: 10,
+    // Pane-death confirmation. When a step's pane is CONFIRMED absent (herdr answered; the pane
+    // wasn't listed) the reconciler records when that was first observed instead of respawning
+    // immediately; only a second confirmed absence past the confirmation window respawns. NULL =
+    // currently believed alive. This is the two-strike guard against a transient herdr blip
+    // spawning a duplicate agent into a worktree whose original agent is still working.
+    sql: `ALTER TABLE run_steps ADD COLUMN absent_at INTEGER;`,
+  },
 ];
 
 /** Apply pending migrations in a transaction. Idempotent. */
