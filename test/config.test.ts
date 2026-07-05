@@ -265,11 +265,48 @@ describe("loadConfig — work sources + belts", () => {
     expect(config.sources[0]!.type).toBe("local_markdown");
     expect((config.sources[0]!.cfg as LocalMarkdownSourceCfg).folder).toBe(join(homedir(), "work"));
     const fix = config.belts[0]!.steps.find((s) => s.name === "fix")!;
-    // the local_markdown fix prompt references the markdown task doc, not Jira
+    // local_markdown has no per-type fix override anymore — the neutral SHARED fix prompt
+    // (WORK_DOC-based, no Jira wording) covers it, and now carries the rework/ask-human guidance.
     expect(fix.enginePrompt).toContain("@@WORK_DOC@@");
     expect(fix.enginePrompt).not.toContain("Jira");
+    expect(fix.enginePrompt).toContain("ask-human");
     // review/pr have no per-type override → shared engine prompt
     expect(config.belts[0]!.steps.find((s) => s.name === "review")!.enginePrompt).toContain("fresh-eyes");
+  });
+
+  it("a work_to_pull_request belt on a github_issues source uses the per-type fix + pr prompts", () => {
+    setup(
+      cfg(
+        `  - type: github_issues
+    github_issues: { repo: acme/tracker }
+`,
+        `  - name: gh-ship
+    belt_type: work_to_pull_request
+    source: github_issues
+    agents:
+      fix:    { tab: fix,    pane: agent }
+      review: { tab: review, pane: agent }
+      pr:     { tab: pr,     pane: agent }
+`,
+      ),
+      { prompts: {} },
+    );
+    const { config } = loadConfig("demo");
+    const steps = config.belts[0]!.steps;
+    const fix = steps.find((s) => s.name === "fix")!;
+    expect(fix.enginePrompt).toContain("GitHub issue");
+    expect(fix.enginePrompt).toContain("issue.json");
+    const pr = steps.find((s) => s.name === "pr")!;
+    expect(pr.enginePrompt).toContain("Closing reference"); // the auto-close linkage mandate
+    // review/evidence have no per-type override → shared engine prompts
+    expect(steps.find((s) => s.name === "review")!.enginePrompt).toContain("fresh-eyes");
+  });
+
+  it("a jira belt keeps the Jira-flavored fix prompt (now under prompts/jira/)", () => {
+    setup(cfg(JIRA_SRC, SHIP_BELT), { prompts: {} });
+    const fix = loadConfig("demo").config.belts[0]!.steps.find((s) => s.name === "fix")!;
+    expect(fix.enginePrompt).toContain("Jira ticket");
+    expect(fix.enginePrompt).toContain("ticket.json");
   });
 
   it("resolves a custom belt's user-defined steps (prompt_file body, budget, heartbeat, no PR)", () => {
