@@ -210,6 +210,13 @@ const MIGRATIONS: { version: number; sql: string }[] = [
       CREATE INDEX idx_transition_outbox_key ON transition_outbox(repo, work_source, ticket_key) WHERE delivered_at IS NULL;
     `,
   },
+  {
+    version: 12,
+    // Attention re-notification clock. The one-shot notify on escalation was easy to miss and a
+    // parked run then sat invisible indefinitely; the reconciler now re-notifies every
+    // limits.attention_renotify_seconds while a run stays parked, tracked here.
+    sql: `ALTER TABLE runs ADD COLUMN attention_notified_at INTEGER;`,
+  },
 ];
 
 /** Apply pending migrations in a transaction. Idempotent. */

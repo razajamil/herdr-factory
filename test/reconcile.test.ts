@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openDb } from "../src/db/index.ts";
 import { Store } from "../src/db/store.ts";
-import { applyPendingFocus, bounceStep, flushTransitionOutbox, reconcileRepo, reconcileRun, requestHumanInput, withTickLock } from "../src/core/reconcile.ts";
+import { applyPendingFocus, bounceStep, flushTransitionOutbox, reconcileRepo, reconcileRun, requestHumanInput, resumeRun, withTickLock } from "../src/core/reconcile.ts";
 import { HerdrUnreachableError, type BeltRuntime, type Deps, type GitApi, type GitHubApi, type HerdrApi, type SourceRuntime, type WorkSource } from "../src/core/deps.ts";
 import type { Config, Secrets, StepConfig } from "../src/config.ts";
 import type { FocusedPane, HumanAskInput, HumanPollInput, HumanReply, MatchItem, Phase, PrInfo, ReviewSig, Ticket, WorkState } from "../src/types.ts";
@@ -67,6 +67,7 @@ function build(opts: { multi?: boolean } = {}) {
     branchDelete: [] as string[],
     humanAsk: [] as HumanAskInput[],
     humanPoll: [] as HumanPollInput[],
+    postNotes: [] as [string, string][],
     agentStart: 0,
     notify: 0,
   };
@@ -83,6 +84,7 @@ function build(opts: { multi?: boolean } = {}) {
       return true;
     },
     materialize: async (_key, memDir) => { mkdirSync(memDir, { recursive: true }); writeFileSync(join(memDir, "ticket.json"), "{}"); },
+    postNote: async (key, note) => { calls.postNotes.push([key, note]); },
     askHuman: async (input) => { calls.humanAsk.push(input); return { externalId: `q-${input.questionId}`, externalCreatedAt: "2026-06-28T00:00:00.000+0000" }; },
     pollHumanReply: async (input) => { calls.humanPoll.push(input); return state.humanReply; },
     health: async () => {},
@@ -99,6 +101,7 @@ function build(opts: { multi?: boolean } = {}) {
       describe: async (key) => ({ key, summary: "md work", type: "task" }),
       transition: async (key, to) => { calls.transitions.push([key, to]); return true; },
       materialize: async (_key, memDir) => { mkdirSync(memDir, { recursive: true }); writeFileSync(join(memDir, "task.md"), "# md"); },
+      postNote: async (key, note) => { calls.postNotes.push([key, note]); },
       askHuman: async (input) => { calls.humanAsk.push(input); return { externalId: `q-${input.questionId}`, externalCreatedAt: "2026-06-28T00:00:00.000+0000" }; },
       pollHumanReply: async (input) => { calls.humanPoll.push(input); return state.humanReply; },
       health: async () => {},
@@ -150,7 +153,7 @@ function build(opts: { multi?: boolean } = {}) {
   const config: Config = {
     repoName: "demo",
     repo: { path: "/main-checkout", baseRef: "origin/master" },
-    limits: { maxActive: 3, watchHours: 7, developBudgetSeconds: 5400, stallSeconds: 2700, reviewBudgetSeconds: 1800, evidenceBudgetSeconds: 2400, prBudgetSeconds: 3600, maxBounces: 3, stepBudgetSeconds: 3600, tickIntervalSeconds: 60, layoutWaitSeconds: 600 },
+    limits: { maxActive: 3, watchHours: 7, attentionRenotifySeconds: 3600, developBudgetSeconds: 5400, stallSeconds: 2700, reviewBudgetSeconds: 1800, evidenceBudgetSeconds: 2400, prBudgetSeconds: 3600, maxBounces: 3, stepBudgetSeconds: 3600, tickIntervalSeconds: 60, layoutWaitSeconds: 600 },
     sources: sources.map((s) => ({ name: s.name, type: s.type })),
     belts,
     guidance: undefined,
@@ -1033,5 +1036,79 @@ describe("transition outbox — source write-backs retried until delivered", () 
       ["K-T5", "in_development"],
       ["K-T5", "in_review"],
     ]);
+  });
+});
+
+describe("attention workflow — resume, parked slots, re-notification", () => {
+  it("resume returns a step-parked run to running with fresh clocks and re-dispatches", async () => {
+    const { deps, store, worktree, calls } = build();
+    const run = seed(store, worktree, "K-A1", "attention", "fix", { attentionReason: "fix step over budget (worker: idle)" });
+    store.upsertRunStep(run.id, "fix", { startedAt: 1, progressSig: "old", progressAt: 1 });
+
+    const res = await resumeRun(deps, store.getRun(run.id)!);
+    expect(res).toMatchObject({ ok: true, phase: "running" });
+    const got = store.getRun(run.id)!;
+    expect(got.phase).toBe("running");
+    expect(got.attentionReason).toBeNull();
+    const rs = store.getRunStep(run.id, "fix")!;
+    expect(rs.startedAt).toBe(1000); // budget clock restarted
+    expect(rs.progressSig).toBeNull(); // heartbeat restarted
+
+    await reconcileRun(deps, store.getRun(run.id)!); // pane w1:p1 is alive → keeps gating, no attention
+    expect(store.getRun(run.id)!.phase).toBe("running");
+    expect(calls.notify).toBe(0);
+  });
+
+  it("resume returns a PR-watch-parked run to reviewing with a fresh deadline", async () => {
+    const { deps, store, worktree } = build();
+    const run = seed(store, worktree, "K-A2", "attention", null, { prNumber: 12, watchDeadline: 5, attentionReason: "review watch expired" });
+    const res = await resumeRun(deps, store.getRun(run.id)!);
+    expect(res).toMatchObject({ ok: true, phase: "reviewing" });
+    const got = store.getRun(run.id)!;
+    expect(got.phase).toBe("reviewing");
+    expect(got.watchDeadline).toBe(1000 + 7 * 3600);
+    expect(got.lastThreadSig).toBeNull(); // next actionable review state re-wakes the resolver
+  });
+
+  it("resume refuses a run that isn't parked", async () => {
+    const { deps, store, worktree } = build();
+    const run = seed(store, worktree, "K-A3", "running", "fix");
+    const res = await resumeRun(deps, store.getRun(run.id)!);
+    expect(res.ok).toBe(false);
+  });
+
+  it("parked runs do not hold claim slots — new work is still claimed at the cap", async () => {
+    const { deps, store, state, worktree } = build();
+    // Three parked runs (the whole max_active=3 cap under the old accounting).
+    seed(store, worktree, "K-P1", "attention", "fix");
+    seed(store, worktree, "K-P2", "attention", "fix");
+    seed(store, worktree, "K-P3", "waiting_for_human", "fix", {});
+    store.createHumanQuestion({ runId: store.activeRunsForKey("demo", "K-P3")[0]!.id, repo: "demo", workSource: "jira", ticketKey: "K-P3", question: "q?" });
+    state.eligible = [ticket("K-NEW")];
+    await reconcileRepo(deps);
+    expect(store.activeRunForTicket("demo", "jira", "K-NEW")).toBeDefined(); // claimed despite 3 parked
+    expect(store.countActive("demo")).toBe(4);
+    expect(store.countOccupying("demo")).toBe(1);
+  });
+
+  it("escalation posts the attention reason to the work source; parked runs re-notify periodically", async () => {
+    const { deps, store, state, worktree, calls, setNow } = build();
+    const run = seed(store, worktree, "K-A4", "running", "review");
+    setNow(1000 + 1801); // review over budget, worker idle → attention
+    await reconcileRun(deps, store.getRun(run.id)!);
+    expect(store.getRun(run.id)!.phase).toBe("attention");
+    expect(calls.notify).toBe(1);
+    expect(calls.postNotes.length).toBe(1); // reason written back to the source
+    expect(calls.postNotes[0]![0]).toBe("K-A4");
+    expect(calls.postNotes[0]![1]).toContain("resume K-A4");
+
+    // Within the renotify window: silent. Past it: notified again (but no second source note).
+    setNow(1000 + 1801 + 3599);
+    await reconcileRun(deps, store.getRun(run.id)!);
+    expect(calls.notify).toBe(1);
+    setNow(1000 + 1801 + 3601);
+    await reconcileRun(deps, store.getRun(run.id)!);
+    expect(calls.notify).toBe(2);
+    expect(calls.postNotes.length).toBe(1);
   });
 });

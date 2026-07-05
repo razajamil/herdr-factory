@@ -180,11 +180,14 @@ async function reconcileRepoImpl(deps: Deps): Promise<void> {
 
   // Phase B — claim new work up to the cap, walking BELTS in priority order. The cap is global
   // across all belts; a higher-priority belt drains its eligible work first, and the FIRST belt
-  // whose `match` predicate accepts an item claims it (first match wins).
-  const active = deps.store.countActive(repo);
-  let slots = deps.config.limits.maxActive - active;
+  // whose `match` predicate accepts an item claims it (first match wins). Capacity counts only
+  // WORKING runs — parked runs (attention / waiting_for_human) keep their worktree but no agent
+  // is consuming machine resources, and a pile of them must not starve the belt.
+  const occupying = deps.store.countOccupying(repo);
+  const parked = deps.store.countActive(repo) - occupying;
+  let slots = deps.config.limits.maxActive - occupying;
   if (slots <= 0) {
-    deps.log("info", `at capacity (${active}/${deps.config.limits.maxActive})`);
+    deps.log("info", `at capacity (${occupying}/${deps.config.limits.maxActive} working, ${parked} parked)`);
     deps.store.touchTick(repo);
     return;
   }
@@ -248,7 +251,7 @@ async function reconcileRepoImpl(deps: Deps): Promise<void> {
       }
     }
   }
-  deps.log("info", `claimed ${claimed}; active ${deps.store.countActive(repo)}/${deps.config.limits.maxActive}`);
+  deps.log("info", `claimed ${claimed}; working ${deps.store.countOccupying(repo)}/${deps.config.limits.maxActive}, parked ${parked}`);
   deps.store.touchTick(repo);
 }
 
@@ -461,13 +464,14 @@ async function trackStepProgress(deps: Deps, run: Run, step: string): Promise<Ru
   return deps.store.upsertRunStep(run.id, step, { progressSig: sha, progressAt: deps.now() });
 }
 
-/** Park a run for human attention: flip phase, record the reason, fire a notification. */
+/** Park a run for human attention: flip phase, record the reason, fire a notification, and put
+ *  the reason where the humans already look — the work source itself (Jira comment / local note). */
 async function escalateAttention(
   deps: Deps,
   run: Run,
   opts: { reason: string; attentionReason: string; body: string; detail?: Record<string, unknown> },
 ): Promise<void> {
-  deps.store.updateRun(run.id, { phase: "attention", attentionReason: opts.attentionReason });
+  deps.store.updateRun(run.id, { phase: "attention", attentionReason: opts.attentionReason, attentionNotifiedAt: deps.now() });
   deps.store.recordEvent({
     runId: run.id,
     repo: deps.config.repoName,
@@ -481,6 +485,16 @@ async function escalateAttention(
   // until the run resolves (re-spawn renames it back; teardown removes the pane). Best-effort.
   if (run.paneId) await deps.herdr.agentRename(run.paneId, `⚠ ATTENTION ${run.ticketKey}`).catch(() => {});
   await deps.herdr.notify(`herdr-factory: ${run.ticketKey} needs attention`, opts.body).catch(() => {});
+  // Best-effort source write-back (once, on escalation — the periodic re-notify stays local).
+  const src = deps.resolveSource(run.workSource);
+  if (src) {
+    await src.client
+      .postNote(
+        run.ticketKey,
+        `⚠ herdr-factory parked this run for attention: ${opts.attentionReason}\n\n${opts.body}\n\nResume with: herdr-factory --repo ${deps.config.repoName} resume ${run.ticketKey}`,
+      )
+      .catch((e) => deps.log("warn", `${run.ticketKey}: attention note not posted to ${src.name}: ${err(e)}`));
+  }
 }
 
 async function postHumanQuestion(deps: Deps, src: SourceRuntime, q: HumanQuestion): Promise<HumanQuestion> {
@@ -990,11 +1004,64 @@ async function reconcileReviewing(deps: Deps, run: Run, src: SourceRuntime): Pro
  * lands while a human is looking — or after an escalation unrelated to the PR (watch timeout, step
  * budget) — should still tear the run down and reclaim its slot. A still-open/closed PR leaves the
  * attention state untouched (the human is handling it); non-PR belts and pre-PR runs stay put.
+ * While parked, the operator is re-notified periodically — the one-shot escalation notify is easy
+ * to miss, and a parked run must never go silently stale.
  */
 async function reconcileAttention(deps: Deps, run: Run, belt: BeltRuntime, src: SourceRuntime): Promise<void> {
-  if (!belt.watchPr || !run.prNumber) return;
-  const pr = await currentPr(deps, run);
-  if (pr?.state === "MERGED") return teardown(deps, run, "merged", src);
+  if (belt.watchPr && run.prNumber) {
+    const pr = await currentPr(deps, run);
+    if (pr?.state === "MERGED") return teardown(deps, run, "merged", src);
+  }
+  if (deps.now() - (run.attentionNotifiedAt ?? 0) >= deps.config.limits.attentionRenotifySeconds) {
+    deps.store.updateRun(run.id, { attentionNotifiedAt: deps.now() });
+    const parkedFor = Math.round((deps.now() - run.updatedAt) / 60);
+    await deps.herdr
+      .notify(
+        `herdr-factory: ${run.ticketKey} still needs attention`,
+        `${run.attentionReason ?? "parked"} — resume with \`herdr-factory --repo ${deps.config.repoName} resume ${run.ticketKey}\` or tear it down. (parked ~${parkedFor}min)`,
+      )
+      .catch(() => {});
+  }
+}
+
+/**
+ * Operator entry point: un-park a run from `attention` and put it back where it was. Most
+ * attention reasons are transient (layout pane came up late, a budget expired on a slow-but-fine
+ * step, a herdr blip) — before this existed the only way out was teardown, which threw the
+ * worktree and all completed work away.
+ *
+ * The return target is derived from what the run had already reached:
+ *   - an active step (`run.step` still in the belt) → `running` with that step's clocks reset
+ *     (fresh budget/heartbeat/absence — the stale ones are usually why it parked);
+ *   - a PR being watched (`prNumber` on a watchPr belt) → `reviewing` with a fresh watch deadline
+ *     and cleared thread signature (so the next actionable review state re-wakes the resolver);
+ *   - neither → back to `claiming` (materialize + first dispatch are idempotent).
+ * The caller reconciles right after, so the re-dispatch happens on this same pass.
+ */
+export async function resumeRun(deps: Deps, run: Run): Promise<{ ok: boolean; phase?: string; message?: string }> {
+  if (run.phase !== "attention") {
+    return { ok: false, message: `run is ${run.phase}, not attention — nothing to resume` };
+  }
+  const belt = deps.resolveBelt(run.belt);
+  if (!belt) return { ok: false, message: `belt "${run.belt}" is not configured — re-add it or tear the run down` };
+
+  const repo = deps.config.repoName;
+  let phase: Run["phase"];
+  if (run.step && stepByName(belt, run.step)) {
+    deps.store.upsertRunStep(run.id, run.step, { startedAt: deps.now(), progressSig: null, progressAt: null, absentAt: null });
+    phase = "running";
+  } else if (belt.watchPr && run.prNumber) {
+    deps.store.updateRun(run.id, { watchDeadline: deps.now() + deps.config.limits.watchHours * 3600, lastThreadSig: null });
+    phase = "reviewing";
+  } else {
+    phase = "claiming";
+  }
+  deps.store.updateRun(run.id, { phase, attentionReason: null, focusPending: true });
+  deps.store.recordEvent({ runId: run.id, repo, ticketKey: run.ticketKey, type: "resumed", detail: { phase, step: run.step } });
+  // Undo the ⚠ pane label (best-effort; a re-spawn would rename it anyway).
+  if (run.paneId) await deps.herdr.agentRename(run.paneId, `${run.step ?? "watch"}:${run.ticketKey}`).catch(() => {});
+  deps.log("info", `${run.ticketKey}: resumed from attention -> ${phase}${run.step ? ` (${run.step})` : ""}`);
+  return { ok: true, phase };
 }
 
 /**

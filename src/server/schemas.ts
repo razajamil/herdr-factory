@@ -51,6 +51,7 @@ const AskHumanResponse = z
   .object({ ok: z.boolean(), questionId: z.number().optional(), posted: z.boolean().optional(), message: z.string().optional() })
   .openapi("AskHuman");
 const BounceResponse = z.object({ ok: z.boolean(), escalated: z.boolean().optional(), message: z.string().optional() }).openapi("Bounce");
+const ResumeResponse = z.object({ ok: z.boolean(), phase: z.string().optional(), message: z.string().optional() }).openapi("Resume");
 
 const RunSchema = z
   .object({
@@ -136,6 +137,7 @@ export const BounceBody = z
   .openapi("BounceBody");
 export const ClaimBody = z.object({ key: z.string(), belt: z.string().optional() }).openapi("ClaimBody");
 export const TeardownBody = z.object({ key: z.string(), source: z.string().optional() }).openapi("TeardownBody");
+export const ResumeBody = z.object({ key: z.string(), source: z.string().optional() }).openapi("ResumeBody");
 
 const jsonBody = <T extends z.ZodType>(schema: T) => ({
   body: { required: true, content: { "application/json": { schema } } },
@@ -222,6 +224,18 @@ export const claimRoute = createRoute({
   request: { params: RepoParam, ...jsonBody(ClaimBody) },
   responses: {
     200: { description: "Claimed", content: { "application/json": { schema: OkResponse } } },
+    ...repoErrors,
+  },
+});
+
+export const resumeRoute = createRoute({
+  method: "post",
+  path: "/repos/{repo}/resume",
+  tags: ["repo"],
+  summary: "Un-park a run from `attention` back to where it was (running/reviewing/claiming)",
+  request: { params: RepoParam, ...jsonBody(ResumeBody) },
+  responses: {
+    200: { description: "Resume result", content: { "application/json": { schema: ResumeResponse } } },
     ...repoErrors,
   },
 });

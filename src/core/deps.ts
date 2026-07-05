@@ -81,6 +81,9 @@ export interface WorkSource {
   /** Write the item's work doc (+ any media) into `memDir` for the fix agent. Idempotent (a
    *  no-op once already materialized). Best-effort: logs rather than throwing on backend issues. */
   materialize(key: string, memDir: string, log: Logger): Promise<void>;
+  /** Post a source-native informational note on the item (Jira comment, local marker file, …).
+   *  Operator-facing events only (e.g. a run parking for attention) — best-effort, no reply. */
+  postNote(key: string, note: string): Promise<void>;
   /** Post a source-native question for a human (Jira/Linear comment, local inbox, …). */
   askHuman(input: HumanAskInput): Promise<HumanAskResult>;
   /** Poll the source for a human reply to a previously-posted question. */

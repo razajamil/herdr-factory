@@ -10,7 +10,7 @@ import { VERSION } from "../version.ts";
 import { withExtractedTelemetryContext } from "../telemetry/index.ts";
 import { annotateCurrentSpan, recordHttpServerDurationEffect, withHttpServerSpan } from "../telemetry/effect.ts";
 import { runEffect } from "../runtime/effect.ts";
-import { bounceStep, claimTicket, reconcileRepo, reconcileRun, requestHumanInput, teardownTicket, withTickLock, withTickLockWaiting } from "../core/reconcile.ts";
+import { bounceStep, claimTicket, reconcileRepo, reconcileRun, requestHumanInput, resumeRun, teardownTicket, withTickLock, withTickLockWaiting } from "../core/reconcile.ts";
 import { stepByName } from "../core/step.ts";
 import { resolveActiveRun, resolveBeltName } from "../resolve.ts";
 import type { Deps } from "../core/deps.ts";
@@ -21,6 +21,7 @@ import {
   eligibleRoute,
   healthRoute,
   reloadRoute,
+  resumeRoute,
   runsRoute,
   shutdownRoute,
   statusRoute,
@@ -243,6 +244,24 @@ export function createApp(ctx: ServerContext): OpenAPIHono {
     if (!rt) return c.json({ error: notConfigured(repo) }, 404);
     await claimTicket(rt.deps, resolveBeltName(rt.deps, belt), key);
     return c.json({ ok: true }, 200);
+  });
+
+  app.openapi(resumeRoute, async (c) => {
+    const { repo } = c.req.valid("param");
+    const { key, source } = c.req.valid("json");
+    const rt = ctx.getRepo(repo);
+    if (!rt) return c.json({ error: notConfigured(repo) }, 404);
+    const run = resolveActiveRun(rt.deps, key, source);
+    if (!run) return c.json({ ok: false, message: `${key}: no active run` }, 200);
+    // Like bounce: resume mutates the phase and leads straight into a re-dispatch, so it must be
+    // serialized against the periodic tick (a stale mid-tick snapshot would fight the un-park).
+    const { ran, result } = await withTickLockWaiting(rt.deps, async () => {
+      const res = await resumeRun(rt.deps, rt.deps.store.getRun(run.id)!);
+      if (res.ok) await reconcileRun(rt.deps, rt.deps.store.getRun(run.id)!);
+      return res;
+    });
+    if (!ran) return c.json({ ok: false, message: `${key}: dispatcher busy — retry the resume` }, 200);
+    return c.json(result!, 200);
   });
 
   app.openapi(teardownRoute, async (c) => {

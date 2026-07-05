@@ -1,4 +1,4 @@
-import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { appendFileSync, cpSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { parse as parseYaml } from "yaml";
 import type { Store } from "../db/store.ts";
@@ -240,6 +240,14 @@ export class LocalMarkdownSource implements WorkSource {
 
   private humanQuestionPath(key: string, questionId: number): string {
     return join(this.folder, ".herdr-factory-human", `${safeName(key)}-q${questionId}.md`);
+  }
+
+  /** Operator-facing note (a run parked for attention, …): append to a per-item notes file in
+   *  the same inbox folder the human questions live in. */
+  async postNote(key: string, note: string): Promise<void> {
+    const dir = join(this.folder, ".herdr-factory-human");
+    mkdirSync(dir, { recursive: true });
+    appendFileSync(join(dir, `${safeName(key)}-notes.md`), `${note}\n\n`);
   }
 
   async askHuman(input: HumanAskInput): Promise<HumanAskResult> {

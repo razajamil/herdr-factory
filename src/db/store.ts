@@ -36,6 +36,7 @@ interface RunRow {
   watch_deadline: number | null;
   last_thread_sig: string | null;
   attention_reason: string | null;
+  attention_notified_at: number | null;
   outcome: string | null;
   focus_pending: number;
   created_at: number;
@@ -62,6 +63,7 @@ function toRun(r: RunRow): Run {
     watchDeadline: r.watch_deadline,
     lastThreadSig: r.last_thread_sig,
     attentionReason: r.attention_reason,
+    attentionNotifiedAt: r.attention_notified_at,
     outcome: r.outcome as Outcome | null,
     focusPending: r.focus_pending !== 0,
     createdAt: r.created_at,
@@ -204,6 +206,19 @@ export class Store {
     return row.n;
   }
 
+  /** Runs actually consuming a machine slot (claiming/running/reviewing/tearing_down). Parked
+   *  runs — attention, waiting_for_human — keep their worktree but no agent is doing work, so
+   *  they don't count against max_active: a pile of runs waiting on humans must not starve the
+   *  belt of new claims. */
+  countOccupying(repo: string): number {
+    const row = this.db
+      .prepare(
+        "SELECT COUNT(*) AS n FROM runs WHERE repo = ? AND ended_at IS NULL AND phase NOT IN ('attention', 'waiting_for_human')",
+      )
+      .get(repo) as { n: number };
+    return row.n;
+  }
+
   activeRuns(repo: string): Run[] {
     const rows = this.db
       .prepare("SELECT * FROM runs WHERE repo = ? AND ended_at IS NULL ORDER BY created_at")
@@ -282,6 +297,7 @@ export class Store {
     if (patch.watchDeadline !== undefined) set("watch_deadline", patch.watchDeadline);
     if (patch.lastThreadSig !== undefined) set("last_thread_sig", patch.lastThreadSig);
     if (patch.attentionReason !== undefined) set("attention_reason", patch.attentionReason);
+    if (patch.attentionNotifiedAt !== undefined) set("attention_notified_at", patch.attentionNotifiedAt);
     if (patch.outcome !== undefined) set("outcome", patch.outcome);
     if (patch.focusPending !== undefined) set("focus_pending", patch.focusPending ? 1 : 0);
     if (sets.length === 0) return;

@@ -196,8 +196,14 @@ export const RepoConfigSchema = z
     }),
     limits: z
       .object({
+        // Concurrent WORKING runs (claiming/running/reviewing/tearing_down). Parked runs —
+        // attention, waiting_for_human — keep their worktree but hold no slot, so work waiting
+        // on humans never starves the belt of new claims.
         max_active: z.coerce.number().int().positive().default(3),
         watch_hours: z.coerce.number().positive().default(7),
+        // Re-notify the operator about a run parked in `attention` every this-many seconds (the
+        // escalation notify is easy to miss; a parked run should never go silently stale).
+        attention_renotify_seconds: z.coerce.number().int().positive().default(3600),
         develop_budget_seconds: z.coerce.number().int().positive().default(5400),
         stall_seconds: z.coerce.number().int().positive().default(2700),
         review_budget_seconds: z.coerce.number().int().positive().default(1800),
@@ -336,6 +342,7 @@ export interface Config {
   limits: {
     maxActive: number;
     watchHours: number;
+    attentionRenotifySeconds: number;
     developBudgetSeconds: number;
     stallSeconds: number;
     reviewBudgetSeconds: number;
@@ -719,6 +726,7 @@ export function loadConfig(repoName: string): Loaded {
     limits: {
       maxActive: parsed.limits.max_active,
       watchHours: parsed.limits.watch_hours,
+      attentionRenotifySeconds: parsed.limits.attention_renotify_seconds,
       developBudgetSeconds: parsed.limits.develop_budget_seconds,
       stallSeconds: parsed.limits.stall_seconds,
       reviewBudgetSeconds: parsed.limits.review_budget_seconds,

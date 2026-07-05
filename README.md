@@ -80,7 +80,9 @@ In `repos/<name>/config.yml`, set:
 
 - `repo.path` / `repo.base_ref` — the main checkout and the branch worktrees fork from
   (repo-global; `~` / `$HOME` are expanded)
-- `limits` — repo-global tuning, incl. `max_active` (the global concurrency cap across belts)
+- `limits` — repo-global tuning, incl. `max_active` (the global cap on concurrently *working*
+  runs across belts; runs parked in `attention`/`waiting_for_human` keep their worktree but
+  don't hold a slot)
 - `work_sources` — backends (≥1): **where** work is pulled from. Each has a `type`
   (`jira` | `local_markdown`), an optional `name` (default = type, unique per repo), and a
   type-specific block. No pipeline lives here anymore — that's a belt.
@@ -178,6 +180,7 @@ in a local_markdown source's folder — and the factory takes it from there.
 ```sh
 herdr-factory --repo <name> status      # see what's in flight (+ server/supervisor state)
 herdr-factory --repo <name> logs         # tail the repo's dispatcher log
+herdr-factory --repo <name> resume <key> # un-park an `attention` run back to where it was
 herdr-factory restart                    # force a restart now (a `git pull` auto-restarts within ~60s)
 herdr-factory reload                      # hot-reload config (e.g. max_active) without a restart
 ```

@@ -66,6 +66,7 @@ export type EventType =
   | "closed"
   | "torn_down"
   | "attention"
+  | "resumed"
   | "error";
 
 /** A single attempt at running one work item through a belt. */
@@ -87,6 +88,7 @@ export interface Run {
   watchDeadline: number | null; // epoch seconds
   lastThreadSig: string | null;
   attentionReason: string | null;
+  attentionNotifiedAt: number | null; // when the operator was last notified about a parked run
   outcome: Outcome | null;
   focusPending: boolean; // active step changed; focus shift deferred until the user views this worktree
   createdAt: number; // epoch seconds
@@ -110,6 +112,7 @@ export type RunPatch = Partial<
     | "watchDeadline"
     | "lastThreadSig"
     | "attentionReason"
+    | "attentionNotifiedAt"
     | "outcome"
     | "focusPending"
   >

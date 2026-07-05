@@ -11,7 +11,7 @@ import { openDb } from "../db/index.ts";
 import { Store } from "../db/store.ts";
 import { systemClock, type Run } from "../types.ts";
 import type { Deps } from "../core/deps.ts";
-import { bounceStep, claimTicket, reconcileRepo, reconcileRun, requestHumanInput, teardownTicket, withTickLock, withTickLockWaiting } from "../core/reconcile.ts";
+import { bounceStep, claimTicket, reconcileRepo, reconcileRun, requestHumanInput, resumeRun, teardownTicket, withTickLock, withTickLockWaiting } from "../core/reconcile.ts";
 import { MEMORY_DIR, stepByName } from "../core/step.ts";
 import * as service from "../watchers/service.ts";
 import { buildDeps, today } from "../build-deps.ts";
@@ -301,6 +301,43 @@ program
         return { ok: true };
       });
       console.log(`${key}: torn down`);
+    } catch (e) {
+      fail(e);
+    }
+  }));
+
+program
+  .command("resume <key>")
+  .description("un-park an `attention` run back to where it was (running/reviewing/claiming)")
+  .option("--source <name>", "disambiguate when the key is active in more than one source")
+  .action(cliAction("resume", async (key: string, opts: { source?: string }) => {
+    try {
+      const repo = requireRepo();
+      const { data } = await viaServerOrLocal(
+        { method: "POST", path: `/repos/${encodeURIComponent(repo)}/resume`, body: { key, source: opts.source } },
+        async () => {
+          const deps = await buildDeps(repo);
+          const run = resolveActiveRun(deps, key, opts.source);
+          if (!run) {
+            deps.log("warn", `${key}: no active run to resume`);
+            return { ok: false, message: "no active run" };
+          }
+          // Resume mutates the phase and re-dispatches — serialize against the tick, like bounce.
+          const { ran, result } = await withTickLockWaiting(deps, async () => {
+            const res = await resumeRun(deps, deps.store.getRun(run.id)!);
+            if (res.ok) await reconcileRun(deps, deps.store.getRun(run.id)!);
+            return res;
+          });
+          if (!ran) return { ok: false, message: "dispatcher busy — retry the resume in a moment" };
+          return result!;
+        },
+      );
+      const d = data as { ok?: boolean; phase?: string; message?: string };
+      if (d.ok === false) {
+        console.log(`${key}: ${d.message ?? "resume failed"}`);
+        return;
+      }
+      console.log(`${key}: resumed -> ${d.phase}`);
     } catch (e) {
       fail(e);
     }

@@ -130,6 +130,10 @@ export class JiraSource implements WorkSource {
     }
   }
 
+  async postNote(key: string, note: string): Promise<void> {
+    await this.jira.addComment(key, note);
+  }
+
   async askHuman(input: HumanAskInput): Promise<HumanAskResult> {
     const comment = await this.jira.addComment(input.key, humanQuestionComment(input));
     return { externalId: comment.id, externalCreatedAt: comment.created ?? null };
