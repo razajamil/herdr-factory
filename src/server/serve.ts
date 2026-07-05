@@ -6,7 +6,7 @@ import { serve as nodeServe } from "@hono/node-server";
 import * as Effect from "effect/Effect";
 import { listConfiguredRepos, serverInfoPath, serverLogsDir, serverPort } from "../config.ts";
 import { buildDeps } from "../build-deps.ts";
-import { pingHealth, readServerInfo } from "./client.ts";
+import { isTickStale, pingHealth, readServerInfo } from "./client.ts";
 import { createApp, type HealthInfo, type RepoRuntime, type ServerContext } from "./app.ts";
 import { reconcileRepo, withTickLock } from "../core/reconcile.ts";
 import { systemClock } from "../types.ts";
@@ -101,13 +101,24 @@ function startLoops(): void {
 }
 
 function health(): HealthInfo {
+  const now = systemClock();
   return {
     ok: true,
     version: VERSION,
     pid: process.pid,
     startedAt,
-    uptimeSec: systemClock() - startedAt,
-    repos: [...repos.entries()].map(([name, rt]) => ({ name, active: rt.deps.store.countActive(name) })),
+    uptimeSec: now - startedAt,
+    repos: [...repos.entries()].map(([name, rt]) => {
+      const lastTickAt = rt.deps.store.lastTickAt(name);
+      return {
+        name,
+        active: rt.deps.store.countActive(name),
+        lastTickAt,
+        // Computed server-side (the server knows each repo's tick interval); the supervisor
+        // just acts on it. True = the tick loop is wedged even though HTTP still answers.
+        tickStale: isTickStale(lastTickAt, startedAt, rt.deps.config.limits.tickIntervalSeconds, now),
+      };
+    }),
   };
 }
 

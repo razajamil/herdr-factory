@@ -352,6 +352,15 @@ export class Store {
     telemetryEvent("store.repo.touch_tick", { repo });
   }
 
+  /** When the repo's last reconcile pass COMPLETED (epoch seconds) — the tick-watchdog signal
+   *  the supervisor restarts on when it goes stale (a wedged tick stops touching it). */
+  lastTickAt(repo: string): number | null {
+    const row = this.db.prepare("SELECT last_tick_at FROM repos WHERE name = ?").get(repo) as
+      | { last_tick_at: number | null }
+      | undefined;
+    return row?.last_tick_at ?? null;
+  }
+
   listRuns(repo: string, includeEnded: boolean): Run[] {
     const sql = includeEnded
       ? "SELECT * FROM runs WHERE repo = ? ORDER BY created_at DESC LIMIT 100"

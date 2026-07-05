@@ -50,23 +50,32 @@ export class HerdrClient {
     return { workspaceId, worktreePath, paneId };
   }
 
+  // Worktree ops run real git checkouts (can be slow on big repos) — give them a bigger budget
+  // than the default exec timeout, but still a HARD one (a hung herdr must not wedge the tick).
+  private static readonly WORKTREE_TIMEOUT_MS = 180_000;
+
   async worktreeCreate(repoCwd: string, branch: string, baseRef: string): Promise<WorktreeResult> {
     return this.parseWorktree(
       await runJson<WorktreeResp>(this.bin, [
         "worktree", "create", "--cwd", repoCwd, "--branch", branch, "--base", baseRef, "--no-focus", "--json",
-      ]),
+      ], { timeoutMs: HerdrClient.WORKTREE_TIMEOUT_MS }),
     );
   }
 
   async worktreeOpen(repoCwd: string, branch: string): Promise<WorktreeResult> {
     return this.parseWorktree(
-      await runJson<WorktreeResp>(this.bin, ["worktree", "open", "--cwd", repoCwd, "--branch", branch, "--no-focus", "--json"]),
+      await runJson<WorktreeResp>(this.bin, ["worktree", "open", "--cwd", repoCwd, "--branch", branch, "--no-focus", "--json"], {
+        timeoutMs: HerdrClient.WORKTREE_TIMEOUT_MS,
+      }),
     );
   }
 
   /** Removes the workspace, checkout dir, and git worktree registration (herdr-owned). */
   async worktreeRemove(workspaceId: string): Promise<void> {
-    await run(this.bin, ["worktree", "remove", "--workspace", workspaceId, "--force", "--json"], { allowFail: true });
+    await run(this.bin, ["worktree", "remove", "--workspace", workspaceId, "--force", "--json"], {
+      allowFail: true,
+      timeoutMs: HerdrClient.WORKTREE_TIMEOUT_MS,
+    });
   }
 
   /** Close the workspace + its panes (independent of git-worktree state). The fallback when

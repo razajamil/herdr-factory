@@ -26,7 +26,7 @@ beforeEach(() => {
   globalThis.fetch = (async (url: string | URL, init?: { method?: string }) => {
     fetchCalls.push({ url: String(url), method: init?.method ?? "GET" });
     const body = { key: "RWR-1", fields: { summary: "s", status: { name: "In development" }, issuetype: { name: "Bug" }, attachment: [] } };
-    return { ok: true, status: 200, json: async () => body, text: async () => "" } as Response;
+    return { ok: true, status: 200, text: async () => JSON.stringify(body), headers: new Headers() } as Response;
   }) as typeof fetch;
 });
 afterEach(() => {
@@ -61,10 +61,10 @@ describe("JiraSource", () => {
       const method = init?.method ?? "GET";
       fetchCalls.push({ url: u, method });
       if (u.includes("/transitions") && method === "GET") {
-        return { ok: true, status: 200, json: async () => ({ transitions: [{ id: "42", to: { name: "Ready for Code Review" } }] }), text: async () => "" } as Response;
+        return { ok: true, status: 200, text: async () => JSON.stringify(({ transitions: [{ id: "42", to: { name: "Ready for Code Review" } }] })), headers: new Headers() } as Response;
       }
       const body = { key: "RWR-1", fields: { summary: "s", status: { name: "In development" }, issuetype: { name: "Bug" }, attachment: [] } };
-      return { ok: true, status: 200, json: async () => body, text: async () => "" } as Response;
+      return { ok: true, status: 200, text: async () => JSON.stringify(body), headers: new Headers() } as Response;
     }) as typeof fetch;
     const moved = await src().transition("RWR-1", "in_review");
     expect(moved).toBe(true);
@@ -81,9 +81,9 @@ describe("JiraSource", () => {
       const u = String(url);
       if (u.includes("/board/254/issue")) {
         const issues = [{ key: "RWR-9", fields: { summary: "Crash on save", issuetype: { name: "Bug" }, status: { name: "To Do" }, labels: ["agent", "p1"] } }];
-        return { ok: true, status: 200, json: async () => ({ issues }), text: async () => "" } as Response;
+        return { ok: true, status: 200, text: async () => JSON.stringify(({ issues })), headers: new Headers() } as Response;
       }
-      return { ok: true, status: 200, json: async () => ({}), text: async () => "" } as Response;
+      return { ok: true, status: 200, text: async () => JSON.stringify(({})), headers: new Headers() } as Response;
     }) as typeof fetch;
     const items = await src().listEligible();
     expect(items.length).toBe(1);
@@ -105,7 +105,7 @@ describe("JiraSource", () => {
     globalThis.fetch = (async (url: string | URL, init?: RequestInit) => {
       fetchCalls.push({ url: String(url), method: init?.method ?? "GET" });
       posted = String(init?.body ?? "");
-      return { ok: true, status: 201, json: async () => ({ id: "10000", created: "2026-06-28T00:00:00.000+0000" }), text: async () => "" } as Response;
+      return { ok: true, status: 201, text: async () => JSON.stringify(({ id: "10000", created: "2026-06-28T00:00:00.000+0000" })), headers: new Headers() } as Response;
     }) as typeof fetch;
 
     const res = await src().askHuman({ repo: "demo", runId: 7, questionId: 3, key: "RWR-1", step: "fix", question: "Which path should win?" });
@@ -123,13 +123,14 @@ describe("JiraSource", () => {
       return {
         ok: true,
         status: 200,
-        json: async () => ({
-          comments: [
-            { id: "q1", created: "2026-06-28T00:00:00.000+0000", body: adf("[herdr-factory question: demo/7/3]") },
-            { id: "a1", created: "2026-06-28T00:01:00.000+0000", author: { displayName: "Pat" }, body: adf("Use the new behavior.") },
-          ],
-        }),
-        text: async () => "",
+        text: async () =>
+          JSON.stringify({
+            comments: [
+              { id: "q1", created: "2026-06-28T00:00:00.000+0000", body: adf("[herdr-factory question: demo/7/3]") },
+              { id: "a1", created: "2026-06-28T00:01:00.000+0000", author: { displayName: "Pat" }, body: adf("Use the new behavior.") },
+            ],
+          }),
+        headers: new Headers(),
       } as Response;
     }) as typeof fetch;
 

@@ -31,6 +31,55 @@ export function readServerInfo(): ServerInfo | null {
   }
 }
 
+/** One repo's tick health as reported by /health. */
+export interface HealthRepo {
+  name: string;
+  active: number;
+  lastTickAt: number | null;
+  tickStale: boolean;
+}
+
+/** The /health payload the supervisor reads (mirrors app.ts's HealthInfo). */
+export interface HealthPayload {
+  ok: boolean;
+  version: string;
+  pid: number;
+  startedAt: number;
+  uptimeSec: number;
+  repos: HealthRepo[];
+}
+
+/**
+ * Is a repo's tick loop wedged? The HTTP layer answering /health only proves the process is
+ * alive — a hung subprocess inside a tick leaves the loop dead while /health stays green. The
+ * repo's last COMPLETED tick going stale is the reliable signal. The threshold is generous
+ * (10 ticks, floor 15min) so long-but-healthy ticks at scale never trip it, and `serverStartedAt`
+ * is the baseline for a freshly (re)started server that hasn't completed its first pass yet.
+ */
+export function isTickStale(
+  lastTickAt: number | null,
+  serverStartedAt: number,
+  tickIntervalSeconds: number,
+  now: number,
+): boolean {
+  const threshold = Math.max(10 * tickIntervalSeconds, 900);
+  const baseline = Math.max(lastTickAt ?? 0, serverStartedAt);
+  return now - baseline > threshold;
+}
+
+/** GET /health and parse the payload; null when unreachable/non-200/malformed (treated as
+ *  unhealthy by the supervisor, same as a dead process). */
+export async function readHealth(port: number, timeoutMs = 3000): Promise<HealthPayload | null> {
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/health`, { signal: AbortSignal.timeout(timeoutMs) });
+    if (!res.ok) return null;
+    const j = (await res.json()) as HealthPayload;
+    return j.ok === true ? j : null;
+  } catch {
+    return null;
+  }
+}
+
 /** Liveness probe: GET /health, true iff it answers 200 with {ok:true} inside the timeout.
  *  A wedged-but-alive server fails this just like a dead one — which is exactly what the
  *  supervisor wants (restart on either). */

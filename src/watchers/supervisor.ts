@@ -2,7 +2,7 @@ import { spawn } from "node:child_process";
 import { rmSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { resolvedNodePath, serverInfoPath } from "../config.ts";
-import { pingHealth, readServerInfo } from "../server/client.ts";
+import { pingHealth, readHealth, readServerInfo } from "../server/client.ts";
 import { VERSION } from "../version.ts";
 import { autoUpdateEnabled, selfUpdate } from "./updater.ts";
 import { telemetrySpan } from "../telemetry/index.ts";
@@ -115,11 +115,23 @@ async function ensureUpImpl(
   const info = readServerInfo();
 
   if (info && !force) {
-    if ((await pingHealth(info.port)) && info.version === VERSION) {
+    // Read the full health payload, not just liveness: a wedged tick loop (hung subprocess mid-
+    // reconcile) keeps answering /health while no repo makes progress. Each repo's tickStale flag
+    // is the watchdog for that — restart on it exactly like on an unresponsive server.
+    const health = await readHealth(info.port);
+    const staleRepos = health ? health.repos.filter((r) => r.tickStale).map((r) => r.name) : [];
+    if (health && info.version === VERSION && staleRepos.length === 0) {
       log("info", `server healthy on :${info.port} (v${info.version})`);
       return { action: "noop" };
     }
-    log("info", info.version !== VERSION ? `server v${info.version} != v${VERSION} — restarting` : "server not responding — restarting");
+    log(
+      "info",
+      !health
+        ? "server not responding — restarting"
+        : info.version !== VERSION
+          ? `server v${info.version} != v${VERSION} — restarting`
+          : `tick loop stale for ${staleRepos.join(", ")} — restarting wedged server`,
+    );
   }
 
   if (info) {

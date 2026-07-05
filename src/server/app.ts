@@ -38,14 +38,15 @@ export interface RepoRuntime {
   ticking: boolean;
 }
 
-/** The /health payload (also what `ensure-up`/pingHealth read back). */
+/** The /health payload (also what `ensure-up`/readHealth read back). `tickStale` per repo is the
+ *  wedged-tick signal the supervisor restarts on. */
 export interface HealthInfo {
   ok: boolean;
   version: string;
   pid: number;
   startedAt: number;
   uptimeSec: number;
-  repos: { name: string; active: number }[];
+  repos: { name: string; active: number; lastTickAt: number | null; tickStale: boolean }[];
 }
 
 /** Everything the HTTP layer needs from the resident lifecycle (implemented in serve.ts). */

@@ -31,7 +31,14 @@ const HealthResponse = z
     pid: z.number(),
     startedAt: z.number(),
     uptimeSec: z.number(),
-    repos: z.array(z.object({ name: z.string(), active: z.number() })),
+    repos: z.array(
+      z.object({
+        name: z.string(),
+        active: z.number(),
+        lastTickAt: z.number().nullable(),
+        tickStale: z.boolean(),
+      }),
+    ),
   })
   .openapi("Health");
 

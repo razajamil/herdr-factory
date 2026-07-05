@@ -1,6 +1,12 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { JiraIssue } from "../types.ts";
+import { httpOk, httpOkBytes } from "./http.ts";
+
+/** Time budget for a JSON API round-trip; media downloads get a larger one. Both are HARD
+ *  bounds — a black-holed Jira connection must never wedge a reconcile tick. */
+const JIRA_TIMEOUT_MS = 30_000;
+const JIRA_MEDIA_TIMEOUT_MS = 120_000;
 
 /** A board-search result with the fields a belt's match predicate routes on. `fields` is the raw
  *  Jira issue.fields object (summary/issuetype/status/labels) fetched by the board query. */
@@ -60,19 +66,19 @@ export class JiraClient {
   }
 
   private async getJson<T>(path: string): Promise<T> {
-    const res = await fetch(this.baseUrl + path, { headers: this.headers() });
-    if (!res.ok) throw new Error(`Jira GET ${path} -> ${res.status}: ${(await res.text()).slice(0, 300)}`);
-    return (await res.json()) as T;
+    const res = await httpOk({ url: this.baseUrl + path, headers: this.headers(), timeoutMs: JIRA_TIMEOUT_MS });
+    return JSON.parse(res.text) as T;
   }
 
   private async postJson<T>(path: string, body: unknown): Promise<T> {
-    const res = await fetch(this.baseUrl + path, {
+    const res = await httpOk({
+      url: this.baseUrl + path,
       method: "POST",
       headers: { ...this.headers(), "Content-Type": "application/json" },
       body: JSON.stringify(body),
+      timeoutMs: JIRA_TIMEOUT_MS,
     });
-    if (!res.ok) throw new Error(`Jira POST ${path} -> ${res.status}: ${(await res.text()).slice(0, 300)}`);
-    return (await res.json()) as T;
+    return JSON.parse(res.text) as T;
   }
 
   /** On board `board`, status `todoStatus`, label `label`. Returns each issue's routing fields
@@ -130,12 +136,14 @@ export class JiraClient {
     );
     const match = (tr.transitions ?? []).find((t) => t.to?.name?.toLowerCase() === targetName.toLowerCase());
     if (!match) throw new Error(`${key}: no transition from "${current}" to "${targetName}"`);
-    const res = await fetch(`${this.baseUrl}/rest/api/3/issue/${key}/transitions`, {
+    // The transition POST returns 204 with an empty body — httpOk (not postJson, which parses).
+    await httpOk({
+      url: `${this.baseUrl}/rest/api/3/issue/${key}/transitions`,
       method: "POST",
       headers: { ...this.headers(), "Content-Type": "application/json" },
       body: JSON.stringify({ transition: { id: match.id } }),
+      timeoutMs: JIRA_TIMEOUT_MS,
     });
-    if (!res.ok) throw new Error(`Jira transition ${key} -> ${res.status}: ${(await res.text()).slice(0, 200)}`);
     return true;
   }
 
@@ -164,9 +172,12 @@ export class JiraClient {
       .slice(0, max);
     const saved: string[] = [];
     for (const a of media) {
-      const res = await fetch(a.content, { headers: this.headers(), redirect: "follow" });
-      if (!res.ok) continue;
-      const buf = Buffer.from(await res.arrayBuffer());
+      let buf: Buffer;
+      try {
+        buf = (await httpOkBytes({ url: a.content, headers: this.headers(), timeoutMs: JIRA_MEDIA_TIMEOUT_MS })).bytes;
+      } catch {
+        continue; // one bad attachment (4xx/timeout) shouldn't sink the rest
+      }
       const safe = a.filename.replace(/[^A-Za-z0-9._-]/g, "_");
       writeFileSync(join(outDir, safe), buf);
       saved.push(safe);
