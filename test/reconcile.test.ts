@@ -4,10 +4,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openDb } from "../src/db/index.ts";
 import { Store } from "../src/db/store.ts";
-import { applyPendingFocus, bounceStep, flushTransitionOutbox, reconcileRepo, reconcileRun, requestHumanInput, resumeRun, withRunLock, withRunLockWaiting, withTickLock } from "../src/core/reconcile.ts";
+import { applyPendingFocus, bounceStep, claimTicket, flushTransitionOutbox, reconcileRepo, reconcileRun, requestHumanInput, resumeRun, withRunLock, withRunLockWaiting, withTickLock } from "../src/core/reconcile.ts";
 import { HerdrUnreachableError, type BeltRuntime, type Deps, type GitApi, type GitHubApi, type HerdrApi, type SourceRuntime, type WorkSource } from "../src/core/deps.ts";
 import type { Config, Secrets, StepConfig } from "../src/config.ts";
-import type { FocusedPane, HumanAskInput, HumanPollInput, HumanReply, MatchItem, Phase, PrInfo, PrSnapshot, ReviewSig, Ticket, WorkState } from "../src/types.ts";
+import type { FocusedPane, HumanAskInput, HumanPollInput, HumanReply, JiraMatchItem, LocalMarkdownMatchItem, Phase, PrInfo, PrSnapshot, ReviewSig, Ticket, WorkState } from "../src/types.ts";
+import { StaleItemError } from "../src/types.ts";
 
 const tmps: string[] = [];
 afterEach(() => {
@@ -31,6 +32,8 @@ interface FakeState {
   herdrUnreachable: boolean; // liveness queries throw HerdrUnreachableError (herdr can't be asked)
   failTransitions: boolean; // the jira source's transition() throws (backend down / 429 / workflow)
   failTransitionStates: Set<string>; // …or throws only for these target states
+  staleTransitionStates: Set<string>; // transition() reports the item GONE for these target states
+  humanPollError: Error | null; // pollHumanReply throws this instead of returning
 }
 
 /** A resolved belt step for the fakes. Budgets/heartbeat/opensPr mirror what config.ts derives for
@@ -55,7 +58,7 @@ function build(opts: { multi?: boolean } = {}) {
   let now = 1000;
   let uidN = 0; // deterministic per-claim branch suffix (u1, u2, …) so re-claims get distinct branches
   const store = new Store(openDb(":memory:"), () => now);
-  const state: FakeState = { eligible: [], eligible2: [], pr: null, sig: { unresolved: 0, failing: 0, sig: "s0" }, paneState: "idle", deadPanes: new Set(), headSha: "sha0", sessionId: "sess-1", workspaceExists: false, focusedPane: { paneId: "w1:p1", workspaceId: "w1", tabId: "w1:t1", label: "agent" }, humanReply: null, herdrUnreachable: false, failTransitions: false, failTransitionStates: new Set() };
+  const state: FakeState = { eligible: [], eligible2: [], pr: null, sig: { unresolved: 0, failing: 0, sig: "s0" }, paneState: "idle", deadPanes: new Set(), headSha: "sha0", sessionId: "sess-1", workspaceExists: false, focusedPane: { paneId: "w1:p1", workspaceId: "w1", tabId: "w1:t1", label: "agent" }, humanReply: null, herdrUnreachable: false, failTransitions: false, failTransitionStates: new Set(), staleTransitionStates: new Set(), humanPollError: null };
   const calls = {
     transitions: [] as [string, WorkState][],
     agentSend: [] as [string, string][],
@@ -73,22 +76,29 @@ function build(opts: { multi?: boolean } = {}) {
     agentStart: 0,
     notify: 0,
   };
-  const wrapJira = (t: Ticket): MatchItem => ({ sourceType: "jira", key: t.key, summary: t.summary, type: t.type, status: "To Do", labels: [], fields: {} });
-  const wrapLm = (t: Ticket): MatchItem => ({ sourceType: "local_markdown", key: t.key, summary: t.summary, type: t.type, path: `/f/${t.key}.md`, filename: `${t.key}.md`, frontMatter: {}, body: "" });
+  const wrapJira = (t: Ticket): JiraMatchItem => ({ sourceType: "jira", key: t.key, summary: t.summary, type: t.type, status: "To Do", labels: [], fields: {} });
+  const wrapLm = (t: Ticket): LocalMarkdownMatchItem => ({ sourceType: "local_markdown", key: t.key, summary: t.summary, type: t.type, labels: [], fields: {}, path: `/f/${t.key}.md`, filename: `${t.key}.md`, frontMatter: {}, body: "" });
   // Fake work sources; transitions record the CANONICAL WorkState (the canonical→backend mapping
   // lives inside the real JiraSource/LocalMarkdownSource, which these fakes stand in for).
   const jiraClient: WorkSource = {
+    spec: { statusOfRecord: "external", mappedStates: ["todo", "in_development", "in_review"], replyChannel: "comments" },
     listEligible: async () => state.eligible.map(wrapJira),
     describe: async (key) => ({ key, summary: "Fix the thing", type: "Bug" }),
     transition: async (key, to) => {
       if (state.failTransitions || state.failTransitionStates.has(to)) throw new Error(`transition to ${to} failed (fake)`);
+      if (state.staleTransitionStates.has(to)) return { kind: "stale", detail: "issue deleted (fake)" };
       calls.transitions.push([key, to]);
-      return true;
+      return { kind: "applied" };
     },
     materialize: async (_key, memDir) => { mkdirSync(memDir, { recursive: true }); writeFileSync(join(memDir, "ticket.json"), "{}"); },
+    workDoc: async () => ({ path: "ticket.json", kind: "Jira ticket (JSON)" }),
     postNote: async (key, note) => { calls.postNotes.push([key, note]); },
     askHuman: async (input) => { calls.humanAsk.push(input); return { externalId: `q-${input.questionId}`, externalCreatedAt: "2026-06-28T00:00:00.000+0000" }; },
-    pollHumanReply: async (input) => { calls.humanPoll.push(input); return state.humanReply; },
+    pollHumanReply: async (input) => {
+      if (state.humanPollError) throw state.humanPollError;
+      calls.humanPoll.push(input);
+      return state.humanReply;
+    },
     health: async () => {},
   };
   const sources: SourceRuntime[] = [{ name: "jira", type: "jira", client: jiraClient }];
@@ -99,10 +109,12 @@ function build(opts: { multi?: boolean } = {}) {
   let lmBelt: BeltRuntime | undefined;
   if (opts.multi) {
     const lmClient: WorkSource = {
+      spec: { statusOfRecord: "internal", mappedStates: ["todo", "in_development", "in_review", "merged", "aborted", "done"], replyChannel: "file" },
       listEligible: async () => state.eligible2.map(wrapLm),
       describe: async (key) => ({ key, summary: "md work", type: "task" }),
-      transition: async (key, to) => { calls.transitions.push([key, to]); return true; },
+      transition: async (key, to) => { calls.transitions.push([key, to]); return { kind: "applied" }; },
       materialize: async (_key, memDir) => { mkdirSync(memDir, { recursive: true }); writeFileSync(join(memDir, "task.md"), "# md"); },
+      workDoc: async () => ({ path: "task.md", kind: "markdown file" }),
       postNote: async (key, note) => { calls.postNotes.push([key, note]); },
       askHuman: async (input) => { calls.humanAsk.push(input); return { externalId: `q-${input.questionId}`, externalCreatedAt: "2026-06-28T00:00:00.000+0000" }; },
       pollHumanReply: async (input) => { calls.humanPoll.push(input); return state.humanReply; },
@@ -229,6 +241,17 @@ describe("reconcile pipeline (work_to_pull_request belt)", () => {
     expect(calls.transitions).toContainEqual(["K-1", "in_development"]);
     // materializeWork wrote the work doc the fix agent reads
     expect(existsSync(join(worktree, ".memory/herdr-factory/ticket.json"))).toBe(true);
+  });
+
+  it("renders @@WORK_DOC@@/@@WORK_DOC_KIND@@ from the source's workDoc() — no engine type-switch", async () => {
+    const { deps, state, worktree, shipBelt } = build();
+    shipBelt.steps[0]!.enginePrompt = "Study @@WORK_DOC@@ (@@WORK_DOC_KIND@@).";
+    state.eligible = [ticket("K-WD")];
+    await reconcileRepo(deps);
+    const prompt = readFileSync(join(worktree, ".memory/herdr-factory/prompt-fix.md"), "utf8");
+    // The regression this pins: an unawaited/sync workDoc through the telemetry proxy would
+    // render ".memory/herdr-factory/undefined (undefined)".
+    expect(prompt).toContain("Study .memory/herdr-factory/ticket.json (Jira ticket (JSON)).");
   });
 
   it("a re-claimed ticket gets a fresh unique branch (so a prior merged PR isn't matched)", async () => {
@@ -1054,6 +1077,107 @@ describe("transition outbox — source write-backs retried until delivered", () 
       ["K-T5", "in_development"],
       ["K-T5", "in_review"],
     ]);
+  });
+});
+
+describe("stale write-backs — two-phase policy (lock-free stamp, run-locked reaction)", () => {
+  it("stale on the claim (in_development) aborts the run on the next pass — one notification total", async () => {
+    const { deps, store, state, calls } = build();
+    state.eligible = [ticket("K-S1")];
+    // The item vanishes between listing and the claim write-back; teardown's own `aborted`
+    // write-back will find it gone too — that second stale must NOT double-notify.
+    state.staleTransitionStates = new Set(["in_development", "aborted"]);
+    await reconcileRepo(deps); // claims; the immediate delivery stamps stale (run already running)
+    const run = store.activeRunForTicket("demo", "jira", "K-S1")!;
+    expect(run.phase).toBe("running"); // stamped, not yet consumed (the claim pass already advanced)
+    expect(store.unhandledStaleIntentForRun(run.id)).toBeDefined();
+
+    state.eligible = [];
+    await reconcileRepo(deps); // Phase A consumes the flag under the run lock
+    const ended = store.getRun(run.id)!;
+    expect(ended.endedAt).not.toBeNull();
+    expect(ended.outcome).toBe("abandoned");
+    expect(calls.notify).toBe(1); // the abort notice; the aborted-intent stale lands in the ended-run path
+    expect(store.unhandledStaleIntentForRun(run.id)).toBeUndefined(); // nothing left to double-fire
+    expect(calls.worktreeRemove).toEqual(["w1"]); // real teardown, not a leak
+  });
+
+  it("stale mid-flight (in_review) parks for a human — work (a PR) may exist; never posts to the gone item", async () => {
+    const { deps, store, state, calls, worktree } = build();
+    const run = seed(store, worktree, "K-S2", "running", "pr");
+    state.staleTransitionStates = new Set(["in_review"]);
+    store.enqueueTransition({ runId: run.id, repo: "demo", workSource: "jira", ticketKey: "K-S2", toState: "in_review" });
+    await flushTransitionOutbox(deps); // lock-free: stamps stale, mutates nothing on the run
+    expect(store.getRun(run.id)!.phase).toBe("running");
+
+    await reconcileRun(deps, store.getRun(run.id)!); // run-locked reaction
+    const got = store.getRun(run.id)!;
+    expect(got.phase).toBe("attention");
+    expect(got.attentionReason).toContain("gone");
+    expect(calls.notify).toBe(1);
+    expect(calls.postNotes).toEqual([]); // skipSourceNote: the item the note would go to is gone
+  });
+
+  it("stale for an already-ended run is consumed silently at delivery time", async () => {
+    const { deps, store, state, calls, worktree } = build();
+    const run = seed(store, worktree, "K-S3", "running", "pr");
+    store.endRun(run.id, "merged");
+    state.staleTransitionStates = new Set(["merged"]);
+    store.enqueueTransition({ runId: run.id, repo: "demo", workSource: "jira", ticketKey: "K-S3", toState: "merged" });
+    await flushTransitionOutbox(deps);
+    expect(store.unhandledStaleIntentForRun(run.id)).toBeUndefined(); // handled at delivery
+    expect(store.pendingTransitionForKey("demo", "jira", "K-S3")).toBe(false); // outbox stops retrying
+    expect(calls.notify).toBe(0);
+    expect(store.getRun(run.id)!.phase).toBe("done"); // never flip an ended run's phase
+  });
+});
+
+describe("human-loop resilience — poll errors back off; a gone item escalates", () => {
+  it("a generic pollHumanReply throw is a backoff'd poll error, not a run error (and recovery works)", async () => {
+    const { deps, store, state, worktree, setNow } = build();
+    const run = seed(store, worktree, "K-H1", "running", "fix");
+    const asked = await requestHumanInput(deps, run, "fix", "Which flag wins?");
+
+    state.humanPollError = new Error("HTTP 429: rate limited");
+    await reconcileRun(deps, store.getRun(run.id)!); // must not bubble to the error path
+    expect(store.getRun(run.id)!.phase).toBe("waiting_for_human");
+    expect(store.getHumanQuestion(asked.questionId)!.pollErrors).toBe(1);
+    const backedOffTo = store.getHumanQuestion(asked.questionId)!.nextPollAt;
+    expect(backedOffTo).toBeGreaterThan(1000); // backed off like a miss
+
+    // Recovery: the source heals and a real reply lands.
+    state.humanPollError = null;
+    state.humanReply = { body: "Use the new flag.", externalId: "a-1", author: "PM" };
+    setNow(backedOffTo + 1);
+    await reconcileRun(deps, store.getRun(run.id)!);
+    expect(store.getRun(run.id)!.phase).toBe("running");
+    expect(store.getHumanQuestion(asked.questionId)!.pollErrors).toBe(0); // reset by the successful poll
+  });
+
+  it("a StaleItemError from pollHumanReply escalates immediately — the reply can never arrive", async () => {
+    const { deps, store, state, calls, worktree } = build();
+    const run = seed(store, worktree, "K-H2", "running", "fix");
+    await requestHumanInput(deps, run, "fix", "Which flag wins?");
+    state.humanPollError = new StaleItemError("issue deleted");
+    await reconcileRun(deps, store.getRun(run.id)!);
+    const got = store.getRun(run.id)!;
+    expect(got.phase).toBe("attention");
+    expect(got.attentionReason).toContain("gone");
+    expect(calls.postNotes).toEqual([]); // no note to a deleted item
+  });
+});
+
+describe("manual claim — INV-11 canonical-key echo", () => {
+  it("re-checks dedup against describe()'s returned key, not the operator's spelling", async () => {
+    const { deps, store, worktree } = build();
+    seed(store, worktree, "K-CANON", "running", "fix"); // active run under the canonical key
+    // The source normalizes any identifier to the canonical key (e.g. display id → immutable id).
+    Object.assign(deps.sources[0]!.client, {
+      describe: async () => ({ key: "K-CANON", summary: "Fix the thing", type: "Bug" }),
+    });
+    await claimTicket(deps, "ship", "K-ALIAS"); // no active run under THIS spelling…
+    // …but the canonical key is already active — claiming again would double-run the item.
+    expect(store.countActive("demo")).toBe(1);
   });
 });
 

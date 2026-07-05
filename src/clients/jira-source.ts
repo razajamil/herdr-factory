@@ -1,8 +1,19 @@
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { JiraSourceCfg } from "../config.ts";
-import type { Logger, WorkSource } from "../core/deps.ts";
-import type { HumanAskInput, HumanAskResult, HumanPollInput, HumanReply, MatchItem, Ticket, WorkState } from "../types.ts";
+import { bearsHerdrMarker, HERDR_MARKER, type Logger, type WorkSource, type WorkSourceSpec } from "../core/deps.ts";
+import type {
+  HumanAskInput,
+  HumanAskResult,
+  HumanPollInput,
+  HumanReply,
+  JiraMatchItem,
+  MatchItem,
+  Ticket,
+  TransitionResult,
+  WorkDocInfo,
+  WorkState,
+} from "../types.ts";
 import { JiraClient, type JiraComment } from "./jira.ts";
 
 // Attachment caps for materialize (images + videos share the count budget). Moved here from
@@ -12,7 +23,7 @@ const MAX_IMAGE_BYTES = 10 * 1024 * 1024; // 10 MB
 const MAX_VIDEO_BYTES = 50 * 1024 * 1024; // 50 MB
 const isMedia = (mime: string): boolean => mime.startsWith("image/") || mime.startsWith("video/");
 
-const QUESTION_MARKER = "[herdr-factory question:";
+const QUESTION_MARKER = `${HERDR_MARKER} question:`;
 
 function bodyText(node: unknown): string {
   if (!node || typeof node !== "object") return "";
@@ -32,7 +43,7 @@ function commentText(comment: JiraComment): string {
 function humanQuestionComment(input: HumanAskInput): string {
   const step = input.step ?? "unknown";
   return [
-    `[herdr-factory question: ${input.repo}/${input.runId}/${input.questionId}]`,
+    `${QUESTION_MARKER} ${input.repo}/${input.runId}/${input.questionId}]`,
     `Work item: ${input.key}`,
     `Step: ${step}`,
     "",
@@ -56,17 +67,26 @@ export class JiraSource implements WorkSource {
     this.jira = new JiraClient(cfg.baseUrl, email, token);
   }
 
+  readonly spec: WorkSourceSpec = {
+    statusOfRecord: "external",
+    mappedStates: ["todo", "in_development", "in_review"],
+    replyChannel: "comments",
+    terminalAutomation: "Jira's GitHub integration owns terminal closure (merged/aborted/done are unmapped)",
+  };
+
   async listEligible(): Promise<MatchItem[]> {
     const items = await this.jira.listEligible(this.cfg.board, this.cfg.label, this.cfg.statusTodo);
-    return items.map((i) => ({
-      sourceType: "jira",
-      key: i.key,
-      summary: i.summary,
-      type: i.type,
-      status: i.status,
-      labels: i.labels,
-      fields: i.fields,
-    }));
+    return items.map(
+      (i): JiraMatchItem => ({
+        sourceType: "jira",
+        key: i.key,
+        summary: i.summary,
+        type: i.type,
+        status: i.status,
+        labels: i.labels,
+        fields: i.fields,
+      }),
+    );
   }
 
   async describe(key: string): Promise<Ticket> {
@@ -93,10 +113,11 @@ export class JiraSource implements WorkSource {
     }
   }
 
-  async transition(key: string, to: WorkState): Promise<boolean> {
+  async transition(key: string, to: WorkState): Promise<TransitionResult> {
     const status = this.statusFor(to);
-    if (!status) return false; // unmapped → no-op, and crucially NO network call (teardown parity)
-    return this.jira.transition(key, status);
+    if (!status) return { kind: "noop" }; // unmapped → no-op, and crucially NO network call (teardown parity)
+    const moved = await this.jira.transition(key, status);
+    return moved ? { kind: "applied" } : { kind: "noop" };
   }
 
   async materialize(key: string, memDir: string, log: Logger): Promise<void> {
@@ -130,8 +151,14 @@ export class JiraSource implements WorkSource {
     }
   }
 
+  async workDoc(): Promise<WorkDocInfo> {
+    return { path: "ticket.json", kind: "Jira ticket (JSON)" };
+  }
+
   async postNote(key: string, note: string): Promise<void> {
-    await this.jira.addComment(key, note);
+    // Marker-tagged so pollHumanReply never mistakes our own attention note for a human reply
+    // (INV-6 — an unmarked note posted while a question was pending used to poison the loop).
+    await this.jira.addComment(key, `${HERDR_MARKER}] ${note}`);
   }
 
   async askHuman(input: HumanAskInput): Promise<HumanAskResult> {
@@ -151,7 +178,9 @@ export class JiraSource implements WorkSource {
     for (const comment of candidates) {
       if (comment.id === input.externalId) continue;
       const text = commentText(comment);
-      if (text.includes(QUESTION_MARKER)) continue;
+      // Skip EVERY herdr-authored artifact — questions AND marked notes (INV-6). Blockquote-aware:
+      // a human reply that quotes the question must still be accepted as a reply.
+      if (bearsHerdrMarker(text)) continue;
       if (!text && !comment.body) continue;
       return {
         body: text || "(Jira comment had no extractable text.)",

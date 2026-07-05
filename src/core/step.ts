@@ -1,10 +1,10 @@
-import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { StepConfig } from "../config.ts";
 import type { BeltRuntime, Deps, SourceRuntime } from "./deps.ts";
 import type { Run, RunStep } from "../types.ts";
-import { telemetrySpan, telemetrySpanSync } from "../telemetry/index.ts";
+import { telemetrySpan } from "../telemetry/index.ts";
 
 export const CLAUDE_FLAGS = ["--dangerously-skip-permissions"];
 export const CLI_PATH = fileURLToPath(new URL("../../bin/herdr-factory", import.meta.url));
@@ -199,29 +199,29 @@ function stepBody(deps: Deps, run: Run, step: StepConfig): string {
 /** Render a step's prompt (its assembled body + tokens + guidance + handover scaffold) and write it
  *  into the worktree's .memory for the agent to read. Function replacers avoid `$`-pattern
  *  interpretation. */
-export function renderStepPrompt(
+export async function renderStepPrompt(
   deps: Deps,
   run: Run,
   belt: BeltRuntime,
   src: SourceRuntime,
   step: StepConfig,
   prior: RunStep | null,
-): void {
-  return telemetrySpanSync(
+): Promise<void> {
+  return telemetrySpan(
     "step.render_prompt",
     { repo: deps.config.repoName, "run.id": run.id, "work.key": run.ticketKey, "work.source": src.name, belt: belt.name, step: step.name },
     () => renderStepPromptImpl(deps, run, belt, src, step, prior),
   );
 }
 
-function renderStepPromptImpl(
+async function renderStepPromptImpl(
   deps: Deps,
   run: Run,
   belt: BeltRuntime,
   src: SourceRuntime,
   step: StepConfig,
   prior: RunStep | null,
-): void {
+): Promise<void> {
   const worktree = run.worktreePath;
   if (!worktree) throw new Error(`${run.ticketKey}: no worktree path`);
   // The step-done command carries --source so the signal resolves to the right run even when two
@@ -237,20 +237,12 @@ function renderStepPromptImpl(
   const bounceCmd = bounceTarget
     ? `${CLI_PATH} --repo ${deps.config.repoName} bounce ${run.ticketKey} ${bounceTarget} --source ${src.name} --reason-file ${MEMORY_DIR}/bounce-${step.name}.md`
     : "";
-  // Where the work item's spec lives + how to describe it. Jira → a single ticket.json.
-  // local_markdown is either a single file (snapshotted to task.md) or a whole directory (copied
-  // to task/); detect which from what materialize wrote into this worktree's .memory.
-  let workDoc: string;
-  let workDocKind: string;
-  if (src.type === "jira") {
-    workDoc = `${MEMORY_DIR}/ticket.json`;
-    workDocKind = "Jira ticket (JSON)";
-  } else {
-    const taskDir = join(worktree, MEMORY_DIR, "task");
-    const isDir = existsSync(taskDir) && statSync(taskDir).isDirectory();
-    workDoc = isDir ? `${MEMORY_DIR}/task/` : `${MEMORY_DIR}/task.md`;
-    workDocKind = isDir ? "directory of markdown files" : "markdown file";
-  }
+  // Where the work item's spec lives + how to describe it — the SOURCE owns this (workDoc pairs
+  // with its materialize; the engine never branches on source type). It may stat the worktree's
+  // .memory to disambiguate layouts (e.g. local_markdown's task/ vs task.md).
+  const wd = await src.client.workDoc(join(worktree, MEMORY_DIR));
+  const workDoc = `${MEMORY_DIR}/${wd.path}`;
+  const workDocKind = wd.kind;
   const sub: Record<string, string> = {
     "@@KEY@@": run.ticketKey,
     "@@REPO@@": deps.config.repoName,
@@ -338,7 +330,7 @@ async function spawnStepImpl(
     if (sid) prior = deps.store.upsertRunStep(run.id, prev!.name, { sessionId: sid });
   }
 
-  renderStepPrompt(deps, run, belt, src, step, prior);
+  await renderStepPrompt(deps, run, belt, src, step, prior);
 
   // Ensure the step row exists so its started_at clock runs from the first attempt — this is
   // what bounds the layout wait across ticks. (started_at is set to now() on first insert and

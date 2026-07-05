@@ -54,6 +54,7 @@ export async function buildDeps(repoName: string): Promise<Deps> {
     const { config, secrets } = loadConfig(repoName);
     mkdirSync(config.paths.stateDir, { recursive: true });
     const store = new Store(openDb(config.paths.dbPath), systemClock);
+    const log = makeLogger(config);
     const git = instrumentObject(new GitClient(), "git");
     const ghRepo = config.repo.github ?? parseGhRepo(await git.originUrl(config.repo.path)) ?? "";
     // Build a live client per work source (backends only — the pipeline lives on belts).
@@ -65,7 +66,7 @@ export async function buildDeps(repoName: string): Promise<Deps> {
         client: instrumentObject(
           s.type === "jira"
             ? new JiraSource(s.jira!, secrets.jiraEmail, secrets.jiraApiToken)
-            : new LocalMarkdownSource(s.localMarkdown!.folder, store, repoName, s.name),
+            : new LocalMarkdownSource(s.localMarkdown!.folder, store, repoName, s.name, log),
           "source",
           sourceAttrs,
         ),
@@ -89,7 +90,7 @@ export async function buildDeps(repoName: string): Promise<Deps> {
       resolveBelt: (name) => (name == null ? undefined : beltByName.get(name)),
       github: instrumentObject(new GitHubClient(), "github", { repo: repoName }),
       git,
-      log: makeLogger(config),
+      log,
       now: systemClock,
       uid: () => randomBytes(3).toString("hex"), // 6 hex chars — unique per claim, ample for branch suffixes
       sleep: (ms) => new Promise((r) => setTimeout(r, ms)),

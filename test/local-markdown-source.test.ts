@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { openDb } from "../src/db/index.ts";
 import { Store } from "../src/db/store.ts";
 import { LocalMarkdownSource } from "../src/clients/local-markdown-source.ts";
+import { isLocalMarkdownItem } from "../src/types.ts";
 
 const tmps: string[] = [];
 afterEach(() => {
@@ -41,11 +42,31 @@ describe("LocalMarkdownSource", () => {
     const { src, folder } = build({ "idea-1.md": "---\ntype: research\n---\n# Idea\n\nthe body" });
     const item = (await src.listEligible()).find((t) => t.key === "idea-1")!;
     expect(item.sourceType).toBe("local_markdown");
-    if (item.sourceType !== "local_markdown") throw new Error("unreachable");
+    if (!isLocalMarkdownItem(item)) throw new Error("unreachable"); // narrow via the shipped guard, as user match.ts files do
     expect(item.filename).toBe("idea-1.md");
     expect(item.path).toBe(join(folder, "idea-1.md"));
     expect(item.frontMatter).toEqual({ type: "research" });
     expect(item.body).toContain("the body");
+    expect(item.labels).toEqual([]); // uniform base field — no front-matter labels here
+    expect(item.fields).toEqual({ type: "research" }); // fields = the front-matter object
+  });
+
+  it("skips items whose keys would break the unquoted step-done command / branch / evidence URL (INV-7)", async () => {
+    const warnings: string[] = [];
+    const folder = mkdtempSync(join(tmpdir(), "lm-"));
+    tmps.push(folder);
+    writeFileSync(join(folder, "ok-task.md"), "# fine");
+    writeFileSync(join(folder, "My Task (v2).md"), "# spaces and parens");
+    const store = new Store(openDb(":memory:"), () => 1000);
+    const src = new LocalMarkdownSource(folder, store, "r", "lm", (_lvl, msg) => warnings.push(msg));
+    expect((await src.listEligible()).map((t) => t.key)).toEqual(["ok-task"]);
+    expect(warnings.some((w) => w.includes("My Task (v2).md"))).toBe(true);
+  });
+
+  it("surfaces front-matter labels on the uniform MatchItem base", async () => {
+    const { src } = build({ "labeled.md": "---\nlabels: [bug, urgent]\n---\n# L" });
+    const item = (await src.listEligible())[0]!;
+    expect(item.labels).toEqual(["bug", "urgent"]);
   });
 
   it("ignores a __-prefixed top-level directory (work still being prepared)", async () => {
@@ -109,15 +130,32 @@ describe("LocalMarkdownSource", () => {
 
   it("transition writes the lifecycle status (idempotent) and records metadata", async () => {
     const { src, store } = build({ "task-a.md": "---\ntitle: T\ntype: chore\n---\n# T" });
-    expect(await src.transition("task-a", "in_development")).toBe(true);
-    let wi = store.getWorkItem("r", "lm", "task-a")!;
+    expect(await src.transition("task-a", "in_development")).toEqual({ kind: "applied" });
+    const wi = store.getWorkItem("r", "lm", "task-a")!;
     expect(wi.status).toBe("in_development");
     expect(wi.title).toBe("T");
     expect(wi.itemType).toBe("chore");
     expect(wi.path).toMatch(/task-a\.md$/);
-    expect(await src.transition("task-a", "in_development")).toBe(false); // idempotent no-op
-    expect(await src.transition("task-a", "merged")).toBe(true); // non-adjacent jump is fine
+    expect(await src.transition("task-a", "in_development")).toEqual({ kind: "noop" }); // idempotent no-op
+    expect(await src.transition("task-a", "merged")).toEqual({ kind: "applied" }); // non-adjacent jump is fine
     expect(store.getWorkItem("r", "lm", "task-a")!.status).toBe("merged");
+  });
+
+  it("workDoc reflects what materialize wrote: task.md for a file item, task/ for a directory item", async () => {
+    const { src, folder } = build({ "task-a.md": "# A" });
+    const mem = join(folder, ".mem");
+    mkdirSync(mem, { recursive: true });
+    // Before materialize: sensible default (single-file layout).
+    expect(await src.workDoc(mem)).toEqual({ path: "task.md", kind: "markdown file" });
+    await src.materialize("task-a", mem, () => {});
+    expect(await src.workDoc(mem)).toEqual({ path: "task.md", kind: "markdown file" });
+    // A directory item → task/ layout.
+    mkdirSync(join(folder, "feature-x"));
+    writeFileSync(join(folder, "feature-x", "spec.md"), "# X");
+    const mem2 = join(folder, ".mem2");
+    mkdirSync(mem2, { recursive: true });
+    await src.materialize("feature-x", mem2, () => {});
+    expect(await src.workDoc(mem2)).toEqual({ path: "task/", kind: "directory of markdown files" });
   });
 
   it("materialize snapshots the file to task.md (idempotent), tolerates a missing file", async () => {

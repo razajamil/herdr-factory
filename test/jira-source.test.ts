@@ -41,15 +41,15 @@ describe("JiraSource", () => {
   // The single most load-bearing parity guarantee: unmapped canonical states (merged/aborted) —
   // which teardown writes for every run — must NOT touch the network, so teardown stays
   // Jira-silent exactly as it was before multi-source.
-  it("transition(merged) and transition(aborted) make ZERO fetch calls and return false", async () => {
-    expect(await src().transition("RWR-1", "merged")).toBe(false);
-    expect(await src().transition("RWR-1", "aborted")).toBe(false);
+  it("transition(merged) and transition(aborted) make ZERO fetch calls and return noop", async () => {
+    expect(await src().transition("RWR-1", "merged")).toEqual({ kind: "noop" });
+    expect(await src().transition("RWR-1", "aborted")).toEqual({ kind: "noop" });
     expect(fetchCalls.length).toBe(0);
   });
 
   it("transition(in_development) maps to the configured status and DOES hit the network", async () => {
-    const moved = await src().transition("RWR-1", "in_development");
-    expect(moved).toBe(false); // already there (case-insensitive) → no POST, but it queried
+    const result = await src().transition("RWR-1", "in_development");
+    expect(result).toEqual({ kind: "noop" }); // already there (case-insensitive) → no POST, but it queried
     expect(fetchCalls.length).toBeGreaterThanOrEqual(1);
     expect(fetchCalls[0]!.url).toContain("/rest/api/3/issue/RWR-1");
   });
@@ -66,9 +66,26 @@ describe("JiraSource", () => {
       const body = { key: "RWR-1", fields: { summary: "s", status: { name: "In development" }, issuetype: { name: "Bug" }, attachment: [] } };
       return { ok: true, status: 200, text: async () => JSON.stringify(body), headers: new Headers() } as Response;
     }) as typeof fetch;
-    const moved = await src().transition("RWR-1", "in_review");
-    expect(moved).toBe(true);
+    const result = await src().transition("RWR-1", "in_review");
+    expect(result).toEqual({ kind: "applied" });
     expect(fetchCalls.some((c) => c.method === "POST" && c.url.includes("/transitions"))).toBe(true);
+  });
+
+  it("workDoc names ticket.json without touching the network", async () => {
+    expect(await src().workDoc()).toEqual({ path: "ticket.json", kind: "Jira ticket (JSON)" });
+    expect(fetchCalls.length).toBe(0);
+  });
+
+  it("postNote posts a marker-tagged comment (INV-6 — never mistakable for a human reply)", async () => {
+    let posted = "";
+    globalThis.fetch = (async (url: string | URL, init?: RequestInit) => {
+      fetchCalls.push({ url: String(url), method: init?.method ?? "GET" });
+      posted = String(init?.body ?? "");
+      return { ok: true, status: 201, text: async () => JSON.stringify(({ id: "10001", created: "2026-06-28T00:00:00.000+0000" })), headers: new Headers() } as Response;
+    }) as typeof fetch;
+    await src().postNote("RWR-1", "⚠ parked for attention");
+    expect(posted).toContain("[herdr-factory]");
+    expect(posted).toContain("parked for attention");
   });
 
   it("describe maps a Jira issue to a Ticket", async () => {
@@ -137,5 +154,33 @@ describe("JiraSource", () => {
     const reply = await src().pollHumanReply({ key: "RWR-1", questionId: 3, externalId: "q1", externalCreatedAt: "2026-06-28T00:00:00.000+0000" });
 
     expect(reply).toMatchObject({ body: "Use the new behavior.", externalId: "a1", author: "Pat" });
+  });
+
+  it("pollHumanReply skips marker-tagged notes but accepts a quote-reply that embeds the question", async () => {
+    const adf = (text: string) => ({ type: "doc", version: 1, content: [{ type: "paragraph", content: [{ type: "text", text }] }] });
+    globalThis.fetch = (async (url: string | URL, init?: RequestInit) => {
+      fetchCalls.push({ url: String(url), method: init?.method ?? "GET" });
+      return {
+        ok: true,
+        status: 200,
+        text: async () =>
+          JSON.stringify({
+            comments: [
+              { id: "q1", created: "2026-06-28T00:00:00.000+0000", body: adf("[herdr-factory question: demo/7/3]") },
+              // A marked attention note posted while the question was pending — must be skipped
+              // (this is the reply-poisoning hazard the widened filter closes).
+              { id: "n1", created: "2026-06-28T00:00:30.000+0000", body: adf("[herdr-factory] ⚠ parked for attention") },
+              // A human reply that QUOTES the question (marker inside a blockquote) — must be accepted.
+              { id: "a1", created: "2026-06-28T00:01:00.000+0000", author: { displayName: "Pat" }, body: adf("> [herdr-factory question: demo/7/3]\nGo with option B.") },
+            ],
+          }),
+        headers: new Headers(),
+      } as Response;
+    }) as typeof fetch;
+
+    const reply = await src().pollHumanReply({ key: "RWR-1", questionId: 3, externalId: "q1", externalCreatedAt: "2026-06-28T00:00:00.000+0000" });
+
+    expect(reply).toMatchObject({ externalId: "a1", author: "Pat" });
+    expect(reply!.body).toContain("Go with option B.");
   });
 });

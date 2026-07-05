@@ -229,6 +229,24 @@ const MIGRATIONS: { version: number; sql: string }[] = [
       ALTER TABLE human_questions ADD COLUMN next_poll_at INTEGER NOT NULL DEFAULT 0;
     `,
   },
+  {
+    version: 14,
+    // Two-phase stale handling. A transition can now report "the item is no longer ours"
+    // (deleted/transferred — TransitionResult "stale"): the LOCK-FREE outbox flush only marks the
+    // intent delivered + stamps stale_at (mutating the run from there would race the run-locked
+    // step machinery); the run-locked Phase A reconcile then consumes unhandled stale intents
+    // (abort/park per policy) and stamps stale_handled_at, so one deleted item never double-fires.
+    //
+    // human_questions.poll_errors counts CONSECUTIVE pollHumanReply throws (reset on success or
+    // reply) — distinct from poll_attempts, which counts genuine "no reply yet" misses (a slow
+    // human is normal; a persistently-throwing source is not and escalates past a threshold).
+    sql: `
+      ALTER TABLE transition_outbox ADD COLUMN stale_at INTEGER;
+      ALTER TABLE transition_outbox ADD COLUMN stale_handled_at INTEGER;
+      ALTER TABLE human_questions ADD COLUMN poll_errors INTEGER NOT NULL DEFAULT 0;
+      CREATE INDEX idx_transition_outbox_stale ON transition_outbox(run_id) WHERE stale_at IS NOT NULL AND stale_handled_at IS NULL;
+    `,
+  },
 ];
 
 /** Apply pending migrations in a transaction. Idempotent. */

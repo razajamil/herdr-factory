@@ -145,6 +145,8 @@ interface TransitionIntentRow {
   created_at: number;
   updated_at: number;
   delivered_at: number | null;
+  stale_at: number | null;
+  stale_handled_at: number | null;
 }
 
 interface HumanQuestionRow {
@@ -162,6 +164,7 @@ interface HumanQuestionRow {
   answer_external_id: string | null;
   answer_author: string | null;
   poll_attempts: number;
+  poll_errors: number;
   next_poll_at: number;
   created_at: number;
   updated_at: number;
@@ -184,6 +187,7 @@ function toHumanQuestion(r: HumanQuestionRow): HumanQuestion {
     answerExternalId: r.answer_external_id,
     answerAuthor: r.answer_author,
     pollAttempts: r.poll_attempts,
+    pollErrors: r.poll_errors,
     nextPollAt: r.next_poll_at,
     createdAt: r.created_at,
     updatedAt: r.updated_at,
@@ -513,6 +517,8 @@ export class Store {
       createdAt: r.created_at,
       updatedAt: r.updated_at,
       deliveredAt: r.delivered_at,
+      staleAt: r.stale_at,
+      staleHandledAt: r.stale_handled_at,
     };
   }
 
@@ -530,7 +536,8 @@ export class Store {
       .prepare(
         `INSERT INTO transition_outbox (run_id, repo, work_source, ticket_key, to_state, attempts, next_attempt_at, created_at, updated_at)
          VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?)
-         ON CONFLICT(run_id, to_state) DO UPDATE SET next_attempt_at = excluded.next_attempt_at, delivered_at = NULL, updated_at = excluded.updated_at`,
+         ON CONFLICT(run_id, to_state) DO UPDATE SET next_attempt_at = excluded.next_attempt_at, delivered_at = NULL,
+           stale_at = NULL, stale_handled_at = NULL, updated_at = excluded.updated_at`,
       )
       .run(input.runId, input.repo, input.workSource, input.ticketKey, input.toState, t, t, t);
     const row = this.db
@@ -590,6 +597,38 @@ export class Store {
       "transition.attempts": attempts,
     });
     return e;
+  }
+
+  /** Delivery reported the item STALE (deleted/transferred — retrying cannot help). Marks the
+   *  intent delivered so the outbox stops retrying, and stamps stale_at for the run-locked
+   *  Phase A policy to consume. Called from the LOCK-FREE outbox flush — no run mutation here. */
+  markTransitionStale(id: number, detail: string): void {
+    const t = this.now();
+    this.db
+      .prepare("UPDATE transition_outbox SET delivered_at = ?, stale_at = ?, last_error = ?, updated_at = ? WHERE id = ?")
+      .run(t, t, detail.slice(0, 500), t, id);
+    const e = this.getTransitionIntent(id);
+    telemetryEvent("store.transition.stale", {
+      repo: e?.repo,
+      "run.id": e?.runId,
+      "work.key": e?.ticketKey,
+      "work.state": e?.toState,
+    });
+  }
+
+  /** The oldest unconsumed stale intent for a run, if any — Phase A's per-run stale policy input. */
+  unhandledStaleIntentForRun(runId: number): TransitionIntent | undefined {
+    const row = this.db
+      .prepare("SELECT * FROM transition_outbox WHERE run_id = ? AND stale_at IS NOT NULL AND stale_handled_at IS NULL ORDER BY id LIMIT 1")
+      .get(runId) as TransitionIntentRow | undefined;
+    return row ? this.toTransitionIntent(row) : undefined;
+  }
+
+  /** Stamp a stale intent consumed (abort/park applied — or deliberately ignored for an ended
+   *  run) so it never fires the policy twice. */
+  markTransitionStaleHandled(id: number): void {
+    const t = this.now();
+    this.db.prepare("UPDATE transition_outbox SET stale_handled_at = ?, updated_at = ? WHERE id = ?").run(t, t, id);
   }
 
   /** Does this work item have any undelivered status write-back? While it does, the item's
@@ -674,9 +713,25 @@ export class Store {
     const attempts = q.pollAttempts + 1;
     const delay = Math.min(60 * 2 ** (attempts - 1), 300);
     const t = this.now();
+    // A miss is a SUCCESSFUL poll that found no reply — it also resets the consecutive-error run.
     this.db
-      .prepare("UPDATE human_questions SET poll_attempts = ?, next_poll_at = ?, updated_at = ? WHERE id = ?")
+      .prepare("UPDATE human_questions SET poll_attempts = ?, poll_errors = 0, next_poll_at = ?, updated_at = ? WHERE id = ?")
       .run(attempts, t + delay, t, id);
+    return this.getHumanQuestion(id)!;
+  }
+
+  /** Record a pollHumanReply THROW: same backoff as a miss, but counted separately so a
+   *  persistently-failing source escalates (a slow human never should). */
+  recordHumanPollError(id: number): HumanQuestion {
+    const q = this.getHumanQuestion(id);
+    if (!q) throw new Error(`recordHumanPollError: no question ${id}`);
+    const errors = q.pollErrors + 1;
+    const delay = Math.min(60 * 2 ** (q.pollAttempts + errors - 1), 300);
+    const t = this.now();
+    this.db
+      .prepare("UPDATE human_questions SET poll_errors = ?, next_poll_at = ?, updated_at = ? WHERE id = ?")
+      .run(errors, t + delay, t, id);
+    telemetryEvent("store.human_question.poll_error", { repo: q.repo, "run.id": q.runId, "question.id": q.id, "poll.errors": errors });
     return this.getHumanQuestion(id)!;
   }
 
@@ -692,6 +747,8 @@ export class Store {
       answerAuthor: reply.author ?? null,
       answeredAt: t,
     });
+    // The answering poll succeeded — close out the consecutive-error run too.
+    this.db.prepare("UPDATE human_questions SET poll_errors = 0 WHERE id = ?").run(id);
     const q = this.getHumanQuestion(id);
     if (!q) throw new Error("answerHumanQuestion: row vanished after update");
     telemetryEvent("store.human_question.answer", { repo: q.repo, "run.id": q.runId, "question.id": q.id, "work.key": q.ticketKey });

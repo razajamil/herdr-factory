@@ -2,8 +2,24 @@ import { appendFileSync, cpSync, existsSync, mkdirSync, readFileSync, readdirSyn
 import { join } from "node:path";
 import { parse as parseYaml } from "yaml";
 import type { Store } from "../db/store.ts";
-import type { Logger, WorkSource } from "../core/deps.ts";
-import type { HumanAskInput, HumanAskResult, HumanPollInput, HumanReply, MatchItem, Ticket, WorkState } from "../types.ts";
+import type { Logger, WorkSource, WorkSourceSpec } from "../core/deps.ts";
+import type {
+  HumanAskInput,
+  HumanAskResult,
+  HumanPollInput,
+  HumanReply,
+  LocalMarkdownMatchItem,
+  MatchItem,
+  Ticket,
+  TransitionResult,
+  WorkDocInfo,
+  WorkState,
+} from "../types.ts";
+
+/** INV-7: a key must survive as an unquoted shell token, a git ref segment, and a URL path
+ *  segment. Filenames are user-chosen, so anything outside this safe set is skipped (with a
+ *  warning) rather than claimed and broken later at step-done/branch/evidence time. */
+const SAFE_KEY = /^[A-Za-z0-9._-]+$/;
 
 /** Split optional YAML front-matter (`--- … ---`) off the head of a markdown doc. Only consumes
  *  the block when it parses to a YAML object — so a leading `---` thematic break (a horizontal
@@ -83,12 +99,20 @@ export class LocalMarkdownSource implements WorkSource {
   private readonly store: Store;
   private readonly repo: string;
   private readonly name: string;
-  constructor(folder: string, store: Store, repo: string, name: string) {
+  private readonly log: Logger;
+  constructor(folder: string, store: Store, repo: string, name: string, log: Logger = () => {}) {
     this.folder = folder;
     this.store = store;
     this.repo = repo;
     this.name = name;
+    this.log = log;
   }
+
+  readonly spec: WorkSourceSpec = {
+    statusOfRecord: "internal",
+    mappedStates: ["todo", "in_development", "in_review", "merged", "aborted", "done"],
+    replyChannel: "file",
+  };
 
   /** Top-level `*.md` in a work directory whose contents seed the ticket: `README.md`
    *  (case-insensitive) if present, else the first `*.md` alphabetically. Null when the directory
@@ -155,7 +179,7 @@ export class LocalMarkdownSource implements WorkSource {
         /* unreadable — ignore */
       }
     }
-    const out: MatchItem[] = [];
+    const out: LocalMarkdownMatchItem[] = [];
     for (const name of names.sort()) {
       if (name.startsWith(".") || name.startsWith("__")) continue; // hidden, or `__`-prefixed = being prepared
       const full = join(this.folder, name);
@@ -175,6 +199,11 @@ export class LocalMarkdownSource implements WorkSource {
       } else {
         continue; // a non-markdown file, or something exotic
       }
+      if (!SAFE_KEY.test(key)) {
+        // INV-7: this key would break the unquoted step-done command / branch name / evidence URL.
+        this.log("warn", `local_markdown: skipping "${name}" — rename it to [A-Za-z0-9._-]+ to make it claimable`);
+        continue;
+      }
       const status = this.store.getWorkItem(this.repo, this.name, key)?.status ?? "todo";
       if (status !== "todo") continue; // claimed earlier or terminal (merged/aborted)
       // Backstop: never list an item that already has an active run (covers the window between
@@ -188,7 +217,19 @@ export class LocalMarkdownSource implements WorkSource {
       }
       const ticket = deriveTicket(key, spec); // for summary/type
       const { data: frontMatter, body } = splitFrontmatter(spec);
-      out.push({ sourceType: "local_markdown", key, summary: ticket.summary, type: ticket.type, path: full, filename: name, frontMatter, body });
+      const labels = Array.isArray(frontMatter.labels) ? frontMatter.labels.filter((l): l is string => typeof l === "string") : [];
+      out.push({
+        sourceType: "local_markdown",
+        key,
+        summary: ticket.summary,
+        type: ticket.type,
+        labels,
+        fields: frontMatter,
+        path: full,
+        filename: name,
+        frontMatter,
+        body,
+      });
     }
     return out;
   }
@@ -212,9 +253,24 @@ export class LocalMarkdownSource implements WorkSource {
     }
   }
 
-  async transition(key: string, to: WorkState): Promise<boolean> {
-    // Tolerant idempotent upsert — any state → any state, no-op (false) if already there.
-    return this.store.setWorkItemStatus(this.repo, this.name, key, to, this.metaFor(key));
+  async transition(key: string, to: WorkState): Promise<TransitionResult> {
+    // Tolerant idempotent upsert — any state → any state, noop if already there. `stale` is never
+    // returned: the ledger row is ours, so a write against it can always be applied.
+    const moved = this.store.setWorkItemStatus(this.repo, this.name, key, to, this.metaFor(key));
+    return { kind: moved ? "applied" : "noop" };
+  }
+
+  /** Which layout materialize produced for THIS run's worktree: a directory item was copied whole
+   *  to task/, a single-file item snapshotted to task.md. Detect from what's on disk (fs-only —
+   *  moved verbatim from step.ts's old type-switch; token output stays byte-identical). */
+  async workDoc(memDirAbs: string): Promise<WorkDocInfo> {
+    let isDir = false;
+    try {
+      isDir = statSync(join(memDirAbs, "task")).isDirectory();
+    } catch {
+      /* no task/ → single-file layout (or not yet materialized) */
+    }
+    return isDir ? { path: "task/", kind: "directory of markdown files" } : { path: "task.md", kind: "markdown file" };
   }
 
   async materialize(key: string, memDir: string, log: Logger): Promise<void> {

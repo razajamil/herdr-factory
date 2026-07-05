@@ -59,6 +59,7 @@ export type EventType =
   | "step_spawned"
   | "step_done"
   | "bounced"
+  | "stale" // a write-back found the item gone at the source (deleted/transferred)
   | "human_question"
   | "human_reply"
   | "focus_applied"
@@ -174,6 +175,11 @@ export interface TransitionIntent {
   createdAt: number;
   updatedAt: number;
   deliveredAt: number | null;
+  /** Set when delivery reported the item stale (deleted/transferred). The lock-free outbox only
+   *  stamps this; the run-locked Phase A reconcile consumes it (abort/park) and stamps
+   *  staleHandledAt so one gone item never double-fires. */
+  staleAt: number | null;
+  staleHandledAt: number | null;
 }
 
 export type HumanQuestionStatus = "pending" | "answered";
@@ -194,6 +200,7 @@ export interface HumanQuestion {
   answerExternalId: string | null;
   answerAuthor: string | null;
   pollAttempts: number; // polls that found no reply yet (drives the backoff)
+  pollErrors: number; // CONSECUTIVE poll throws (reset on any successful poll); escalates past a cap
   nextPollAt: number; // don't poll the source again before this (epoch seconds; 0 = due now)
   createdAt: number;
   updatedAt: number;
@@ -232,8 +239,49 @@ export interface HumanReply {
   author?: string | null;
 }
 
-/** The kind of backend a work source polls. */
+/** The kind of backend a work source polls. Closed on purpose (zod config discrimination + TUI
+ *  exhaustiveness); extended in exactly one place per new source. */
 export type SourceType = "jira" | "local_markdown";
+
+/** Outcome of one transition delivery attempt. Replaces the old boolean: `applied`/`noop` were
+ *  its true/false, `stale` is the state a boolean could not express — "retrying cannot help". */
+export type TransitionResultKind =
+  /** Backend state actually moved. Outbox: mark delivered + record a `transition` event. */
+  | "applied"
+  /** Nothing to do: already at the target, OR the state is UNMAPPED for this source
+   *  (spec.mappedStates — unmapped MUST be decided with ZERO network), OR a write raced the
+   *  backend's own automation (e.g. GitHub's Fixes-#n auto-close beat us to `merged`).
+   *  Outbox: delivered, silent. */
+  | "noop"
+  /** The item is no longer ours: transferred, deleted, inaccessible, or preconditions destroyed.
+   *  Retrying cannot help — the outbox marks the intent delivered and flags the run for the
+   *  run-locked stale policy (abort/park; see reconcile). NEVER return stale for a plausibly
+   *  transient failure — throw instead (throw = retry me). */
+  | "stale";
+
+export interface TransitionResult {
+  kind: TransitionResultKind;
+  /** Human-readable context; surfaces in the stale attention/abort messaging. */
+  detail?: string;
+}
+
+/** Typed escape for the human-question loop: the item backing a question is gone (deleted /
+ *  transferred / inaccessible). askHuman/pollHumanReply throw this instead of a generic error so
+ *  the engine escalates attention instead of backing off against a nonexistent item forever. */
+export class StaleItemError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "StaleItemError";
+  }
+}
+
+/** How the materialized work doc is described to agent prompts. `path` is RELATIVE to the run's
+ *  memDir (e.g. "ticket.json", "task.md", "task/"); step.ts renders
+ *  @@WORK_DOC@@ = `${MEMORY_DIR}/${path}` and @@WORK_DOC_KIND@@ = kind. */
+export interface WorkDocInfo {
+  path: string;
+  kind: string; // e.g. "Jira ticket (JSON)", "markdown file"
+}
 
 /** epoch-seconds clock, injected for testability. */
 export type Clock = () => number;
@@ -241,10 +289,15 @@ export const systemClock: Clock = () => Math.floor(Date.now() / 1000);
 
 // --- client domain types ----------------------------------------------------
 
+/** Lean identity for claim + branch naming. `displayKey` is the pretty, possibly-mutable form
+ *  ("#123", "ENG-123") for logs/notes ONLY — never persisted, never fed to branches or dedup
+ *  (display identifiers can mutate; the canonical `key` must not — see INV-7 in deps.ts). */
 export interface Ticket {
   key: string;
   summary: string;
   type: string;
+  displayKey?: string; // defaults to key
+  url?: string; // browser link for operator notes/logs
 }
 
 export interface JiraAttachment {
@@ -323,34 +376,42 @@ export interface MatchSource {
   type: SourceType;
 }
 
-/** A Jira candidate (sourceType "jira") exposed to a belt's match predicate. `fields` is the raw
- *  Jira issue.fields object (summary/status/issuetype/labels/…) for arbitrary routing. */
-export interface JiraMatchItem {
-  sourceType: "jira";
-  key: string;
-  summary: string;
-  type: string; // issue type name, e.g. "Bug"
-  status: string; // current Jira status name
+/**
+ * A candidate work item: the rich, source-tagged metadata a source surfaces from `listEligible`.
+ * Belts route on it (as `ctx.item`), and the lean Ticket used for claim + branch naming is derived
+ * from it via `ticketOf` — so key/summary/type live in exactly one place.
+ *
+ * A GENERIC BASE, not a closed union: nothing in core switches on `sourceType` (only user
+ * `match.ts` predicates do), so adding a source requires ZERO edits here. The per-source
+ * interfaces below are typing conveniences for match predicates — narrow with the type guards.
+ */
+export interface MatchItem extends Ticket {
+  sourceType: SourceType;
+  /** Backend labels/tags; [] when the concept doesn't exist — uniform so belt predicates can
+   *  route on labels without knowing the source type. */
   labels: string[];
+  /** Raw source-native payload (Jira issue.fields, the REST issue object, front-matter, …). */
   fields: Record<string, unknown>;
 }
 
-/** A local_markdown candidate (sourceType "local_markdown") exposed to a belt's match predicate. */
-export interface LocalMarkdownMatchItem {
+/** A Jira candidate. `fields` is the raw Jira issue.fields object (summary/status/issuetype/…). */
+export interface JiraMatchItem extends MatchItem {
+  sourceType: "jira";
+  status: string; // current Jira status name
+}
+
+/** A local_markdown candidate. `labels` come from a front-matter `labels:` array (else []);
+ *  `fields` is the parsed front-matter object. */
+export interface LocalMarkdownMatchItem extends MatchItem {
   sourceType: "local_markdown";
-  key: string;
-  summary: string;
-  type: string;
   path: string; // the .md file or directory backing this item
   filename: string; // basename of `path`
   frontMatter: Record<string, unknown>; // parsed YAML front-matter ({} when none)
   body: string; // the markdown body (front-matter stripped)
 }
 
-/** A candidate work item: the rich, source-tagged metadata a source surfaces from `listEligible`.
- *  Belts route on it (as `ctx.item`), and the lean Ticket (key/summary/type) used for claim +
- *  branch naming is derived from it via `ticketOf` — so key/summary/type live in exactly one place. */
-export type MatchItem = JiraMatchItem | LocalMarkdownMatchItem;
+export const isJiraItem = (i: MatchItem): i is JiraMatchItem => i.sourceType === "jira";
+export const isLocalMarkdownItem = (i: MatchItem): i is LocalMarkdownMatchItem => i.sourceType === "local_markdown";
 
 export interface MatchContext {
   item: MatchItem;
@@ -360,7 +421,7 @@ export interface MatchContext {
 /** The shape of a belt's `match.ts` default export. May be sync or async. */
 export type BeltMatch = (ctx: MatchContext) => boolean | Promise<boolean>;
 
-/** The lean Ticket every candidate carries (key/summary/type) — for claim + branch naming. */
+/** The lean Ticket every candidate carries — for claim + branch naming (MatchItem IS a Ticket). */
 export function ticketOf(item: MatchItem): Ticket {
-  return { key: item.key, summary: item.summary, type: item.type };
+  return { key: item.key, summary: item.summary, type: item.type, displayKey: item.displayKey, url: item.url };
 }

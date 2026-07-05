@@ -4,8 +4,8 @@ import * as Effect from "effect/Effect";
 import { runEffect } from "../runtime/effect.ts";
 import { HerdrUnreachableError, type BeltRuntime, type Deps, type SourceRuntime } from "./deps.ts";
 import type { StepConfig } from "../config.ts";
-import type { HumanQuestion, MatchItem, Outcome, PrInfo, PrSnapshot, Run, RunStep, Ticket, TransitionIntent, WorkState } from "../types.ts";
-import { outcomeToWorkState, ticketOf } from "../types.ts";
+import type { HumanQuestion, HumanReply, MatchItem, Outcome, PrInfo, PrSnapshot, Run, RunStep, Ticket, TransitionIntent, WorkState } from "../types.ts";
+import { outcomeToWorkState, StaleItemError, ticketOf } from "../types.ts";
 import { branchName } from "./branch.ts";
 import { firstStep, indexOfStep, materializeWork, MEMORY_DIR, nextStep, spawnStep, stepByName } from "./step.ts";
 import { wakeResolver } from "./watch.ts";
@@ -27,20 +27,49 @@ const PANE_ABSENCE_CONFIRM_SECONDS = 45;
 // transition left the ticket To Do — and since eligibility queries by status, the ticket would be
 // claimed AGAIN after teardown and the merged work re-done.
 
-/** One delivery attempt for an intent. Marks delivered on success (including source-side no-ops:
- *  already there / unmapped state); on failure records the attempt + backoff and returns false. */
+/** One delivery attempt for an intent. `applied`/`noop` mark it delivered; `stale` (the item is
+ *  gone — deleted/transferred; retrying cannot help) ALSO marks it delivered but stamps stale_at
+ *  for the run-locked Phase A stale policy. This function is called LOCK-FREE from the Phase 0
+ *  outbox flush, so it must never mutate the run itself — only the intent row + events.
+ *  On a throw it records the attempt + backoff and returns false (throw = retry me). */
 async function deliverTransition(deps: Deps, src: SourceRuntime, intent: TransitionIntent): Promise<boolean> {
   try {
-    const moved = await src.client.transition(intent.ticketKey, intent.toState);
-    deps.store.markTransitionDelivered(intent.id);
-    if (moved) {
-      deps.store.recordEvent({
-        runId: intent.runId,
-        repo: intent.repo,
-        ticketKey: intent.ticketKey,
-        type: "transition",
-        detail: { to: intent.toState, attempts: intent.attempts },
-      });
+    const result = await src.client.transition(intent.ticketKey, intent.toState);
+    switch (result.kind) {
+      case "applied":
+        deps.store.markTransitionDelivered(intent.id);
+        deps.store.recordEvent({
+          runId: intent.runId,
+          repo: intent.repo,
+          ticketKey: intent.ticketKey,
+          type: "transition",
+          detail: { to: intent.toState, attempts: intent.attempts },
+        });
+        break;
+      case "noop":
+        deps.store.markTransitionDelivered(intent.id); // already there / unmapped / automation won the race
+        break;
+      case "stale": {
+        const detail = result.detail ?? "item no longer exists at the source";
+        deps.store.markTransitionStale(intent.id, detail);
+        deps.store.recordEvent({
+          runId: intent.runId,
+          repo: intent.repo,
+          ticketKey: intent.ticketKey,
+          type: "stale",
+          detail: { to: intent.toState, reason: detail },
+        });
+        // An ended (or already tearing-down) run needs no policy reaction — consume the flag here
+        // so Phase A never sees it. Reading the run lock-free is fine; only mutation is not.
+        const run = deps.store.getRun(intent.runId);
+        if (!run || run.endedAt !== null || run.phase === "done" || run.phase === "tearing_down") {
+          deps.store.markTransitionStaleHandled(intent.id);
+          deps.log("warn", `${intent.ticketKey}: ${intent.toState} write-back found the item gone (${detail}) — run already ${run?.phase ?? "gone"}, nothing to do`);
+        } else {
+          deps.log("warn", `${intent.ticketKey}: ${intent.toState} write-back found the item gone (${detail}) — stale policy will handle the run`);
+        }
+        break;
+      }
     }
     return true;
   } catch (e) {
@@ -423,6 +452,36 @@ async function reconcileRunImpl(deps: Deps, run: Run, ctx: TickCtx): Promise<voi
     }
     return;
   }
+  // Stale policy (run-locked half of the two-phase handling — the lock-free outbox flush only
+  // stamped stale_at): a write-back found this run's item GONE at the source. Consume the flag
+  // exactly once, then abort or park per policy.
+  if (run.phase !== "done" && run.phase !== "tearing_down") {
+    const stale = deps.store.unhandledStaleIntentForRun(run.id);
+    if (stale) {
+      deps.store.markTransitionStaleHandled(stale.id);
+      const why = stale.lastError ?? "item no longer exists at the source";
+      if (stale.toState === "in_development") {
+        // The claim write-back found the item gone: a human deleted/closed it during claim —
+        // "don't do this work". Abort promptly, bounding further token spend (the first agent may
+        // already be running; the claim transition fires after the first spawn). Teardown's own
+        // `aborted` intent going stale again lands in the ended-run path — no double-fire.
+        deps.log("warn", `${run.ticketKey}: aborting — ${why}`);
+        await deps.herdr.notify(`herdr-factory: ${run.ticketKey} aborted`, `Work item gone at the source (${why}) — run aborted.`).catch(() => {});
+        await teardown(deps, run, "abandoned", src);
+      } else {
+        // Mid-flight (e.g. in_review): the work exists — a PR may be up — so park for a human
+        // instead of destroying it. No source note: the item it would go to is gone.
+        await escalateAttention(deps, run, {
+          reason: "source_item_stale",
+          attentionReason: `work item gone at the source (${why})`,
+          body: `${run.ticketKey}: the ${stale.toState} write-back found the item gone (${why}). Resume to continue anyway, or tear the run down.`,
+          detail: { toState: stale.toState, why },
+          skipSourceNote: true,
+        });
+      }
+      return;
+    }
+  }
   await dispatchPhase(deps, run, belt, src, ctx);
   // Then, on every pass for every active run, try to apply any deferred focus shift. Doing
   // it here (not only on the tick that transitioned) is what lets a transition in an
@@ -571,7 +630,7 @@ async function trackStepProgress(deps: Deps, run: Run, step: string): Promise<Ru
 async function escalateAttention(
   deps: Deps,
   run: Run,
-  opts: { reason: string; attentionReason: string; body: string; detail?: Record<string, unknown> },
+  opts: { reason: string; attentionReason: string; body: string; detail?: Record<string, unknown>; skipSourceNote?: boolean },
 ): Promise<void> {
   deps.store.updateRun(run.id, { phase: "attention", attentionReason: opts.attentionReason, attentionNotifiedAt: deps.now() });
   deps.store.recordEvent({
@@ -588,7 +647,8 @@ async function escalateAttention(
   if (run.paneId) await deps.herdr.agentRename(run.paneId, `⚠ ATTENTION ${run.ticketKey}`).catch(() => {});
   await deps.herdr.notify(`herdr-factory: ${run.ticketKey} needs attention`, opts.body).catch(() => {});
   // Best-effort source write-back (once, on escalation — the periodic re-notify stays local).
-  const src = deps.resolveSource(run.workSource);
+  // Skipped when the escalation IS about the source item being gone — posting to it can't work.
+  const src = opts.skipSourceNote ? undefined : deps.resolveSource(run.workSource);
   if (src) {
     await src.client
       .postNote(
@@ -824,6 +884,22 @@ export async function bounceStep(
   return { ok: true };
 }
 
+/** Consecutive pollHumanReply THROWS before a waiting run escalates (misses never count — humans
+ *  are allowed to be slow). At the 5-min backoff cap this is ~100 min of a failing source. */
+const HUMAN_POLL_ERROR_ESCALATE = 20;
+
+/** The item backing a pending human question is gone (deleted/transferred) — the reply can never
+ *  arrive. Park for a human; no source note (the item it would go to is what's gone). */
+function humanLoopStale(deps: Deps, run: Run, q: HumanQuestion, why: string): Promise<void> {
+  return escalateAttention(deps, run, {
+    reason: "source_item_stale",
+    attentionReason: `work item gone while waiting for a human reply (${why})`,
+    body: `${run.ticketKey}: question #${q.id} can never be answered — the work item is gone at the source (${why}). Resume to continue anyway, or tear the run down.`,
+    detail: { questionId: q.id, why },
+    skipSourceNote: true,
+  });
+}
+
 async function reconcileWaitingForHuman(deps: Deps, run: Run, belt: BeltRuntime, src: SourceRuntime): Promise<void> {
   let q = deps.store.pendingHumanQuestionForRun(run.id);
   if (!q) {
@@ -851,6 +927,7 @@ async function reconcileWaitingForHuman(deps: Deps, run: Run, belt: BeltRuntime,
         detail: { step: q.step, questionId: q.id, externalId: q.externalId, posted: true, retry: true },
       });
     } catch (e) {
+      if (e instanceof StaleItemError) return humanLoopStale(deps, run, q, err(e));
       deps.log("warn", `${run.ticketKey}: human question #${q.id} still not posted: ${err(e)}`);
       return;
     }
@@ -862,12 +939,32 @@ async function reconcileWaitingForHuman(deps: Deps, run: Run, belt: BeltRuntime,
   // sustained source-API load for nothing. Misses double the interval (60s → 5min cap).
   if (deps.now() < q.nextPollAt) return;
 
-  const reply = await src.client.pollHumanReply({
-    key: run.ticketKey,
-    questionId: q.id,
-    externalId,
-    externalCreatedAt: q.externalCreatedAt,
-  });
+  let reply: HumanReply | null;
+  try {
+    reply = await src.client.pollHumanReply({
+      key: run.ticketKey,
+      questionId: q.id,
+      externalId,
+      externalCreatedAt: q.externalCreatedAt,
+    });
+  } catch (e) {
+    // The item backing the question is gone → escalate now. Anything else is a poll ERROR:
+    // backoff like a miss (a rate-limited source must not make the Phase A error path hot every
+    // tick) but count it separately — a slow HUMAN is normal, a persistently-throwing source is
+    // not, and a parked run doesn't occupy capacity so it would otherwise wedge invisibly.
+    if (e instanceof StaleItemError) return humanLoopStale(deps, run, q, err(e));
+    const errored = deps.store.recordHumanPollError(q.id);
+    deps.log("warn", `${run.ticketKey}: reply poll for question #${q.id} failed (${errored.pollErrors} consecutive): ${err(e)}`);
+    if (errored.pollErrors >= HUMAN_POLL_ERROR_ESCALATE) {
+      await escalateAttention(deps, run, {
+        reason: "human_poll_failing",
+        attentionReason: `reply polling has failed ${errored.pollErrors} times in a row`,
+        body: `${run.ticketKey}: polling for a reply to question #${q.id} keeps failing (${err(e)}). The question may need re-posting, or the source is unhealthy — run doctor.`,
+        detail: { questionId: q.id, pollErrors: errored.pollErrors },
+      });
+    }
+    return;
+  }
   if (!reply) {
     const missed = deps.store.recordHumanPollMiss(q.id);
     deps.log("info", `${run.ticketKey}: waiting for human reply to question #${q.id} (next poll in ${missed.nextPollAt - deps.now()}s)`);
@@ -1244,6 +1341,13 @@ export async function claimTicket(deps: Deps, beltName: string, ticketKey: strin
     return;
   }
   const ticket = await src.client.describe(ticketKey);
+  // INV-11: describe may normalize an alternate identifier to the canonical key (e.g. a display
+  // id → immutable id). Re-check dedup against the key that will actually be claimed, or the same
+  // item could be claimed twice under two spellings.
+  if (ticket.key !== ticketKey && deps.store.activeRunForTicket(deps.config.repoName, src.name, ticket.key)) {
+    deps.log("warn", `${ticketKey}: already has an active run in source "${src.name}" (as ${ticket.key})`);
+    return;
+  }
   await claim(deps, belt, src, ticket);
 }
 
