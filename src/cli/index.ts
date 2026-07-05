@@ -11,7 +11,7 @@ import { openDb } from "../db/index.ts";
 import { Store } from "../db/store.ts";
 import { systemClock, type Run } from "../types.ts";
 import type { Deps } from "../core/deps.ts";
-import { bounceStep, claimTicket, reconcileRepo, reconcileRun, requestHumanInput, resumeRun, teardownTicket, withTickLock, withTickLockWaiting } from "../core/reconcile.ts";
+import { bounceStep, claimTicket, reconcileRepo, reconcileRun, requestHumanInput, resumeRun, teardownTicket, withRunLock, withRunLockWaiting, withTickLock } from "../core/reconcile.ts";
 import { MEMORY_DIR, stepByName } from "../core/step.ts";
 import * as service from "../watchers/service.ts";
 import { buildDeps, today } from "../build-deps.ts";
@@ -322,13 +322,13 @@ program
             deps.log("warn", `${key}: no active run to resume`);
             return { ok: false, message: "no active run" };
           }
-          // Resume mutates the phase and re-dispatches — serialize against the tick, like bounce.
-          const { ran, result } = await withTickLockWaiting(deps, async () => {
+          // Resume mutates the phase and re-dispatches — serialize under this run's lock, like bounce.
+          const { ran, result } = await withRunLockWaiting(deps, run.id, async () => {
             const res = await resumeRun(deps, deps.store.getRun(run.id)!);
             if (res.ok) await reconcileRun(deps, deps.store.getRun(run.id)!);
             return res;
           });
-          if (!ran) return { ok: false, message: "dispatcher busy — retry the resume in a moment" };
+          if (!ran) return { ok: false, message: "run busy — retry the resume in a moment" };
           return result!;
         },
       );
@@ -370,8 +370,9 @@ program
           deps.store.markStepDone(run.id, step);
           deps.store.recordEvent({ runId: run.id, repo: deps.config.repoName, ticketKey: key, type: "step_done", detail: { step } });
           deps.log("info", `${key}: step-done ${step} recorded`);
-          const advanced = await withTickLock(deps, () => reconcileRun(deps, deps.store.getRun(run.id)!));
-          if (!advanced) deps.log("info", `${key}: tick busy — next tick will advance the belt`);
+          // Per-run lock: the nudge lands even while a tick is mid-pass on other runs.
+          const advanced = await withRunLock(deps, run.id, () => reconcileRun(deps, deps.store.getRun(run.id)!));
+          if (!advanced) deps.log("info", `${key}: run busy — the next pass will advance the belt`);
           return { ok: true, advanced };
         },
       );
@@ -406,10 +407,14 @@ program
             deps.log("warn", `${key}: step "${step}" is not in belt "${belt.name}"`);
             return { ok: false, message: `step "${step}" is not in belt "${belt.name}"` };
           }
-          const result = await requestHumanInput(deps, run, step, question);
-          const advanced = await withTickLock(deps, () => reconcileRun(deps, deps.store.getRun(run.id)!));
-          if (!advanced) deps.log("info", `${key}: tick busy — next tick will poll for a human reply`);
-          return result;
+          // Non-monotonic phase flip — must hold the run lock (see the server handler).
+          const { ran, result } = await withRunLockWaiting(deps, run.id, async () => {
+            const res = await requestHumanInput(deps, deps.store.getRun(run.id)!, step, question);
+            await reconcileRun(deps, deps.store.getRun(run.id)!);
+            return res;
+          });
+          if (!ran) return { ok: false, message: "run busy — retry ask-human in a moment" };
+          return result!;
         },
       );
       const d = data as { ok?: boolean; questionId?: number; posted?: boolean; message?: string };
@@ -447,10 +452,10 @@ program
           if (!belt) return { ok: false, message: `run has no configured belt "${run.belt}"` };
           const src = deps.resolveSource(run.workSource);
           if (!src) return { ok: false, message: `run has no configured work source "${run.workSource}"` };
-          // The bounce rewinds the step + re-dispatches a pane, so it must run UNDER the tick lock
-          // (serialized against the periodic tick), not as a fire-and-forget nudge.
-          const { ran, result } = await withTickLockWaiting(deps, () => bounceStep(deps, deps.store.getRun(run.id)!, belt, src, toStep, reason));
-          if (!ran) return { ok: false, message: "dispatcher busy — retry the bounce in a moment" };
+          // The bounce rewinds the step + re-dispatches a pane, so it must run UNDER this run's
+          // lock (serialized against the tick's pass over this run), not as a fire-and-forget nudge.
+          const { ran, result } = await withRunLockWaiting(deps, run.id, () => bounceStep(deps, deps.store.getRun(run.id)!, belt, src, toStep, reason));
+          if (!ran) return { ok: false, message: "run busy — retry the bounce in a moment" };
           return result!;
         },
       );

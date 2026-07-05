@@ -1,5 +1,7 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import * as Effect from "effect/Effect";
+import { runEffect } from "../runtime/effect.ts";
 import { HerdrUnreachableError, type BeltRuntime, type Deps, type SourceRuntime } from "./deps.ts";
 import type { StepConfig } from "../config.ts";
 import type { HumanQuestion, MatchItem, Outcome, PrInfo, Run, RunStep, Ticket, TransitionIntent, WorkState } from "../types.ts";
@@ -94,47 +96,97 @@ export async function flushTransitionOutbox(deps: Deps): Promise<void> {
 }
 
 /**
- * Run `fn` under the per-repo single-instance tick lock; returns true if it ran, false if
- * the lock was already held (a tick is mid-flight). The TTL is floored well above the
- * longest healthy tick (which can block ~120s waiting on a layout pane) so a slow-but-live
- * tick can't have its lock stolen — it only auto-expires on a genuinely crashed tick.
- * Shared by the `tick` command and the `step-done` event-nudge.
+ * Acquire lock `key`, run `fn` under it with a keep-alive heartbeat, then release. Returns false
+ * (fn not run) when the lock is already held.
+ *
+ * The heartbeat re-extends the TTL every ttl/3 while `fn` is in flight: the event loop stays free
+ * during awaited subprocesses/fetches, so a long-but-ALIVE holder keeps its lock no matter how
+ * slow the pass gets (at 50-100 active runs a healthy tick can legitimately outlive any fixed
+ * TTL — under the old fixed-TTL scheme that expiry mid-tick reopened the concurrent-reconcile /
+ * double-spawn window the lock exists to close). Extensions stop the moment the process dies —
+ * crash, kill, or the supervisor's wedged-tick watchdog restart — and the TTL then expires
+ * normally, so a dead holder still recovers within one TTL. The owner token is unique per
+ * ACQUISITION (not per process): two contexts in one process can never mistake each other's hold
+ * for their own.
+ */
+let lockSeq = 0; // per-process acquisition counter (deps.uid() is reserved for branch suffixes)
+
+async function withHeartbeatLock(deps: Deps, key: string, ttlSec: number, fn: () => Promise<void>): Promise<boolean> {
+  const owner = `pid:${process.pid}:${++lockSeq}`;
+  if (!deps.store.acquireLock(key, owner, ttlSec)) return false;
+  const timer = setInterval(
+    () => {
+      try {
+        deps.store.extendLock(key, owner, ttlSec);
+      } catch {
+        /* next beat retries; TTL expiry is the backstop */
+      }
+    },
+    Math.max(5_000, (ttlSec * 1000) / 3),
+  );
+  try {
+    await fn();
+  } finally {
+    clearInterval(timer);
+    deps.store.releaseLock(key, owner);
+  }
+  return true;
+}
+
+/**
+ * Run `fn` under the per-repo single-instance tick lock (heartbeat-extended; see
+ * withHeartbeatLock); returns true if it ran, false if a tick is already mid-flight.
+ * Shared by the `tick` command and the server's periodic loop.
  */
 export async function withTickLock(deps: Deps, fn: () => Promise<void>): Promise<boolean> {
   return telemetrySpan("tick.lock", { repo: deps.config.repoName }, async (span) => {
-    const key = `tick:${deps.config.repoName}`;
-    const owner = `pid:${process.pid}`;
     const ttl = Math.max(deps.config.limits.tickIntervalSeconds * 2, 300);
-    if (!deps.store.acquireLock(key, owner, ttl)) {
-      span.setAttribute("lock.acquired", false);
+    const startedAt = Date.now();
+    const ran = await withHeartbeatLock(deps, `tick:${deps.config.repoName}`, ttl, fn);
+    span.setAttribute("lock.acquired", ran);
+    if (!ran) {
       recordTick(false, { repo: deps.config.repoName, "tick.skip_reason": "lock_held" });
       recordTickLockSkipped({ repo: deps.config.repoName });
       return false;
     }
-    span.setAttribute("lock.acquired", true);
-    const startedAt = Date.now();
-    try {
-      await fn();
-    } finally {
-      deps.store.releaseLock(key, owner);
-      recordTickDuration(Date.now() - startedAt, { repo: deps.config.repoName });
-      recordTick(true, { repo: deps.config.repoName });
-    }
+    recordTickDuration(Date.now() - startedAt, { repo: deps.config.repoName });
+    recordTick(true, { repo: deps.config.repoName });
     return true;
   });
 }
 
+/** Per-run lock TTL. A single run's reconcile is bounded by the item-1 exec/fetch timeouts;
+ *  the heartbeat covers the legitimately-slow tail (worktree create, attachment downloads). */
+const RUN_LOCK_TTL_SECONDS = 300;
+
 /**
- * Acquire the per-repo tick lock, run `fn` under it, and return its result — retrying briefly if a
- * tick is mid-flight rather than dropping the work (unlike the fire-and-forget nudge). This is for
- * the `bounce` signal: unlike step-done (a single monotonic flag whose stale read only DEFERS an
- * idempotent forward advance), a bounce rewinds `run.step` AND re-dispatches a pane, so a concurrent
- * tick reconciling the run from its pre-bounce snapshot would respawn/double-spawn the wrong step.
- * Serializing the whole bounce against the tick (both take this same lock) closes that window.
- * Returns { ran: false } if the lock stays held past the bounded wait (~15s) — caller reports "busy".
+ * Run `fn` under `run:<id>` — the mutual exclusion for everything that MUTATES one run: the
+ * tick's Phase A reconcile of that run, and the event nudges (step-done / bounce / ask-human /
+ * resume). Per-run locks are what let a nudge land IMMEDIATELY while a long tick is mid-pass
+ * (the old design serialized nudges behind the whole repo-wide tick lock, so at scale every
+ * advance degraded to tick latency): a nudge only contends with work on its own run.
+ * Returns false (fn not run) when the run is being reconciled by someone else right now.
  */
-export async function withTickLockWaiting<T>(
+export async function withRunLock(deps: Deps, runId: number, fn: () => Promise<void>): Promise<boolean> {
+  return telemetrySpan("run.lock", { repo: deps.config.repoName, "run.id": runId }, async (span) => {
+    const ran = await withHeartbeatLock(deps, `run:${runId}`, RUN_LOCK_TTL_SECONDS, fn);
+    span.setAttribute("lock.acquired", ran);
+    return ran;
+  });
+}
+
+/**
+ * withRunLock + a bounded wait (~15s), returning `fn`'s result. For the NON-monotonic run
+ * mutations that must not be dropped on contention: a bounce rewinds `run.step` AND re-dispatches
+ * a pane, ask-human flips the phase to waiting_for_human, resume un-parks — a concurrent
+ * reconcile working from a stale pre-mutation snapshot would respawn/double-spawn the wrong step
+ * or overwrite the phase flip (the old unserialized ask-human could orphan its question forever).
+ * step-done stays fire-and-forget (a monotonic flag whose stale read only defers an idempotent
+ * advance). Returns { ran: false } when the run stays busy past the wait — caller reports "busy".
+ */
+export async function withRunLockWaiting<T>(
   deps: Deps,
+  runId: number,
   fn: () => Promise<T>,
   opts: { tries?: number; delayMs?: number } = {},
 ): Promise<{ ran: boolean; result?: T }> {
@@ -142,7 +194,7 @@ export async function withTickLockWaiting<T>(
   const delayMs = opts.delayMs ?? 500;
   for (let i = 0; i < tries; i++) {
     let result: T | undefined;
-    const ran = await withTickLock(deps, async () => {
+    const ran = await withRunLock(deps, runId, async () => {
       result = await fn();
     });
     if (ran) return { ran: true, result };
@@ -168,15 +220,32 @@ async function reconcileRepoImpl(deps: Deps): Promise<void> {
     deps.log("error", `transition outbox flush failed: ${err(e)}`);
   }
 
-  // Phase A — advance everything in flight.
-  for (const run of deps.store.activeRuns(repo)) {
-    try {
-      await reconcileRun(deps, run);
-    } catch (e) {
-      deps.log("error", `${run.ticketKey}: ${err(e)}`);
-      deps.store.recordEvent({ runId: run.id, repo, ticketKey: run.ticketKey, type: "error", detail: { message: err(e) } });
-    }
-  }
+  // Phase A — advance everything in flight, in parallel with bounded concurrency (most of a
+  // run's reconcile is subprocess/network wait, so the wall-clock of a pass stops growing
+  // linearly with the active-run count). Each run is guarded by its own run lock: an event nudge
+  // (step-done/bounce/ask-human/resume) holding a run just skips it this pass — that run is
+  // being advanced anyway — and nudges for OTHER runs land mid-pass unimpeded.
+  await runEffect(
+    Effect.forEach(
+      deps.store.activeRuns(repo),
+      (run) =>
+        Effect.tryPromise({
+          try: async () => {
+            const ran = await withRunLock(deps, run.id, () => reconcileRun(deps, run));
+            if (!ran) deps.log("info", `${run.ticketKey}: busy (nudge in flight) — skipped this pass`);
+          },
+          catch: (cause) => cause,
+        }).pipe(
+          Effect.catchAll((e) =>
+            Effect.sync(() => {
+              deps.log("error", `${run.ticketKey}: ${err(e)}`);
+              deps.store.recordEvent({ runId: run.id, repo, ticketKey: run.ticketKey, type: "error", detail: { message: err(e) } });
+            }),
+          ),
+        ),
+      { concurrency: deps.config.limits.reconcileConcurrency, discard: true },
+    ),
+  );
 
   // Phase B — claim new work up to the cap, walking BELTS in priority order. The cap is global
   // across all belts; a higher-priority belt drains its eligible work first, and the FIRST belt
@@ -279,7 +348,9 @@ async function claimImpl(deps: Deps, belt: BeltRuntime, src: SourceRuntime, tick
   });
   deps.store.recordEvent({ runId: run.id, repo, ticketKey: ticket.key, type: "claimed", detail: { branch, source: src.name, belt: belt.name } });
   deps.log("info", `${belt.name}/${ticket.key}: claimed -> ${branch}`);
-  await reconcileRun(deps, run);
+  // Under the run lock like every other mutation of this run (uncontended for a fresh claim; the
+  // guard matters once its first agent exists and can nudge).
+  await withRunLock(deps, run.id, () => reconcileRun(deps, run));
 }
 
 export async function reconcileRun(deps: Deps, run: Run): Promise<void> {

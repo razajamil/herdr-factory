@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openDb } from "../src/db/index.ts";
 import { Store } from "../src/db/store.ts";
-import { applyPendingFocus, bounceStep, flushTransitionOutbox, reconcileRepo, reconcileRun, requestHumanInput, resumeRun, withTickLock } from "../src/core/reconcile.ts";
+import { applyPendingFocus, bounceStep, flushTransitionOutbox, reconcileRepo, reconcileRun, requestHumanInput, resumeRun, withRunLock, withRunLockWaiting, withTickLock } from "../src/core/reconcile.ts";
 import { HerdrUnreachableError, type BeltRuntime, type Deps, type GitApi, type GitHubApi, type HerdrApi, type SourceRuntime, type WorkSource } from "../src/core/deps.ts";
 import type { Config, Secrets, StepConfig } from "../src/config.ts";
 import type { FocusedPane, HumanAskInput, HumanPollInput, HumanReply, MatchItem, Phase, PrInfo, ReviewSig, Ticket, WorkState } from "../src/types.ts";
@@ -153,7 +153,7 @@ function build(opts: { multi?: boolean } = {}) {
   const config: Config = {
     repoName: "demo",
     repo: { path: "/main-checkout", baseRef: "origin/master" },
-    limits: { maxActive: 3, watchHours: 7, attentionRenotifySeconds: 3600, developBudgetSeconds: 5400, stallSeconds: 2700, reviewBudgetSeconds: 1800, evidenceBudgetSeconds: 2400, prBudgetSeconds: 3600, maxBounces: 3, stepBudgetSeconds: 3600, tickIntervalSeconds: 60, layoutWaitSeconds: 600 },
+    limits: { maxActive: 3, watchHours: 7, attentionRenotifySeconds: 3600, developBudgetSeconds: 5400, stallSeconds: 2700, reviewBudgetSeconds: 1800, evidenceBudgetSeconds: 2400, prBudgetSeconds: 3600, maxBounces: 3, stepBudgetSeconds: 3600, tickIntervalSeconds: 60, reconcileConcurrency: 8, layoutWaitSeconds: 600 },
     sources: sources.map((s) => ({ name: s.name, type: s.type })),
     belts,
     guidance: undefined,
@@ -1110,5 +1110,60 @@ describe("attention workflow — resume, parked slots, re-notification", () => {
     await reconcileRun(deps, store.getRun(run.id)!);
     expect(calls.notify).toBe(2);
     expect(calls.postNotes.length).toBe(1);
+  });
+});
+
+describe("per-run locks — nudges land while a tick is mid-pass", () => {
+  it("withRunLock runs even while the repo tick lock is held (only its own run contends)", async () => {
+    const { deps, store, worktree } = build();
+    const run = seed(store, worktree, "K-L1", "running", "fix");
+    deps.store.acquireLock("tick:demo", "other-owner", 300); // a long tick is mid-flight
+    let ran = 0;
+    expect(await withRunLock(deps, run.id, async () => { ran += 1; })).toBe(true);
+    expect(ran).toBe(1);
+  });
+
+  it("withRunLock skips when the same run is already being reconciled", async () => {
+    const { deps, store, worktree } = build();
+    const run = seed(store, worktree, "K-L2", "running", "fix");
+    deps.store.acquireLock(`run:${run.id}`, "other-owner", 300);
+    let ran = 0;
+    expect(await withRunLock(deps, run.id, async () => { ran += 1; })).toBe(false);
+    expect(ran).toBe(0);
+  });
+
+  it("withRunLockWaiting retries until the lock frees, then returns fn's result", async () => {
+    const { deps, store, worktree } = build();
+    const run = seed(store, worktree, "K-L3", "running", "fix");
+    deps.store.acquireLock(`run:${run.id}`, "other-owner", 300);
+    let tries = 0;
+    const origSleep = deps.sleep;
+    deps.sleep = async (ms) => {
+      tries += 1;
+      if (tries === 2) deps.store.releaseLock(`run:${run.id}`, "other-owner"); // holder finishes
+      return origSleep(0);
+    };
+    const { ran, result } = await withRunLockWaiting(deps, run.id, async () => "advanced");
+    expect(ran).toBe(true);
+    expect(result).toBe("advanced");
+  });
+
+  it("extendLock is owner-checked (a lost lock is not re-asserted)", () => {
+    const { deps } = build();
+    expect(deps.store.acquireLock("run:99", "me", 60)).toBe(true);
+    expect(deps.store.extendLock("run:99", "me", 60)).toBe(true);
+    expect(deps.store.extendLock("run:99", "not-me", 60)).toBe(false);
+  });
+
+  it("phase A reconciles all runs in parallel and still claims new work", async () => {
+    const { deps, store, state, worktree } = build();
+    deps.config.limits.maxActive = 5;
+    seed(store, worktree, "K-M1", "running", "fix");
+    seed(store, worktree, "K-M2", "running", "fix");
+    seed(store, worktree, "K-M3", "running", "fix");
+    state.eligible = [ticket("K-M4")];
+    await reconcileRepo(deps);
+    expect(store.activeRunForTicket("demo", "jira", "K-M4")).toBeDefined();
+    expect(store.countActive("demo")).toBe(4);
   });
 });

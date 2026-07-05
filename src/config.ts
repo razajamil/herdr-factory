@@ -219,6 +219,10 @@ export const RepoConfigSchema = z
         // Default budget for a custom belt's step when it sets no `budget_seconds` of its own.
         step_budget_seconds: z.coerce.number().int().positive().default(3600),
         tick_interval_seconds: z.coerce.number().int().positive().default(60),
+        // How many active runs Phase A reconciles concurrently. Most of a run's reconcile is
+        // subprocess/network wait, so parallelism keeps tick wall-clock roughly flat as the
+        // active-run count grows; each run still holds its own run lock.
+        reconcile_concurrency: z.coerce.number().int().positive().default(8),
         // How long to wait for a step's configured tab/pane to come up (with an idle agent)
         // before flagging the item for attention. Generous by default to allow the user's
         // layout setup + dev-server startup to finish; only applies to steps with a tab/pane.
@@ -351,6 +355,7 @@ export interface Config {
     maxBounces: number;
     stepBudgetSeconds: number;
     tickIntervalSeconds: number;
+    reconcileConcurrency: number;
     layoutWaitSeconds: number;
   };
   sources: WorkSourceConfig[];
@@ -735,6 +740,7 @@ export function loadConfig(repoName: string): Loaded {
       maxBounces: parsed.limits.max_bounces,
       stepBudgetSeconds: parsed.limits.step_budget_seconds,
       tickIntervalSeconds: parsed.limits.tick_interval_seconds,
+      reconcileConcurrency: parsed.limits.reconcile_concurrency,
       layoutWaitSeconds: parsed.limits.layout_wait_seconds,
     },
     sources,

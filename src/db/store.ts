@@ -371,6 +371,16 @@ export class Store {
     telemetryEvent("store.lock.release", { "lock.name": name, "lock.owner": owner });
   }
 
+  /** Push a HELD lock's expiry out (the keep-alive heartbeat). Owner-checked: returns false when
+   *  the lock isn't currently ours (expired and re-acquired by someone else) — the holder must
+   *  treat that as lost, not re-assert it. */
+  extendLock(name: string, owner: string, ttlSec: number): boolean {
+    const info = this.db
+      .prepare("UPDATE locks SET expires_at = ? WHERE name = ? AND owner = ?")
+      .run(this.now() + ttlSec, name, owner);
+    return Number(info.changes) > 0;
+  }
+
   upsertRepo(name: string, repoPath: string, baseRef: string | null, github: string | null): void {
     this.db
       .prepare(
