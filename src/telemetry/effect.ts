@@ -14,6 +14,13 @@ const attentionEvents = Metric.counter("herdr_factory.attention_events", { incre
 const tickLocksSkipped = Metric.counter("herdr_factory.tick.lock_skipped", { incremental: true });
 const ticks = Metric.counter("herdr_factory.ticks", { incremental: true });
 
+const rateLimitRemaining = Metric.gauge("herdr_factory.rate_limit.remaining", { description: "Backend-reported rate-limit remaining (per backend label)" });
+const rateLimitWaitMs = Metric.histogram(
+  "herdr_factory.rate_limit.wait_ms",
+  durationBoundaries,
+  "Time spent waiting on a client-side token bucket in milliseconds",
+);
+
 const httpServerDuration = Metric.histogram(
   "herdr_factory.http.server.duration_ms",
   durationBoundaries,
@@ -68,6 +75,14 @@ export function recordTickEffect(ran: boolean, attrs: TelemetryAttributes = {}):
 
 export function recordTickLockSkippedEffect(attrs: TelemetryAttributes = {}): Effect.Effect<void> {
   return Metric.increment(Metric.taggedWithLabels(tickLocksSkipped, metricLabels(attrs)));
+}
+
+export function recordRateLimitRemainingEffect(remaining: number, attrs: TelemetryAttributes = {}): Effect.Effect<void> {
+  return Metric.update(Metric.taggedWithLabels(rateLimitRemaining, metricLabels(attrs)), remaining);
+}
+
+export function recordRateLimitWaitEffect(ms: number, attrs: TelemetryAttributes = {}): Effect.Effect<void> {
+  return Metric.update(Metric.taggedWithLabels(rateLimitWaitMs, metricLabels(attrs)), ms);
 }
 
 export function telemetryEventEffect(name: string, attrs: TelemetryAttributes = {}): Effect.Effect<void> {

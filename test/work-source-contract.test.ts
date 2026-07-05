@@ -14,6 +14,7 @@ import { LocalMarkdownSource } from "../src/clients/local-markdown-source.ts";
 import { bearsHerdrMarker, HERDR_MARKER, type WorkSource } from "../src/core/deps.ts";
 import { instrumentObject } from "../src/telemetry/index.ts";
 import type { WorkState } from "../src/types.ts";
+import { makeFakeGithub, makeSource } from "./helpers/github-fake.ts";
 
 const ALL_STATES: WorkState[] = ["todo", "in_development", "in_review", "merged", "aborted", "done"];
 
@@ -23,8 +24,10 @@ const SAFE_KEY = /^[A-Za-z0-9._/#-]+$/;
 /** What a harness gives the generic tests: a live source + hooks to poke its fake backend. */
 interface ContractCtx {
   src: WorkSource;
-  /** Create item `key` in the backend, eligible (todo). */
-  seedEligible(key: string): void;
+  /** Create the next item in the backend, eligible (todo); returns its source-native key
+   *  (harness-owned — GitHub keys are issue numbers, Jira's are PROJ-n, local_markdown's are
+   *  filenames). */
+  seedEligible(): string;
   /** Delete item `key` from the backend (simulates a vanished item). */
   removeItem(key: string): void;
   /** Count of ALL backend calls so far (network requests / their moral equivalent). Always 0 for
@@ -109,7 +112,11 @@ function jiraHarness(): ContractCtx {
   );
   return {
     src,
-    seedEligible: (key) => void issues.set(key, { status: "To Do", comments: [] }),
+    seedEligible: () => {
+      const key = `RWR-${issues.size + 1}`;
+      issues.set(key, { status: "To Do", comments: [] });
+      return key;
+    },
     removeItem: (key) => void issues.delete(key),
     backendCalls: () => calls,
     postExternalComment: (key, body) => {
@@ -132,9 +139,14 @@ function localMarkdownHarness(): ContractCtx {
   tmps.push(folder);
   const store = new Store(openDb(":memory:"), () => 1000);
   const src = new LocalMarkdownSource(folder, store, "r", "lm", () => {});
+  let seq = 0;
   return {
     src,
-    seedEligible: (key) => writeFileSync(join(folder, `${key}.md`), `# Summary of ${key}\n\nbody`),
+    seedEligible: () => {
+      const key = `item-${++seq}`;
+      writeFileSync(join(folder, `${key}.md`), `# Summary of ${key}\n\nbody`);
+      return key;
+    },
     removeItem: (key) => rmSync(join(folder, `${key}.md`), { force: true }),
     backendCalls: () => 0, // purely local — zero-network invariants hold by construction
     memDir: () => {
@@ -146,9 +158,34 @@ function localMarkdownHarness(): ContractCtx {
   };
 }
 
+// --- github_issues harness: the in-memory REST backend from test/helpers/github-fake.ts --------
+
+function githubIssuesHarness(): ContractCtx {
+  const fake = makeFakeGithub();
+  const src = makeSource(fake);
+  let seq = 0;
+  return {
+    src,
+    seedEligible: () => {
+      const n = ++seq;
+      fake.addIssue(n);
+      return String(n);
+    },
+    removeItem: (key) => void fake.gone.set(Number(key), 410), // deleted (the documented status)
+    backendCalls: () => fake.calls.length,
+    postExternalComment: (key, body) => fake.addComment(Number(key), body, "human"),
+    memDir: () => {
+      const d = mkdtempSync(join(tmpdir(), "contract-gh-"));
+      tmps.push(d);
+      return d;
+    },
+  };
+}
+
 const HARNESSES: Harness[] = [
   { name: "jira", make: jiraHarness },
   { name: "local_markdown", make: localMarkdownHarness },
+  { name: "github_issues", make: githubIssuesHarness },
 ];
 
 // --- the charter, as tests ----------------------------------------------------------------------
@@ -169,11 +206,11 @@ describe.each(HARNESSES)("WorkSource contract: $name", ({ make }) => {
 
   it("eligible items carry non-empty key/summary/type, a safe key, and the uniform labels/fields base", async () => {
     const ctx = make();
-    ctx.seedEligible("item-1");
+    const key = ctx.seedEligible();
     const items = await ctx.src.listEligible();
     expect(items.length).toBe(1);
     const item = items[0]!;
-    expect(item.key).toBe("item-1");
+    expect(item.key).toBe(key);
     expect(item.key).toMatch(SAFE_KEY); // INV-7
     expect(item.summary.trim()).not.toBe("");
     expect(item.type.trim()).not.toBe("");
@@ -183,29 +220,29 @@ describe.each(HARNESSES)("WorkSource contract: $name", ({ make }) => {
 
   it("INV-3: transition to an UNMAPPED state is a noop with ZERO backend calls", async () => {
     const ctx = make();
-    ctx.seedEligible("item-1");
+    const key = ctx.seedEligible();
     const unmapped = ALL_STATES.filter((s) => !ctx.src.spec.mappedStates.includes(s));
     const before = ctx.backendCalls();
     for (const state of unmapped) {
-      expect(await ctx.src.transition("item-1", state)).toEqual({ kind: "noop" });
+      expect(await ctx.src.transition(key, state)).toEqual({ kind: "noop" });
     }
     expect(ctx.backendCalls()).toBe(before); // the load-bearing teardown-silence guarantee
   });
 
   it("INV-2: transition is idempotent — applied on a real move, noop on re-delivery", async () => {
     const ctx = make();
-    ctx.seedEligible("item-1");
-    expect((await ctx.src.transition("item-1", "in_development")).kind).toBe("applied");
-    expect((await ctx.src.transition("item-1", "in_development")).kind).toBe("noop"); // outbox retry
-    expect((await ctx.src.transition("item-1", "in_review")).kind).toBe("applied");
+    const key = ctx.seedEligible();
+    expect((await ctx.src.transition(key, "in_development")).kind).toBe("applied");
+    expect((await ctx.src.transition(key, "in_development")).kind).toBe("noop"); // outbox retry
+    expect((await ctx.src.transition(key, "in_review")).kind).toBe("applied");
   });
 
   it("INV-1: a claimed (in_development) item drops out of listEligible", async () => {
     const ctx = make();
-    ctx.seedEligible("item-1");
-    ctx.seedEligible("item-2");
-    await ctx.src.transition("item-1", "in_development");
-    expect((await ctx.src.listEligible()).map((i) => i.key)).toEqual(["item-2"]);
+    const first = ctx.seedEligible();
+    const second = ctx.seedEligible();
+    await ctx.src.transition(first, "in_development");
+    expect((await ctx.src.listEligible()).map((i) => i.key)).toEqual([second]);
   });
 
   it("describe throws for an unknown key", async () => {
@@ -215,26 +252,26 @@ describe.each(HARNESSES)("WorkSource contract: $name", ({ make }) => {
 
   it("INV-4: materialize is idempotent and tolerates a vanished item without throwing", async () => {
     const ctx = make();
-    ctx.seedEligible("item-1");
+    const key = ctx.seedEligible();
     const mem = ctx.memDir();
-    await ctx.src.materialize("item-1", mem, () => {});
+    await ctx.src.materialize(key, mem, () => {});
     const after = ctx.backendCalls();
-    await ctx.src.materialize("item-1", mem, () => {}); // second run: no backend work
+    await ctx.src.materialize(key, mem, () => {}); // second run: no backend work
     expect(ctx.backendCalls()).toBe(after);
     // Vanished item: log, never throw.
-    ctx.removeItem("item-1");
-    await expect(ctx.src.materialize("item-1", ctx.memDir(), () => {})).resolves.toBeUndefined();
+    ctx.removeItem(key);
+    await expect(ctx.src.materialize(key, ctx.memDir(), () => {})).resolves.toBeUndefined();
   });
 
   it("workDoc never throws (pre- AND post-materialize) and returns a usable relative path", async () => {
     const ctx = make();
-    ctx.seedEligible("item-1");
+    const key = ctx.seedEligible();
     const mem = ctx.memDir();
     const before = await ctx.src.workDoc(mem);
     expect(before.path.trim()).not.toBe("");
     expect(before.kind.trim()).not.toBe("");
     expect(before.path.startsWith("/")).toBe(false); // relative to memDir, by contract
-    await ctx.src.materialize("item-1", mem, () => {});
+    await ctx.src.materialize(key, mem, () => {});
     const after = await ctx.src.workDoc(mem);
     expect(after.path.trim()).not.toBe("");
   });
@@ -260,21 +297,21 @@ describe.each(HARNESSES.filter((h) => h.make().src.spec.replyChannel === "commen
 
     it("INV-5: askHuman returns a durable externalId and the posted question bears the marker", async () => {
       const ctx = make();
-      ctx.seedEligible("item-1");
-      const res = await ask(ctx.src, "item-1");
+      const key = ctx.seedEligible();
+      const res = await ask(ctx.src, key);
       expect(res.externalId.trim()).not.toBe("");
       // The question artifact itself must be skipped by the poll — proven behaviorally below.
     });
 
     it("INV-6: pollHumanReply skips every herdr-authored artifact (question AND marked postNote), then accepts a real reply", async () => {
       const ctx = make();
-      ctx.seedEligible("item-1");
-      const q = await ask(ctx.src, "item-1");
-      const input = { key: "item-1", questionId: 3, externalId: q.externalId, externalCreatedAt: q.externalCreatedAt };
+      const key = ctx.seedEligible();
+      const q = await ask(ctx.src, key);
+      const input = { key, questionId: 3, externalId: q.externalId, externalCreatedAt: q.externalCreatedAt };
       expect(await ctx.src.pollHumanReply(input)).toBeNull(); // only the question exists
-      await ctx.src.postNote("item-1", "⚠ parked for attention"); // must be marker-tagged by the source
+      await ctx.src.postNote(key, "⚠ parked for attention"); // must be marker-tagged by the source
       expect(await ctx.src.pollHumanReply(input)).toBeNull(); // the note must NOT read as a reply
-      ctx.postExternalComment!("item-1", "Use the new behavior.");
+      ctx.postExternalComment!(key, "Use the new behavior.");
       const reply = await ctx.src.pollHumanReply(input);
       expect(reply).not.toBeNull();
       expect(reply!.body).toContain("Use the new behavior.");
@@ -282,10 +319,10 @@ describe.each(HARNESSES.filter((h) => h.make().src.spec.replyChannel === "commen
 
     it("INV-6: a quote-reply embedding the question (marker inside a blockquote) IS a reply", async () => {
       const ctx = make();
-      ctx.seedEligible("item-1");
-      const q = await ask(ctx.src, "item-1");
-      ctx.postExternalComment!("item-1", `> ${HERDR_MARKER} question: demo/7/3]\nGo with option B.`);
-      const reply = await ctx.src.pollHumanReply({ key: "item-1", questionId: 3, externalId: q.externalId, externalCreatedAt: q.externalCreatedAt });
+      const key = ctx.seedEligible();
+      const q = await ask(ctx.src, key);
+      ctx.postExternalComment!(key, `> ${HERDR_MARKER} question: demo/7/3]\nGo with option B.`);
+      const reply = await ctx.src.pollHumanReply({ key, questionId: 3, externalId: q.externalId, externalCreatedAt: q.externalCreatedAt });
       expect(reply).not.toBeNull();
       expect(reply!.body).toContain("Go with option B.");
     });

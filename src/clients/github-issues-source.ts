@@ -1,0 +1,437 @@
+// The github_issues work source: GitHub Issues polled by a trigger label, driven to a merged PR.
+//
+// STATUS OF RECORD: GitHub (spec external — work_items is never touched). The lifecycle
+// projection on the issue:
+//   eligible          = open + trigger label + not a PR + no in-flight state label
+//   in_development    = state label swap, then the trigger label is CONSUMED (re-add = retry)
+//   in_review         = state label swap
+//   merged | done     = strip state labels; close as completed (close_on.*) — the idempotent
+//                       backstop over the PR's `Fixes #n` auto-close (which only fires on
+//                       default-branch merges and can be disabled repo-wide)
+//   aborted           = strip in-flight labels + add the aborted label; issue stays OPEN
+//                       (a visible, retriageable failure artifact) unless close_on.aborted
+// Every mapped transition is an idempotent GET → diff → apply (INV-2); "already there" — incl.
+// auto-close winning the race — is a noop. 301/410/404 map to `stale` (see classifyGone): those
+// are "the item is no longer ours", where retrying cannot help.
+import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { bearsHerdrMarker, HERDR_MARKER, type Logger, type WorkSource, type WorkSourceSpec } from "../core/deps.ts";
+import {
+  StaleItemError,
+  type GithubIssuesMatchItem,
+  type HumanAskInput,
+  type HumanAskResult,
+  type HumanPollInput,
+  type HumanReply,
+  type MatchItem,
+  type Ticket,
+  type TransitionResult,
+  type WorkDocInfo,
+  type WorkState,
+} from "../types.ts";
+import { classifyGone, GithubIssuesClient, labelNames, type GhComment, type GhIssue } from "./github-issues.ts";
+
+/** Resolved github_issues-source config (the client/source own the shape; the descriptor maps YAML onto it). */
+export interface GithubIssuesSourceCfg {
+  repo: string; // "owner/name" the issues live in
+  triggerLabel: string;
+  stateLabels: { inDevelopment: string; inReview: string; aborted: string };
+  closeOn: { merged: boolean; done: boolean; aborted: boolean };
+  typeLabels: Record<string, string>; // issue label (lowercased) -> Ticket.type
+  defaultType: string;
+  maxPages: number; // listEligible pages of 100
+}
+
+const QUESTION_MARKER = `${HERDR_MARKER} question:`;
+
+// Attachment caps (Jira parity — jira-source.ts): images + videos share the count budget.
+const MAX_ATTACHMENTS = 12;
+const MAX_MEDIA_BYTES = 50 * 1024 * 1024;
+
+/** Hosts we download embedded media from. private-user-images + camo are what body_html
+ *  (full+json) rewrites private-repo attachments to — the ONLY form that resolves under a PAT;
+ *  the raw-body forms work for public repos. Anything else is left as a link. */
+const MEDIA_HOSTS = [
+  "private-user-images.githubusercontent.com",
+  "user-images.githubusercontent.com",
+  "camo.githubusercontent.com",
+  "github.com/user-attachments/",
+];
+
+/** Strip HTML comments + invisible/bidi characters from untrusted text before it reaches a
+ *  prompt (INV-4; the raw payload stays in issue.json). */
+function sanitize(text: string): string {
+  return text
+    .replace(/<!--[\s\S]*?-->/g, "")
+    // biome-ignore lint/suspicious/noControlCharactersInRegex: stripping control chars is the point
+    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F\u200B-\u200F\u202A-\u202E\u2066-\u2069\uFEFF]/g, "");
+}
+
+function humanQuestionComment(input: HumanAskInput): string {
+  return [
+    `${QUESTION_MARKER} ${input.repo}/${input.runId}/${input.questionId}]`,
+    `Work item: #${input.key}`,
+    `Step: ${input.step ?? "unknown"}`,
+    "",
+    input.question.trim(),
+    "",
+    "Reply in a NEW comment — herdr-factory resumes automatically when it sees the reply. (Edits to existing comments are not seen.)",
+  ].join("\n");
+}
+
+export class GithubIssuesSource implements WorkSource {
+  private readonly gh: GithubIssuesClient;
+  private readonly cfg: GithubIssuesSourceCfg;
+  private readonly prRepo: string; // the repo PRs are opened against (may differ from cfg.repo)
+  private readonly ensuredLabels = new Set<string>(); // memoized ensureLabel results (per process)
+
+  constructor(cfg: GithubIssuesSourceCfg, gh: GithubIssuesClient, prRepo: string) {
+    this.cfg = cfg;
+    this.gh = gh;
+    this.prRepo = prRepo;
+  }
+
+  readonly spec: WorkSourceSpec = {
+    statusOfRecord: "external",
+    mappedStates: ["in_development", "in_review", "merged", "aborted", "done"],
+    replyChannel: "comments",
+    terminalAutomation: "PR closing keywords (Fixes #n) auto-close on default-branch merges; the close here is the idempotent backstop",
+  };
+
+  private stateLabelFor(to: WorkState): string | undefined {
+    switch (to) {
+      case "in_development":
+        return this.cfg.stateLabels.inDevelopment;
+      case "in_review":
+        return this.cfg.stateLabels.inReview;
+      case "aborted":
+        return this.cfg.stateLabels.aborted;
+      default:
+        return undefined;
+    }
+  }
+
+  private allStateLabels(): string[] {
+    return [this.cfg.stateLabels.inDevelopment, this.cfg.stateLabels.inReview, this.cfg.stateLabels.aborted];
+  }
+
+  /** Ticket.type: GitHub's native issue type when present, else the first type_labels hit over
+   *  the issue's labels, else default_type. Drives the branch prefix + @@TYPE@@. */
+  private typeOf(issue: GhIssue): string {
+    const native = issue.type?.name?.trim();
+    if (native) return native;
+    for (const label of labelNames(issue)) {
+      const mapped = this.cfg.typeLabels[label.toLowerCase()];
+      if (mapped) return mapped;
+    }
+    return this.cfg.defaultType;
+  }
+
+  private toItem(issue: GhIssue): GithubIssuesMatchItem {
+    return {
+      sourceType: "github_issues",
+      key: String(issue.number),
+      displayKey: `#${issue.number}`,
+      url: issue.html_url,
+      summary: issue.title,
+      type: this.typeOf(issue),
+      labels: labelNames(issue),
+      fields: issue as Record<string, unknown>,
+      number: issue.number,
+      repo: this.cfg.repo,
+      state: "open",
+      assignees: (issue.assignees ?? []).map((a) => a.login),
+      author: issue.user?.login ?? null,
+      body: issue.body ?? "",
+    };
+  }
+
+  async listEligible(): Promise<MatchItem[]> {
+    const out: GithubIssuesMatchItem[] = [];
+    const inFlight = new Set([this.cfg.stateLabels.inDevelopment, this.cfg.stateLabels.inReview]);
+    for (let page = 1; page <= this.cfg.maxPages; page++) {
+      const batch = await this.gh.listOpenIssuesByLabel(this.cfg.triggerLabel, page);
+      for (const issue of batch) {
+        if (issue.pull_request) continue; // the list endpoint interleaves PRs — never claimable
+        // Belt-and-braces: an in-flight state label means a claim's label swap partially landed
+        // (or a human hand-edited) — don't double-claim. The aborted label deliberately does NOT
+        // gate here: re-adding the trigger is the whole retry affordance.
+        if (labelNames(issue).some((l) => inFlight.has(l))) continue;
+        out.push(this.toItem(issue));
+      }
+      if (batch.length < 100) break;
+    }
+    return out; // oldest-first (sort=created asc) — overflow beyond maxPages surfaces on later ticks
+  }
+
+  async describe(key: string): Promise<Ticket> {
+    const n = Number(key.replace(/^#/, "")); // tolerate the "#123" spelling; canonical key is bare
+    if (!Number.isInteger(n) || n <= 0) throw new Error(`github_issues: "${key}" is not an issue number`);
+    const issue = await this.gh.getIssue(n);
+    if (issue.pull_request) throw new Error(`github_issues: #${n} is a pull request, not an issue`);
+    return { key: String(n), displayKey: `#${n}`, url: issue.html_url, summary: issue.title, type: this.typeOf(issue) };
+  }
+
+  /** Lazily make sure a state label exists in the repo (memoized), so a fresh repo works on the
+   *  first claim without manual label setup. Failures propagate — the outbox retries. */
+  private async ensureLabel(name: string): Promise<void> {
+    if (this.ensuredLabels.has(name)) return;
+    if (!(await this.gh.labelExists(name))) {
+      await this.gh.createLabel(name, "5319e7", "managed by herdr-factory");
+    }
+    this.ensuredLabels.add(name);
+  }
+
+  async transition(key: string, to: WorkState): Promise<TransitionResult> {
+    if (!this.spec.mappedStates.includes(to)) return { kind: "noop" }; // unmapped (todo) → ZERO network (INV-3)
+    const n = Number(key);
+    try {
+      // Idempotent GET → diff → apply. The GET is also the stale probe: 301/410/404 end here.
+      const issue = await this.gh.getIssue(n);
+      if (issue.pull_request) return { kind: "stale", detail: `#${n} is a pull request` };
+      const have = new Set(labelNames(issue));
+      const want = this.stateLabelFor(to);
+      let applied = false;
+
+      if (to === "in_development" || to === "in_review") {
+        if (issue.state === "closed") {
+          // A closed issue BEFORE any merge is a human cancel signal — the run's stale policy
+          // parks it (in_review) or aborts it (in_development) rather than working killed work.
+          return { kind: "stale", detail: `issue #${n} was closed (${issue.state_reason ?? "no reason"}) before ${to}` };
+        }
+        await this.ensureLabel(want!);
+        if (!have.has(want!)) {
+          await this.gh.addLabels(n, [want!]);
+          applied = true;
+        }
+        for (const l of this.allStateLabels()) {
+          if (l !== want && have.has(l)) applied = (await this.gh.removeLabel(n, l)) || applied;
+        }
+        if (to === "in_development" && have.has(this.cfg.triggerLabel)) {
+          // Consume the trigger LAST: if the swap partially fails and retries, the still-present
+          // trigger keeps the item filtered by the in-flight guard, never double-claimed.
+          applied = (await this.gh.removeLabel(n, this.cfg.triggerLabel)) || applied;
+        }
+        return { kind: applied ? "applied" : "noop" };
+      }
+
+      // Terminal states: strip in-flight labels; aborted gains its artifact label; close per config.
+      for (const l of [this.cfg.stateLabels.inDevelopment, this.cfg.stateLabels.inReview]) {
+        if (have.has(l)) applied = (await this.gh.removeLabel(n, l)) || applied;
+      }
+      if (to === "aborted") {
+        await this.ensureLabel(want!);
+        if (!have.has(want!)) {
+          await this.gh.addLabels(n, [want!]);
+          applied = true;
+        }
+      } else if (have.has(this.cfg.stateLabels.aborted)) {
+        applied = (await this.gh.removeLabel(n, this.cfg.stateLabels.aborted)) || applied;
+      }
+      const close = to === "merged" ? this.cfg.closeOn.merged : to === "done" ? this.cfg.closeOn.done : this.cfg.closeOn.aborted;
+      if (close && issue.state === "open") {
+        await this.gh.closeIssue(n, to === "aborted" ? "not_planned" : "completed");
+        applied = true;
+      }
+      // Already closed (auto-close / a human beat us): converged — never reopen, never complain.
+      return { kind: applied ? "applied" : "noop" };
+    } catch (e) {
+      const gone = classifyGone(e);
+      if (gone) return { kind: "stale", detail: `issue #${n} ${gone}` };
+      throw e; // transient (throw = retry me, INV-2)
+    }
+  }
+
+  /** Render the issue (title, body, every comment) + its media into memDir as task.md /
+   *  attachments/ / issue.json. Idempotent on task.md; best-effort throughout (INV-4). */
+  async materialize(key: string, memDir: string, log: Logger): Promise<void> {
+    if (existsSync(join(memDir, "task.md"))) return; // idempotent across claiming ticks
+    const n = Number(key);
+    let issue: GhIssue;
+    let comments: GhComment[];
+    try {
+      // full+json: body_html carries the JWT-signed attachment URLs that resolve on private
+      // repos. Download IMMEDIATELY below — those JWTs expire within minutes.
+      issue = await this.gh.getIssue(n, { full: true });
+      comments = await this.gh.listComments(n, { full: true });
+    } catch (e) {
+      log("warn", `${key}: could not fetch the issue for materialize: ${e instanceof Error ? e.message : String(e)}`);
+      return; // next claiming tick retries (task.md not written)
+    }
+    try {
+      writeFileSync(join(memDir, "issue.json"), JSON.stringify({ issue, comments }, null, 2));
+    } catch {
+      log("warn", `${key}: could not save issue.json`);
+    }
+
+    mkdirSync(join(memDir, "attachments"), { recursive: true });
+    const media = new MediaCollector(this.gh, join(memDir, "attachments"), log, key);
+
+    const lines: string[] = [
+      `# Issue #${n}: ${sanitize(issue.title)}`,
+      "",
+      `- URL: ${issue.html_url ?? `https://github.com/${this.cfg.repo}/issues/${n}`}`,
+      `- Repo: ${this.cfg.repo}`,
+      `- Author: ${issue.user?.login ?? "unknown"}`,
+      `- State: ${issue.state}`,
+      `- Labels: ${labelNames(issue).join(", ") || "(none)"}`,
+      // The pr step copies this line into the PR body VERBATIM — linkage + auto-close on merge.
+      // Short form when the issue lives in the PR repo is the docs-guaranteed spelling; the
+      // descriptor passes prRepo so cross-repo issues get the qualified form.
+      `- Closing reference: Fixes ${this.cfg.repo === this.prRepo ? `#${n}` : `${this.cfg.repo}#${n}`}`,
+      "",
+      "## Description",
+      "",
+      await media.rewrite(sanitize(issue.body ?? "_(no description)_"), issue.body_html),
+    ];
+    for (const c of comments) {
+      const text = c.body ?? "";
+      if (bearsHerdrMarker(text)) continue; // our own questions/notes are not task content
+      lines.push("", `## Comment by ${c.user?.login ?? "unknown"} (${c.created_at})`, "", await media.rewrite(sanitize(text), c.body_html));
+    }
+    if (media.failed > 0) lines.push("", `> note: ${media.failed} attachment(s) could not be downloaded — follow the original links above.`);
+    writeFileSync(join(memDir, "task.md"), `${lines.join("\n")}\n`);
+  }
+
+  async workDoc(): Promise<WorkDocInfo> {
+    return { path: "task.md", kind: "GitHub issue (markdown: title, body, all comments; raw JSON in issue.json; media in attachments/)" };
+  }
+
+  async postNote(key: string, note: string): Promise<void> {
+    await this.gh.createComment(Number(key), `${HERDR_MARKER}] ${note}`);
+  }
+
+  async askHuman(input: HumanAskInput): Promise<HumanAskResult> {
+    const n = Number(input.key);
+    try {
+      // Idempotent per questionId (INV-5): askHuman is re-invoked every tick until an externalId
+      // is PERSISTED — if our earlier POST succeeded but the response was lost, re-posting would
+      // ask the human twice. Scan for the marker first (blockquote-aware via the exact first line).
+      const marker = `${QUESTION_MARKER} ${input.repo}/${input.runId}/${input.questionId}]`;
+      const existing = (await this.gh.listComments(n)).find((c) => (c.body ?? "").startsWith(marker));
+      if (existing) return { externalId: String(existing.id), externalCreatedAt: existing.created_at };
+      const posted = await this.gh.createComment(n, humanQuestionComment(input));
+      return { externalId: String(posted.id), externalCreatedAt: posted.created_at };
+    } catch (e) {
+      const gone = classifyGone(e);
+      if (gone) throw new StaleItemError(`issue #${n} ${gone}`);
+      throw e;
+    }
+  }
+
+  async pollHumanReply(input: HumanPollInput): Promise<HumanReply | null> {
+    const n = Number(input.key);
+    try {
+      // `since` filters on updated_at (cheap server-side narrowing); the created_at guard below is
+      // the real cutoff — it also drops EDITED old comments (hence "reply in a NEW comment").
+      const comments = await this.gh.listComments(n, { since: input.externalCreatedAt ?? undefined });
+      const cutoff = input.externalCreatedAt ? Date.parse(input.externalCreatedAt) : Number.NaN;
+      for (const c of comments) {
+        if (String(c.id) === input.externalId) continue;
+        if (Number.isFinite(cutoff) && Date.parse(c.created_at) <= cutoff) continue;
+        const text = c.body ?? "";
+        // INV-6: skip every herdr-authored artifact (questions AND marked notes) — but a human
+        // QUOTE-REPLY that embeds the question as `> …` blockquote lines IS a reply. NO author
+        // filtering: under gh-CLI auth the bot login IS the operator's login.
+        if (bearsHerdrMarker(text)) continue;
+        if (!text.trim()) continue;
+        return { body: text, externalId: String(c.id), externalCreatedAt: c.created_at, author: c.user?.login ?? null };
+      }
+      return null;
+    } catch (e) {
+      const gone = classifyGone(e);
+      if (gone) throw new StaleItemError(`issue #${n} ${gone}`);
+      throw e;
+    }
+  }
+
+  async health(): Promise<void> {
+    let repo: { has_issues?: boolean; permissions?: { push?: boolean } };
+    try {
+      repo = await this.gh.getRepo();
+    } catch (e) {
+      throw new Error(`github_issues: cannot reach ${this.cfg.repo} — bad auth, or the token lacks access (${e instanceof Error ? e.message : String(e)})`);
+    }
+    if (repo.has_issues === false) throw new Error(`github_issues: issues are disabled on ${this.cfg.repo} — enable them in repo settings`);
+    if (repo.permissions && repo.permissions.push === false) {
+      throw new Error(`github_issues: the token has no push/write access to ${this.cfg.repo} — labels and comments will fail`);
+    }
+    if (!(await this.gh.labelExists(this.cfg.triggerLabel))) {
+      throw new Error(`github_issues: trigger label "${this.cfg.triggerLabel}" does not exist in ${this.cfg.repo} — create it (or set trigger_label) and add it to issues you want worked`);
+    }
+  }
+}
+
+/** Downloads embedded media (capped, allowlisted hosts) and rewrites links to local paths.
+ *  Prefers body_html's URLs (JWT-signed private-repo form) by mapping raw-body URLs to their
+ *  html counterparts when both reference the same asset id. */
+class MediaCollector {
+  private count = 0;
+  failed = 0;
+  private readonly seen = new Map<string, string>(); // url -> local relative path
+  // NOTE: no constructor parameter properties — the CLI runs under Node's strip-only
+  // type-stripping, which doesn't support them (same constraint as http.ts's TokenBucket).
+  private readonly gh: GithubIssuesClient;
+  private readonly dir: string;
+  private readonly log: Logger;
+  private readonly key: string;
+  constructor(gh: GithubIssuesClient, dir: string, log: Logger, key: string) {
+    this.gh = gh;
+    this.dir = dir;
+    this.log = log;
+    this.key = key;
+  }
+
+  /** Every downloadable URL in `text`, with the html variant (when given) consulted first so
+   *  private-repo signed URLs win over their raw-body 404-under-PAT counterparts. */
+  async rewrite(text: string, html?: string): Promise<string> {
+    const urls = new Set<string>([...extractMediaUrls(html ?? ""), ...extractMediaUrls(text)]);
+    let out = text;
+    for (const url of urls) {
+      const local = await this.fetch(url);
+      if (!local) continue;
+      // Rewrite BOTH the exact url and its raw-body counterpart when the asset id matches.
+      out = out.split(url).join(local);
+      const assetId = url.match(/user-attachments\/assets\/([\w-]+)/)?.[1] ?? url.match(/\/(\d+)-([\w-]+)\.(\w+)/)?.[2];
+      if (assetId) {
+        out = out.replace(new RegExp(`https://[^\\s)"']*${assetId}[^\\s)"']*`, "g"), local);
+      }
+    }
+    return out;
+  }
+
+  private async fetch(url: string): Promise<string | null> {
+    const cached = this.seen.get(url);
+    if (cached) return cached;
+    if (this.count >= MAX_ATTACHMENTS) return null;
+    try {
+      const bytes = await this.gh.downloadBytes(url);
+      if (bytes.length > MAX_MEDIA_BYTES) {
+        this.log("warn", `${this.key}: attachment over the ${MAX_MEDIA_BYTES / 1024 / 1024}MB cap — skipped (${url.slice(0, 120)})`);
+        this.failed += 1;
+        return null;
+      }
+      this.count += 1;
+      const name = `attachment-${this.count}${extensionOf(url)}`;
+      writeFileSync(join(this.dir, name), bytes);
+      const rel = `attachments/${name}`;
+      this.seen.set(url, rel);
+      return rel;
+    } catch {
+      this.failed += 1;
+      this.log("warn", `${this.key}: attachment download failed — leaving the link (${url.slice(0, 120)})`);
+      return null;
+    }
+  }
+}
+
+function extensionOf(url: string): string {
+  const m = url.match(/\.(png|jpe?g|gif|webp|svg|mp4|mov|webm)(\?|$)/i);
+  return m ? `.${m[1]!.toLowerCase()}` : "";
+}
+
+/** Markdown/HTML image + asset URLs on the allowlisted hosts. */
+export function extractMediaUrls(text: string): string[] {
+  const urls = text.match(/https:\/\/[^\s)"'<>\]]+/g) ?? [];
+  return urls.filter((u) => MEDIA_HOSTS.some((h) => u.includes(h)));
+}

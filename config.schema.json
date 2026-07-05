@@ -202,6 +202,108 @@
               "local_markdown"
             ],
             "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "type": {
+                "type": "string",
+                "const": "github_issues"
+              },
+              "name": {
+                "type": "string",
+                "minLength": 1
+              },
+              "github_issues": {
+                "type": "object",
+                "properties": {
+                  "repo": {
+                    "type": "string",
+                    "pattern": "^[\\w.-]+\\/[\\w.-]+$"
+                  },
+                  "trigger_label": {
+                    "default": "herdr",
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "state_labels": {
+                    "default": {},
+                    "type": "object",
+                    "properties": {
+                      "in_development": {
+                        "default": "herdr:in-development",
+                        "type": "string",
+                        "minLength": 1
+                      },
+                      "in_review": {
+                        "default": "herdr:in-review",
+                        "type": "string",
+                        "minLength": 1
+                      },
+                      "aborted": {
+                        "default": "herdr:aborted",
+                        "type": "string",
+                        "minLength": 1
+                      }
+                    },
+                    "additionalProperties": false
+                  },
+                  "close_on": {
+                    "default": {},
+                    "type": "object",
+                    "properties": {
+                      "merged": {
+                        "default": true,
+                        "type": "boolean"
+                      },
+                      "done": {
+                        "default": true,
+                        "type": "boolean"
+                      },
+                      "aborted": {
+                        "default": false,
+                        "type": "boolean"
+                      }
+                    },
+                    "additionalProperties": false
+                  },
+                  "type_labels": {
+                    "default": {
+                      "bug": "Bug",
+                      "defect": "Bug",
+                      "chore": "Chore",
+                      "task": "Chore",
+                      "enhancement": "Feature"
+                    },
+                    "type": "object",
+                    "propertyNames": {
+                      "type": "string"
+                    },
+                    "additionalProperties": {
+                      "type": "string",
+                      "minLength": 1
+                    }
+                  },
+                  "default_type": {
+                    "default": "Feature",
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "max_pages": {
+                    "default": 1,
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 10
+                  }
+                },
+                "additionalProperties": false
+              }
+            },
+            "required": [
+              "type",
+              "github_issues"
+            ],
+            "additionalProperties": false
           }
         ]
       }

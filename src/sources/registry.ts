@@ -16,6 +16,7 @@ import type { ZodType } from "zod";
 import type { Store } from "../db/store.ts";
 import type { Logger, WorkSource } from "../core/deps.ts";
 import type { SourceType } from "../types.ts";
+import { githubIssuesDescriptor } from "./github-issues/descriptor.ts";
 import { jiraDescriptor } from "./jira/descriptor.ts";
 import { localMarkdownDescriptor } from "./local-markdown/descriptor.ts";
 
@@ -70,7 +71,7 @@ export type AnySourceDescriptor = SourceDescriptor<any>;
 
 // jira MUST stay first with default name "jira" (db/migrate.ts v6 backfill invariant + the
 // generated config.schema.json's union order, which the schema-sync test pins byte-for-byte).
-export const SOURCE_DESCRIPTORS: readonly AnySourceDescriptor[] = [jiraDescriptor, localMarkdownDescriptor];
+export const SOURCE_DESCRIPTORS: readonly AnySourceDescriptor[] = [jiraDescriptor, localMarkdownDescriptor, githubIssuesDescriptor];
 
 export function descriptorFor(type: SourceType): AnySourceDescriptor {
   const d = SOURCE_DESCRIPTORS.find((x) => x.type === type);

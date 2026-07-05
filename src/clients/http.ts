@@ -7,7 +7,7 @@ import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Schedule from "effect/Schedule";
 import { runEffectPromise } from "../runtime/effect.ts";
-import { telemetryEventEffect, withTelemetrySpan } from "../telemetry/effect.ts";
+import { recordRateLimitWaitEffect, telemetryEventEffect, withTelemetrySpan } from "../telemetry/effect.ts";
 
 /** Default budget for a JSON API round-trip. Media downloads pass their own larger budget. */
 export const DEFAULT_HTTP_TIMEOUT_MS = 30_000;
@@ -49,6 +49,12 @@ export interface HttpRequest {
   headers?: Record<string, string>;
   body?: string;
   timeoutMs?: number;
+  /** "manual" surfaces 3xx as the response itself (→ a typed HttpStatusError via httpExpectOk)
+   *  instead of transparently following it. Load-bearing for GitHub issue calls: a transferred
+   *  issue answers 301, and following it same-origin would preserve the Authorization header AND
+   *  the method — silently mutating the issue in its NEW repo. Default "follow" (Jira + media
+   *  downloads keep their behavior byte-identical). */
+  redirect?: "follow" | "manual";
 }
 
 export interface HttpResponse {
@@ -62,11 +68,19 @@ export interface HttpResponse {
 
 function parseRetryAfter(headers: Headers): number | null {
   const raw = headers.get("retry-after");
-  if (!raw) return null;
-  const secs = Number(raw);
-  if (Number.isFinite(secs) && secs >= 0) return Math.round(secs * 1000);
-  const at = Date.parse(raw); // HTTP-date form
-  return Number.isNaN(at) ? null : Math.max(0, at - Date.now());
+  if (raw) {
+    const secs = Number(raw);
+    if (Number.isFinite(secs) && secs >= 0) return Math.round(secs * 1000);
+    const at = Date.parse(raw); // HTTP-date form
+    if (!Number.isNaN(at)) return Math.max(0, at - Date.now());
+  }
+  // GitHub's primary rate limit answers without Retry-After but with the x-ratelimit pair —
+  // synthesize the wait from the reset stamp. Harmless for backends that don't send these.
+  if (headers.get("x-ratelimit-remaining") === "0") {
+    const reset = Number(headers.get("x-ratelimit-reset"));
+    if (Number.isFinite(reset) && reset > 0) return Math.max(0, Math.round(reset * 1000 - Date.now()));
+  }
+  return null;
 }
 
 /**
@@ -83,7 +97,7 @@ function httpAttempt(req: HttpRequest, as: "text" | "bytes"): Effect.Effect<Http
       // tryPromise's AbortSignal aborts on fiber interruption — so the timeout below really
       // cancels the in-flight fetch instead of leaving it running in the background.
       try: (signal) =>
-        fetch(req.url, { method: req.method ?? "GET", headers: req.headers, body: req.body, redirect: "follow", signal }),
+        fetch(req.url, { method: req.method ?? "GET", headers: req.headers, body: req.body, redirect: req.redirect ?? "follow", signal }),
       catch: (cause) => new HttpNetworkError(req.url, cause),
     }).pipe(
       Effect.flatMap((res) =>
@@ -189,23 +203,48 @@ const MAX_RETRY_AFTER_MS = 60_000;
 export interface HttpPolicy {
   /** Shared per-backend bucket; every attempt (including retries) takes a token. */
   bucket?: TokenBucket;
+  /** Multiple buckets acquired in order (e.g. a per-minute AND a per-hour mutation cap). When
+   *  set, wins over `bucket`. */
+  buckets?: readonly TokenBucket[];
   /** Extra attempts after the first (default 3). */
   retries?: number;
+  /** Override which failures are retried (default: transport/timeout + 429/5xx). A backend with
+   *  a distinctive rate-limit shape (GitHub's 403+Retry-After secondaries) widens this per policy
+   *  without touching anyone else's behavior. */
+  isRetryable?: (e: HttpError) => boolean;
+  /** Cap on an honored Retry-After sleep, below the global MAX_RETRY_AFTER_MS. A mutation-heavy
+   *  caller with its own durable retry loop (the transition outbox) sets this LOW to fail fast
+   *  back to that loop instead of stalling a reconcile tick for a full minute. */
+  maxRetryAfterMs?: number;
 }
 
 /**
- * The full outbound pipeline: token from the bucket → request → non-2xx as typed failure →
+ * The full outbound pipeline: token(s) from the bucket(s) → request → non-2xx as typed failure →
  * retry with exponential backoff + jitter (Schedule) for retryable failures, honoring a 429/503
  * Retry-After by sleeping it BEFORE the schedule's own delay. This is the item-6 seam layered on
  * item 1's timeout-bounded attempts.
  */
 export function httpWithPolicy(req: HttpRequest, policy: HttpPolicy = {}, as: "text" | "bytes" = "text"): Effect.Effect<HttpResponse, HttpError> {
-  const attempt = (policy.bucket ? acquireToken(policy.bucket) : Effect.void).pipe(
+  const retryable = policy.isRetryable ?? isRetryable;
+  const retryAfterCap = Math.min(policy.maxRetryAfterMs ?? MAX_RETRY_AFTER_MS, MAX_RETRY_AFTER_MS);
+  const buckets = policy.buckets ?? (policy.bucket ? [policy.bucket] : []);
+  // Bucket acquisition with the wait time recorded — budget back-pressure should be visible in
+  // telemetry, not a silent slowdown.
+  const acquireAll = Effect.suspend(() => {
+    const startedAt = Date.now();
+    return Effect.forEach(buckets, acquireToken, { discard: true }).pipe(
+      Effect.flatMap(() => {
+        const waited = Date.now() - startedAt;
+        return waited > 5 ? recordRateLimitWaitEffect(waited, { "url.full": req.url }) : Effect.void;
+      }),
+    );
+  });
+  const attempt = acquireAll.pipe(
     Effect.flatMap(() => httpExpectOk(req, as)),
     Effect.catchAll((e) =>
-      e instanceof HttpStatusError && e.retryAfterMs != null && isRetryable(e)
+      e instanceof HttpStatusError && e.retryAfterMs != null && retryable(e)
         ? telemetryEventEffect("http.retry_after_honored", { "url.full": req.url, "http.response.status_code": e.status, "retry_after.ms": e.retryAfterMs }).pipe(
-            Effect.flatMap(() => Effect.sleep(Duration.millis(Math.min(e.retryAfterMs!, MAX_RETRY_AFTER_MS)))),
+            Effect.flatMap(() => Effect.sleep(Duration.millis(Math.min(e.retryAfterMs!, retryAfterCap)))),
             Effect.flatMap(() => Effect.fail(e)),
           )
         : Effect.fail(e),
@@ -213,7 +252,7 @@ export function httpWithPolicy(req: HttpRequest, policy: HttpPolicy = {}, as: "t
   );
   return attempt.pipe(
     Effect.retry({
-      while: isRetryable,
+      while: retryable,
       schedule: Schedule.exponential(Duration.millis(500), 2).pipe(
         Schedule.jittered,
         Schedule.intersect(Schedule.recurs(policy.retries ?? 3)),

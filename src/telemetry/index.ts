@@ -9,6 +9,7 @@ import {
   recordDomainEventEffect,
   recordHttpClientDurationEffect,
   recordHttpServerDurationEffect,
+  recordRateLimitRemainingEffect,
   recordTickDurationEffect,
   recordTickEffect,
   recordTickLockSkippedEffect,
@@ -195,6 +196,10 @@ export function recordTick(ran: boolean, attrs: TelemetryAttributes = {}): void 
 
 export function recordTickLockSkipped(attrs: TelemetryAttributes = {}): void {
   runTelemetry(recordTickLockSkippedEffect(attrs));
+}
+
+export function recordRateLimitRemaining(remaining: number, attrs: TelemetryAttributes = {}): void {
+  runTelemetry(recordRateLimitRemainingEffect(remaining, attrs));
 }
 
 export function instrumentObject<T extends object>(target: T, prefix: string, attrs: TelemetryAttributes = {}): T {

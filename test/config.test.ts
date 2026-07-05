@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { loadConfig, assertMainCheckout, expandHome, configJsonSchema, evidenceKeyPrefix } from "../src/config.ts";
 import type { JiraSourceCfg } from "../src/clients/jira-source.ts";
+import type { GithubIssuesSourceCfg } from "../src/clients/github-issues-source.ts";
 import type { LocalMarkdownSourceCfg } from "../src/sources/local-markdown/descriptor.ts";
 
 const cleanups: (() => void)[] = [];
@@ -95,6 +96,84 @@ describe("loadConfig — work sources + belts", () => {
     expect(belt.source).toBe("jira");
     expect(belt.priority).toBe(100); // default
     expect(belt.watchPr).toBe(true);
+  });
+
+  it("maps a github_issues source with defaults (labels, close_on, type map) and camelCase resolution", () => {
+    setup(
+      cfg(
+        `  - type: github_issues
+    name: gh
+    github_issues: { repo: acme/tracker, trigger_label: factory }
+`,
+        `  - name: ship
+    belt_type: work_to_pull_request
+    source: gh
+    agents:
+      fix:    { tab: fix,    pane: agent }
+      review: { tab: review, pane: agent }
+      pr:     { tab: pr,     pane: agent }
+`,
+      ),
+      { prompts: {} },
+    );
+    const { config } = loadConfig("demo");
+    const s = config.sources[0]!;
+    expect(s.name).toBe("gh");
+    expect(s.type).toBe("github_issues");
+    const gh = s.cfg as GithubIssuesSourceCfg;
+    expect(gh.repo).toBe("acme/tracker");
+    expect(gh.triggerLabel).toBe("factory");
+    expect(gh.stateLabels).toEqual({ inDevelopment: "herdr:in-development", inReview: "herdr:in-review", aborted: "herdr:aborted" });
+    expect(gh.closeOn).toEqual({ merged: true, done: true, aborted: false });
+    expect(gh.typeLabels.bug).toBe("Bug");
+    expect(gh.defaultType).toBe("Feature");
+    expect(gh.maxPages).toBe(1);
+    expect(config.belts[0]!.source).toBe("gh");
+  });
+
+  it("github_issues: repo may be omitted (defaults to the PR repo at build time); bad shapes rejected", () => {
+    setup(
+      cfg(
+        `  - type: github_issues
+    github_issues: {}
+`,
+        `  - name: ship
+    belt_type: work_to_pull_request
+    source: github_issues
+    agents:
+      fix:    { tab: fix,    pane: agent }
+      review: { tab: review, pane: agent }
+      pr:     { tab: pr,     pane: agent }
+`,
+      ),
+      { prompts: {} },
+    );
+    const { config } = loadConfig("demo");
+    expect((config.sources[0]!.cfg as GithubIssuesSourceCfg).repo).toBeUndefined();
+
+    setup(
+      cfg(
+        `  - type: github_issues
+    github_issues: { repo: not-a-repo }
+`,
+        SHIP_BELT.replace("source: jira", "source: github_issues"),
+      ),
+      { prompts: {} },
+    );
+    expect(() => loadConfig("demo")).toThrow(/owner\/name/);
+  });
+
+  it("github_issues: unknown keys in the block are rejected (strict)", () => {
+    setup(
+      cfg(
+        `  - type: github_issues
+    github_issues: { repo: acme/tracker, labels: nope }
+`,
+        SHIP_BELT.replace("source: jira", "source: github_issues"),
+      ),
+      { prompts: {} },
+    );
+    expect(() => loadConfig("demo")).toThrow(/[Uu]nrecognized/);
   });
 
   it("loads secrets strictly from the per-repo env (a shared global env is ignored)", () => {

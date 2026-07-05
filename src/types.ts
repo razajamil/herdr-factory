@@ -241,7 +241,7 @@ export interface HumanReply {
 
 /** The kind of backend a work source polls. Closed on purpose (zod config discrimination + TUI
  *  exhaustiveness); extended in exactly one place per new source. */
-export type SourceType = "jira" | "local_markdown";
+export type SourceType = "jira" | "local_markdown" | "github_issues";
 
 /** Outcome of one transition delivery attempt. Replaces the old boolean: `applied`/`noop` were
  *  its true/false, `stale` is the state a boolean could not express — "retrying cannot help". */
@@ -410,8 +410,20 @@ export interface LocalMarkdownMatchItem extends MatchItem {
   body: string; // the markdown body (front-matter stripped)
 }
 
+/** A github_issues candidate. `fields` is the raw REST issue object. */
+export interface GithubIssuesMatchItem extends MatchItem {
+  sourceType: "github_issues";
+  number: number; // === Number(key)
+  repo: string; // "owner/name" the issue lives in (may differ from the PR repo)
+  state: "open"; // listEligible only surfaces open issues
+  assignees: string[];
+  author: string | null;
+  body: string; // raw markdown body, for match predicates
+}
+
 export const isJiraItem = (i: MatchItem): i is JiraMatchItem => i.sourceType === "jira";
 export const isLocalMarkdownItem = (i: MatchItem): i is LocalMarkdownMatchItem => i.sourceType === "local_markdown";
+export const isGithubIssuesItem = (i: MatchItem): i is GithubIssuesMatchItem => i.sourceType === "github_issues";
 
 export interface MatchContext {
   item: MatchItem;
