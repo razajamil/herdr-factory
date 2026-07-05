@@ -68,10 +68,14 @@ async function killServer(pid: number, port: number): Promise<void> {
       /* fall through to signals */
     }
   }
-  for (let i = 0; i < 15 && alive(pid); i++) {
-    signal(pid, "SIGTERM");
-    await sleep(200);
-  }
+  // SIGTERM triggers the same graceful shutdown as /shutdown (its shuttingDown guard makes the
+  // two idempotent), so send it regardless of whether the POST landed.
+  signal(pid, "SIGTERM");
+  // serve's drain lets in-flight ticks finish for up to 15s (+ a 250ms response defer + telemetry
+  // flush). SIGKILL only after that window has clearly closed: hard-killing a mid-tick pass leaves
+  // its heartbeat-extended tick/run locks to TTL-expire (~5min of skipped runs on the new server).
+  // The common case (no tick in flight) exits the loop in one beat.
+  for (let waited = 0; waited < 18_000 && alive(pid); waited += 200) await sleep(200);
   if (alive(pid)) signal(pid, "SIGKILL");
   try {
     rmSync(serverInfoPath());

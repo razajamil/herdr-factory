@@ -855,8 +855,12 @@ what the old per-repo `watch` did, but collapsed into a single process plus a lo
 **Supervision is a stateless scheduled `ensure-up`.** One launchd job, `com.herdr-factory.server`,
 runs `herdr-factory ensure-up` on `StartInterval` (60s). `ensure-up` is a **one-shot**: optionally
 self-update (see *Updates* below), then read `/health`; if healthy **and** the version matches
-**and no repo's tick loop is stale** → no-op; else kill any stale/wedged pid (graceful
-`POST /shutdown` first, then `SIGTERM`→`SIGKILL` to free the port) and spawn a detached `serve`.
+**and no repo's tick loop is stale** → no-op; else kill any stale/wedged pid and spawn a detached
+`serve`. The kill is graceful-first with a grace period sized to the server's own drain: `POST
+/shutdown` + `SIGTERM` (idempotent — same handler), then **SIGKILL only after 18s** — outlasting
+the 15s in-flight-tick drain — so a routine update/restart almost never hard-kills a mid-tick
+pass (whose heartbeat-extended locks would otherwise sit until TTL expiry, ~5min of skipped
+runs on the new server). A process with no tick in flight exits in well under a second.
 
 **The wedged-tick watchdog.** The HTTP layer answering `/health` only proves the *process* is
 alive — a tick wedged on a hung subprocess would leave the loop dead while `/health` stayed
@@ -992,6 +996,21 @@ Hard-won from the bash prototype — encode as types/tests/asserts:
   `watchers/updater.ts` (`git fetch` + hard reset to `@{u}`) both run git in the herdr-factory
   package dir. A successful auto-update **forces** a restart — the running process's `VERSION` was
   read at start, so the version compare alone wouldn't catch the freshly-reset code.
+- **Migrations are expand/contract; in-flight runs must survive every upgrade.** Auto-update
+  restarts `serve` on *every pushed commit*, so a migration always meets a DB with runs mid-flight —
+  and, for a few seconds around the restart, a still-draining old-code process writing to the
+  migrated schema (any fresh CLI invocation — e.g. a worker's `step-done` falling back in-process —
+  runs NEW code and migrates on open). So: **expand first** (add columns with defaults, new tables,
+  widened CHECKs — all of v1–v13 are this shape); never drop/rename/re-type anything the previous
+  release still writes — **contract only a release after** the last writer is gone. And every
+  migration must carry in-flight runs forward (the v6 `work_source` backfill / v7 phase-widening
+  precedent), never leave them unreconcilable.
+- **The agent-facing CLI surface is a cross-release compatibility contract.** Rendered prompts bake
+  the exact `step-done` / `bounce` / `ask-human` / `evidence-upload` command lines (flags included)
+  into agents already running in panes — and those agents outlive any number of auto-update
+  restarts. Renaming a command or flag strands every in-flight step: the agent's baked command
+  errors, and the step can only die by budget → `attention`. Changes must be additive — new flags
+  optional, old spellings accepted for at least one release after a rename.
 
 ---
 
