@@ -1,0 +1,199 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1520 640" role="img" aria-label="The work_to_pull_request belt: work sources drop items onto a conveyor that runs through fix, evidence, review and PR stations, through a CI and human-review gate, to merge and teardown. Evidence and review can bounce work back to fix.">
+  <style>
+    text { font-family: -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  </style>
+  <defs>
+    <pattern id="hz" width="14" height="14" patternTransform="rotate(45)" patternUnits="userSpaceOnUse">
+      <rect width="14" height="14" fill="#3d3527"/>
+      <rect width="7" height="14" fill="#f5b83d"/>
+    </pattern>
+    <marker id="arrAmber" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse">
+      <path d="M0 0L10 5L0 10z" fill="#fbbf24"/>
+    </marker>
+    <marker id="arrRed" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse">
+      <path d="M0 0L10 5L0 10z" fill="#f87171"/>
+    </marker>
+    <marker id="arrMuted" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M0 0L10 5L0 10z" fill="#8fa0b8"/>
+    </marker>
+    <g id="crate">
+      <rect width="46" height="34" rx="3" fill="#b5854a" stroke="#7a5426" stroke-width="2"/>
+      <path d="M15 2 V32 M31 2 V32" stroke="#7a5426" stroke-width="1.2" opacity="0.65"/>
+      <path d="M2 2 L44 32" stroke="#7a5426" stroke-width="1" opacity="0.3"/>
+    </g>
+    <circle id="roller" r="9" fill="#1a2130" stroke="#3a465e" stroke-width="2"/>
+  </defs>
+
+  <!-- backdrop -->
+  <rect width="1520" height="640" rx="18" fill="#141926"/>
+  <rect x="1" y="1" width="1518" height="638" rx="17" fill="none" stroke="#232b3a" stroke-width="2"/>
+  <line x1="40" y1="504" x2="1480" y2="504" stroke="#222a39" stroke-width="3"/>
+
+  <!-- title plate -->
+  <rect x="420" y="22" width="680" height="54" rx="10" fill="#0e1119" stroke="#f5b83d" stroke-width="2"/>
+  <circle cx="434" cy="36" r="3" fill="#39435a"/><circle cx="1086" cy="36" r="3" fill="#39435a"/>
+  <circle cx="434" cy="62" r="3" fill="#39435a"/><circle cx="1086" cy="62" r="3" fill="#39435a"/>
+  <text x="760" y="56" text-anchor="middle" font-size="21" font-weight="700"><tspan fill="#f5d78a">BELT Nº 1 · </tspan><tspan class="mono" fill="#ffd97a">work_to_pull_request</tspan></text>
+  <text x="760" y="98" text-anchor="middle" font-size="14.5" fill="#8fa0b8">feed it a ticket, walk away — a merged pull request comes out the other end</text>
+
+  <!-- work items falling into the hopper -->
+  <g transform="rotate(-7 98 120)">
+    <rect x="48" y="90" width="100" height="60" rx="8" fill="#1c2434" stroke="#4c8dff" stroke-width="1.5"/>
+    <text x="98" y="114" text-anchor="middle" font-size="13" font-weight="700" fill="#7fb0ff">PROJ-123</text>
+    <text x="98" y="132" text-anchor="middle" font-size="10.5" fill="#8fa0b8">jira ticket</text>
+  </g>
+  <g transform="rotate(6 202 96)">
+    <rect x="154" y="66" width="96" height="58" rx="8" fill="#1c2434" stroke="#8fa0b8" stroke-width="1.5"/>
+    <text x="202" y="90" text-anchor="middle" class="mono" font-size="12.5" fill="#dbe3ee">task.md</text>
+    <text x="202" y="108" text-anchor="middle" font-size="10.5" fill="#8fa0b8">markdown brief</text>
+  </g>
+  <path d="M104 162 v22 M148 156 v20 M206 140 v24" stroke="#55627a" stroke-width="2" stroke-dasharray="4 5" stroke-linecap="round"/>
+
+  <!-- intake hopper + chute -->
+  <rect x="36" y="200" width="206" height="12" rx="4" fill="#2a3242" stroke="#3a465e" stroke-width="1.5"/>
+  <polygon points="42,212 236,212 184,318 94,318" fill="#202839" stroke="#3a465e" stroke-width="2"/>
+  <text x="139" y="248" text-anchor="middle" font-size="14.5" font-weight="700" fill="#d7dfeb">WORK SOURCES</text>
+  <text x="139" y="268" text-anchor="middle" class="mono" font-size="10" fill="#8fa0b8">jira · local_markdown</text>
+  <rect x="112" y="318" width="54" height="116" fill="#1c2330" stroke="#3a465e" stroke-width="2"/>
+  <rect x="104" y="424" width="70" height="10" fill="url(#hz)" stroke="#3a465e" stroke-width="1"/>
+  <text x="178" y="368" class="mono" font-size="12" fill="#f5d78a">claim →</text>
+  <text x="178" y="386" font-size="10.5" fill="#8fa0b8">herdr worktree</text>
+
+  <!-- conveyor -->
+  <rect x="150" y="440" width="1160" height="30" fill="#232b3a" stroke="#3a465e" stroke-width="2"/>
+  <g fill="#4a5670">
+    <polygon points="330,447 340,455 330,463"/><polygon points="344,447 354,455 344,463"/>
+    <polygon points="565,447 575,455 565,463"/><polygon points="579,447 589,455 579,463"/>
+    <polygon points="795,447 805,455 795,463"/><polygon points="809,447 819,455 809,463"/>
+    <polygon points="1215,447 1225,455 1215,463"/><polygon points="1229,447 1239,455 1229,463"/>
+  </g>
+  <g>
+    <use href="#roller" x="190" y="486"/><use href="#roller" x="270" y="486"/><use href="#roller" x="350" y="486"/>
+    <use href="#roller" x="430" y="486"/><use href="#roller" x="510" y="486"/><use href="#roller" x="590" y="486"/>
+    <use href="#roller" x="670" y="486"/><use href="#roller" x="750" y="486"/><use href="#roller" x="830" y="486"/>
+    <use href="#roller" x="910" y="486"/><use href="#roller" x="990" y="486"/><use href="#roller" x="1070" y="486"/>
+    <use href="#roller" x="1150" y="486"/><use href="#roller" x="1230" y="486"/><use href="#roller" x="1300" y="486"/>
+  </g>
+
+  <!-- ══ station: FIX ══ -->
+  <g>
+    <rect x="268" y="372" width="9" height="68" fill="#2a3242" stroke="#3a465e" stroke-width="1"/>
+    <rect x="393" y="372" width="9" height="68" fill="#2a3242" stroke="#3a465e" stroke-width="1"/>
+    <rect x="250" y="252" width="170" height="120" rx="10" fill="#1e2534" stroke="#3a465e" stroke-width="2"/>
+    <rect x="253" y="255" width="164" height="8" rx="4" fill="#f59e0b"/>
+    <circle cx="276" cy="290" r="12" fill="#0e1119" stroke="#f59e0b" stroke-width="1.5"/>
+    <text x="276" y="294.5" text-anchor="middle" font-size="11.5" font-weight="700" fill="#f59e0b">01</text>
+    <text x="296" y="295" font-size="16.5" font-weight="700" fill="#eef2f8">FIX</text>
+    <rect x="352" y="264" width="58" height="17" rx="8.5" fill="#0e1119" stroke="#d97757" stroke-width="1"/>
+    <text x="381" y="276.5" text-anchor="middle" font-size="9.5" fill="#e08a68">✳ agent</text>
+    <text x="335" y="320" text-anchor="middle" font-size="11" fill="#97a3b8">implements the change,</text>
+    <text x="335" y="338" text-anchor="middle" font-size="11" fill="#97a3b8">commits as it goes</text>
+    <g stroke="#f59e0b" fill="none" stroke-linecap="round">
+      <path d="M335 372 L318 388 L342 398" stroke-width="3.5"/>
+      <path d="M342 398 L349 393 M342 398 L347 405" stroke-width="2.5"/>
+    </g>
+    <circle cx="318" cy="388" r="3.5" fill="#f59e0b"/>
+  </g>
+
+  <!-- ══ station: EVIDENCE ══ -->
+  <g>
+    <rect x="488" y="372" width="9" height="68" fill="#2a3242" stroke="#3a465e" stroke-width="1"/>
+    <rect x="613" y="372" width="9" height="68" fill="#2a3242" stroke="#3a465e" stroke-width="1"/>
+    <rect x="470" y="252" width="170" height="120" rx="10" fill="#1e2534" stroke="#3a465e" stroke-width="2"/>
+    <rect x="473" y="255" width="164" height="8" rx="4" fill="#38bdf8"/>
+    <circle cx="496" cy="290" r="12" fill="#0e1119" stroke="#38bdf8" stroke-width="1.5"/>
+    <text x="496" y="294.5" text-anchor="middle" font-size="11.5" font-weight="700" fill="#38bdf8">02</text>
+    <text x="516" y="295" font-size="16.5" font-weight="700" fill="#eef2f8">EVIDENCE</text>
+    <rect x="572" y="264" width="58" height="17" rx="8.5" fill="#0e1119" stroke="#d97757" stroke-width="1"/>
+    <text x="601" y="276.5" text-anchor="middle" font-size="9.5" fill="#e08a68">✳ agent</text>
+    <text x="555" y="320" text-anchor="middle" font-size="11" fill="#97a3b8">films the running app —</text>
+    <text x="555" y="338" text-anchor="middle" font-size="11" fill="#97a3b8">dev server + playwright</text>
+    <text x="555" y="358" text-anchor="middle" class="mono" font-size="10.5" fill="#38bdf8">→ S3 · CloudFront</text>
+    <polygon points="549,398 561,398 573,436 537,436" fill="#38bdf8" opacity="0.12"/>
+    <rect x="538" y="376" width="34" height="22" rx="4" fill="#0e1119" stroke="#38bdf8" stroke-width="1.5"/>
+    <circle cx="555" cy="387" r="6" fill="none" stroke="#38bdf8" stroke-width="1.5"/>
+    <circle cx="555" cy="387" r="2" fill="#38bdf8"/>
+  </g>
+
+  <!-- ══ station: REVIEW ══ -->
+  <g>
+    <rect x="708" y="372" width="9" height="68" fill="#2a3242" stroke="#3a465e" stroke-width="1"/>
+    <rect x="833" y="372" width="9" height="68" fill="#2a3242" stroke="#3a465e" stroke-width="1"/>
+    <rect x="690" y="252" width="170" height="120" rx="10" fill="#1e2534" stroke="#3a465e" stroke-width="2"/>
+    <rect x="693" y="255" width="164" height="8" rx="4" fill="#a78bfa"/>
+    <circle cx="716" cy="290" r="12" fill="#0e1119" stroke="#a78bfa" stroke-width="1.5"/>
+    <text x="716" y="294.5" text-anchor="middle" font-size="11.5" font-weight="700" fill="#a78bfa">03</text>
+    <text x="736" y="295" font-size="16.5" font-weight="700" fill="#eef2f8">REVIEW</text>
+    <rect x="792" y="264" width="58" height="17" rx="8.5" fill="#0e1119" stroke="#d97757" stroke-width="1"/>
+    <text x="821" y="276.5" text-anchor="middle" font-size="9.5" fill="#e08a68">✳ agent</text>
+    <text x="775" y="320" text-anchor="middle" font-size="11" fill="#97a3b8">strict read-only gate:</text>
+    <text x="775" y="338" text-anchor="middle" font-size="11" fill="#97a3b8">pass on, or bounce back</text>
+    <circle cx="770" cy="384" r="9" fill="none" stroke="#a78bfa" stroke-width="3"/>
+    <line x1="777" y1="391" x2="787" y2="401" stroke="#a78bfa" stroke-width="3.5" stroke-linecap="round"/>
+  </g>
+
+  <!-- ══ station: PR ══ -->
+  <g>
+    <rect x="928" y="372" width="9" height="68" fill="#2a3242" stroke="#3a465e" stroke-width="1"/>
+    <rect x="1053" y="372" width="9" height="68" fill="#2a3242" stroke="#3a465e" stroke-width="1"/>
+    <rect x="910" y="252" width="170" height="120" rx="10" fill="#1e2534" stroke="#3a465e" stroke-width="2"/>
+    <rect x="913" y="255" width="164" height="8" rx="4" fill="#4ade80"/>
+    <circle cx="936" cy="290" r="12" fill="#0e1119" stroke="#4ade80" stroke-width="1.5"/>
+    <text x="936" y="294.5" text-anchor="middle" font-size="11.5" font-weight="700" fill="#4ade80">04</text>
+    <text x="956" y="295" font-size="16.5" font-weight="700" fill="#eef2f8">PR</text>
+    <rect x="1012" y="264" width="58" height="17" rx="8.5" fill="#0e1119" stroke="#d97757" stroke-width="1"/>
+    <text x="1041" y="276.5" text-anchor="middle" font-size="9.5" fill="#e08a68">✳ agent</text>
+    <text x="995" y="320" text-anchor="middle" font-size="11" fill="#97a3b8">opens the pull request,</text>
+    <text x="995" y="338" text-anchor="middle" font-size="11" fill="#97a3b8">evidence links baked in</text>
+    <path d="M967 380 h20 l12 8 l-12 8 h-20 z" fill="#0e1119" stroke="#4ade80" stroke-width="1.5"/>
+    <circle cx="992" cy="388" r="2" fill="#4ade80"/>
+  </g>
+
+  <!-- bounce arrows -->
+  <circle cx="775" cy="248" r="3" fill="#f87171"/>
+  <path d="M 775 248 C 775 150, 315 150, 315 248" fill="none" stroke="#f87171" stroke-width="2.5" stroke-dasharray="8 6" marker-end="url(#arrRed)"/>
+  <text x="545" y="144" text-anchor="middle" font-size="12" font-weight="700" fill="#f87171">bounce · review findings</text>
+  <text x="545" y="126" text-anchor="middle" font-size="10" fill="#7f8ca3">after limits.max_bounces → parked for attention</text>
+  <circle cx="555" cy="248" r="3" fill="#fbbf24"/>
+  <path d="M 555 248 C 555 186, 355 186, 355 248" fill="none" stroke="#fbbf24" stroke-width="2.5" stroke-dasharray="8 6" marker-end="url(#arrAmber)"/>
+  <text x="450" y="231" text-anchor="middle" font-size="12" font-weight="700" fill="#fbbf24">bounce · not fixed yet</text>
+
+  <!-- crates on the belt -->
+  <use href="#crate" x="192" y="406"/>
+  <use href="#crate" x="424" y="406"/>
+  <g transform="translate(464 404)"><circle r="8" fill="#f59e0b" stroke="#141926" stroke-width="2"/><path d="M-3.5 0.5 L-1 3 L4 -2.5" fill="none" stroke="#141926" stroke-width="2" stroke-linecap="round"/></g>
+  <use href="#crate" x="644" y="406"/>
+  <g transform="translate(684 404)"><circle r="8" fill="#38bdf8" stroke="#141926" stroke-width="2"/><path d="M-3.5 0.5 L-1 3 L4 -2.5" fill="none" stroke="#141926" stroke-width="2" stroke-linecap="round"/></g>
+  <use href="#crate" x="864" y="406"/>
+  <g transform="translate(904 404)"><circle r="8" fill="#a78bfa" stroke="#141926" stroke-width="2"/><path d="M-3.5 0.5 L-1 3 L4 -2.5" fill="none" stroke="#141926" stroke-width="2" stroke-linecap="round"/></g>
+  <use href="#crate" x="1150" y="406"/>
+  <line x1="1192" y1="406" x2="1200" y2="398" stroke="#4ade80" stroke-width="1"/>
+  <rect x="1188" y="382" width="50" height="16" rx="3" fill="#0e1119" stroke="#4ade80" stroke-width="1.2"/>
+  <text x="1213" y="394" text-anchor="middle" class="mono" font-size="10" fill="#4ade80">PR #42</text>
+
+  <!-- merge gate -->
+  <rect x="1136" y="302" width="108" height="138" fill="#4ade80" opacity="0.05"/>
+  <rect x="1120" y="296" width="16" height="144" rx="3" fill="#1e2534" stroke="#3a465e" stroke-width="1.5"/>
+  <rect x="1244" y="296" width="16" height="144" rx="3" fill="#1e2534" stroke="#3a465e" stroke-width="1.5"/>
+  <circle cx="1190" cy="254" r="12" fill="#4ade80" opacity="0.18"/>
+  <circle cx="1190" cy="254" r="6" fill="#4ade80"/>
+  <rect x="1104" y="262" width="172" height="40" rx="8" fill="#0e1119" stroke="#4ade80" stroke-width="2"/>
+  <text x="1190" y="280" text-anchor="middle" font-size="12.5" font-weight="700" fill="#4ade80">CI · BOTS · HUMANS</text>
+  <text x="1190" y="295" text-anchor="middle" font-size="9.5" fill="#8fa0b8">rides the PR to merge</text>
+  <text x="1190" y="528" text-anchor="middle" font-size="10.5" fill="#66738a">review comments wake the worker</text>
+
+  <!-- merged + teardown -->
+  <text x="1400" y="390" text-anchor="middle" font-size="13" font-weight="700" fill="#4ade80">MERGED</text>
+  <circle cx="1400" cy="414" r="16" fill="#4ade80" opacity="0.15"/>
+  <circle cx="1400" cy="414" r="9" fill="#4ade80"/>
+  <use href="#crate" transform="translate(1322 414) rotate(18)"/>
+  <rect x="1330" y="446" width="140" height="10" rx="3" fill="url(#hz)" stroke="#3a465e" stroke-width="1"/>
+  <rect x="1330" y="456" width="140" height="60" rx="8" fill="#1a212f" stroke="#3a465e" stroke-width="2"/>
+  <path d="M 1394 496 A 11 11 0 1 1 1411 486" fill="none" stroke="#8fa0b8" stroke-width="2.5" marker-end="url(#arrMuted)"/>
+  <text x="1400" y="545" text-anchor="middle" font-size="12" fill="#97a3b8">teardown</text>
+  <text x="1400" y="561" text-anchor="middle" font-size="10.5" fill="#66738a">worktree recycled</text>
+
+  <!-- floor caption -->
+  <text x="760" y="600" text-anchor="middle" font-size="12.5" fill="#66738a">one herdr worktree per item · one agent per station · handoffs ride the belt · no LLM tokens spent watching</text>
+</svg>

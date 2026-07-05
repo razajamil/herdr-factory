@@ -1,34 +1,43 @@
 # herdr-factory — Architecture
 
-> **⚠️ Belt redesign (current model — read this first).** The pipeline is no longer a fixed
-> per-source `fix → review → pr`. Config now has two top-level lists: **`work_sources`** (backends:
-> *where* work is pulled — `jira` / `local_markdown`, with no pipeline) and **`belt`** (*what* to do
-> with it). A **belt** pairs a source with an ordered pipeline and has a `belt_type`:
-> - **`work_to_pull_request`** — the engine-owned `fix → review → pr` flow + the PR-watch/merge
->   lifecycle (`reviewing` phase, resolver). This is exactly the pipeline the sections below
->   describe; it now lives on a belt and is gated by belt selection.
-> - **`custom`** — user-defined ordered `steps[]`, each with its own `prompt_file`, fully
->   agent-driven: the run ends when the **last** step signals `step-done` (no PR, no `reviewing`).
->
-> The `agents.{fix,review,pr}` block + `workspace_name` + `priority` moved **off the source and
-> onto the belt**. Belt selection is programmatic: at claim time belts are walked in `priority`
-> order and the first whose `match` predicate (a `.ts` default export `(ctx)=>boolean`) accepts an
-> item claims it (first match wins; no `match` ⇒ accept all). A run records its `belt` + active
-> `step` columns. Phases collapsed to `claiming | running | waiting_for_human | reviewing |
-> tearing_down | done | attention` (the active step is on `run.step`; `waiting_for_human` is the
-> ask-human park); `StepName` is now `string`; `prompt_type` is gone.
-> Prompt model: a `work_to_pull_request` step uses the engine-shipped prompt, optionally **augmented**
-> by an `agents.<step>.prompt_file`; a `custom` step's body is its (required) `prompt_file`. Each
-> `prompt_file` has a `prompt_file_source` — `config` (the repo's config folder, read at load) or
-> `repo` (the target repo checkout, read from the run's worktree at render time) — and every step
-> gets an injected handover scaffold. Outcomes gained `completed` and WorkState
-> gained `done` for custom-belt terminals. Migration v7 adds `runs.belt`/`runs.step` and widens the
-> `work_items.status` CHECK. **Where the prose below says "per source pipeline / `agents` /
-> `prompt_type` / fix→review→pr is universal," read it as the `work_to_pull_request` belt** — the
-> mechanics (worktree, per-step gate, handoff, PR watch) are unchanged; only their configuration
-> home and selection moved. The README reflects the new model end-to-end.
+Autonomous work → PR factory that runs Claude worker agents across one or
+more repos, on top of [herdr](https://herdr.dev) worktrees. A single idempotent
+reconciler (`reconcileRepo`, looped by the resident **`serve`** daemon — one process
+that ticks every configured repo and exposes a local HTTP API), pulls eligible work
+from the repo's **work sources**, claims each item onto a **belt** (priority order,
+first `match` wins), spins up one herdr worktree + one worker agent per belt step, and —
+for a `work_to_pull_request` belt — watches the PR and tears the worktree down on
+merge/close. The server is kept alive by a **stateless `ensure-up` supervisor** run on
+a schedule (a launchd job on macOS, a systemd `--user` timer on Linux) — see
+[§12](#12-server--supervision).
 
-> **Reliability & scale layer (most recent pass).** A six-part hardening for the 50–100
+**Work sources** are the pluggable front of the engine (`work_sources`, ≥1 per repo): *where*
+work is pulled, with no pipeline attached. Two types ship today — `jira` (poll a board; status
+of record lives in Jira) and `local_markdown` (a folder of `*.md` briefs; lifecycle tracked
+internally in SQLite). A source is just a `type` + an optional unique `name` (default = the
+type) + its backend block.
+
+**Belts** are the pipelines (`belt`, ≥1 per repo): *what* to do with the work. A belt pairs a
+`source` with an ordered list of steps and carries the `workspace_name` branch template, a
+`priority`, and an optional programmatic `match` predicate (a `.ts` default export
+`(ctx) => boolean`, sync or async, with `ctx = { item, source: { name, type } }`; no `match` ⇒
+accept all) — at claim time belts are walked in priority order and the first that accepts an
+item claims it (**first match wins**). Two `belt_type`s ship:
+
+- **`work_to_pull_request`** — the engine-owned `fix → evidence → review → pr` flow (evidence is
+  opt-in — see [§7](#7-the-reconciler--multi-agent-pipeline)) + the PR-watch/merge lifecycle
+  (`reviewing` phase, resolver).
+- **`custom`** — user-defined ordered `steps[]`, each with its own `prompt_file` as the whole
+  step body, fully agent-driven: the run ends when the **last** step signals `step-done`
+  (no PR, no `reviewing`).
+
+A run records its `belt` + active `step`; phases are `claiming | running | waiting_for_human |
+reviewing | tearing_down | done | attention` (`waiting_for_human` is the ask-human park,
+`attention` the operator park). `repo` and `limits` stay repo-global; everything downstream of
+"here is an eligible item" — the worktree, the step gate, the handoff, the watch — is
+source-agnostic.
+
+> **Reliability & scale layer.** A six-part hardening for the 50–100
 > active-run regime, described inline throughout: **(1)** hard timeouts on every external call +
 > a wedged-tick watchdog (`/health` reports per-repo `lastTickAt`/`tickStale`; `ensure-up`
 > restarts on staleness — §5, §12); **(2)** herdr-unreachable ≠ pane-dead, with two-strike absence
@@ -40,22 +49,6 @@
 > **(6)** rate limiting — a Jira token bucket + Retry-After-honoring retries, one batched GitHub
 > GraphQL query per tick for all watched PRs, human-reply poll backoff, and per-tick claim
 > admission (§5, §7). Migrations v10–v13.
-
-Autonomous work → PR factory that runs Claude worker agents across one or
-more repos, on top of [herdr](https://herdr.dev) worktrees. A single idempotent
-reconciler (`reconcileRepo`, looped by the resident **`serve`** daemon — one process
-that ticks every configured repo and exposes a local HTTP API), pulls eligible work
-from one or more **work sources** (a Jira board, a folder of markdown briefs, …) in
-priority order, spins up one herdr worktree + Claude worker per item, watches the PR,
-and tears the worktree down on merge/close. The server is kept alive by a **stateless
-`ensure-up` supervisor** run on a schedule (one launchd job) — see [§12](#12-server--supervision).
-
-**Work sources** are the pluggable front of the engine. Each repo configures an ordered,
-priority-ranked list of them (`work_sources`); two types ship today — `jira` (poll a board;
-status of record lives in Jira) and `local_markdown` (a folder of `*.md` files; lifecycle
-tracked internally in SQLite). Everything downstream of "here is an eligible item" — the
-worktree, the fix→review→pr pipeline, the watch — is source-agnostic. `workspace_name` and the
-pipeline `agents` are configured **per source**; `repo` and `limits` are repo-global.
 
 This document is the canonical design of the TypeScript implementation
 (run directly by Node's built-in type stripping, no build step) backed by SQLite.
@@ -89,7 +82,7 @@ This document is the canonical design of the TypeScript implementation
 
 | Concern | Choice |
 |---|---|
-| Language / runtime | TypeScript on Node ≥24, run via **native type stripping** (no build step) |
+| Language / runtime | TypeScript on Node ≥26 (`.node-version` pins the exact build — **vendored** into `<state>/runtime/` in managed installs), run via **native type stripping** (no build step) |
 | CLI | **commander** |
 | State store | **node:sqlite** (`DatabaseSync` — Node built-in, synchronous; no native module) |
 | Config | **`yaml`** + **`zod`** (parse + validate → types) |
@@ -97,23 +90,29 @@ This document is the canonical design of the TypeScript implementation
 | Local API server | **Hono** on **`@hono/node-server`** (resident `serve`, 127.0.0.1); **`@hono/zod-openapi`** validates requests + generates the OpenAPI doc, **`@hono/swagger-ui`** at `/ui`; native **`fetch`** clients |
 | HTTP (Jira REST) | **`clients/http.ts`** — an **Effect**-based pipeline over native `fetch`: interruption-wired timeouts, a shared token bucket, and `Schedule` retries (exponential + jitter) honoring `Retry-After` |
 | Effects / concurrency | **`effect`** — the HTTP retry/rate-limit pipeline, bounded-concurrency Phase A (`Effect.forEach`), and the OpenTelemetry runtime (`@effect/opentelemetry`) |
+| Evidence upload | **`@aws-sdk`** (`client-s3` + `lib-storage` multipart; ambient credential chain — no `aws` CLI) |
+| TUI | **`@opentui/core`** (native renderer — Node ≥26 with FFI; the launcher adds the flags) |
 | Tests | **vitest** (dev-only) |
-| External CLIs | **herdr**, **gh**, **git** |
+| External CLIs | **herdr**, **gh**, **git** (+ **claude**, launched inside herdr panes) |
 
 Runtime dep footprint: `commander`, `yaml`, `zod`, `hono` + `@hono/node-server` +
-`@hono/zod-openapi` + `@hono/swagger-ui`, `effect` (+ the OpenTelemetry exporters and the AWS SDK
-for evidence upload) — all pure-JS. SQLite is Node's built-in `node:sqlite` — no native module.
-Everything else is Node built-ins or the external CLIs; the `.ts` sources run unbuilt via Node's
-native type stripping (which is also why the code avoids TS **constructor parameter properties** —
-strip-only mode rejects them at runtime even though `tsc` and vitest accept them).
+`@hono/zod-openapi` + `@hono/swagger-ui`, `effect` (+ the OpenTelemetry exporters, `mime-types`,
+and the AWS SDK for evidence upload) — all pure-JS. SQLite is Node's built-in `node:sqlite` — the
+engine has no native module (`@opentui/core`'s prebuilt native renderer is TUI-only, resolved per
+platform by pnpm). Everything else is Node built-ins or the external CLIs; the `.ts` sources run
+unbuilt via Node's native type stripping (which is also why the code avoids TS **constructor
+parameter properties** — strip-only mode rejects them at runtime even though `tsc` and vitest
+accept them). In a managed install Node itself is **vendored**: `install.sh` / the self-updater
+download the `.node-version`-pinned build into `<state>/runtime/<ver>` (SHA-256-verified against
+`SHASUMS256.txt`) and flip an atomic `current` symlink — no system Node, no version manager.
 
 ---
 
 ## 3. Layered architecture
 
 ```
-  launchd · StartInterval ──► ensure-up ──spawns / health-checks──► serve.ts (resident daemon)
-  (one job: launchd.ts)                                               │  Hono API @127.0.0.1
+  launchd / systemd timer ─60s─► ensure-up ──spawns / health-checks──► serve.ts (resident daemon)
+  (one job: watchers/service.ts)                                      │  Hono API @127.0.0.1
                                                                       │  + per-repo tick loops
   herdr-factory <cmd> ──► cli/index.ts ──POST /repos/:repo/… (else in-process)─┤
   (--repo · dispatch · --json)        via server/client.ts             │
@@ -141,17 +140,19 @@ Tests substitute fakes + `:memory:` SQLite.
 
 ```
 herdr-factory/
-  package.json  tsconfig.json  README.md  docs/ARCHITECTURE.md
+  package.json  tsconfig.json  README.md  docs/ARCHITECTURE.md  install.sh
   bin/herdr-factory          cwd-robust launcher → `node src/cli/index.ts` (resolves its own dir through
-                          symlinks; runs Node >= 24 — active, else the baked node-path; symlinked into ~/.local/bin)
-  .node-version              pins node 24 for this package (read by nvm/fnm/asdf/mise)
+                          symlinks; Node >= 26 — active, else the baked node-path; no args → the TUI)
+  bin/herdr-factory-tui      TUI launcher: same Node resolution + --experimental-ffi (opentui's renderer)
+  .node-version              exact Node pin (26.x) — drives the vendored-runtime provisioning
   src/
     cli/index.ts          commander program; routes via server (else in-process), dispatches
     build-deps.ts         buildDeps(repo) — shared by the server + every command's local path
     resolve.ts            pure resolveSourceName / resolveActiveRun (throw, not exit; CLI+server)
-    config.ts             env + repos/<name>/config.yml → zod → typed Config (work_sources[]);
-                          listConfiguredRepos + server path/port helpers
-    types.ts              shared domain types (incl. WorkState, WorkItem)
+    config.ts             env + repos/<name>/config.yml → zod → typed Config (work_sources[] + belt[]);
+                          listConfiguredRepos + server path/port helpers + the editor JSON Schema
+    doctor.ts             the doctor checks: managed / you-provide / per-repo (--deep = live probes)
+    types.ts              shared domain types (incl. Phase, WorkState, WorkItem)
     version.ts            VERSION = package version + git HEAD sha (a new commit changes it, so
                           ensure-up restarts an outdated serve — stamped into /health + server.json)
     server/
@@ -160,22 +161,28 @@ herdr-factory/
       schemas.ts          zod request/response schemas + createRoute defs (validation + the doc)
       client.ts           CLI side: readServerInfo / pingHealth / serverFetch / viaServerOrLocal
     watchers/
-      launchd.ts          one supervisor job (com.herdr-factory.server) running `ensure-up`
-      supervisor.ts       stateless `ensure-up` / `stopServer` (health-check + detached serve spawn)
-      updater.ts          selfUpdate: git fetch + hard-reset to upstream (HERDR_FACTORY_AUTO_UPDATE)
+      service.ts          platform dispatch: darwin → launchd.ts · linux → systemd.ts
+      launchd.ts          the macOS LaunchAgent (com.herdr-factory.server) running `ensure-up`
+      systemd.ts          the Linux systemd --user service + timer (herdr-factory.timer)
+      supervisor.ts       stateless `ensure-up` / killServer (health-check + detached serve spawn)
+      updater.ts          selfUpdate: git fetch + hard-reset to upstream (HERDR_FACTORY_AUTO_UPDATE);
+                          re-provisions Node / re-installs deps when .node-version / the lockfile change
+      provision.ts        vendored-Node download + SHA-256 verify + atomic `current` flip
     db/{index,migrate,store,tx}.ts
     clients/{exec,http,herdr,jira,jira-source,local-markdown-source,github,git}.ts
     core/{deps,branch,step,watch,reconcile}.ts
     runtime/effect.ts        the shared Effect ManagedRuntime (also hosts the OTel layer)
     telemetry/…              OpenTelemetry spans/metrics (no-op unless HERDR_FACTORY_TELEMETRY)
-    prompts/{fix,review,pr}.md + prompts/local_markdown/fix.md  (per-source-type built-ins)
-  examples/example-repo/{config.yml, fix.md, review.md, pr.md, guidelines-prompt.md}
+    tui/…                    the opentui TUI (Dashboard · Config editor · Doctor)
+    prompts/{fix,evidence,review,pr}.md + prompts/local_markdown/fix.md  (per-source-type built-ins)
+  examples/example-repo/{config.yml, guidelines-prompt.md, match-bugs.ts, prompts/…}
   test/                   vitest
 ```
 
-Config/state live OUTSIDE any repo:
-`~/.config/herdr-factory/{env, repos/<name>/{config.yml, guidelines-prompt.md}}` and
-`~/.local/state/herdr-factory/{herdr-factory.db, <repo>/logs/}`.
+Code/config/state live OUTSIDE any repo: the managed code checkout at
+`~/.local/share/herdr-factory/` (install.sh + auto-update own it);
+`~/.config/herdr-factory/{config.schema.json, repos/<name>/{config.yml, env, guidelines-prompt.md}}`;
+`~/.local/state/herdr-factory/{herdr-factory.db, runtime/<node>/, node-path, server.json, logs/, <repo>/logs/}`.
 
 ---
 
@@ -197,12 +204,14 @@ out to `herdr …` and parses its JSON; it contains zero terminal/worktree logic
 - pane **list / current** (incl. the `focused` flag — which pane the user is viewing)
 - desktop **notifications**
 
-**The fix layout** (a tab/pane per pipeline agent) is applied by the external
+**The step layout** (a tab/pane per pipeline agent) is applied by the external
 **workspace-manager herdr plugin** on `worktree.created`. herdr-factory does **not** apply
-layouts — it relies on the plugin and simply *targets* the resulting panes: one per
-agent, from `agents.{fix,review,pr}.tab` / `.pane` in config. herdr-factory **waits** for a
-targeted pane to come up (escalating to `attention` after `layout_wait_seconds`) and only
-spawns a pane itself for steps that have **no** tab/pane configured (see [§8](#8-step-agent-model)).
+layouts — it relies on the plugin and simply *targets* the resulting panes: one per step, from a
+belt's `agents.{fix,evidence,review,pr}.tab`/`.pane` (w2pr) or a custom step's `tab`/`pane`.
+herdr-factory **waits** for a targeted pane to come up (escalating to `attention` after
+`layout_wait_seconds`) and only spawns a pane itself for steps that have **no** tab/pane
+configured — except `evidence`, which never spawns its own: with no tab/pane that step is
+skipped entirely (see [§8](#8-step-agent-model)).
 
 **herdr-factory performs git/filesystem ops ONLY for things outside herdr's model:**
 
@@ -260,7 +269,8 @@ reverse-engineered during the bash prototype.
     `focused` flag — herdr exposes no focus-change event to subscribe to, so it's polled)
 - **Work sources** — the polymorphic front of the engine. The core depends only on the
   `WorkSource` interface (in `core/deps.ts`) and the canonical `WorkState` lifecycle
-  (`todo → in_development → in_review → merged|aborted`):
+  (`todo → in_development → in_review → merged|aborted|done` — `done` is the custom-belt
+  terminal):
   - `listEligible() → Ticket[]` (todo items, in claim order)
   - `describe(key) → Ticket` (metadata for the manual `claim`)
   - `transition(key, WorkState) → boolean` (maps the canonical state onto the backend; returns
@@ -273,9 +283,10 @@ reverse-engineered during the bash prototype.
   - `askHuman(input)` / `pollHumanReply(input)` (the ask-human park: post a source-native
     question, poll for the reply — polls back off 60s→5min per question)
   - `health()` (throws if misconfigured/unreachable — the `doctor` per-source check)
-  A `SourceRuntime` bundles a source's config identity (`name`/`type`/`priority`/`workspaceName`/
-  `agents`) with its live `client`. `Deps.sources` is the priority-ordered list; `resolveSource`
-  maps a run's `work_source` back to its runtime.
+  A `SourceRuntime` bundles a source's identity (`name`/`type`) with its live `client`;
+  `resolveSource` maps a run's `work_source` back to its runtime. `Deps.belts` is the
+  priority-ordered `BeltRuntime` list (a belt's resolved config — ordered `steps`, `watchPr` —
+  plus its loaded `match` predicate); `resolveBelt` maps a run's `belt` back to its runtime.
 - **`jira.ts`** (basic auth over `clients/http.ts`) — the low-level Jira REST client:
   `listEligible()` via the Agile board endpoint `/rest/agile/1.0/board/<id>/issue?jql=…`;
   `getIssue`, `currentStatus`, `transition(key, statusName)` (case-insensitive `.to.name` match,
@@ -315,7 +326,7 @@ reverse-engineered during the bash prototype.
 
 One global DB `~/.local/state/herdr-factory/herdr-factory.db`, via Node's built-in `node:sqlite`
 (`DatabaseSync` — synchronous, no native module; still flagged *experimental*, which the pinned
-Node ≥24 keeps stable for us). `db/index.ts` sets `PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;`
+Node keeps stable for us). `db/index.ts` sets `PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;`
 then runs migrations (`schema_version` + ordered SQL). `node:sqlite` has no `.transaction()` /
 `.pragma()` helper (unlike better-sqlite3), so a small `db/tx.ts` wraps `BEGIN IMMEDIATE`/`COMMIT`/
 `ROLLBACK` (used by migrations and `acquireLock`) and PRAGMAs run via `exec`. Per-repo ticks write
@@ -456,32 +467,47 @@ the healthy path is unchanged (status moves the same tick), but a failure is ret
 exponential backoff (60s doubling, 1h cap) until the source confirms, instead of the old
 logged-then-dropped "deferred".
 
-### The pipeline
+### The pipeline (work_to_pull_request)
 
-A ticket flows through a sequence of **single-responsibility agents**, each a separate
-herdr agent in its own tab/pane, dispatched and gated by the reconciler:
+An item flows through a sequence of **single-responsibility agents**, each a separate
+herdr agent in its own tab/pane, dispatched and gated by the reconciler. The run's phase is
+`running` throughout; `run.step` names the active station:
 
-| Phase | Agent | Does | Hands off |
-|---|---|---|---|
-| `fixing` | **fix** | read ticket + images → implement → lint/type/tests → commit | `handoff-fix.md` + `step-done fix` |
-| `auto_review` | **review** | fresh-eyes review of the diff → make changes → commit | `handoff-review.md` + `step-done review` |
-| `pr_round` | **pr** | open + push the PR → drive the automated round (CI green + bot comments) | `step-done pr` → human review |
+| Step | Does | Hands off |
+|---|---|---|
+| **fix** | read the work doc + attachments → implement → lint/type/tests → commit | `handoff-fix.md` + `step-done fix` |
+| **evidence** *(opt-in)* | capture the running app (dev server + playwright screenshots/video) → publish to S3 → judge: pass forward or **bounce to fix** | `handoff-evidence.md` + `step-done` / `bounce` |
+| **review** | fresh-eyes **read-only** gate — never edits or commits: pass forward, or **bounce to fix** with findings | `handoff-review.md` + `step-done` / `bounce` |
+| **pr** | push + open the PR (evidence URLs embedded) → drive the automated round (CI green + bot comments) | `step-done pr` → human review |
 
-The agents come from the run's source's `agents.{fix,review,pr}` config (each
-`{tab?, pane?, prompt_type, prompt_file?}` — **per source**, read off the resolved
-`SourceRuntime`); `core/step.ts` holds the ordered `STEPS` descriptors that sequence them and a
-generic `reconcileStep` gates each. After `pr_round`, the run enters
-the `reviewing` human-review watch (unchanged: watches the PR, wakes a resolver).
+The steps come from the run's **belt**: for w2pr the engine defines the ordered `PR_STEPS`
+(`config.ts` — each step's budget/heartbeat/bounce-targets resolved onto a generic `StepConfig`,
+so `core/step.ts`/`reconcileStep` stay belt-agnostic), and the belt's
+`agents.{fix,evidence,review,pr}` block supplies each station's layout pane + optional
+augmenting `prompt_file`. **`evidence` is opt-in**: it verifies fix's work through an agent your
+layout provides, so it materializes only when its block sets `tab`+`pane` — otherwise the
+pipeline is fix → review → pr; it never spawns its own pane. A **bounce**
+(`bounce <KEY> fix --reason-file …`) rewinds `run.step`, writes the findings to
+`feedback-fix.md` in the worktree, clears the target's *and* the intermediate steps' completion
+so they re-run, and counts toward `max_bounces` (default 6; per-belt override; `0` disables —
+past the cap the run parks for `attention`). After the last step, the run enters the `reviewing`
+human-review watch (watches the PR, wakes a resolver). A **custom** belt runs the same machinery
+over user-defined steps with no PR watch — its last `step-done` tears the run down with outcome
+`completed`.
 
 ```mermaid
 flowchart TD
     subgraph PIPE["Pipeline — one agent per step, each in its own herdr pane"]
       direction TB
       fix["fix agent<br/>implement → verify → commit"]
-      review["review agent<br/>fresh-eyes review → commit"]
+      evidence["evidence agent (opt-in)<br/>capture app → publish → judge"]
+      review["review agent<br/>fresh-eyes READ-ONLY gate"]
       pr["pr agent<br/>open + push PR → CI / bot round"]
-      fix -->|"agent → herdr-factory step-done KEY fix<br/>(+ writes handoff-fix.md)"| review
-      review -->|"agent → herdr-factory step-done KEY review<br/>(+ writes handoff-review.md)"| pr
+      fix -->|"agent → herdr-factory step-done KEY fix<br/>(+ writes handoff-fix.md)"| evidence
+      evidence -->|"agent → step-done KEY evidence"| review
+      review -->|"agent → step-done KEY review"| pr
+      evidence -.->|"agent → herdr-factory bounce KEY fix<br/>(+ writes feedback-fix.md)"| fix
+      review -.->|"agent → herdr-factory bounce KEY fix"| fix
     end
 
     subgraph DISP["Dispatcher — core/reconcile"]
@@ -505,9 +531,9 @@ flowchart TD
 
 Every edge is labelled with the command(s) that propagate state across it, by actor:
 
-- **`agent →`** — run by the step agent in its pane. The single `herdr-factory step-done
-  KEY <step>` call is *all* an agent issues to advance the pipeline (it also writes its
-  handoff note first); the dispatcher does everything else.
+- **`agent →`** — run by the step agent in its pane. The `herdr-factory step-done KEY <step>` /
+  `bounce` / `ask-human` calls are *all* an agent issues to steer the pipeline (it also writes
+  its handoff note first); the dispatcher does everything else.
 - **`disp →`** — run by the dispatcher (`core/reconcile`) over the herdr socket
   (`herdr worktree …`, `herdr agent send`, `herdr notification show`), `gh`, and `git`,
   plus Jira REST for the status transitions (not a CLI).
@@ -561,8 +587,9 @@ by what they actually need:
   *latest* step's pane (the `reviewing` resolver reuses it). Teardown (herdr `worktree
   remove`) reaps all of a run's panes at once.
 - **Liveness:** the commit-HEAD heartbeat applies to `fix` / `pr` (they commit) but not
-  `review` (`STEPS[].heartbeat`); each step also has its own budget
-  (`develop_/review_/pr_budget_seconds`).
+  `evidence` / `review` (`StepConfig.heartbeat`; custom steps default it off); each step also has
+  its own budget (`develop_/evidence_/review_/pr_budget_seconds`; a custom step's
+  `budget_seconds`, else `step_budget_seconds`).
 - **Coordination:** on-demand `agent read` / `agent send` is agent-to-agent traffic
   *outside* the tick, so the dispatcher is no longer the sole coordinator and the DB
   timeline no longer captures every inter-agent interaction.
@@ -581,9 +608,10 @@ by what they actually need:
 ### Trade-offs (why this isn't an obvious win)
 
 - **Lossy handoffs + feedback loops.** CI failures and review comments loop *back* to
-  code-fixing, so a clean linear `fix → review → pr` relay fights the work's real,
-  iterative shape; on-demand query softens the lossy part, the loops remain.
-- **Cost & accountability.** ~3 panes / sessions per ticket vs. 1; no single agent
+  code-fixing, so a clean linear relay fights the work's real, iterative shape. The
+  evidence/review → fix **bounce** now models the biggest loop explicitly, and on-demand query
+  softens the lossy handoffs; the CI/comment loops remain in `pr` and `reviewing`.
+- **Cost & accountability.** ~3–4 panes / sessions per ticket vs. 1; no single agent
   owns the outcome end-to-end (diffusion of responsibility).
 - **Why keep the dispatcher in charge anyway:** the `pr` step does *not* re-implement
   CI watching as an idle LLM — the **tick** still owns external watching
@@ -594,11 +622,12 @@ by what they actually need:
 
 ## 8. Step-agent model
 
-Each step is a Claude agent (`core/step.ts`) dispatched **by the reconciler, never by
+Each step is an agent (`core/step.ts`) dispatched **by the reconciler, never by
 another agent**, through the shared `dispatchToLayout(tab, pane, prompt, …)` helper. Per
 step (`spawnStep`):
 
-1. **Dispatch** — two modes, by whether the step has a configured `tab`/`pane` (`src.agents.<step>`):
+1. **Dispatch** — two modes, by whether the step has a configured `tab`/`pane` (from the belt's
+   `agents.<step>` block or the custom step, resolved onto its `StepConfig`):
    - **Configured** (the user's layout owns the pane): find that pane and require an agent
      that is present **and idle** (agent-agnostic — claude *or* opencode), then `agent send`
      the prompt + Enter. If the pane isn't up yet or its agent is still busy starting up,
@@ -613,18 +642,24 @@ step (`spawnStep`):
    `run.pane_id`, the latest active pane) and reset `started_at` (now the per-step budget
    clock); set `run.focus_pending` so the worktree view can follow the active step (§7,
    *Focus follows the active step* — applied later, never stealing focus from another worktree).
-2. **Prompt** — config load resolves each step's prompt by `prompt_type`: `augment` =
-   the engine's built-in step prompt + the repo's `prompt_file` (if any) as additions; `replace`
-   = the `prompt_file` verbatim. The built-in is resolved **per source type**:
+2. **Prompt** — the step body is resolved by belt type: a **w2pr** step uses the engine-shipped
+   prompt, optionally **augmented** by its agent block's `prompt_file`; a **custom** step's body
+   *is* its (required) `prompt_file`. Each `prompt_file` carries a `prompt_file_source` —
+   `config` (the repo's config folder, read + existence-checked at load) or `repo` (the target
+   repo checkout, read from the run's **worktree at render time**, so prompts can live
+   version-controlled next to the code). The built-in is resolved **per source type**:
    `src/prompts/<type>/<step>.md` if present, else the shared `src/prompts/<step>.md` (so
-   `local_markdown` gets its own `fix` prompt pointing at `task.md` / `task/`, while review/pr share
-   the defaults). `renderStepPrompt` then substitutes tokens (`@@KEY@@`, `@@WORK_DOC@@` —
-   `ticket.json` for Jira; `task.md` (file) or `task/` (directory) for local_markdown, detected from
-   what `materialize` wrote into the worktree — `@@WORK_DOC_KIND@@`, `@@HANDOFF_IN@@`, `@@PRIOR_PANE@@`,
-   `@@STEP_DONE_CMD@@` — which carries `--source` so the signal resolves unambiguously, …) into
-   that resolved prompt, appends `guidelines-prompt.md`, and appends a standard footer that points
-   the agent at its inputs and tells it to write its handoff note + signal `step-done`. The rendered prompt is written to
-   `.memory/herdr-factory/prompt-<step>.md`; the agent is told to read it.
+   `local_markdown` gets its own `fix` prompt pointing at `task.md` / `task/`, while
+   evidence/review/pr share the defaults). `renderStepPrompt` then substitutes tokens (`@@KEY@@`,
+   `@@WORK_DOC@@` — `ticket.json` for Jira; `task.md` (file) or `task/` (directory) for
+   local_markdown, detected from what `materialize` wrote into the worktree —
+   `@@WORK_DOC_KIND@@`, `@@HANDOFF_IN@@`, `@@PRIOR_PANE@@`/`@@PRIOR_SESSION@@`,
+   `@@STEP_DONE_CMD@@`/`@@BOUNCE_CMD@@`/`@@EVIDENCE_UPLOAD_CMD@@` — each carrying `--source` so
+   the signal resolves unambiguously, …), appends `guidelines-prompt.md`, and appends the
+   **handover scaffold**: where you are in the belt, the prior step's handoff + session pointer,
+   the ask-human protocol, the bounce protocol (when the step declares `canBounceTo`), and the
+   finish protocol — write your handoff note, then signal `step-done`. The rendered prompt is
+   written to `.memory/herdr-factory/prompt-<step>.md`; the agent is told to read it.
 3. **Handoff out** — before signalling, the agent writes
    `.memory/herdr-factory/handoff-<step>.md` (did / why / uncertain / verify-next).
 4. **Signal** — `herdr-factory --repo <name> step-done <KEY> <step>` sets the step's `done`
@@ -651,8 +686,9 @@ so live Q&A is available — at the cost of up to 3 panes/sessions per run.
 ### Per-step liveness
 
 The tick's watchdog (`reconcileStep`) gates each step on `step-done`, with safety nets:
-the commit-HEAD **stall** heartbeat (`fix` / `pr` only — `review` may not commit) and a
-per-step **budget** (`develop_/review_/pr_budget_seconds`). Past the budget while the
+the commit-HEAD **stall** heartbeat (`fix` / `pr` only — `evidence`/`review` don't commit) and a
+per-step **budget** (`develop_/evidence_/review_/pr_budget_seconds`; custom steps
+`budget_seconds` else `step_budget_seconds`). Past the budget while the
 agent isn't actively `working`, or stalled past `stall_seconds`, the run → `attention`.
 
 **Liveness never acts on uncertainty.** herdr being unreachable (`HerdrUnreachableError`) defers
@@ -728,35 +764,64 @@ from being claimed again).
       / `step_budget_seconds` (custom-step default) / `tick_interval_seconds`
       / `reconcile_concurrency` (Phase-A parallelism, default 8) / `max_claims_per_tick`
       (claim admission, default 10) / `layout_wait_seconds`.
-    - `work_sources` — **required, ≥1**, an ordered list (`zod` discriminated union on `type`).
-      Each entry:
+    - `work_sources` — **required, ≥1** (`zod` discriminated union on `type`, `.strict()`
+      members — unknown keys are parse errors). Each entry is identity + backend only, no
+      pipeline:
       - `type` — `jira` | `local_markdown`.
       - `name` — optional identifier, **default = `type`**, must be unique within the repo
         (validated on the *resolved* names, so two unnamed `jira` sources collide). Stored on each
         run's `work_source`. **The pre-existing Jira source must keep the default name `jira`** so
         v6-backfilled in-flight runs resolve.
-      - `priority` — optional, default `100`; **lower = pulled first**; ties break by list order.
-      - `workspace_name` — **per source** now. Branch-name template (worktree + workspace derive
-        from it). Vars: `{{work_id}}` `{{work_slug}}` (≤20) `{{work_full_slug}}` (≤50)
-        `{{work_type}}` `{{semantic_work_prefix}}` (`fix`/`chore`/`feature`). zod requires `{{work_id}}`.
-        Default `{{semantic_work_prefix}}/{{work_id}}-{{work_full_slug}}`. A short per-run uid
-        (`deps.uid()`) is appended to the rendered name so each claim — incl. a re-claim of a merged
-        ticket — gets a distinct branch (the pr step's `prForBranch` then can't match a stale merged
-        PR on a reused branch name). (Keys should be unique across
-        sources, and per-source templates should differ, so two sources can't collide on a branch.)
-      - `agents` — **per source**, required, one block each for `fix`/`review`/`pr`: `tab`/`pane`
-        (optional, both-or-neither) + `prompt_type` (required, no default: `augment` | `replace`)
-        + `prompt_file`. `augment` combines the per-type built-in (`src/prompts/<type>/<step>.md`,
-        else `src/prompts/<step>.md`) with the optional `prompt_file`; `replace` sends `prompt_file`
-        verbatim (required).
-      - type block: `jira` (`base_url` / `project` / `board` / `label` / 3 `status` names —
-        `merged`/`aborted` are intentionally absent, so teardown never transitions Jira) **or**
-        `local_markdown` (`folder`).
+      - type block: `jira` (`base_url` / `project` / `board` / `label`, default `agent` / 3
+        `status` names, defaulted `To Do`/`In Progress`/`In Review` — `merged`/`aborted` are
+        intentionally absent, so teardown never transitions Jira) **or** `local_markdown`
+        (`folder`).
+    - `belt` — **required, ≥1** (`zod` discriminated union on `belt_type`, `.strict()` members —
+      `agents` on a `custom` belt is a parse error, not silently ignored). Common fields:
+      - `name` (unique) · `source` (must reference a `work_sources` name) · `priority` (optional,
+        default `100`; **lower = matched first**; ties keep config order — stable sort).
+      - `match` — optional path (relative to the repo's config folder) to a `.ts` module whose
+        default export is `(ctx) => boolean` (sync or async),
+        `ctx = { item, source: { name, type } }`; no `match` ⇒ accept everything from the source.
+      - `workspace_name` — optional branch-name template (worktree + workspace derive from it).
+        Vars: `{{work_id}}` (required by zod) `{{work_slug}}` (≤20) `{{work_full_slug}}` (≤50)
+        `{{work_type}}` `{{semantic_work_prefix}}` (`fix`/`chore`/`feature`). Default
+        `{{semantic_work_prefix}}/{{work_id}}-{{work_full_slug}}`. A short per-run uid
+        (`deps.uid()`) is appended to the rendered name so each claim — incl. a re-claim of a
+        merged ticket — gets a distinct branch (the pr step's `prForBranch` then can't match a
+        stale merged PR on a reused branch name).
+      - `max_bounces` — optional per-belt override of `limits.max_bounces`.
+      - **`belt_type: work_to_pull_request`** adds `agents`: one block each for `fix`/`review`/
+        `pr` (required; `{}` is fine — the factory spawns the pane) and `evidence` (**opt-in**:
+        the step runs only when its block sets `tab`+`pane`, else it's skipped and the pipeline
+        is fix → review → pr). Each block: `tab`/`pane` (optional, both-or-neither) + an optional
+        `prompt_file` (+ required `prompt_file_source`: `config` | `repo`) that **augments** the
+        engine's per-type built-in (`src/prompts/<type>/<step>.md`, else `src/prompts/<step>.md`).
+      - **`belt_type: custom`** adds `steps[]` (≥1): each `{ name` (lowercase slug, unique within
+        the belt)`, prompt_file + prompt_file_source` (required — the whole step body)`,
+        tab?/pane?, budget_seconds?` (default `limits.step_budget_seconds`)`, heartbeat?`
+        (default false) `}`. Custom steps don't (yet) declare evidence/bounce.
+    - `evidence` — optional repo-wide block: where the evidence step publishes captures.
+      `bucket` + `region` + `cloudfront_domain` (required together), optional `key_prefix` /
+      `profile` / `github_username` (default: the `gh` login at upload time). Non-secret
+      pointers only — AWS creds come from the ambient credential chain (or the named `profile`);
+      upload is pure `@aws-sdk` (multipart via `lib-storage`), keys under
+      `herdr-factory/<github_username>/<key_prefix>/<key>/<runId>-<timestamp>/`. Omit the block
+      and evidence still captures/assesses/bounces — it just publishes nothing
+      (`doctor --deep` verifies with a real S3 write probe).
   - `guidelines-prompt.md` — optional; appended verbatim to every agent prompt (all sources).
-- **Global secrets** stay the same: `JIRA_EMAIL` / `JIRA_API_TOKEN` (auth only; *where* a Jira
-  source polls is its per-source `base_url`).
+- **Editor schema** — each `config.yml`'s modeline
+  (`# yaml-language-server: $schema=../../config.schema.json`) points at a JSON Schema generated
+  from this same zod schema (`z.toJSONSchema`, so it can't drift): autocomplete + unknown-key
+  errors in any editor. `herdr-factory install`/`schema` write it to
+  `<configDir>/config.schema.json`; a committed repo-root copy serves the in-repo example
+  (`npm run schema`, drift-guarded by a test). The structural schema can't express the
+  cross-field rules — those stay at load time (below).
 - `config.ts` asserts `repo.path` is a **main checkout** (not a linked worktree), since herdr can't
-  create worktrees from one. The work-source *clients* are constructed in `build-deps.ts`'s `buildDeps`
+  create worktrees from one. The other load-time cross-field checks: unique source/belt/step names,
+  every `belt.source` references a configured source, tab/pane both-or-neither, `{{work_id}}` in
+  `workspace_name`, and `match` / `config`-sourced `prompt_file` existence — all with readable
+  errors. The work-source *clients* are constructed in `build-deps.ts`'s `buildDeps`
   (the `local_markdown` client needs the `Store`); `config.ts` stays pure data + prompt resolution.
 
 Onboarding a repo is pure data: drop a `repos/<name>/` folder, define its herdr layout
@@ -778,18 +843,23 @@ herdr-factory --repo <name> step-done <KEY> <step> [--source <name>]  # agent �
 herdr-factory --repo <name> ask-human <KEY> <step> --question[-file] …  # agent → park until a human replies
 herdr-factory --repo <name> bounce <KEY> <toStep> --reason[-file] …     # agent → send work back for rework
 herdr-factory --repo <name> evidence-upload <KEY> [--source <name>]    # publish captured evidence (S3)
-herdr-factory --repo <name> runs [--all] | timeline <KEY> | logs [N]   # read the DB / repo log
+herdr-factory --repo <name> runs [--all] | timeline <KEY> | logs [n]   # read the DB / repo log
 # machine-wide (no --repo)
 herdr-factory serve                       # the resident daemon: tick every repo + Hono API (+ /doc, /ui)
 herdr-factory ensure-up [--restart]       # supervisor one-shot: auto-update + (re)start serve if down/wedged/outdated
 herdr-factory restart                     # graceful restart of the running server (pick up new code)
 herdr-factory update                      # pull latest (hard reset to upstream) + restart onto it
 herdr-factory reload                      # hot-reload config + re-discover repos (no restart)
-herdr-factory install | uninstall | start | stop   # the one supervisor launchd job
-herdr-factory capture-lock acquire|release <owner> # machine-global capture lock
-herdr-factory doctor                      # herdr / gh / claude / per-source health / server / db
+herdr-factory provision-node              # (re)download the pinned vendored Node runtime
+herdr-factory schema [--stdout]           # write the config.yml JSON Schema for editors
+herdr-factory install | uninstall | start | stop   # the supervisor service (launchd / systemd)
+herdr-factory capture-lock acquire|release [owner] # machine-global capture lock
+herdr-factory doctor [--deep] [--repo <name>]      # managed / you-provide / per-repo health (--deep: live probes)
 herdr-factory help
 ```
+
+Plain `herdr-factory` (no arguments) opens the **TUI** (Dashboard · Config editor · Doctor) via
+`bin/herdr-factory-tui`.
 
 **Server routing.** The mutating + nudge commands (`tick`, `step-done`, `ask-human`, `bounce`,
 `resume`, `claim`, `teardown`) route through the running server (`POST /repos/:repo/…`) when it's
@@ -801,8 +871,11 @@ no server needed); the server exposes the same reads as JSON (`GET /repos/:repo/
 web UI ([§16](#16-web-ui-future)).
 
 `eligible` lists todo items **across all sources** (each annotated with its `source`). `doctor`
-runs a **per-source** `health()` check (Jira auth/board; local_markdown folder exists) plus a
-server-liveness line. `claim` takes `--belt` (defaulted when there's a single belt, required
+reports three groups: **managed** (node runtime ≥26 — vendored or ambient, auto-update upstream,
+supervisor service loaded, server responding, DB present), **you-provide** (`git` / `herdr` /
+`gh` / `claude` on PATH; `--deep` exercises herdr and `gh auth status`), and — with `--repo` —
+**per-repo** (config loads + valid, main checkout, origin resolved, per-source `health()`, Jira
+secrets present, and a `--deep` S3 write-probe of the evidence bucket). `claim` takes `--belt` (defaulted when there's a single belt, required
 when >1); `teardown`/`step-done`/`ask-human`/`bounce`/`resume` resolve the run by key and take
 `--source` to disambiguate when a key is active in more than one source (the agent's rendered
 commands always carry `--source`).
@@ -852,8 +925,11 @@ what the old per-repo `watch` did, but collapsed into a single process plus a lo
   in-flight tick finish (idempotent + on-disk, so a hard kill is safe too), remove `server.json`,
   exit 0.
 
-**Supervision is a stateless scheduled `ensure-up`.** One launchd job, `com.herdr-factory.server`,
-runs `herdr-factory ensure-up` on `StartInterval` (60s). `ensure-up` is a **one-shot**: optionally
+**Supervision is a stateless scheduled `ensure-up`.** One machine-wide job — a launchd
+LaunchAgent `com.herdr-factory.server` on macOS, a systemd `--user` timer `herdr-factory.timer`
+on Linux (`watchers/service.ts` dispatches by platform; the installer runs
+`loginctl enable-linger` so it survives logout) — runs `herdr-factory ensure-up` every 60s.
+`ensure-up` is a **one-shot**: optionally
 self-update (see *Updates* below), then read `/health`; if healthy **and** the version matches
 **and no repo's tick loop is stale** → no-op; else kill any stale/wedged pid and spawn a detached
 `serve`. The kill is graceful-first with a grace period sized to the server's own drain: `POST
@@ -872,28 +948,35 @@ an unresponsive server. Item-1 timeouts make this belt-and-braces (every externa
 bounded, so ticks are finite by construction), and the restart is what stops a wedged holder's
 lock heartbeat so its locks expire.
 
-- `ProgramArguments = [node, "<abs>/src/cli/index.ts", "ensure-up"]`; `EnvironmentVariables` = captured
-  `PATH` + `HOME` (no experimental flags needed — native type stripping and `node:sqlite` are both
-  usable without flags on Node ≥24). Secrets aren't in the plist; `serve` re-reads the env file per repo.
+- `ProgramArguments`/`ExecStart` = `[<node>, "<abs>/src/cli/index.ts", "ensure-up"]`, where
+  `<node>` is `resolvedNodePath(process.execPath)` — in a managed install the **vendored**
+  `runtime/current/bin/node`, so a `.node-version` bump takes effect on the next spawn without
+  reinstalling the service. Environment = captured `PATH` + `HOME` plus the
+  `HERDR_FACTORY_*`/`OTEL_*` allowlist (no experimental flags needed — native type stripping and
+  `node:sqlite` are flag-free on Node ≥26). Secrets aren't in the service definition; `serve`
+  re-reads the env file per repo.
 - **Why a scheduled one-shot, not `KeepAlive` on `serve`.** A one-shot supervisor is itself immune
   to the per-user launchd interval-timer wedging that bit the old resident `watch` after sleep/wake
   (a missed beat is harmless — `serve` self-sustains between runs), it detects a **wedged-but-alive**
   server (which `KeepAlive` can't — it only reacts to process death), and "run a command on a
-  schedule" is the portable seam for systemd timers / cron / Task Scheduler later. `install` also
+  schedule" is the portable seam — it's what made the Linux port one new file (`systemd.ts`), and
+  Windows Task Scheduler would be the same seam. `install` also
   boots out any legacy per-repo `com.herdr-factory.<repo>` `watch` jobs so an upgrade is clean.
 - **Updates are fully unattended.** Each `ensure-up` tick first runs the **supervised updater**
   (`watchers/updater.ts`, on by default — set `HERDR_FACTORY_AUTO_UPDATE=0` to disable): `git fetch`
-  + a **hard reset** to the current branch's upstream (`@{u}`), resolved against the package dir, plus
-  a `pnpm`/`npm install` if `package.json`/`pnpm-lock.yaml` changed (no native modules → no rebuild).
+  + a **hard reset** to the current branch's upstream (`@{u}`), resolved against the package dir;
+  then, when `.node-version` changed, **re-provisions the vendored Node** (download + SHA-256
+  verify + atomic `current` flip — a Node bump also forces the dep re-install); and a
+  `pnpm`/`npm install` when `package.json`/`pnpm-lock.yaml` changed.
   Best-effort: any git/network failure logs and is skipped, never breaking the tick. When the reset
   lands new code, ensure-up **forces a restart** (the running process's `VERSION` was read at start, so
   it can't rely on the version compare). Independently, `VERSION` = package version + git HEAD sha, so
   *any* code change also trips the version-mismatch restart on the next tick. `herdr-factory restart`
   (= `ensure-up --restart`) forces a restart now; `herdr-factory update` runs the updater + restart on
   demand (and works even when auto-update is disabled). The hard reset discards local edits on the
-  daemon machine — by design (see §14). Note `HERDR_FACTORY_AUTO_UPDATE` only takes effect where
-  `ensure-up` actually runs — the launchd plist currently bakes only `PATH`/`HOME`, so disabling it
-  for the supervised path means adding the var to the plist (or just committing/pushing your code).
+  daemon machine — by design (see §14). Note `HERDR_FACTORY_AUTO_UPDATE` is captured into the
+  service environment **at install time** (the launchd/systemd env allowlist) — change it by
+  re-running `herdr-factory install` with the variable set, or just commit/push your code.
 
 ---
 
@@ -982,15 +1065,16 @@ Hard-won from the bash prototype — encode as types/tests/asserts:
   no server up (`viaServerOrLocal` falls back to in-process), so a worker's `step-done` lands even
   mid-restart. Errors from a *reached* server propagate (they're not a `NoServerError` → no
   fallback); only unreachability falls back.
-- **Runtime requires Node ≥ 24; no native modules.** The `.ts` sources run via native
-  type-stripping and state lives in the built-in `node:sqlite` — both need Node ≥ 24, and neither
-  is ABI-coupled (there is no compiled `.node` to match). The CLI is invoked by worker agents **from
-  another repo's worktree**, whose `node` on PATH may be older — so `bin/herdr-factory` uses the
-  active `node` when it's ≥ 24, else re-execs with the Node 24 path the CLI self-bakes
-  (`process.execPath` → `<state>/node-path`, `config.nodePathFile`) on every ≥ 24 run; it errors
-  with guidance only if neither is available (so the first run / `install` must be under Node ≥ 24
-  to seed it). The launchd supervisor + the `serve` it spawns run under the `process.execPath` baked
-  into the plist at install time, so `install` must be run under a Node ≥ 24.
+- **Runtime requires Node ≥ 26; the engine has no native modules.** The `.ts` sources run via
+  native type-stripping and state lives in the built-in `node:sqlite`; nothing in the engine is
+  ABI-coupled (opentui's prebuilt native renderer is TUI-only). The CLI is invoked by worker
+  agents **from another repo's worktree**, whose `node` on PATH may be older — so both launchers
+  use the active `node` when it's ≥ 26, else re-exec with the baked node path
+  (`process.execPath` → `<state>/node-path`, `config.nodePathFile` — in a managed install the
+  **vendored** `runtime/current/bin/node` provisioned by install.sh / the self-updater); they
+  error with guidance only if neither is available. The supervisor service + the `serve` it
+  spawns run under `resolvedNodePath`, so a `.node-version` bump takes effect on the next spawn
+  without reinstalling the service.
 - **Self-update + `VERSION` resolve against the package dir, never the caller's cwd.** A worker
   invokes the CLI from another repo's worktree, so `version.ts` (git HEAD sha → `VERSION`) and
   `watchers/updater.ts` (`git fetch` + hard reset to `@{u}`) both run git in the herdr-factory
@@ -1042,15 +1126,23 @@ routing through the server and falling back to in-process when it's down.
 
 **Since then** (a packaging + framework pass): the state store moved from `better-sqlite3` to Node's
 built-in **`node:sqlite`** (no native module → no ABI/`mise` coupling); the launcher runs **`node`
-directly** (mise dropped, a `.node-version` pin instead) and **`pnpm` is dev-only** (`npm install
---omit=dev` to run); **`VERSION` is derived from the git HEAD sha** so any new commit auto-restarts
+directly** (mise dropped, a `.node-version` pin instead) and **`pnpm` was made optional** (since
+superseded — the installer now vendors Node and runs `pnpm install` itself, see the platform pass
+below); **`VERSION` is derived from the git HEAD sha** so any new commit auto-restarts
 `serve`; the source tree was split into **`cli/` · `server/` · `watchers/`**; the HTTP layer moved
 to **Hono** with **`@hono/zod-openapi`** request validation + a generated OpenAPI doc (`/doc`) and
 Swagger UI (`/ui`); and a **supervised auto-updater** (`watchers/updater.ts`) now `git fetch`es +
 hard-resets to upstream on each `ensure-up` tick (on by default, `HERDR_FACTORY_AUTO_UPDATE=0` to
 disable, plus a manual `herdr-factory update`).
 
-**Most recent: the reliability & scale pass** (the six-part banner at the top; migrations
+**The belt redesign + evidence** (migrations v7–v9): config split into `work_sources` + `belt`
+(priority + `match` routing, `custom` belts, the `agents`/`workspace_name` move off sources onto
+belts, `prompt_type` → `prompt_file_source`); the w2pr flow gained the **evidence** station
+(opt-in via tab/pane: playwright capture under the shared `capture-lock`, S3/CloudFront publish
+via the pure AWS SDK) and the **bounce** rework loop (evidence/review → fix, `max_bounces`
+backstop), plus `ask-human` (the `waiting_for_human` park, v8).
+
+**The reliability & scale pass** (the six-part banner at the top; migrations
 v10–v13): hard timeouts on every external call + the wedged-tick watchdog; herdr-unreachable
 distinguished from pane-death with two-strike respawn confirmation; the transition outbox +
 claim guard; the attention workflow (`resume`, parked runs off the claim cap, source write-back,
@@ -1060,6 +1152,15 @@ admission). Unit-tested throughout (`test/reconcile.test.ts` covers the outbox, 
 confirmation, attention workflow, batching and backoff; `test/exec-timeout.test.ts` the exec/
 staleness primitives) — but not yet soaked at the 50–100-run scale it targets. Watch live runs
 before trusting it fully unsupervised.
+
+**Most recent: the platform & packaging pass.** A zero-prereq **`install.sh`** (needs only
+git/curl/tar): vendors the `.node-version`-pinned Node — **≥ 26 now, one runtime for engine +
+TUI** — SHA-256-verified into `<state>/runtime/` with an atomic `current` flip, installs pnpm +
+deps, links the shims, and registers the supervisor on **macOS (launchd) or Linux (systemd
+`--user`, glibc + musl, x64 + arm64)** via the `watchers/service.ts` platform seam; the
+self-updater re-provisions Node / re-installs deps as pins change, and restarts drain gracefully
+(18s SIGKILL grace outlasting the 15s in-flight-tick drain). Ops grew the full-screen **TUI**
+(opentui: Dashboard · Config editor · Doctor) and `doctor --deep` (live herdr/gh/S3 probes).
 
 ---
 

@@ -55,8 +55,10 @@ belt:
   # can bounce back to fix if the fix isn't proven; review is a strict read-only gate that passes or
   # bounces back to fix; pr opens the PR (embedding the evidence URLs) + rides CI. An
   # `agents.{fix,evidence,review,pr}` block picks each step's layout pane (set tab+pane together for a
-  # layout your herdr setup provisions; omit both — or omit the whole `evidence` key — to have
-  # herdr-factory spawn a dedicated pane). Each agent may OPTIONALLY add a `prompt_file` (+ a required
+  # layout your herdr setup provisions; omit both to have herdr-factory spawn a dedicated pane —
+  # except `evidence`, which runs ONLY when a tab+pane targets an agent your layout provides; with
+  # no tab/pane the evidence step is skipped entirely and the belt is fix → review → pr).
+  # Each agent may OPTIONALLY add a `prompt_file` (+ a required
   # `prompt_file_source`: `config` = this folder, `repo` = the target repo checkout, read from the
   # worktree at run time) that AUGMENTS that step's engine prompt with repo-specific instructions —
   # e.g. `fix: { tab: fix, pane: agent, prompt_file: .herdr/fix-notes.md, prompt_file_source: repo }`.
@@ -68,7 +70,7 @@ belt:
     workspace_name: "{{semantic_work_prefix}}/{{work_id}}-{{work_slug}}"
     agents:
       fix: { tab: fix, pane: agent }
-      evidence: { tab: evidence, pane: agent } # optional; omit to spawn a dedicated pane
+      evidence: { tab: evidence, pane: agent } # opt-in; omit tab/pane to SKIP the evidence step
       review: { tab: review, pane: agent }
       pr: { tab: pr, pane: agent }
 
