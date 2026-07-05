@@ -12,10 +12,11 @@ a schedule (a launchd job on macOS, a systemd `--user` timer on Linux) — see
 [§12](#12-server--supervision).
 
 **Work sources** are the pluggable front of the engine (`work_sources`, ≥1 per repo): *where*
-work is pulled, with no pipeline attached. Two types ship today — `jira` (poll a board; status
-of record lives in Jira) and `local_markdown` (a folder of `*.md` briefs; lifecycle tracked
-internally in SQLite). A source is just a `type` + an optional unique `name` (default = the
-type) + its backend block.
+work is pulled, with no pipeline attached. Three types ship today — `jira` (poll a board; status
+of record lives in Jira), `local_markdown` (a folder of `*.md` briefs; lifecycle tracked
+internally in SQLite), and `github_issues` (poll a repo's open issues by trigger label; status
+of record lives on GitHub as labels + open/closed state). A source is just a `type` + an
+optional unique `name` (default = the type) + its backend block.
 
 **Belts** are the pipelines (`belt`, ≥1 per repo): *what* to do with the work. A belt pairs a
 `source` with an ordered list of steps and carries the `workspace_name` branch template, a
@@ -42,13 +43,16 @@ source-agnostic.
 > a wedged-tick watchdog (`/health` reports per-repo `lastTickAt`/`tickStale`; `ensure-up`
 > restarts on staleness — §5, §12); **(2)** herdr-unreachable ≠ pane-dead, with two-strike absence
 > confirmation before any respawn (§5, §8); **(3)** a **transition outbox** — source status
-> write-backs are persisted intents retried until delivered, with a claim guard against
-> known-stale eligibility (§6, §7); **(4)** an **attention workflow** — `resume` un-parks runs,
-> parked runs stop holding claim slots, escalations write back to the work source and re-notify
+> write-backs are persisted intents retried until delivered (a `stale` outcome — the item is gone —
+> is delivered too, and flags the run for the run-locked stale policy instead of retrying forever),
+> with a claim guard against known-stale eligibility (§6, §7); **(4)** an **attention workflow** —
+> `resume` un-parks runs, parked runs stop holding claim slots, escalations write back to the work
+> source and re-notify
 > (§8, §11); **(5)** parallel Phase A + **per-run locks** + heartbeat-extended locks (§7, §12);
-> **(6)** rate limiting — a Jira token bucket + Retry-After-honoring retries, one batched GitHub
+> **(6)** rate limiting — a Jira token bucket + a process-wide GitHub REST budget, both with
+> Retry-After-honoring retries, one batched GitHub
 > GraphQL query per tick for all watched PRs, human-reply poll backoff, and per-tick claim
-> admission (§5, §7). Migrations v10–v13.
+> admission (§5, §7). Migrations v10–v13 (v14 added the stale two-phase columns — §15).
 
 This document is the canonical design of the TypeScript implementation
 (run directly by Node's built-in type stripping, no build step) backed by SQLite.
@@ -88,7 +92,7 @@ This document is the canonical design of the TypeScript implementation
 | Config | **`yaml`** + **`zod`** (parse + validate → types) |
 | Subprocess (herdr/gh/git) | **`node:child_process`** `execFile` (arg arrays, no shell; **hard timeout on every call** — default 60s, kills the child) |
 | Local API server | **Hono** on **`@hono/node-server`** (resident `serve`, 127.0.0.1); **`@hono/zod-openapi`** validates requests + generates the OpenAPI doc, **`@hono/swagger-ui`** at `/ui`; native **`fetch`** clients |
-| HTTP (Jira REST) | **`clients/http.ts`** — an **Effect**-based pipeline over native `fetch`: interruption-wired timeouts, a shared token bucket, and `Schedule` retries (exponential + jitter) honoring `Retry-After` |
+| HTTP (Jira + GitHub REST) | **`clients/http.ts`** — an **Effect**-based pipeline over native `fetch`: interruption-wired timeouts, shared (chainable) token buckets, and `Schedule` retries (exponential + jitter) honoring `Retry-After` |
 | Effects / concurrency | **`effect`** — the HTTP retry/rate-limit pipeline, bounded-concurrency Phase A (`Effect.forEach`), and the OpenTelemetry runtime (`@effect/opentelemetry`) |
 | Evidence upload | **`@aws-sdk`** (`client-s3` + `lib-storage` multipart; ambient credential chain — no `aws` CLI) |
 | TUI | **`@opentui/core`** (native renderer — Node ≥26 with FFI; the launcher adds the flags) |
@@ -125,10 +129,11 @@ download the `.node-version`-pinned build into `<state>/runtime/<ver>` (SHA-256-
                 ▼                                 ▼
       ┌──── db/ store (SQLite) ─┐       ┌──── clients/ (thin glue) ───────┐
       │ runs · events · locks  │       │ HerdrClient  JiraClient          │
-      │ repos · migrations     │       │ GitHubClient GitClient  exec()   │
-      └────────────────────────┘       └───────────┬──────────────────────┘
+      │ repos · migrations     │       │ GithubIssuesClient GitHubClient  │
+      └────────────────────────┘       │ GitClient  exec()                │
+                                       └───────────┬──────────────────────┘
                                                     ▼
-                                       herdr · gh · git · fetch(Jira REST)
+                                 herdr · gh · git · fetch(Jira + GitHub REST)
 ```
 
 **Dependency rule:** `core` imports *interfaces*; `cli` **and** `server` construct the concrete
@@ -149,8 +154,10 @@ herdr-factory/
     cli/index.ts          commander program; routes via server (else in-process), dispatches
     build-deps.ts         buildDeps(repo) — shared by the server + every command's local path
     resolve.ts            pure resolveSourceName / resolveActiveRun (throw, not exit; CLI+server)
-    config.ts             env + repos/<name>/config.yml → zod → typed Config (work_sources[] + belt[]);
-                          listConfiguredRepos + server path/port helpers + the editor JSON Schema
+    config.ts             env map (repos/<name>/env: loadEnvMap/saveEnvValues) + repos/<name>/config.yml
+                          → zod → typed Config (work_sources[] — union assembled from the source
+                          registry — + belt[]); listConfiguredRepos + server path/port helpers + the
+                          editor JSON Schema
     doctor.ts             the doctor checks: managed / you-provide / per-repo (--deep = live probes)
     types.ts              shared domain types (incl. Phase, WorkState, WorkItem)
     version.ts            VERSION = package version + git HEAD sha (a new commit changes it, so
@@ -169,12 +176,17 @@ herdr-factory/
                           re-provisions Node / re-installs deps when .node-version / the lockfile change
       provision.ts        vendored-Node download + SHA-256 verify + atomic `current` flip
     db/{index,migrate,store,tx}.ts
-    clients/{exec,http,herdr,jira,jira-source,local-markdown-source,github,git}.ts
+    clients/{exec,http,herdr,jira,jira-source,local-markdown-source,
+             github-issues,github-issues-source,github-budget,github,git}.ts
+    sources/registry.ts      the source REGISTRY: one descriptor per type (zod configSchema /
+      + sources/<type>/descriptor.ts   resolveConfig / create / secrets manifest / TUI fields) —
+                             the single edit surface for adding source N+1 (checklist in its header)
     core/{deps,branch,step,watch,reconcile}.ts
     runtime/effect.ts        the shared Effect ManagedRuntime (also hosts the OTel layer)
     telemetry/…              OpenTelemetry spans/metrics (no-op unless HERDR_FACTORY_TELEMETRY)
     tui/…                    the opentui TUI (Dashboard · Config editor · Doctor)
-    prompts/{fix,evidence,review,pr}.md + prompts/local_markdown/fix.md  (per-source-type built-ins)
+    prompts/{fix,evidence,review,pr}.md            shared step prompts (fix.md is source-neutral)
+    prompts/jira/fix.md + prompts/github_issues/{fix,pr}.md   per-source-type overrides
   examples/example-repo/{config.yml, guidelines-prompt.md, match-bugs.ts, prompts/…}
   test/                   vitest
 ```
@@ -219,7 +231,7 @@ skipped entirely (see [§8](#8-step-agent-model)).
   models worktrees, not branches)
 - read/maintenance git: `show-ref`, `remote get-url`, `rev-parse HEAD` (the worker
   heartbeat), defensive `worktree prune`
-- everything non-terminal: Jira REST, GitHub via `gh`, SQLite, config, the
+- everything non-terminal: Jira + GitHub REST, GitHub via `gh`, SQLite, config, the
   reconciler logic
 
 If a future need looks like "manage a pane/tab/worktree/agent," it belongs in
@@ -239,13 +251,22 @@ reverse-engineered during the bash prototype.
   `allowFail`**: `allowFail` means "a non-zero exit is expected data"; a timeout is
   infrastructure failure the caller must see. This is the load-bearing guarantee that a hung
   `herdr`/`gh`/`git` can never wedge the tick loop.
-- **`http.ts`** — the Effect-based outbound HTTP pipeline for backend clients (Jira today).
-  Per-attempt timeouts are interruption-wired (`Effect.tryPromise`'s AbortSignal fires on fiber
-  interruption, so `Effect.timeout` genuinely cancels the in-flight fetch); non-2xx becomes a
-  typed `HttpStatusError` carrying status + parsed `Retry-After`. `httpWithPolicy` layers a
-  shared **`TokenBucket`** (take a token per attempt) and an Effect `Schedule` retry —
-  exponential + jitter for 429/5xx/timeout/network, honoring a server-sent `Retry-After`
-  (capped 60s) before the schedule's own delay; 4xx fails fast.
+- **`http.ts`** — the Effect-based outbound HTTP pipeline for backend clients (Jira + GitHub
+  issues). Per-attempt timeouts are interruption-wired (`Effect.tryPromise`'s AbortSignal fires
+  on fiber interruption, so `Effect.timeout` genuinely cancels the in-flight fetch); non-2xx
+  becomes a typed `HttpStatusError` carrying status + parsed `Retry-After` (`parseRetryAfter`
+  also synthesizes the wait from GitHub's `x-ratelimit-remaining`/`x-ratelimit-reset` pair when
+  the header is absent). `httpWithPolicy` layers shared **`TokenBucket`s** (a token per attempt;
+  `HttpPolicy.buckets` chains several — e.g. a per-minute AND a per-hour mutation cap — with the
+  wait recorded as `herdr_factory.rate_limit.wait_ms`, and each response's
+  `x-ratelimit-remaining` as `herdr_factory.rate_limit.remaining`) and an Effect `Schedule`
+  retry — exponential + jitter for 429/5xx/timeout/network, honoring a server-sent `Retry-After`
+  (capped 60s, or lower via `HttpPolicy.maxRetryAfterMs` for callers with their own durable
+  retry loop) before the schedule's own delay; 4xx fails fast unless the policy's `isRetryable`
+  override widens it (GitHub's 403+Retry-After secondary limits). `HttpRequest.redirect:
+  "manual"` surfaces 3xx as typed status errors instead of transparently following them —
+  load-bearing for the GitHub issue calls (a transferred issue answers 301; default stays
+  `"follow"`).
 - **`herdr.ts`** —
   - `worktreeCreateOrOpen(repoCwd, branch, baseRef) → {workspaceId, worktreePath, paneId}`
     (parses `.result.workspace.workspace_id` / `.worktree.checkout_path` /
@@ -270,23 +291,67 @@ reverse-engineered during the bash prototype.
 - **Work sources** — the polymorphic front of the engine. The core depends only on the
   `WorkSource` interface (in `core/deps.ts`) and the canonical `WorkState` lifecycle
   (`todo → in_development → in_review → merged|aborted|done` — `done` is the custom-belt
-  terminal):
-  - `listEligible() → Ticket[]` (todo items, in claim order)
-  - `describe(key) → Ticket` (metadata for the manual `claim`)
-  - `transition(key, WorkState) → boolean` (maps the canonical state onto the backend; returns
-    false — a no-op — when already there or the state is unmapped for this source, **with no
-    network call** for an unmapped state). Callers never invoke this fire-and-forget anymore —
-    the reconciler routes every transition through the **outbox** (§7), which retries failures.
+  terminal). The interface's doc block is a numbered **charter** (INV-1..11: re-claim
+  convergence, idempotent retry-safe transitions, zero-network unmapped states, idempotent
+  best-effort materialize, durable idempotent askHuman, marker-based self-authorship, key
+  safety, bring-your-own rate limits, durable source names, single-factory claiming,
+  canonical-key echo), enforced as a
+  parametrized contract suite over every shipped source (`test/work-source-contract.test.ts` —
+  §13). Nine methods plus a declarative spec:
+  - `readonly spec: WorkSourceSpec` — declared ownership/capabilities: `statusOfRecord`
+    (`external` | `internal`), `mappedStates`, `replyChannel` (`comments` | `file`), optional
+    `terminalAutomation` note. Consumed by `doctor` and the contract suite ONLY — the
+    reconciler never branches on it, so it can't drift into a second state machine.
+  - `listEligible() → MatchItem[]` (a bounded batch of todo items, in claim order)
+  - `describe(key) → Ticket` (metadata for the manual `claim`; may accept an alternate
+    identifier but returns the CANONICAL key — the engine re-checks active-run dedup against
+    the returned key before claiming, INV-11)
+  - `transition(key, WorkState) → TransitionResult` — `{kind: applied|noop|stale, detail?}`
+    replaces the old boolean. `noop` = already at the target, or the state is unmapped for this
+    source (**decided with no network call** — `spec.mappedStates`), or the backend's own
+    automation won the race; `stale` = the item is gone (deleted/transferred — retrying cannot
+    help): the outbox marks the intent delivered and flags the run for the run-locked stale
+    policy (§7). A throw means "retry me". Callers never invoke this fire-and-forget — the
+    reconciler routes every transition through the **outbox** (§7).
   - `materialize(key, memDir, log)` (write the work doc + any media; idempotent, best-effort)
-  - `postNote(key, note)` (source-native operator-facing note — a Jira comment / local marker
-    file; used when a run parks for `attention`)
+  - `workDoc(memDirAbs) → WorkDocInfo` (`{path, kind}` — describes what materialize wrote,
+    driving the `@@WORK_DOC@@`/`@@WORK_DOC_KIND@@` prompt tokens; this replaced the per-type
+    switch that used to live in `step.ts`. Local-fs-only, never throws; async only because
+    `instrumentObject` wraps every client method in an async telemetry proxy)
+  - `postNote(key, note)` (source-native operator-facing note — a Jira/GitHub comment / local
+    marker file; used when a run parks for `attention`; **marker-tagged**, see below)
   - `askHuman(input)` / `pollHumanReply(input)` (the ask-human park: post a source-native
-    question, poll for the reply — polls back off 60s→5min per question)
+    question, poll for the reply — polls back off 60s→5min per question; a poll throw counts as
+    a poll ERROR with the same backoff, escalating after 20 consecutive; both throw
+    `StaleItemError` when the item is gone, escalating the run instead of polling a nonexistent
+    item forever)
   - `health()` (throws if misconfigured/unreachable — the `doctor` per-source check)
+  Every artifact a source writes to its reply channel carries the exported **`HERDR_MARKER`**
+  (`"[herdr-factory"`), and reply polling drops marker-bearing comments via `bearsHerdrMarker` —
+  **blockquote-aware**, so a human quote-reply that embeds the question as `> ` lines still
+  counts as a reply (INV-6). Author-identity filtering is never load-bearing: under gh-CLI
+  auth the bot login IS the operator's login.
   A `SourceRuntime` bundles a source's identity (`name`/`type`) with its live `client`;
   `resolveSource` maps a run's `work_source` back to its runtime. `Deps.belts` is the
   priority-ordered `BeltRuntime` list (a belt's resolved config — ordered `steps`, `watchPr` —
   plus its loaded `match` predicate); `resolveBelt` maps a run's `belt` back to its runtime.
+- **`sources/registry.ts`** — one `SourceDescriptor` per type: the zod `configSchema` (the full
+  `.strict()` source object), `resolveConfig` (snake_case parse → camelCase block), `create`
+  (build the live client), the `secrets` manifest, and the TUI `defaultBlock`/`fields`.
+  `config.ts` assembles the `work_sources` discriminated union from the descriptors,
+  `build-deps` constructs clients via `descriptorFor(type).create(ctx)`, and `doctor`'s secrets
+  check + the TUI's type enum / field / credential rows are all descriptor-driven
+  (`WorkSourceConfig` is just `{name, type, cfg: unknown}` — `cfg` is opaque to everything but
+  the type's own descriptor). The registry header documents the whole **adding-source-N+1
+  checklist**: the `WorkSource` impl in `src/clients/`, a descriptor in
+  `src/sources/<type>/`, one literal in the `SourceType` union (`src/types.ts`), one
+  `SOURCE_DESCRIPTORS` entry, `npm run schema`, and a contract-suite harness — plus optional
+  per-type prompt overrides and a `MatchItem` convenience interface + type guard. Zero other
+  core edits. Secrets are a raw per-repo **env map** (`loadEnvMap`/`saveEnvValues` in
+  `config.ts`, same chmod-600 `repos/<name>/env` file as before): the engine never interprets
+  keys — each descriptor's manifest declares what matters (`JIRA_EMAIL` + `JIRA_API_TOKEN`
+  required for `jira`; `GITHUB_TOKEN` optional for `github_issues`, falling back to
+  `gh auth token`).
 - **`jira.ts`** (basic auth over `clients/http.ts`) — the low-level Jira REST client:
   `listEligible()` via the Agile board endpoint `/rest/agile/1.0/board/<id>/issue?jql=…`;
   `getIssue`, `currentStatus`, `transition(key, statusName)` (case-insensitive `.to.name` match,
@@ -297,8 +362,10 @@ reverse-engineered during the bash prototype.
   have landed, and a rare duplicate comment beats a retry storm of writes. **`jira-source.ts`**
   adapts it to `WorkSource`: it holds the configured status map and maps canonical→Jira status —
   `merged`/`aborted` are **unmapped** (Jira's terminal state is owned by its GitHub integration),
-  so `transition` short-circuits to a no-op **before any network call** and teardown stays
-  Jira-silent. `materialize` writes `ticket.json` + attachments.
+  so `transition` answers `noop` **before any network call** and teardown stays
+  Jira-silent. `materialize` writes `ticket.json` + attachments. `postNote` is marker-tagged and
+  `pollHumanReply` drops **every** marker-bearing comment (questions AND notes — an unmarked
+  attention note posted while a question was pending used to poison the reply loop), per INV-6.
 - **`local-markdown-source.ts`** — a folder of work items (top-level only; dot-prefixed and
   `__`-prefixed names skipped — `__` marks work still being prepared). Each item is a single `*.md` file **or** a top-level subdirectory holding ≥1 top-level
   `*.md` (only that level is checked; a `<key>.md` file wins a collision with a `<key>/` dir).
@@ -309,6 +376,38 @@ reverse-engineered during the bash prototype.
   AND have no active run (a backstop over the run-table dedup); `transition` upserts
   `work_items.status`; `materialize` snapshots a file to `task.md` or copies a directory whole to
   `task/`; `health` stats the folder.
+- **`github-issues-source.ts`** (+ **`github-issues.ts`**, **`github-budget.ts`**) — the
+  `github_issues` source. GitHub is the **status of record** (spec `external`; `work_items`
+  never touched), projected onto the issue: eligible = open + `trigger_label` (default `herdr`)
+  + not a PR + no in-flight state label, listed **oldest-first**; `in_development` swaps in its
+  state label then **consumes the trigger label last** (a partial swap keeps the item filtered,
+  never double-claimed; re-adding the trigger is the retry affordance); `in_review` swaps
+  labels; `merged`/`done` strip state labels and close the issue as `completed` per `close_on` —
+  the idempotent backstop over the PR's `Fixes #n` auto-close (which only fires on
+  default-branch merges and can be disabled repo-wide); it never reopens. `aborted` strips
+  in-flight labels, adds the aborted label, and leaves the issue **open** (a visible,
+  retriageable failure artifact) unless `close_on.aborted` (then `not_planned`). Every mapped
+  transition is an idempotent GET → diff → apply; a human closing the issue pre-merge is a
+  cancel signal (→ `stale` — except a `completed` close seen at `in_review`, which is almost
+  always `Fixes #n` auto-close racing a fast merge → `noop`; the PR watch owns that signal).
+  `github-issues.ts` is a raw REST client on the `http.ts` pipeline
+  (deliberately NOT the gh CLI — typed statuses are load-bearing) with `redirect: "manual"`: a
+  transferred issue answers **301** (which a followed redirect would silently chase into the
+  new repo, auth + method preserved — mutating the issue there), a deleted one **410**, an
+  inaccessible one **404** — all mapped to `stale`/`StaleItemError` via `classifyGone`. Auth is
+  `GITHUB_TOKEN` else the gh CLI's token (`gh auth token`, refreshed once on a 401).
+  `github-budget.ts` holds the **process-wide** budget buckets (module singletons — every repo
+  runtime spends the same authenticated user's budget): reads 5/s sustained; mutations chain a
+  per-minute (~60/min under GitHub's 80/min secondary cap) AND a per-hour (500/hr) bucket.
+  `materialize` renders `task.md` — sanitized title/body + every non-herdr comment + a
+  `Closing reference:` line the pr prompt copies into the PR body verbatim — plus the raw
+  `issue.json` sidecar and `attachments/` (media downloaded **immediately** from `body_html`'s
+  JWT-signed URLs, the only form that resolves on private repos; capped 12 files / 50MB).
+  `askHuman` is idempotent per question (it scans for the question marker before posting); the
+  reply filter is blockquote-aware with **no author filtering** (gh-CLI shared identity).
+  `health()` checks repo reachability, issues enabled, push permission, and that the trigger
+  label exists. `repo` is optional (defaults to the PR repo; the descriptor's `create()` throws
+  at startup when neither resolves).
 - **`github.ts`** (`gh` via execFile) — `prForBranch(repo, branch)` (first-sighting discovery
   only), `prByNumber(repo, n)` (the durable identity once adopted — survives head-branch deletion
   on merge), `reviewSignature(repo, n) → {unresolved, failing, sig}` (graphql review threads +
@@ -381,10 +480,12 @@ CREATE TABLE human_questions(            -- ask-human park: one pending question
   id INTEGER PRIMARY KEY AUTOINCREMENT, run_id INTEGER NOT NULL REFERENCES runs(id),
   repo TEXT NOT NULL, work_source TEXT NOT NULL, ticket_key TEXT NOT NULL, step TEXT,
   question TEXT NOT NULL, status TEXT NOT NULL CHECK (status IN ('pending','answered')),
-  external_id TEXT, external_created_at TEXT,              -- the source-native object (Jira comment)
+  external_id TEXT, external_created_at TEXT,              -- the source-native object (Jira/GitHub comment)
   answer TEXT, answer_external_id TEXT, answer_author TEXT,
   poll_attempts INTEGER NOT NULL DEFAULT 0,                -- misses drive the poll backoff (v13)
   next_poll_at INTEGER NOT NULL DEFAULT 0,                 -- 60s doubling, 5min cap (v13)
+  poll_errors INTEGER NOT NULL DEFAULT 0,                  -- CONSECUTIVE poll throws (reset on
+                                                           -- success); escalates past 20 (v14)
   created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, answered_at INTEGER);
 CREATE UNIQUE INDEX idx_human_questions_one_pending_run ON human_questions(run_id) WHERE status='pending';
 
@@ -395,6 +496,8 @@ CREATE TABLE transition_outbox(          -- source status write-backs as persist
   attempts INTEGER NOT NULL DEFAULT 0, next_attempt_at INTEGER NOT NULL,  -- exponential backoff
   last_error TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
   delivered_at INTEGER,                  -- set once the source confirms (or reports a no-op)
+  stale_at INTEGER,                      -- delivery found the item GONE; stamped lock-free (v14)
+  stale_handled_at INTEGER,              -- the run-locked stale policy consumed it (v14)
   UNIQUE(run_id, to_state));             -- enqueue is idempotent across retried ticks
 
 CREATE TABLE locks(name TEXT PRIMARY KEY, owner TEXT, acquired_at INTEGER, expires_at INTEGER);
@@ -411,8 +514,10 @@ locks: `acquireLock/extendLock/releaseLock` (extend = the heartbeat; owner-check
 (`getRunStep`/`upsertRunStep`/`markStepDone`/`bumpBounces`), the transition outbox
 (`enqueueTransition`, `dueTransitions`, `undeliveredTransitionBefore` — in-order-per-run guard,
 `markTransitionDelivered`, `recordTransitionAttempt` — 60s-doubling backoff capped 1h,
-`pendingTransitionForKey` — the claim guard), the human questions
-(`createHumanQuestion`/`pendingHumanQuestionForRun`/`answerHumanQuestion`/`recordHumanPollMiss`),
+`pendingTransitionForKey` — the claim guard, and the stale two-phase:
+`markTransitionStale`/`unhandledStaleIntentForRun`/`markTransitionStaleHandled`), the human
+questions (`createHumanQuestion`/`pendingHumanQuestionForRun`/`answerHumanQuestion`/
+`recordHumanPollMiss`/`recordHumanPollError`),
 and the `work_items` ledger: `getWorkItem`, `listWorkItems(repo,source,status?)`,
 `setWorkItemStatus(repo,source,key,status,meta?)` (idempotent, tolerant any→any, returns false
 if already there).
@@ -431,8 +536,8 @@ pile of runs waiting on humans must not starve the belt of new claims. History i
 (we set `ended_at`), so the web UI can show attempts, outcomes, and durations.
 
 **event types:** `claimed · transition · worktree_created · step_spawned · step_done · bounced ·
-human_question · human_reply · focus_applied · pr_opened · resolver_woken · merged · closed ·
-torn_down · attention · resumed · error`
+stale · human_question · human_reply · focus_applied · pr_opened · resolver_woken · merged ·
+closed · torn_down · attention · resumed · error`
 (plus legacy `worker_*` / `review_*` kept for old-run history).
 
 ---
@@ -442,7 +547,15 @@ torn_down · attention · resumed · error`
 `core/reconcile.ts` → `reconcileRepo(deps)`: **Phase 0** flushes the **transition outbox** —
 every due, undelivered source status write-back is retried (in per-run id order, stopping a
 run's chain at its first failure), so write-backs converge even at capacity and for
-already-ended runs. **Phase A** advances every active run one idempotent step, **in parallel
+already-ended runs. Delivery is **lock-free**: `applied`/`noop` mark the intent delivered; a
+**`stale`** result (the item is gone at the source) also marks it delivered but only *stamps*
+`stale_at` + records a `stale` event — the run itself is never mutated here (that would race the
+run-locked step machinery; ended/tearing-down runs are closed out silently on the spot). The
+run-locked half consumes an unhandled stale intent **exactly once** at the top of each run's
+Phase-A pass (`stale_handled_at`): an `in_development` stale — the claim write-back found the
+item deleted/closed, i.e. "don't do this work" — aborts the run promptly; a mid-flight stale
+(e.g. `in_review` — a PR may be up) parks it for `attention` with **no source note** (the item
+the note would go to is what's gone). **Phase A** advances every active run one idempotent step, **in parallel
 with bounded concurrency** (`limits.reconcile_concurrency`, default 8, via `Effect.forEach` —
 most of a run's reconcile is subprocess/network wait, so pass wall-clock stays roughly flat as
 the active-run count grows). Each run is reconciled **under its own `run:<id>` lock**; a run
@@ -648,12 +761,15 @@ step (`spawnStep`):
    `config` (the repo's config folder, read + existence-checked at load) or `repo` (the target
    repo checkout, read from the run's **worktree at render time**, so prompts can live
    version-controlled next to the code). The built-in is resolved **per source type**:
-   `src/prompts/<type>/<step>.md` if present, else the shared `src/prompts/<step>.md` (so
-   `local_markdown` gets its own `fix` prompt pointing at `task.md` / `task/`, while
-   evidence/review/pr share the defaults). `renderStepPrompt` then substitutes tokens (`@@KEY@@`,
-   `@@WORK_DOC@@` — `ticket.json` for Jira; `task.md` (file) or `task/` (directory) for
-   local_markdown, detected from what `materialize` wrote into the worktree —
-   `@@WORK_DOC_KIND@@`, `@@HANDOFF_IN@@`, `@@PRIOR_PANE@@`/`@@PRIOR_SESSION@@`,
+   `src/prompts/<type>/<step>.md` if present, else the shared `src/prompts/<step>.md`. The
+   shared `fix.md` is source-NEUTRAL (`@@WORK_DOC@@`-based, with the rework + ask-human
+   guidance); `jira` and `github_issues` override `fix` with source-flavored versions, and
+   `github_issues` also overrides `pr` (it mandates copying the work doc's
+   `Closing reference:` line into the PR body verbatim — the issue-linkage/auto-close hook);
+   evidence/review/pr otherwise share the defaults. `renderStepPrompt` then substitutes tokens
+   (`@@KEY@@`, `@@WORK_DOC@@`/`@@WORK_DOC_KIND@@` — from the source's own `workDoc()`
+   (`ticket.json` for Jira, `task.md`/`task/` for local_markdown, `task.md` for
+   github_issues) — `@@HANDOFF_IN@@`, `@@PRIOR_PANE@@`/`@@PRIOR_SESSION@@`,
    `@@STEP_DONE_CMD@@`/`@@BOUNCE_CMD@@`/`@@EVIDENCE_UPLOAD_CMD@@` — each carrying `--source` so
    the signal resolves unambiguously, …), appends `guidelines-prompt.md`, and appends the
    **handover scaffold**: where you are in the belt, the prior step's handoff + session pointer,
@@ -749,10 +865,13 @@ from being claimed again).
 
 ## 10. Config
 
-- **Per-repo secrets** — `repos/<name>/env` (chmod 600): `JIRA_EMAIL`, `JIRA_API_TOKEN` — Jira
-  **auth** only. Secrets are strictly per-repo; there is no shared/global secrets file. *Where*
-  work is polled from (the Atlassian site `base_url`) is per-repo config, not a secret.
-  (`loadSecrets(repoDir)` reads only `<repoDir>/env`.)
+- **Per-repo secrets** — `repos/<name>/env` (chmod 600), loaded as a raw **env map**
+  (`loadEnvMap(repoDir)` reads only `<repoDir>/env`; `saveEnvValues` merges TUI edits back,
+  preserving unrelated keys). The engine never interprets the keys — each source descriptor's
+  secrets manifest declares what matters: `JIRA_EMAIL` + `JIRA_API_TOKEN` (required, `jira`) ·
+  `GITHUB_TOKEN` (optional, `github_issues` — falls back to the gh CLI's token). Secrets are
+  strictly per-repo; there is no shared/global secrets file. *Where* work is polled from (the
+  Atlassian site `base_url`, the GitHub `repo`) is per-repo config, not a secret.
 - **Per-repo** — `~/.config/herdr-factory/repos/<name>/`:
   - `config.yml` — parsed with `yaml`, validated with `zod` → typed `Config`:
     - `repo` — `path` / `base_ref` / `github` (repo-global). `path` (and any source path) supports
@@ -764,10 +883,11 @@ from being claimed again).
       / `step_budget_seconds` (custom-step default) / `tick_interval_seconds`
       / `reconcile_concurrency` (Phase-A parallelism, default 8) / `max_claims_per_tick`
       (claim admission, default 10) / `layout_wait_seconds`.
-    - `work_sources` — **required, ≥1** (`zod` discriminated union on `type`, `.strict()`
+    - `work_sources` — **required, ≥1** (`zod` discriminated union on `type`, assembled from the
+      source registry's descriptors — §5; `.strict()`
       members — unknown keys are parse errors). Each entry is identity + backend only, no
       pipeline:
-      - `type` — `jira` | `local_markdown`.
+      - `type` — `jira` | `local_markdown` | `github_issues`.
       - `name` — optional identifier, **default = `type`**, must be unique within the repo
         (validated on the *resolved* names, so two unnamed `jira` sources collide). Stored on each
         run's `work_source`. **The pre-existing Jira source must keep the default name `jira`** so
@@ -775,7 +895,11 @@ from being claimed again).
       - type block: `jira` (`base_url` / `project` / `board` / `label`, default `agent` / 3
         `status` names, defaulted `To Do`/`In Progress`/`In Review` — `merged`/`aborted` are
         intentionally absent, so teardown never transitions Jira) **or** `local_markdown`
-        (`folder`).
+        (`folder`) **or** `github_issues` (`repo` — optional, default = the PR repo, throws at
+        startup when neither resolves / `trigger_label`, default `herdr` /
+        `state_labels.{in_development,in_review,aborted}`, defaulted `herdr:*` /
+        `close_on.{merged,done,aborted}`, defaults `true`/`true`/`false` / `type_labels` map +
+        `default_type` (native GitHub issue type wins when present) / `max_pages`, default 1).
     - `belt` — **required, ≥1** (`zod` discriminated union on `belt_type`, `.strict()` members —
       `agents` on a `custom` belt is a parse error, not silently ignored). Common fields:
       - `name` (unique) · `source` (must reference a `work_sources` name) · `priority` (optional,
@@ -821,8 +945,9 @@ from being claimed again).
   create worktrees from one. The other load-time cross-field checks: unique source/belt/step names,
   every `belt.source` references a configured source, tab/pane both-or-neither, `{{work_id}}` in
   `workspace_name`, and `match` / `config`-sourced `prompt_file` existence — all with readable
-  errors. The work-source *clients* are constructed in `build-deps.ts`'s `buildDeps`
-  (the `local_markdown` client needs the `Store`); `config.ts` stays pure data + prompt resolution.
+  errors. The work-source *clients* are constructed in `build-deps.ts`'s `buildDeps` via each
+  type's registry descriptor (`descriptorFor(type).create(ctx)` — the ctx carries the env map,
+  `Store`, and resolved `ghRepo`); `config.ts` stays pure data + prompt resolution.
 
 Onboarding a repo is pure data: drop a `repos/<name>/` folder, define its herdr layout
 (workspace-manager plugin), and `herdr-factory reload` so the running server discovers it (or
@@ -874,8 +999,9 @@ web UI ([§16](#16-web-ui-future)).
 reports three groups: **managed** (node runtime ≥26 — vendored or ambient, auto-update upstream,
 supervisor service loaded, server responding, DB present), **you-provide** (`git` / `herdr` /
 `gh` / `claude` on PATH; `--deep` exercises herdr and `gh auth status`), and — with `--repo` —
-**per-repo** (config loads + valid, main checkout, origin resolved, per-source `health()`, Jira
-secrets present, and a `--deep` S3 write-probe of the evidence bucket). `claim` takes `--belt` (defaulted when there's a single belt, required
+**per-repo** (config loads + valid, main checkout, origin resolved, per-source `health()`, the
+descriptor-declared required secrets present, and a `--deep` S3 write-probe of the evidence
+bucket). `claim` takes `--belt` (defaulted when there's a single belt, required
 when >1); `teardown`/`step-done`/`ask-human`/`bounce`/`resume` resolve the run by key and take
 `--source` to disambiguate when a key is active in more than one source (the agent's rendered
 commands always carry `--source`).
@@ -986,7 +1112,11 @@ vitest. Store tested against `:memory:` SQLite (run lifecycle, active counting,
 lock TTL). `core/reconcile` tested with fake clients + in-memory store + an
 injected `now()` → deterministic phase-machine assertions. Every bug from the
 bash prototype is encoded as a regression test (see §14). Clients get thin
-contract tests; a live read-only smoke via `doctor`/`eligible`. The server client +
+contract tests; a live read-only smoke via `doctor`/`eligible`. The work-source **charter**
+(INV-1..11, `core/deps.ts`) runs as a parametrized contract suite over all three shipped
+sources (`test/work-source-contract.test.ts` — passing it is what "implements `WorkSource`"
+means behaviorally); `test/helpers/github-fake.ts` is the in-memory GitHub REST backend it and
+the per-source github tests share. The server client +
 fallback are unit-tested (`test/server-client.test.ts`): `readServerInfo`, `pingHealth`,
 and `viaServerOrLocal` against an ephemeral `node:http` server — asserting it uses the
 server when reachable, falls back to in-process on `NoServerError`, and propagates a
@@ -1008,11 +1138,14 @@ Hard-won from the bash prototype — encode as types/tests/asserts:
   the fallbacks are active, not defensive-only.
 - Jira transition match is **case-insensitive** on `.to.name`; no-op if already
   in target.
-- **Work-source parity:** the `WorkSource.transition` of any source returns `false` (a no-op)
-  for an unmapped/already-there state **with no side effect**. For Jira, `merged`/`aborted` are
-  unmapped and short-circuit **before any network call**, so teardown stays Jira-silent exactly
-  as before multi-source (a unit test asserts zero `fetch` calls). `local_markdown.transition` is
-  an idempotent, tolerant any→any upsert that never throws on a "non-adjacent" jump.
+- **Work-source parity:** `WorkSource.transition` returns a `TransitionResult` — `noop` for an
+  unmapped/already-there state **with no side effect**, and unmapped states
+  (`spec.mappedStates`) decided **before any network call** (the contract suite asserts zero
+  backend calls). For Jira, `merged`/`aborted` are unmapped, so teardown stays Jira-silent
+  exactly as before multi-source. `local_markdown.transition` is
+  an idempotent, tolerant any→any upsert that never throws on a "non-adjacent" jump. `stale` is
+  reserved for "the item is no longer ours — retrying cannot help" (deleted/transferred); a
+  plausibly-transient failure must THROW instead (throw = retry me).
 - **Source identity:** runs carry `work_source`; the Phase-B dedup is `(repo, source, key)`. The
   v6 backfill stamps pre-upgrade runs `'jira'`, so the pre-existing Jira source MUST keep the
   default name `jira`. A run whose source vanished from config escalates to `attention` (but a
@@ -1044,6 +1177,20 @@ Hard-won from the bash prototype — encode as types/tests/asserts:
   `in_development` must never land after `in_review` and walk the source backward). Run phases
   never gate on delivery. Phase B must skip items with a pending write-back — their source
   status is known-stale (the merged-work re-claim loop).
+- **Stale handling is two-phase.** The lock-free Phase 0 outbox flush only marks a `stale`
+  intent delivered + stamps `stale_at` — it never mutates the run (that would race the
+  run-locked step machinery); the run-locked Phase A consumes it exactly once
+  (`stale_handled_at`): abort on an `in_development` stale, park with no source note mid-flight.
+  `askHuman`/`pollHumanReply` throw `StaleItemError` for a gone item so a waiting run escalates
+  instead of polling a nonexistent item forever.
+- **`describe` echoes the canonical key (INV-11).** It may accept an alternate spelling
+  (`#123`), but the engine re-checks active-run dedup against the RETURNED key before claiming —
+  otherwise one item can be claimed twice under two spellings.
+- **Marker-based self-authorship (INV-6).** Every reply-channel artifact a source writes carries
+  `HERDR_MARKER`, and reply polling drops marker-bearing comments via `bearsHerdrMarker` —
+  **blockquote-aware**, so a quote-reply embedding the question still counts as a human reply.
+  Author-identity filtering is never load-bearing (under gh-CLI auth the bot login IS the
+  operator's login).
 - **Everything that mutates one run holds its `run:<id>` lock** — the tick's Phase-A pass and
   every nudge (step-done / bounce / ask-human / resume). `ask-human` in particular is a
   non-monotonic phase flip; unserialized it can be overwritten by a stale-snapshot reconcile,
@@ -1153,7 +1300,7 @@ confirmation, attention workflow, batching and backoff; `test/exec-timeout.test.
 staleness primitives) — but not yet soaked at the 50–100-run scale it targets. Watch live runs
 before trusting it fully unsupervised.
 
-**Most recent: the platform & packaging pass.** A zero-prereq **`install.sh`** (needs only
+**The platform & packaging pass.** A zero-prereq **`install.sh`** (needs only
 git/curl/tar): vendors the `.node-version`-pinned Node — **≥ 26 now, one runtime for engine +
 TUI** — SHA-256-verified into `<state>/runtime/` with an atomic `current` flip, installs pnpm +
 deps, links the shims, and registers the supervisor on **macOS (launchd) or Linux (systemd
@@ -1161,6 +1308,25 @@ deps, links the shims, and registers the supervisor on **macOS (launchd) or Linu
 self-updater re-provisions Node / re-installs deps as pins change, and restarts drain gracefully
 (18s SIGKILL grace outlasting the 15s in-flight-tick drain). Ops grew the full-screen **TUI**
 (opentui: Dashboard · Config editor · Doctor) and `doctor --deep` (live herdr/gh/S3 probes).
+
+**Most recent: work-source contract v2 + the source registry + `github_issues`** (migration
+v14). The `WorkSource` interface became a numbered **charter** (INV-1..11), enforced by a
+parametrized contract suite (`test/work-source-contract.test.ts`): `transition` now returns a
+`TransitionResult` (`applied`/`noop`/`stale`) with **two-phase stale handling** in the engine
+(the lock-free outbox stamps `stale_at`; the run-locked Phase A aborts/parks — §7); `workDoc()`
+moved the work-doc shape onto the source (killing the last per-source-type switch in `step.ts`);
+a declarative `spec` plus the shared marker primitives (`HERDR_MARKER`/`bearsHerdrMarker`,
+blockquote-aware) landed in `core/deps.ts`; `askHuman`/`pollHumanReply` gained `StaleItemError`
+and poll-error escalation (`human_questions.poll_errors`). `MatchItem` opened from a closed
+union into a generic base + per-source convenience interfaces and type guards
+(`isJiraItem`/`isLocalMarkdownItem`/`isGithubIssuesItem`) for user `match.ts` files. Everything
+type-specific consolidated into the **source registry** (`sources/registry.ts` — one descriptor
+per type; config/build-deps/doctor/TUI all descriptor-driven; secrets became a raw per-repo
+**env map**), on top of which the **`github_issues`** source shipped (§5): trigger-label
+polling, a label-projected lifecycle with the close-as-completed backstop, manual-redirect REST
+on the shared http pipeline, process-wide GitHub budget buckets, and its own `fix`/`pr` prompts
+(the shared `fix.md` went source-neutral; `prompts/local_markdown/fix.md` was superseded by it
+and deleted).
 
 ---
 

@@ -5,7 +5,7 @@
 // ── Adding source N+1 (the whole checklist) ──────────────────────────────────────────────────
 //  1. src/clients/<type>-source.ts        — the WorkSource implementation (+ its client)
 //  2. src/sources/<type>/descriptor.ts    — schema / resolveConfig / create / secrets / tui
-//  3. one literal in SOURCE_TYPES         — src/types.ts (keeps the closed union honest)
+//  3. one literal in the SourceType union — src/types.ts (keeps the closed union honest)
 //  4. one entry in SOURCE_DESCRIPTORS     — below
 //  5. `npm run schema`                    — regenerate config.schema.json (test-enforced)
 //  6. register a harness in test/work-source-contract.test.ts (the charter suite)

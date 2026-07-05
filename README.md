@@ -4,11 +4,12 @@
 
 **The autonomous work → pull-request factory.**
 
-Point it at a Jira board or a folder of task briefs. Walk away.
+Point it at a Jira board, a GitHub repo's issues, or a folder of task briefs. Walk away.
 Merged PRs come out the other end.
 
 [Install](#install) · [Quick start](#quick-start) ·
-[Markdown briefs](#markdown-briefs--work-without-a-ticket) · [The belts](#the-belts) ·
+[Markdown briefs](#markdown-briefs--work-without-a-ticket) ·
+[GitHub issues](#github-issues--label-an-issue-get-a-pr) · [The belts](#the-belts) ·
 [Highlights](#highlights) · [Reference](#reference)
 
 </div>
@@ -17,8 +18,8 @@ Merged PRs come out the other end.
 
 herdr-factory is an autonomous, worktree based, coding-agent factory built on top of [herdr](https://herdr.dev) that fits the workflow your team already has:
 
-- **Plugs into your existing development process.** Jira tickets in, GitHub pull requests out —
-  through your normal CI and code review.
+- **Plugs into your existing development process.** Jira tickets or GitHub issues in, GitHub
+  pull requests out — through your normal CI and code review.
 - **Full agent sessions, fully visible.** Every step is a real interactive session in a herdr
   pane — not a hidden sub-agent — so you can watch the work and steer it precisely when needed.
 - **Local only.** No data leaves your machine: work queue, run history, logs, and even the
@@ -83,6 +84,10 @@ you'll pass to `--repo`:
 JIRA_EMAIL=you@org.com
 JIRA_API_TOKEN=...          # id.atlassian.com → Security → API tokens
 ```
+
+(Jira is the walkthrough; a [GitHub Issues source](#github-issues--label-an-issue-get-a-pr)
+needs no credentials at all beyond your already-authenticated `gh` CLI — add a `GITHUB_TOKEN`
+line to the same file only if you want it to use a dedicated token instead.)
 
 ### 2. Point it at a repo and a board
 
@@ -201,6 +206,31 @@ echo "Try virtualizing the results table — does it fix the scroll jank?" > ~/f
 
 The full fix → review → pr pipeline runs on the brief and hands you a reviewed PR.
 
+## GitHub issues — label an issue, get a PR
+
+A `github_issues` source turns a repo's own issue tracker into the work queue — no Jira, no
+extra credentials (it uses your authenticated `gh` CLI's token unless you set `GITHUB_TOKEN`):
+
+```yaml
+work_sources:
+  - type: github_issues
+    github_issues: {} # polls the PR repo's open issues labelled `herdr`; all fields optional
+
+belt:
+  - name: issues-to-prs
+    belt_type: work_to_pull_request
+    source: github_issues
+    agents: { fix: {}, review: {}, pr: {} }
+```
+
+Label an issue `herdr` (the `trigger_label`) and the factory claims it — swapping the label for
+`herdr:in-development` and **consuming the trigger**, so re-adding `herdr` later is how you retry
+a run. The agents get the issue body, the whole comment thread, and any embedded
+images/screen-recordings as the spec; the PR carries a `Fixes #n` line so the merge auto-closes
+the issue (the factory closes it as completed anyway, as a backstop). A failed run leaves the
+issue open, labelled `herdr:aborted`, for retriage; questions and attention notes arrive as
+issue comments — reply in a new comment and the run resumes.
+
 ## The belts
 
 A **belt** pairs a work source with an ordered pipeline of agent steps. Two belt types ship today.
@@ -248,16 +278,18 @@ At claim time belts are walked in `priority` order (lower first); the first belt
 predicate accepts an item claims it — **first match wins**, and a belt with no `match` accepts
 everything from its source. `match` is a `.ts` file in the repo's config folder whose default
 export is `(ctx) => boolean` (sync or async), with `ctx = { item, source: { name, type } }` — the
-item carries source-native routing metadata (for Jira: labels, status, the raw fields). Route
+item carries `labels` uniformly plus source-native routing metadata (Jira's status + raw fields,
+a GitHub issue's number/author/body, a markdown brief's front-matter). Route
 bugs to one belt and stories to another, programmatically.
 
 ## Highlights
 
-- **Zero tokens on the factory floor.** Polling Jira, claiming, watching PRs, liveness checks,
-  retries — all deterministic code (native `fetch`, `gh`, `herdr`). Agents run only inside the
-  steps, and the PR resolver wakes only when the review state actually changes.
+- **Zero tokens on the factory floor.** Polling Jira or GitHub, claiming, watching PRs, liveness
+  checks, retries — all deterministic code (native `fetch`, `gh`, `herdr`). Agents run only inside
+  the steps, and the PR resolver wakes only when the review state actually changes.
 - **The ask-human cord.** A blocked or unsure agent runs `ask-human`: the factory posts the
-  question through the work source (a Jira comment, or an inbox file for markdown sources), parks
+  question through the work source (a Jira or GitHub issue comment, or an inbox file for
+  markdown sources), parks
   the run as `waiting_for_human` — **freeing its concurrency slot** — polls for the reply with
   backoff, then writes the answer into the worktree and resumes the same step automatically.
 - **Bounce-back rework.** Evidence and review send flawed work _backward_ with written findings
@@ -273,8 +305,9 @@ bugs to one belt and stories to another, programmatically.
   source of truth: every command falls back to running in-process when it's down, so a worker's
   `step-done` lands even mid-restart. Workers live in herdr and survive factory restarts. Source
   status write-backs are persisted intents, retried until the source confirms.
-- **Built to scale.** Active runs reconcile in parallel under per-run locks; Jira traffic flows
-  through a token bucket with `Retry-After`-honoring retries; all watched PRs share one batched
+- **Built to scale.** Active runs reconcile in parallel under per-run locks; Jira and GitHub
+  traffic flows through token buckets (GitHub's is a process-wide budget) with
+  `Retry-After`-honoring retries; all watched PRs share one batched
   GraphQL query per tick; claim admission smooths big-backlog cold starts; every subprocess and
   HTTP call is hard-timeout-bounded, with a wedged-tick watchdog behind it all.
 - **Self-driving operations.** One resident server ticks every repo; a stateless scheduled
@@ -319,7 +352,9 @@ instead of waiting for the next tick.
 Everything repo-specific lives in `~/.config/herdr-factory/repos/<name>/`:
 
 - `config.yml` — the file described below (`<name>` is what you pass to `--repo`).
-- `env` — Jira auth only (`JIRA_EMAIL`, `JIRA_API_TOKEN`), `chmod 600`. Strictly per-repo; there
+- `env` — per-source credentials, `chmod 600`: `JIRA_EMAIL` + `JIRA_API_TOKEN` for a `jira`
+  source; `GITHUB_TOKEN` for `github_issues` (optional — without it the factory uses your
+  `gh` CLI's token); `local_markdown` needs none. Strictly per-repo; there
   is no global secrets file.
 - `guidelines-prompt.md` _(optional)_ — appended to every step prompt of every belt.
 - Any `match` predicates and `config`-sourced prompt files referenced by `config.yml`.
@@ -368,6 +403,28 @@ reference it), and a type block:
   front-matter, else the first H1, else the filename. Lifecycle is tracked in the factory's own
   DB — **the folder is never modified**. A file materializes as `task.md`; a directory is copied
   whole as `task/`, so multi-file briefs (spec + assets) work.
+- **`github_issues`** — polls a repo's open issues carrying `trigger_label` (default `herdr`),
+  oldest first; the status of record stays on GitHub, projected as labels. Fields (all optional):
+  `repo` (`owner/name`; default = the repo PRs are opened against), `trigger_label`,
+  `state_labels` (`in_development`/`in_review`/`aborted`, defaults `herdr:in-development` /
+  `herdr:in-review` / `herdr:aborted`; created on demand), `close_on`
+  (`merged`/`done`/`aborted`, defaults `true`/`true`/`false`), `type_labels` (issue label →
+  work type; GitHub's native issue type wins when present) + `default_type` (default `Feature`),
+  `max_pages` (pages of 100 per poll, default 1). Lifecycle: claiming swaps in the
+  in-development label and **consumes the trigger label** — re-adding it is the retry; success
+  strips the state labels and closes the issue as completed (a backstop over the PR's `Fixes #n`
+  auto-close — it never reopens); an aborted run leaves the issue **open** with the aborted
+  label unless `close_on.aborted` (then closed as not-planned). The issue body, all human
+  comments, and embedded images/videos are materialized for the agents; ask-human questions are
+  posted as issue comments (reply in a **new** comment).
+
+  ```yaml
+  work_sources:
+    - type: github_issues
+      github_issues:
+        repo: my-org/my-app # optional — defaults to the PR repo
+        trigger_label: herdr
+  ```
 
 ### `belt` (≥ 1)
 
@@ -537,8 +594,9 @@ keys jump to a numbered section, arrows move within it, `Esc` pops back out, `q`
   confirmation).
 - **Config** — a repo list and a full `config.yml` editor: edits the YAML surgically (comments
   and the schema modeline preserved), validates against the engine schema, `^S` saves, `[`/`]`
-  reorder list entries. Jira credentials appear as masked, replace-only `secrets (env)` fields
-  written separately to the `env` file (`chmod 600`).
+  reorder list entries. Credentials appear as masked, replace-only `secrets (env)` fields —
+  declared per source type (`JIRA_EMAIL`/`JIRA_API_TOKEN` for jira, `GITHUB_TOKEN` for
+  github_issues) — written separately to the `env` file (`chmod 600`).
 - **Doctor** — the same checks as the CLI: `r` re-runs, `d` toggles deep mode (live herdr/gh/S3
   probes).
 

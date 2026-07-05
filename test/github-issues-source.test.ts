@@ -152,6 +152,14 @@ describe("GithubIssuesSource — transitions (GET → diff → apply)", () => {
     expect((await src.transition("7", "in_review")).kind).toBe("stale");
   });
 
+  it("in_review on an issue closed as COMPLETED is a noop — auto-close racing a fast merge, not a cancel", async () => {
+    fake = makeFakeGithub();
+    fake.addIssue(7, { state: "closed", state_reason: "completed" });
+    const src = makeSource(fake);
+    expect((await src.transition("7", "in_review")).kind).toBe("noop"); // PR watch owns the real signal
+    expect((await src.transition("7", "in_development")).kind).toBe("stale"); // at claim time it's still a cancel
+  });
+
   it("410 (deleted), 301 (transferred), 404 (inaccessible) → stale with ZERO mutations issued", async () => {
     fake = makeFakeGithub();
     const src = makeSource(fake);

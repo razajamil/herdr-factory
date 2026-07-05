@@ -455,7 +455,7 @@ nothing to change → `noop`; 301 → `stale("transferred")`; 410 → `stale("de
 |---|---|---|
 | todo | *(never requested by the engine)* | unmapped ⇒ noop, zero network (INV-3) |
 | in_development | ensure labels exist; **add** `herdr:in-development` + strip other state labels, **then remove** `trigger_label` (this order keeps the belt-and-braces filter covering the partial-failure gap) | issue closed / 301 / 410 / 404 → stale (engine aborts the run promptly, §4.1); trigger already gone → proceed (benign race) |
-| in_review | swap `herdr:in-development` → `herdr:in-review` | DELETE-of-absent-label 404 → treat as removed (documented); **closed issue → stale("issue closed before review")** — at in_review time the PR hasn't merged, so a closed issue is unambiguously a human cancel signal; park, don't proceed (DP-13) |
+| in_review | swap `herdr:in-development` → `herdr:in-review` | DELETE-of-absent-label 404 → treat as removed (documented); **closed as `not_planned` → stale** (human cancel — park, DP-13); **closed as `completed` → noop** — that's Fixes-#n auto-close racing a fast merge ahead of a delayed write-back; the PR watch owns the real signal and parking would false-positive on every fast merge (refined at implementation time) |
 | merged / done | strip state labels; if open AND `close_on.*`: `PATCH state=closed, state_reason=completed` | already closed (auto-close won the race) → noop — benign by construction; **never reopen** |
 | aborted | strip in-flight labels; add `herdr:aborted`; issue stays OPEN (visible, retriageable — OpenHands prior art); `close_on.aborted` → close as `not_planned` | closed → noop |
 

@@ -195,8 +195,12 @@ export class GithubIssuesSource implements WorkSource {
 
       if (to === "in_development" || to === "in_review") {
         if (issue.state === "closed") {
-          // A closed issue BEFORE any merge is a human cancel signal — the run's stale policy
-          // parks it (in_review) or aborts it (in_development) rather than working killed work.
+          // A closed issue at claim time (in_development) is a cancel signal — abort via stale.
+          // At in_review time, state_reason disambiguates: not_planned = a human killed the work
+          // → stale (park); completed = almost always Fixes-#n auto-close racing a fast merge
+          // ahead of this delayed write-back → noop (the PR watch is the real signal and will
+          // tear the run down; parking here would false-positive on every fast merge).
+          if (to === "in_review" && issue.state_reason !== "not_planned") return { kind: "noop" };
           return { kind: "stale", detail: `issue #${n} was closed (${issue.state_reason ?? "no reason"}) before ${to}` };
         }
         await this.ensureLabel(want!);
