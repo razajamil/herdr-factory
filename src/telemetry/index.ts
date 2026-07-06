@@ -1,5 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { context, propagation, ROOT_CONTEXT } from "@opentelemetry/api";
+import { AsyncLocalStorageContextManager } from "@opentelemetry/context-async-hooks";
+import { CompositePropagator, W3CBaggagePropagator, W3CTraceContextPropagator } from "@opentelemetry/core";
 import * as Effect from "effect/Effect";
 import { runEffect, runEffectPromise, runEffectSync } from "../runtime/effect.ts";
 import {
@@ -95,7 +97,43 @@ function runTelemetry(effect: Effect.Effect<void>): void {
   }
 }
 
+/**
+ * Register the OTel global context manager + propagator. THIS IS LOAD-BEARING for span nesting.
+ *
+ * Our business logic is async/await, not one Effect fiber: every `telemetrySpan`/`withTickLock`/…
+ * re-enters the runtime via `runtime.runPromise*`, which starts a FRESH fiber with no Effect
+ * parent span. @effect/opentelemetry's tracer then falls back to `context.active()` to find the
+ * parent (see OtelSpan `getOtelParent`) — but that only works if a real ContextManager is
+ * registered. Without one, `context.active()` is always ROOT_CONTEXT, so every span becomes its
+ * own root and traces come out disjointed. The same fallback is what carries the parent across
+ * `runEffect` boundaries between the Effect-native spans (server tick loop) and the imperative
+ * `telemetrySpan` tree (core reconcile).
+ *
+ * The propagator additionally powers cross-process tracing: the CLI injects its active span into
+ * request headers (injectTelemetryHeaders) and the server re-parents onto it
+ * (withExtractedTelemetryContext) — both no-ops without a registered propagator.
+ *
+ * The pre-`@effect/opentelemetry` implementation got all of this for free from `NodeSDK.start()`,
+ * which registers both. `NodeSdk.layer` deliberately does not (Effect apps parent via fibers), so
+ * we must register them ourselves. Idempotent + gated on telemetry being enabled.
+ */
+let propagationRegistered = false;
+function registerContextPropagation(): void {
+  if (propagationRegistered) return;
+  propagationRegistered = true;
+  if (!isTelemetryEnabled()) return;
+  context.setGlobalContextManager(new AsyncLocalStorageContextManager().enable());
+  propagation.setGlobalPropagator(
+    new CompositePropagator({ propagators: [new W3CTraceContextPropagator(), new W3CBaggagePropagator()] }),
+  );
+}
+
+// Register at module load so it is in place before the first span, regardless of entry point
+// (CLI, serve, TUI). initTelemetry() below also calls it as the explicit, named init hook.
+registerContextPropagation();
+
 export function initTelemetry(): boolean {
+  registerContextPropagation();
   return isTelemetryEnabled();
 }
 

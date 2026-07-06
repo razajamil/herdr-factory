@@ -2,6 +2,8 @@ services:
   lgtm:
     image: grafana/otel-lgtm:latest
     ports:
-      - "3000:3000"
+      # Grafana UI. Host port is configurable so it can dodge a busy 3000.
+      - "${GRAFANA_PORT:-3001}:3000"
+      # OTLP ingest (gRPC / HTTP) — what herdr-factory exports to.
       - "4317:4317"
       - "4318:4318"
