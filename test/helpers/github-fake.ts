@@ -11,11 +11,12 @@ export interface FakeIssue {
   state_reason: string | null;
   labels: Set<string>;
   body: string;
+  body_html?: string; // defaults to <p>{body}</p>
   user: { login: string };
   assignees: { login: string }[];
   pull_request?: object; // present ⇒ the "issue" is a PR
   type?: { name: string } | null; // native issue type
-  comments: { id: number; created_at: string; body: string; user: { login: string } }[];
+  comments: { id: number; created_at: string; updated_at: string; body: string; user: { login: string } }[];
 }
 
 export interface FakeGithub {
@@ -24,12 +25,23 @@ export interface FakeGithub {
   /** number → status the API answers for it (301 transferred / 410 deleted / 404 no access). */
   gone: Map<number, number>;
   calls: { method: string; path: string }[];
+  /** EVERY url the stub saw, including non-API hosts (media downloads) — the SSRF assertion. */
+  fetchedUrls: string[];
   mutations: () => number;
   hasIssues: boolean;
   push: boolean;
   commentSeq: { n: number };
+  /** Shifted one per API request when non-empty: answer with this status instead (rate-limit /
+   *  auth failure injection). retryAfter → Retry-After header; remaining/reset → x-ratelimit-*. */
+  failNext: { status: number; retryAfter?: number; remaining?: string; reset?: number }[];
+  /** Labels whose next GET /labels/{name} lies "404" once — the ensureLabel create race. */
+  denyLabelGetOnce: Set<string>;
+  /** Full media URL → served bytes (anything not here 404s; non-https hosts too). */
+  assets: Map<string, Buffer>;
   addIssue(n: number, opts?: Partial<Omit<FakeIssue, "number" | "labels" | "comments">> & { labels?: string[] }): FakeIssue;
-  addComment(n: number, body: string, login?: string): void;
+  addComment(n: number, body: string, login?: string): number;
+  /** Edit an existing comment: body changes, updated_at bumps, created_at stays. */
+  editComment(n: number, id: number, body: string): void;
   restore(): void;
 }
 
@@ -53,10 +65,14 @@ export function makeFakeGithub(repo = "acme/tracker"): FakeGithub {
     repoLabels: new Set(["herdr", "bug", "enhancement"]),
     gone: new Map(),
     calls: [],
+    fetchedUrls: [],
     mutations: () => fake.calls.filter((c) => MUTATING.has(c.method)).length,
     hasIssues: true,
     push: true,
     commentSeq: { n: 0 },
+    failNext: [],
+    denyLabelGetOnce: new Set(),
+    assets: new Map(),
     addIssue(n, opts = {}) {
       const issue: FakeIssue = {
         number: n,
@@ -65,6 +81,7 @@ export function makeFakeGithub(repo = "acme/tracker"): FakeGithub {
         state_reason: opts.state_reason ?? null,
         labels: new Set(opts.labels ?? ["herdr"]),
         body: opts.body ?? `Body of issue ${n}`,
+        body_html: opts.body_html,
         user: opts.user ?? { login: "reporter" },
         assignees: opts.assignees ?? [],
         pull_request: opts.pull_request,
@@ -77,15 +94,27 @@ export function makeFakeGithub(repo = "acme/tracker"): FakeGithub {
     addComment(n, body, login = "human") {
       const issue = fake.issues.get(n)!;
       const id = ++fake.commentSeq.n;
-      issue.comments.push({ id, created_at: new Date(2026, 5, 28, 0, id).toISOString(), body, user: { login } });
+      const at = new Date(2026, 5, 28, 0, id).toISOString();
+      issue.comments.push({ id, created_at: at, updated_at: at, body, user: { login } });
+      return id;
+    },
+    editComment(n, id, body) {
+      const c = fake.issues.get(n)!.comments.find((x) => x.id === id)!;
+      c.body = body;
+      c.updated_at = new Date(2026, 5, 28, 0, ++fake.commentSeq.n).toISOString(); // later than any created_at so far
     },
     restore() {
       globalThis.fetch = realFetch;
     },
   };
 
-  const json = (body: unknown, status = 200) =>
-    ({ ok: status < 300, status, text: async () => JSON.stringify(body), headers: new Headers({ "x-ratelimit-remaining": "4999" }) }) as Response;
+  const json = (body: unknown, status = 200, headers: Record<string, string> = {}) =>
+    ({
+      ok: status < 300,
+      status,
+      text: async () => JSON.stringify(body),
+      headers: new Headers({ "x-ratelimit-remaining": "4999", ...headers }),
+    }) as Response;
 
   const issueJson = (i: FakeIssue) => ({
     number: i.number,
@@ -94,7 +123,7 @@ export function makeFakeGithub(repo = "acme/tracker"): FakeGithub {
     state_reason: i.state_reason,
     labels: [...i.labels].map((name) => ({ name })),
     body: i.body,
-    body_html: `<p>${i.body}</p>`,
+    body_html: i.body_html ?? `<p>${i.body}</p>`,
     user: i.user,
     assignees: i.assignees,
     html_url: `https://github.com/${repo}/issues/${i.number}`,
@@ -105,7 +134,28 @@ export function makeFakeGithub(repo = "acme/tracker"): FakeGithub {
   globalThis.fetch = (async (url: string | URL, init?: RequestInit) => {
     const u = new URL(String(url));
     const method = init?.method ?? "GET";
+    fake.fetchedUrls.push(String(url));
+    // Media routes: anything not under api.github.com is a byte download (or a 404).
+    if (u.host !== "api.github.com") {
+      const bytes = fake.assets.get(String(url));
+      if (!bytes) return json({ message: "no such asset" }, 404);
+      return {
+        ok: true,
+        status: 200,
+        text: async () => "",
+        arrayBuffer: async () => bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength),
+        headers: new Headers(),
+      } as Response;
+    }
     fake.calls.push({ method, path: u.pathname });
+    const injected = fake.failNext.shift();
+    if (injected) {
+      return json({ message: `injected ${injected.status}` }, injected.status, {
+        ...(injected.retryAfter != null ? { "retry-after": String(injected.retryAfter) } : {}),
+        ...(injected.remaining != null ? { "x-ratelimit-remaining": injected.remaining } : {}),
+        ...(injected.reset != null ? { "x-ratelimit-reset": String(injected.reset) } : {}),
+      });
+    }
     const esc = repo.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
     // GET /repos/o/r
@@ -116,7 +166,10 @@ export function makeFakeGithub(repo = "acme/tracker"): FakeGithub {
     const labelM = u.pathname.match(new RegExp(`^/repos/${esc}/labels/(.+)$`));
     if (labelM) {
       const name = decodeURIComponent(labelM[1]!);
-      if (method === "GET") return fake.repoLabels.has(name) ? json({ name }) : json({ message: "Not Found" }, 404);
+      if (method === "GET") {
+        if (fake.denyLabelGetOnce.delete(name)) return json({ message: "Not Found" }, 404); // the create-race lie
+        return fake.repoLabels.has(name) ? json({ name }) : json({ message: "Not Found" }, 404);
+      }
     }
     if (method === "POST" && u.pathname === `/repos/${repo}/labels`) {
       const body = JSON.parse(String(init?.body)) as { name: string };
@@ -147,12 +200,14 @@ export function makeFakeGithub(repo = "acme/tracker"): FakeGithub {
         const body = (JSON.parse(String(init?.body)) as { body: string }).body;
         const id = ++fake.commentSeq.n;
         const created_at = new Date(2026, 5, 28, 0, id).toISOString();
-        issue.comments.push({ id, created_at, body, user: { login: "operator" } });
+        issue.comments.push({ id, created_at, updated_at: created_at, body, user: { login: "operator" } });
         return json({ id, created_at, body, user: { login: "operator" } }, 201);
       }
       const since = u.searchParams.get("since");
+      // Real GitHub filters `since` on UPDATED_at — an old comment edited later re-enters the
+      // window (the edited-old-comment trap the source's created_at guard must catch).
       const list = issue.comments
-        .filter((c) => !since || Date.parse(c.created_at) >= Date.parse(since))
+        .filter((c) => !since || Date.parse(c.updated_at) >= Date.parse(since))
         .map((c) => ({ ...c, body_html: `<p>${c.body}</p>` }));
       return json(list);
     }
@@ -185,8 +240,27 @@ export function makeFakeGithub(repo = "acme/tracker"): FakeGithub {
 /** A wired source over the fake backend: generous test buckets (no throttling sleeps), stubbed
  *  token, PR repo = issues repo unless overridden. */
 export function makeSource(fake: FakeGithub, cfg: Partial<GithubIssuesSourceCfg> = {}, prRepo?: string) {
+  return makeWired(fake, cfg, prRepo).src;
+}
+
+/** As makeSource, but exposing the client + auth/budget seams for the rate-limit/auth tests. */
+export function makeWired(
+  _fake: FakeGithub,
+  cfg: Partial<GithubIssuesSourceCfg> = {},
+  prRepo?: string,
+  opts: { envToken?: string; buckets?: { read: TokenBucket[]; mutation: TokenBucket[] } } = {},
+) {
   const merged = { ...DEFAULT_CFG, ...cfg };
-  const fast = { read: [new TokenBucket(10_000, 10_000)], mutation: [new TokenBucket(10_000, 10_000)] };
-  const client = new GithubIssuesClient(merged.repo, undefined, async () => "test-token", fast);
-  return new GithubIssuesSource(merged, client, prRepo ?? merged.repo);
+  const tokenCalls = { n: 0 };
+  const budget = opts.buckets ?? { read: [new TokenBucket(10_000, 10_000)], mutation: [new TokenBucket(10_000, 10_000)] };
+  const client = new GithubIssuesClient(
+    merged.repo,
+    opts.envToken,
+    async () => {
+      tokenCalls.n += 1;
+      return `test-token-${tokenCalls.n}`;
+    },
+    budget,
+  );
+  return { src: new GithubIssuesSource(merged, client, prRepo ?? merged.repo), client, tokenCalls };
 }

@@ -130,15 +130,23 @@ export function postTeardown(repo: string, key: string, source?: string | null):
   return post(`/repos/${encodeURIComponent(repo)}/teardown`, source ? { key, source } : { key });
 }
 
+export interface ReloadOutcome {
+  reached: boolean; // a server answered at all
+  failures: { name: string; error: string }[]; // repos the server could NOT load after the reload
+}
+
 /** Best-effort hot-reload nudge after a config save, so the running server re-reads config.yml
- *  without a restart. Silent on failure (no server / older server). */
-export async function postReload(): Promise<boolean> {
+ *  without a restart. Silent when there's no server to reach — but per-repo LOAD failures are
+ *  surfaced: a saved config that knocks a repo out of the tick loop must not read as success. */
+export async function postReload(): Promise<ReloadOutcome> {
   const info = readInfo();
-  if (!info) return false;
+  if (!info) return { reached: false, failures: [] };
   try {
     const res = await fetch(`http://127.0.0.1:${info.port}/reload`, { method: "POST", signal: AbortSignal.timeout(2500) });
-    return res.ok;
+    if (!res.ok) return { reached: false, failures: [] };
+    const body = (await res.json().catch(() => ({}))) as { failures?: { name: string; error: string }[] };
+    return { reached: true, failures: body.failures ?? [] };
   } catch {
-    return false;
+    return { reached: false, failures: [] };
   }
 }

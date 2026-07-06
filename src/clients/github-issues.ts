@@ -5,22 +5,29 @@
 // a deleted issue answers 410. All issue API calls therefore use redirect: "manual".
 // The gh CLI remains the transport for the PR watcher and for agents inside prompts; only its
 // auth is borrowed here (`gh auth token`) when no GITHUB_TOKEN is configured.
-import * as Effect from "effect/Effect";
-import { runEffectPromise } from "../runtime/effect.ts";
-import { recordRateLimitRemaining } from "../telemetry/index.ts";
+import type { Logger } from "../core/deps.ts";
+import { recordRateLimitRemaining, telemetryEvent } from "../telemetry/index.ts";
 import { run } from "./exec.ts";
 import { GITHUB_MUTATION_BUCKETS, githubReadBucket } from "./github-budget.ts";
-import { HttpStatusError, httpWithPolicy, type HttpError, type HttpPolicy, type HttpResponse, type TokenBucket } from "./http.ts";
+import { HttpStatusError, httpOk, httpOkBytes, type HttpError, type HttpPolicy, type HttpResponse, type TokenBucket } from "./http.ts";
 
 const API = "https://api.github.com";
 const API_VERSION = "2022-11-28";
 const JSON_TIMEOUT_MS = 30_000;
 const MEDIA_TIMEOUT_MS = 120_000;
 
+/** A rate-limit wait worth sleeping through inline. Above this the 403/429 is PRIMARY-limit
+ *  exhaustion (the reset can be tens of minutes out) — no retry budget can outlast it, and each
+ *  capped sleep would stall a reconcile tick for minutes while spending more requests against an
+ *  already-empty budget. Fail fast instead: the poll/outbox backoffs own recovery at that scale. */
+const MAX_INLINE_RATE_WAIT_MS = 30_000;
+
 /** GitHub's secondary rate limits answer 403 + Retry-After (not 429) — widen the retry predicate
- *  for THIS backend only. Everything else keeps the default transport/timeout/429/5xx set. */
+ *  for THIS backend only. A huge (synthesized-from-reset) wait means primary exhaustion → NOT
+ *  retryable. Everything else keeps the default transport/timeout/429/5xx set. */
 function githubRetryable(e: HttpError): boolean {
   if (e instanceof HttpStatusError) {
+    if (e.retryAfterMs != null && e.retryAfterMs > MAX_INLINE_RATE_WAIT_MS) return false; // primary exhaustion
     return e.status === 429 || e.status >= 500 || (e.status === 403 && e.retryAfterMs != null);
   }
   return true; // timeout / network
@@ -81,12 +88,14 @@ export class GithubIssuesClient {
   private readonly envToken: string | undefined;
   private readonly tokenCmd: () => Promise<string | null>;
   private readonly budget: GithubBudget;
-  private token: string | null | undefined; // memoized (undefined = not yet fetched)
+  private readonly log: Logger;
+  private token: string | undefined; // memoized SUCCESSFUL bootstrap only (never cache a failure)
 
-  constructor(repo: string, envToken?: string, tokenCmd?: () => Promise<string | null>, budget?: GithubBudget) {
+  constructor(repo: string, envToken?: string, tokenCmd?: () => Promise<string | null>, budget?: GithubBudget, log: Logger = () => {}) {
     this.repo = repo;
     this.envToken = envToken?.trim() || undefined;
     this.budget = budget ?? { read: [githubReadBucket], mutation: GITHUB_MUTATION_BUCKETS };
+    this.log = log;
     // Default bootstrap: the user's gh CLI session. Injectable for tests.
     this.tokenCmd =
       tokenCmd ??
@@ -98,7 +107,10 @@ export class GithubIssuesClient {
 
   private async authToken(): Promise<string> {
     if (this.envToken) return this.envToken;
-    if (this.token === undefined) this.token = await this.tokenCmd();
+    // Memoize only a SUCCESSFUL bootstrap: caching a failure (gh not yet logged in at factory
+    // start) would keep the source dead for the process lifetime, since the 401-refresh path
+    // only fires when a request was actually sent.
+    if (this.token === undefined) this.token = (await this.tokenCmd()) ?? undefined;
     if (!this.token) {
       throw new Error("GitHub auth missing — set GITHUB_TOKEN in the repo env, or authenticate the gh CLI (`gh auth login`)");
     }
@@ -114,28 +126,27 @@ export class GithubIssuesClient {
       const policy: HttpPolicy = {
         buckets: opts.mutation ? this.budget.mutation : this.budget.read,
         isRetryable: githubRetryable,
-        // Mutations fail fast back to their durable retry loop (the transition outbox) instead of
-        // stalling a reconcile tick on a long secondary-limit sleep; POSTs also retry only once
-        // (a timed-out write may have landed — comment duplication over retry storms).
-        ...(opts.mutation ? { retries: 1, maxRetryAfterMs: 15_000 } : {}),
+        // Bounded inline waits on BOTH paths — a reconcile tick must never stall for minutes on
+        // rate-limit sleeps. Mutations fail fast back to their durable retry loop (the transition
+        // outbox) and retry only once (a timed-out write may have landed — comment duplication
+        // over retry storms); reads keep two retries but cap each honored wait.
+        ...(opts.mutation ? { retries: 1, maxRetryAfterMs: 15_000 } : { retries: 2, maxRetryAfterMs: 10_000 }),
       };
-      const res = await runEffectPromise(
-        httpWithPolicy(
-          {
-            url: `${API}${path}`,
-            method,
-            redirect: "manual",
-            timeoutMs: JSON_TIMEOUT_MS,
-            headers: {
-              Authorization: `Bearer ${await this.authToken()}`,
-              Accept: opts.accept ?? "application/vnd.github+json",
-              "X-GitHub-Api-Version": API_VERSION,
-              ...(opts.body !== undefined ? { "Content-Type": "application/json" } : {}),
-            },
-            body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
+      const res = await httpOk(
+        {
+          url: `${API}${path}`,
+          method,
+          redirect: "manual",
+          timeoutMs: JSON_TIMEOUT_MS,
+          headers: {
+            Authorization: `Bearer ${await this.authToken()}`,
+            Accept: opts.accept ?? "application/vnd.github+json",
+            "X-GitHub-Api-Version": API_VERSION,
+            ...(opts.body !== undefined ? { "Content-Type": "application/json" } : {}),
           },
-          policy,
-        ),
+          body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
+        },
+        policy,
       );
       const remaining = Number(res.headers.get("x-ratelimit-remaining"));
       if (Number.isFinite(remaining)) recordRateLimitRemaining(remaining, { backend: "github", resource: res.headers.get("x-ratelimit-resource") ?? "core" });
@@ -145,6 +156,8 @@ export class GithubIssuesClient {
       return await attempt();
     } catch (e) {
       if (e instanceof HttpStatusError && e.status === 401 && !this.envToken && this.token !== undefined) {
+        this.log("warn", `github: 401 with a memoized gh-CLI token — refreshing it once (${method} ${path})`);
+        telemetryEvent("github.token_refreshed", { "http.request.method": method });
         this.token = undefined; // gh CLI token rotated — refetch once
         return attempt();
       }
@@ -185,8 +198,11 @@ export class GithubIssuesClient {
         accept: opts.full ? "application/vnd.github.full+json" : undefined,
       });
       out.push(...batch);
-      if (batch.length < 100) break;
+      if (batch.length < 100) return out;
     }
+    // Page 10 came back full — more comments exist. Callers assume completeness (materialize's
+    // "all comments"; askHuman's idempotency scan), so never truncate silently.
+    this.log("warn", `github: issue #${n} has over ${out.length} comments — the rest were not fetched`);
     return out;
   }
 
@@ -245,13 +261,10 @@ export class GithubIssuesClient {
    *  signature IS the auth, and leaking the API token to arbitrary redirect targets would be
    *  worse than a failed download. */
   async downloadBytes(url: string): Promise<Buffer> {
-    const res = await runEffectPromise(
-      httpWithPolicy(
-        { url, timeoutMs: MEDIA_TIMEOUT_MS, redirect: "follow" },
-        { buckets: this.budget.read, isRetryable: githubRetryable },
-        "bytes",
-      ),
+    const res = await httpOkBytes(
+      { url, timeoutMs: MEDIA_TIMEOUT_MS, redirect: "follow" },
+      { buckets: this.budget.read, isRetryable: githubRetryable, retries: 2, maxRetryAfterMs: 10_000 },
     );
-    return res.bytes!;
+    return res.bytes;
   }
 }

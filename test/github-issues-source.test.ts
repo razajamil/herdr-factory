@@ -2,7 +2,8 @@ import { describe, it, expect, afterEach } from "vitest";
 import { mkdtempSync, readFileSync, rmSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { makeFakeGithub, makeSource, type FakeGithub } from "./helpers/github-fake.ts";
+import { makeFakeGithub, makeSource, makeWired, type FakeGithub } from "./helpers/github-fake.ts";
+import { TokenBucket } from "../src/clients/http.ts";
 import { isGithubIssuesItem, StaleItemError } from "../src/types.ts";
 
 let fake: FakeGithub | undefined;
@@ -293,5 +294,150 @@ describe("GithubIssuesSource — workDoc", () => {
     const wd = await makeSource(fake).workDoc();
     expect(wd.path).toBe("task.md");
     expect(fake.calls.length).toBe(0);
+  });
+});
+
+describe("GithubIssuesSource — pagination", () => {
+  it("max_pages caps the listing; a short page ends it; oldest-first survives paging", async () => {
+    fake = makeFakeGithub();
+    for (let n = 1; n <= 150; n++) fake.addIssue(n);
+    expect((await makeSource(fake, { maxPages: 1 }).listEligible()).length).toBe(100);
+    fake.calls.length = 0;
+    const all = await makeSource(fake, { maxPages: 2 }).listEligible();
+    expect(all.length).toBe(150);
+    expect(all[0]!.key).toBe("1");
+    expect(all.at(-1)!.key).toBe("150");
+    expect(fake.calls.filter((c) => c.path.endsWith("/issues")).length).toBe(2); // exactly 2 list calls
+  });
+});
+
+describe("GithubIssuesSource — ensureLabel race", () => {
+  it("tolerates the create race: GET says missing, POST answers 422 already-exists — transition still lands", async () => {
+    fake = makeFakeGithub();
+    fake.addIssue(7);
+    fake.repoLabels.add("herdr:in-development"); // it DOES exist…
+    fake.denyLabelGetOnce.add("herdr:in-development"); // …but the existence probe lies once (concurrent creator)
+    expect((await makeSource(fake).transition("7", "in_development")).kind).toBe("applied");
+    expect(fake.issues.get(7)!.labels.has("herdr:in-development")).toBe(true);
+  });
+});
+
+describe("GithubIssuesSource — materialize media pipeline", () => {
+  const UUID = "aaaabbbbccccdddd0000";
+  const RAW = `https://github.com/user-attachments/assets/${UUID}`;
+  const SIGNED = `https://private-user-images.githubusercontent.com/1/999-${UUID}.png?jwt=tok`;
+
+  it("downloads via body_html's signed URL, rewrites BOTH url forms, and never false-footnotes", async () => {
+    fake = makeFakeGithub();
+    fake.addIssue(7, {
+      body: `See the screenshot: ![img](${RAW})`,
+      body_html: `<p>See the screenshot: <img src="${SIGNED}"></p>`,
+    });
+    fake.assets.set(SIGNED, Buffer.from("png-bytes")); // the raw form 404s under a PAT, like real life
+    const dir = mem();
+    await makeSource(fake).materialize("7", dir, () => {});
+    const task = readFileSync(join(dir, "task.md"), "utf8");
+    expect(task).toContain("attachments/attachment-1.png");
+    expect(task).not.toContain(RAW); // the raw form was rewritten via the shared asset id
+    expect(task).not.toContain("could not be downloaded"); // one asset, one download, no false failure
+    expect(readFileSync(join(dir, "attachments", "attachment-1.png"), "utf8")).toBe("png-bytes");
+    // The 404-under-PAT raw URL was never fetched — the signed download satisfied the asset id.
+    expect(fake.fetchedUrls.filter((u) => u === RAW).length).toBe(0);
+  });
+
+  it("never fetches lookalike hosts — the allowlist is a parsed-hostname check, not a substring match", async () => {
+    fake = makeFakeGithub();
+    const EVIL_SUBDOMAIN = "https://camo.githubusercontent.com.evil.net/x.png";
+    const EVIL_PATH = "https://evil.net/a/github.com/user-attachments/x.png";
+    const EVIL_QUERY = "https://internal.corp:8080/x?user-images.githubusercontent.com";
+    fake.addIssue(7, { body: `![a](${EVIL_SUBDOMAIN}) ![b](${EVIL_PATH}) ![c](${EVIL_QUERY})` });
+    const dir = mem();
+    await makeSource(fake).materialize("7", dir, () => {});
+    const task = readFileSync(join(dir, "task.md"), "utf8");
+    // Links left untouched, and — the load-bearing part — no fetch ever left for those hosts.
+    expect(task).toContain(EVIL_SUBDOMAIN);
+    const offHost = fake.fetchedUrls.filter((u) => u.includes("evil") || u.includes("internal.corp"));
+    expect(offHost).toEqual([]);
+  });
+
+  it("caps downloads at 12 attachments and footnotes what was skipped", async () => {
+    fake = makeFakeGithub();
+    const urls = Array.from({ length: 13 }, (_, i) => `https://user-images.githubusercontent.com/1/${i}.png`);
+    for (const u of urls) fake.assets.set(u, Buffer.from(`bytes-${u}`));
+    fake.addIssue(7, { body: urls.map((u) => `![x](${u})`).join(" ") });
+    const dir = mem();
+    await makeSource(fake).materialize("7", dir, () => {});
+    const task = readFileSync(join(dir, "task.md"), "utf8");
+    expect(task).toContain("attachment-12"); // 12 downloaded…
+    expect(task).toContain("1 attachment(s) could not be downloaded"); // …the 13th footnoted
+  });
+});
+
+describe("GithubIssuesSource — edited-old-comment trap", () => {
+  it("a pre-question comment edited AFTER the question re-enters the since window but is NOT a reply", async () => {
+    fake = makeFakeGithub();
+    fake.addIssue(7);
+    const oldId = fake.addComment(7, "an old pre-question comment", "human");
+    const src = makeSource(fake);
+    const q = await src.askHuman({ repo: "demo", runId: 4, questionId: 9, key: "7", step: "fix", question: "Which flag wins?" });
+    fake.editComment(7, oldId, "edited long after the question"); // updated_at now > question created_at
+    const reply = await src.pollHumanReply({ key: "7", questionId: 9, externalId: q.externalId, externalCreatedAt: q.externalCreatedAt });
+    expect(reply).toBeNull(); // created_at guard holds — hence "reply in a NEW comment"
+  });
+});
+
+describe("GithubIssuesClient — rate limits + auth", () => {
+  it("a 401 with a gh-CLI token refreshes the token exactly once and succeeds", async () => {
+    fake = makeFakeGithub();
+    fake.addIssue(7);
+    const { src, tokenCalls } = makeWired(fake);
+    fake.failNext.push({ status: 401 });
+    const t = await src.describe("7");
+    expect(t.key).toBe("7");
+    expect(tokenCalls.n).toBe(2); // bootstrap + one refresh
+  });
+
+  it("a 401 with an env-provided GITHUB_TOKEN is NOT refreshed (the env token is authoritative)", async () => {
+    fake = makeFakeGithub();
+    fake.addIssue(7);
+    const { src, tokenCalls } = makeWired(fake, {}, undefined, { envToken: "pat-from-env" });
+    fake.failNext.push({ status: 401 });
+    await expect(src.describe("7")).rejects.toThrow();
+    expect(tokenCalls.n).toBe(0);
+  });
+
+  it("a secondary-limit 403 with a short Retry-After is retried and succeeds", async () => {
+    fake = makeFakeGithub();
+    fake.addIssue(7);
+    const { src } = makeWired(fake);
+    fake.failNext.push({ status: 403, retryAfter: 0, remaining: "30" });
+    const t = await src.describe("7");
+    expect(t.key).toBe("7");
+  });
+
+  it("PRIMARY exhaustion (remaining: 0, reset far away) fails fast — no retry burns against an empty budget", async () => {
+    fake = makeFakeGithub();
+    fake.addIssue(7);
+    const { src } = makeWired(fake);
+    const farReset = Math.floor(Date.now() / 1000) + 1800; // 30 min out
+    fake.failNext.push({ status: 403, remaining: "0", reset: farReset });
+    const started = Date.now();
+    await expect(src.describe("7")).rejects.toThrow(/403/);
+    expect(Date.now() - started).toBeLessThan(2_000); // failed fast, not 60s-per-attempt sleeps
+    expect(fake.calls.filter((c) => c.path.endsWith("/issues/7")).length).toBe(1); // exactly one attempt
+  });
+
+  it("mutations acquire EVERY chained budget bucket — the hourly cap blocks even when the minute cap is open", async () => {
+    fake = makeFakeGithub();
+    fake.addIssue(7, { labels: ["herdr", "herdr:in-development"] });
+    // Minute bucket wide open; "hourly" bucket pre-drained with ~25/s refill → every mutation
+    // must WAIT ≈40ms for a token instead of sailing through the open minute bucket.
+    const hourly = new TokenBucket(25, 1);
+    hourly.tryTake(); // drain the initial burst token
+    const buckets = { read: [new TokenBucket(10_000, 10_000)], mutation: [new TokenBucket(10_000, 10_000), hourly] };
+    const { src } = makeWired(fake, {}, undefined, { buckets });
+    const started = Date.now();
+    expect((await src.transition("7", "in_review")).kind).toBe("applied");
+    expect(Date.now() - started).toBeGreaterThanOrEqual(30);
   });
 });

@@ -449,8 +449,16 @@ export function createConfigEditor(renderer: CliRenderer, confirm: ConfirmFn): T
     writeFileSync(join(repoConfigDir(loadedRepo), "config.yml"), text);
     loadedText = text;
     setStatus("✓ saved", theme.status.good);
-    void postReload().then((ok) => {
-      if (ok && loadedRepo) setStatus("✓ saved · server reloaded", theme.status.good);
+    void postReload().then((outcome) => {
+      if (!loadedRepo || !outcome.reached) return;
+      const failed = outcome.failures.find((f) => f.name === loadedRepo) ?? outcome.failures[0];
+      if (failed) {
+        // The save was schema-valid but the server could NOT load the repo (e.g. a source whose
+        // client can't be constructed) — the repo is NOT ticking; "reloaded" would be a lie.
+        setStatus(`✗ saved, but repo "${failed.name}" failed to load: ${failed.error}`, theme.status.bad);
+      } else {
+        setStatus("✓ saved · server reloaded", theme.status.good);
+      }
     });
   }
 

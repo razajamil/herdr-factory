@@ -34,6 +34,9 @@ interface FakeState {
   failTransitionStates: Set<string>; // …or throws only for these target states
   staleTransitionStates: Set<string>; // transition() reports the item GONE for these target states
   humanPollError: Error | null; // pollHumanReply throws this instead of returning
+  humanAskError: Error | null; // askHuman throws this instead of posting
+  failEligible: boolean; // the jira source's listEligible throws (backend outage)
+  itemLabels: Record<string, string[]>; // labels the jira fake attaches per key (default [])
 }
 
 /** A resolved belt step for the fakes. Budgets/heartbeat/opensPr mirror what config.ts derives for
@@ -58,7 +61,7 @@ function build(opts: { multi?: boolean } = {}) {
   let now = 1000;
   let uidN = 0; // deterministic per-claim branch suffix (u1, u2, …) so re-claims get distinct branches
   const store = new Store(openDb(":memory:"), () => now);
-  const state: FakeState = { eligible: [], eligible2: [], pr: null, sig: { unresolved: 0, failing: 0, sig: "s0" }, paneState: "idle", deadPanes: new Set(), headSha: "sha0", sessionId: "sess-1", workspaceExists: false, focusedPane: { paneId: "w1:p1", workspaceId: "w1", tabId: "w1:t1", label: "agent" }, humanReply: null, herdrUnreachable: false, failTransitions: false, failTransitionStates: new Set(), staleTransitionStates: new Set(), humanPollError: null };
+  const state: FakeState = { eligible: [], eligible2: [], pr: null, sig: { unresolved: 0, failing: 0, sig: "s0" }, paneState: "idle", deadPanes: new Set(), headSha: "sha0", sessionId: "sess-1", workspaceExists: false, focusedPane: { paneId: "w1:p1", workspaceId: "w1", tabId: "w1:t1", label: "agent" }, humanReply: null, herdrUnreachable: false, failTransitions: false, failTransitionStates: new Set(), staleTransitionStates: new Set(), humanPollError: null, humanAskError: null, failEligible: false, itemLabels: {} };
   const calls = {
     transitions: [] as [string, WorkState][],
     agentSend: [] as [string, string][],
@@ -76,13 +79,16 @@ function build(opts: { multi?: boolean } = {}) {
     agentStart: 0,
     notify: 0,
   };
-  const wrapJira = (t: Ticket): JiraMatchItem => ({ sourceType: "jira", key: t.key, summary: t.summary, type: t.type, status: "To Do", labels: [], fields: {} });
+  const wrapJira = (t: Ticket): JiraMatchItem => ({ sourceType: "jira", key: t.key, summary: t.summary, type: t.type, status: "To Do", labels: state.itemLabels[t.key] ?? [], fields: {} });
   const wrapLm = (t: Ticket): LocalMarkdownMatchItem => ({ sourceType: "local_markdown", key: t.key, summary: t.summary, type: t.type, labels: [], fields: {}, path: `/f/${t.key}.md`, filename: `${t.key}.md`, frontMatter: {}, body: "" });
   // Fake work sources; transitions record the CANONICAL WorkState (the canonical→backend mapping
   // lives inside the real JiraSource/LocalMarkdownSource, which these fakes stand in for).
   const jiraClient: WorkSource = {
     spec: { statusOfRecord: "external", mappedStates: ["todo", "in_development", "in_review"], replyChannel: "comments" },
-    listEligible: async () => state.eligible.map(wrapJira),
+    listEligible: async () => {
+      if (state.failEligible) throw new Error("jira is down (fake)");
+      return state.eligible.map(wrapJira);
+    },
     describe: async (key) => ({ key, summary: "Fix the thing", type: "Bug" }),
     transition: async (key, to) => {
       if (state.failTransitions || state.failTransitionStates.has(to)) throw new Error(`transition to ${to} failed (fake)`);
@@ -93,7 +99,11 @@ function build(opts: { multi?: boolean } = {}) {
     materialize: async (_key, memDir) => { mkdirSync(memDir, { recursive: true }); writeFileSync(join(memDir, "ticket.json"), "{}"); },
     workDoc: async () => ({ path: "ticket.json", kind: "Jira ticket (JSON)" }),
     postNote: async (key, note) => { calls.postNotes.push([key, note]); },
-    askHuman: async (input) => { calls.humanAsk.push(input); return { externalId: `q-${input.questionId}`, externalCreatedAt: "2026-06-28T00:00:00.000+0000" }; },
+    askHuman: async (input) => {
+      if (state.humanAskError) throw state.humanAskError;
+      calls.humanAsk.push(input);
+      return { externalId: `q-${input.questionId}`, externalCreatedAt: "2026-06-28T00:00:00.000+0000" };
+    },
     pollHumanReply: async (input) => {
       if (state.humanPollError) throw state.humanPollError;
       calls.humanPoll.push(input);
@@ -1118,6 +1128,21 @@ describe("stale write-backs — two-phase policy (lock-free stamp, run-locked re
     expect(calls.postNotes).toEqual([]); // skipSourceNote: the item the note would go to is gone
   });
 
+  it("a LATE-delivering claim intent going stale on a run that reached reviewing PARKS it — never tears down an open PR", async () => {
+    const { deps, store, state, calls, worktree } = build();
+    // The in_development write-back threw at claim time and backed off; meanwhile the run
+    // advanced all the way to reviewing with an open PR. Then the issue was deleted.
+    const run = seed(store, worktree, "K-S4", "reviewing", null, { prNumber: 42, watchDeadline: 99999 });
+    state.staleTransitionStates = new Set(["in_development"]);
+    store.enqueueTransition({ runId: run.id, repo: "demo", workSource: "jira", ticketKey: "K-S4", toState: "in_development" });
+    await flushTransitionOutbox(deps);
+    await reconcileRun(deps, store.getRun(run.id)!);
+    const got = store.getRun(run.id)!;
+    expect(got.phase).toBe("attention"); // parked — the abort branch keys on run PROGRESS, not the intent
+    expect(got.endedAt).toBeNull();
+    expect(calls.worktreeRemove).toEqual([]); // the worktree (and its PR's branch) survives
+  });
+
   it("stale for an already-ended run is consumed silently at delivery time", async () => {
     const { deps, store, state, calls, worktree } = build();
     const run = seed(store, worktree, "K-S3", "running", "pr");
@@ -1164,6 +1189,101 @@ describe("human-loop resilience — poll errors back off; a gone item escalates"
     expect(got.phase).toBe("attention");
     expect(got.attentionReason).toContain("gone");
     expect(calls.postNotes).toEqual([]); // no note to a deleted item
+  });
+
+  it("a StaleItemError from the askHuman RE-POST path escalates too (the question can never be posted)", async () => {
+    const { deps, store, state, worktree } = build();
+    const run = seed(store, worktree, "K-H5", "running", "fix");
+    state.humanAskError = new Error("jira 502 (fake)"); // initial post fails transiently → question recorded, unposted
+    const asked = await requestHumanInput(deps, run, "fix", "Which flag wins?");
+    expect(asked.posted).toBe(false);
+    state.humanAskError = new StaleItemError("issue deleted"); // by the re-post tick, the item is gone
+    await reconcileRun(deps, store.getRun(run.id)!);
+    expect(store.getRun(run.id)!.phase).toBe("attention");
+  });
+
+  it("20 consecutive poll ERRORS escalate (a failing source must not poll invisibly forever)", async () => {
+    const { deps, store, state, worktree, setNow } = build();
+    const run = seed(store, worktree, "K-H3", "running", "fix");
+    const asked = await requestHumanInput(deps, run, "fix", "Which flag wins?");
+    state.humanPollError = new Error("HTTP 429: rate limited");
+    let now = 1000;
+    for (let i = 0; i < 20; i++) {
+      now += 301; // always past the 5-min backoff cap
+      setNow(now);
+      await reconcileRun(deps, store.getRun(run.id)!);
+    }
+    const got = store.getRun(run.id)!;
+    expect(store.getHumanQuestion(asked.questionId)!.pollErrors).toBe(20);
+    expect(got.phase).toBe("attention");
+    expect(got.attentionReason).toContain("failed 20 times");
+  });
+
+  it("resume of a run parked out of the human loop returns it to waiting_for_human with a fresh poll window", async () => {
+    const { deps, store, state, worktree, setNow } = build();
+    const run = seed(store, worktree, "K-H4", "running", "fix");
+    const asked = await requestHumanInput(deps, run, "fix", "Which flag wins?");
+    state.humanPollError = new StaleItemError("transient-looking outage"); // parks it
+    await reconcileRun(deps, store.getRun(run.id)!);
+    expect(store.getRun(run.id)!.phase).toBe("attention");
+
+    const res = await resumeRun(deps, store.getRun(run.id)!);
+    // The question is still pending — resuming to `running` would orphan it (only
+    // waiting_for_human polls for replies) and silently drop whatever the human answered.
+    expect(res).toMatchObject({ ok: true, phase: "waiting_for_human" });
+    expect(store.getHumanQuestion(asked.questionId)!.pollErrors).toBe(0); // fresh escalation window
+    expect(store.getHumanQuestion(asked.questionId)!.nextPollAt).toBe(0); // due immediately
+
+    // The source healed and the human answered — the resumed run picks the reply up.
+    state.humanPollError = null;
+    state.humanReply = { body: "Use the new flag.", externalId: "a-9", author: "PM" };
+    setNow(2000);
+    await reconcileRun(deps, store.getRun(run.id)!);
+    expect(store.getRun(run.id)!.phase).toBe("running");
+    expect(store.getHumanQuestion(asked.questionId)!.status).toBe("answered");
+  });
+
+  it("a NEW ask-human supersedes a stale pending question instead of silently binding to it", async () => {
+    const { deps, store, state, worktree, calls } = build();
+    const run = seed(store, worktree, "K-H6", "running", "fix");
+    const first = await requestHumanInput(deps, run, "fix", "Original question?");
+    expect(calls.humanAsk).toHaveLength(1);
+    // Simulate the post-resume state: the run is running again, the old question still pending.
+    deps.store.updateRun(run.id, { phase: "running" });
+    const second = await requestHumanInput(deps, store.getRun(run.id)!, "fix", "A different question?");
+    expect(second.questionId).not.toBe(first.questionId);
+    expect(calls.humanAsk).toHaveLength(2); // the new question was actually POSTED to the source
+    expect(store.getHumanQuestion(first.questionId)!.status).toBe("answered"); // superseded, not pending
+    expect(store.getHumanQuestion(first.questionId)!.answer).toContain("superseded");
+    expect(store.pendingHumanQuestionForRun(run.id)!.id).toBe(second.questionId);
+    // The idempotent RE-ASK of the same question still reuses (no duplicate post).
+    const again = await requestHumanInput(deps, store.getRun(run.id)!, "fix", "A different question?");
+    expect(again.questionId).toBe(second.questionId);
+    expect(calls.humanAsk).toHaveLength(2);
+  });
+});
+
+describe("multi-source resilience + label routing", () => {
+  it("one source's listEligible outage does not starve the other source's claims", async () => {
+    const { deps, store, state } = build({ multi: true });
+    state.failEligible = true; // jira is down
+    state.eligible = [ticket("K-J1")];
+    state.eligible2 = [ticket("K-L1", "task")];
+    await reconcileRepo(deps);
+    expect(store.activeRunForTicket("demo", "jira", "K-J1")).toBeUndefined();
+    expect(store.activeRunForTicket("demo", "lm", "K-L1")).toBeDefined(); // lm claimed regardless
+  });
+
+  it("belts route on the uniform MatchItem labels field (first matching belt wins)", async () => {
+    const { deps, store, state, shipBelt } = build();
+    const bugsBelt: BeltRuntime = { ...shipBelt, name: "bugs", priority: 1, match: async ({ item }) => item.labels.includes("bug") };
+    const restBelt: BeltRuntime = { ...shipBelt, name: "rest", priority: 2 };
+    deps.belts.splice(0, deps.belts.length, bugsBelt, restBelt);
+    state.itemLabels["K-B"] = ["bug", "agent"];
+    state.eligible = [ticket("K-B"), ticket("K-F")];
+    await reconcileRepo(deps);
+    expect(store.activeRunForTicket("demo", "jira", "K-B")!.belt).toBe("bugs");
+    expect(store.activeRunForTicket("demo", "jira", "K-F")!.belt).toBe("rest");
   });
 });
 

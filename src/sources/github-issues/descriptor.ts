@@ -77,8 +77,8 @@ export const githubIssuesDescriptor: SourceDescriptor<ResolvedBlock> = {
         `work source "${ctx.sourceName}": no GitHub repo to poll — set github_issues.repo (owner/name), or repo.github / a git origin so the default resolves`,
       );
     }
-    const client = new GithubIssuesClient(repo, ctx.env.GITHUB_TOKEN);
-    return new GithubIssuesSource({ ...ctx.cfg, repo }, client, ctx.ghRepo || repo);
+    const client = new GithubIssuesClient(repo, ctx.env.GITHUB_TOKEN, undefined, undefined, ctx.log);
+    return new GithubIssuesSource({ ...ctx.cfg, repo }, client, ctx.ghRepo || repo, ctx.log);
   },
   secrets: [
     {

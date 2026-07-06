@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import { parse as parseYaml } from "yaml";
 import { z } from "zod";
 import type { SourceType } from "./types.ts";
+import { expandHome } from "./paths.ts";
 import { SOURCE_DESCRIPTORS, descriptorFor } from "./sources/registry.ts";
 
 // ── Work sources: where to poll work from (no agents/pipeline here anymore — that's a belt). ──
@@ -373,15 +374,9 @@ function stateRoot(): string {
   return resolve(process.env.HERDR_FACTORY_STATE_ROOT?.trim() || join(homedir(), ".local", "state", "herdr-factory"));
 }
 
-/** Expand a leading `~`/`~/` and any `$HOME`/`${HOME}` to the home directory. Absolute paths and
- *  paths without those tokens are returned unchanged, so it's a safe no-op for already-absolute
- *  config values. Applied uniformly to repo.path and local_markdown.folder. */
-export function expandHome(p: string): string {
-  let out = p;
-  if (out === "~" || out.startsWith("~/")) out = join(homedir(), out.slice(1));
-  out = out.replace(/\$\{HOME\}|\$HOME(?![A-Za-z0-9_])/g, homedir());
-  return out;
-}
+// expandHome lives in the import-free leaf src/paths.ts (descriptors need it, and anything a
+// descriptor imports must never lead back into this module — see paths.ts's header on the cycle).
+export { expandHome };
 
 function parseEnvFile(path: string): Record<string, string> {
   const out: Record<string, string> = {};

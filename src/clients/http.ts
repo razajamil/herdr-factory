@@ -200,6 +200,14 @@ function isRetryable(e: HttpError): boolean {
  *  a reconcile fiber for minutes. */
 const MAX_RETRY_AFTER_MS = 60_000;
 
+function hostOf(url: string): string {
+  try {
+    return new URL(url).host;
+  } catch {
+    return "invalid-url";
+  }
+}
+
 export interface HttpPolicy {
   /** Shared per-backend bucket; every attempt (including retries) takes a token. */
   bucket?: TokenBucket;
@@ -229,13 +237,14 @@ export function httpWithPolicy(req: HttpRequest, policy: HttpPolicy = {}, as: "t
   const retryAfterCap = Math.min(policy.maxRetryAfterMs ?? MAX_RETRY_AFTER_MS, MAX_RETRY_AFTER_MS);
   const buckets = policy.buckets ?? (policy.bucket ? [policy.bucket] : []);
   // Bucket acquisition with the wait time recorded — budget back-pressure should be visible in
-  // telemetry, not a silent slowdown.
+  // telemetry, not a silent slowdown. Labeled by HOST (bounded cardinality — url.full embeds
+  // issue numbers/timestamps and would mint a new series per request; it stays a span attribute).
   const acquireAll = Effect.suspend(() => {
     const startedAt = Date.now();
     return Effect.forEach(buckets, acquireToken, { discard: true }).pipe(
       Effect.flatMap(() => {
         const waited = Date.now() - startedAt;
-        return waited > 5 ? recordRateLimitWaitEffect(waited, { "url.full": req.url }) : Effect.void;
+        return waited > 5 ? recordRateLimitWaitEffect(waited, { "url.host": hostOf(req.url) }) : Effect.void;
       }),
     );
   });

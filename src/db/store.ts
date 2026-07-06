@@ -720,6 +720,13 @@ export class Store {
     return this.getHumanQuestion(id)!;
   }
 
+  /** Fresh polling window for a resumed run: due now, error run cleared (a resume must get a
+   *  full escalation window, not instantly re-trip the consecutive-error cap). */
+  resetHumanPollBackoff(id: number): void {
+    const t = this.now();
+    this.db.prepare("UPDATE human_questions SET poll_attempts = 0, poll_errors = 0, next_poll_at = 0, updated_at = ? WHERE id = ?").run(t, id);
+  }
+
   /** Record a pollHumanReply THROW: same backoff as a miss, but counted separately so a
    *  persistently-failing source escalates (a slow human never should). */
   recordHumanPollError(id: number): HumanQuestion {

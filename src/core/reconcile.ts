@@ -460,7 +460,12 @@ async function reconcileRunImpl(deps: Deps, run: Run, ctx: TickCtx): Promise<voi
     if (stale) {
       deps.store.markTransitionStaleHandled(stale.id);
       const why = stale.lastError ?? "item no longer exists at the source";
-      if (stale.toState === "in_development") {
+      // Abort vs park keys on the RUN'S progress, not just which intent went stale: a claim-time
+      // in_development intent can deliver stale long after the run advanced (the outbox backs
+      // off up to 1h while phases move on) — destroying a reviewing run's worktree with an open
+      // PR is exactly what the park branch exists to prevent.
+      const preWork = stale.toState === "in_development" && run.prNumber == null && (run.phase === "claiming" || run.phase === "running");
+      if (preWork) {
         // The claim write-back found the item gone: a human deleted/closed it during claim —
         // "don't do this work". Abort promptly, bounding further token spend (the first agent may
         // already be running; the claim transition fires after the first spawn). Teardown's own
@@ -684,7 +689,20 @@ export async function requestHumanInput(
   const src = deps.resolveSource(run.workSource);
   if (!src) throw new Error(`${run.ticketKey}: work source "${run.workSource}" not configured`);
 
-  const existing = deps.store.pendingHumanQuestionForRun(run.id);
+  // Reuse a pending question only when it IS this question (same step + text) — the idempotent
+  // re-ask path. A DIFFERENT pending question (possible after a resume out of a parked human
+  // loop) must be superseded, not silently reused: binding the new ask to the old row would post
+  // nothing to the source and anchor the reply poll on a comment no human is answering.
+  const pending = deps.store.pendingHumanQuestionForRun(run.id);
+  const existing = pending && pending.step === step && pending.question === question.trim() ? pending : undefined;
+  if (pending && !existing) {
+    deps.store.updateHumanQuestion(pending.id, {
+      status: "answered",
+      answer: "(superseded by a newer question from the agent — no human reply was received)",
+      answeredAt: deps.now(),
+    });
+    deps.log("warn", `${run.ticketKey}: superseding stale pending question #${pending.id} with a new ask`);
+  }
   let q = existing ?? deps.store.createHumanQuestion({
     runId: run.id,
     repo: deps.config.repoName,
@@ -894,7 +912,7 @@ function humanLoopStale(deps: Deps, run: Run, q: HumanQuestion, why: string): Pr
   return escalateAttention(deps, run, {
     reason: "source_item_stale",
     attentionReason: `work item gone while waiting for a human reply (${why})`,
-    body: `${run.ticketKey}: question #${q.id} can never be answered — the work item is gone at the source (${why}). Resume to continue anyway, or tear the run down.`,
+    body: `${run.ticketKey}: question #${q.id} can never be answered — the work item is gone at the source (${why}). Tear the run down (resuming would just re-park after the next poll finds the item still gone).`,
     detail: { questionId: q.id, why },
     skipSourceNote: true,
   });
@@ -1253,8 +1271,16 @@ export async function resumeRun(deps: Deps, run: Run): Promise<{ ok: boolean; ph
   if (!belt) return { ok: false, message: `belt "${run.belt}" is not configured — re-add it or tear the run down` };
 
   const repo = deps.config.repoName;
+  const pendingQuestion = deps.store.pendingHumanQuestionForRun(run.id);
   let phase: Run["phase"];
-  if (run.step && stepByName(belt, run.step)) {
+  if (pendingQuestion && run.step && stepByName(belt, run.step)) {
+    // The run was parked OUT of waiting_for_human (poll failures / a stale item) with its
+    // question still pending. Resuming to `running` would orphan it — the reply poller only
+    // runs for waiting_for_human — silently dropping whatever the human answered. Go back to
+    // waiting with a fresh poll window instead.
+    deps.store.resetHumanPollBackoff(pendingQuestion.id);
+    phase = "waiting_for_human";
+  } else if (run.step && stepByName(belt, run.step)) {
     deps.store.upsertRunStep(run.id, run.step, { startedAt: deps.now(), progressSig: null, progressAt: null, absentAt: null });
     phase = "running";
   } else if (belt.watchPr && run.prNumber) {

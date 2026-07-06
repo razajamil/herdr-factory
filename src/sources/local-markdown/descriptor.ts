@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { LocalMarkdownSource } from "../../clients/local-markdown-source.ts";
-import { expandHome } from "../../config.ts";
+import { expandHome } from "../../paths.ts";
 import type { SourceDescriptor } from "../registry.ts";
 
 /** Resolved local_markdown-source config. */
@@ -23,8 +23,6 @@ export const localMarkdownDescriptor: SourceDescriptor<LocalMarkdownSourceCfg> =
     .strict(),
   resolveConfig(parsed) {
     const s = parsed as unknown as { local_markdown: { folder: string } };
-    // expandHome is imported from config.ts across an ESM cycle (config → registry → here); safe
-    // because it's a hoisted function declaration only CALLED at resolve time, never at module init.
     return { folder: expandHome(s.local_markdown.folder) };
   },
   create(ctx) {

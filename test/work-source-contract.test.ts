@@ -245,9 +245,25 @@ describe.each(HARNESSES)("WorkSource contract: $name", ({ make }) => {
     expect((await ctx.src.listEligible()).map((i) => i.key)).toEqual([second]);
   });
 
-  it("describe throws for an unknown key", async () => {
+  it("describe throws for an unknown key — and echoes the CANONICAL key for a known one (INV-11)", async () => {
+    const ctx = make();
+    await expect(ctx.src.describe("no-such-item")).rejects.toThrow();
+    const key = ctx.seedEligible();
+    expect((await ctx.src.describe(key)).key).toBe(key); // the engine dedups on what describe returns
+  });
+
+  it("INV-5: askHuman is idempotent per questionId — a lost response never double-asks the human", async () => {
+    const ctx = make();
+    const key = ctx.seedEligible();
+    const input = { repo: "demo", runId: 7, questionId: 3, key, step: "fix", question: "Which path should win?" };
+    const first = await ctx.src.askHuman(input);
+    const again = await ctx.src.askHuman(input); // externalId was never persisted → re-invoked
+    expect(again.externalId).toBe(first.externalId);
+  });
+
+  it("health resolves on a healthy backend", async () => {
     const { src } = make();
-    await expect(src.describe("no-such-item")).rejects.toThrow();
+    await expect(src.health()).resolves.toBeUndefined();
   });
 
   it("INV-4: materialize is idempotent and tolerates a vanished item without throwing", async () => {

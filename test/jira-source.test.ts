@@ -116,10 +116,14 @@ describe("JiraSource", () => {
     expect(fetchCalls.length).toBe(after);
   });
 
-  it("askHuman posts a marked Jira comment", async () => {
+  it("askHuman posts a marked Jira comment — after scanning for an earlier post (INV-5 idempotency)", async () => {
     let posted = "";
     globalThis.fetch = (async (url: string | URL, init?: RequestInit) => {
-      fetchCalls.push({ url: String(url), method: init?.method ?? "GET" });
+      const method = init?.method ?? "GET";
+      fetchCalls.push({ url: String(url), method });
+      if (method === "GET") {
+        return { ok: true, status: 200, text: async () => JSON.stringify({ comments: [] }), headers: new Headers() } as Response;
+      }
       posted = String(init?.body ?? "");
       return { ok: true, status: 201, text: async () => JSON.stringify(({ id: "10000", created: "2026-06-28T00:00:00.000+0000" })), headers: new Headers() } as Response;
     }) as typeof fetch;
@@ -127,9 +131,31 @@ describe("JiraSource", () => {
     const res = await src().askHuman({ repo: "demo", runId: 7, questionId: 3, key: "RWR-1", step: "fix", question: "Which path should win?" });
 
     expect(res.externalId).toBe("10000");
-    expect(fetchCalls).toEqual([{ url: "https://x.atlassian.net/rest/api/3/issue/RWR-1/comment", method: "POST" }]);
+    // Scan first (a lost response must not double-ask the human), then post.
+    expect(fetchCalls.map((c) => c.method)).toEqual(["GET", "POST"]);
+    expect(fetchCalls[1]!.url).toBe("https://x.atlassian.net/rest/api/3/issue/RWR-1/comment");
     expect(posted).toContain("herdr-factory question: demo/7/3");
     expect(posted).toContain("Which path should win?");
+  });
+
+  it("askHuman finds its own earlier question instead of re-posting (lost-response recovery)", async () => {
+    const adf = (text: string) => ({ type: "doc", version: 1, content: [{ type: "paragraph", content: [{ type: "text", text }] }] });
+    globalThis.fetch = (async (url: string | URL, init?: RequestInit) => {
+      const method = init?.method ?? "GET";
+      fetchCalls.push({ url: String(url), method });
+      return {
+        ok: true,
+        status: 200,
+        text: async () =>
+          JSON.stringify({ comments: [{ id: "9999", created: "2026-06-28T00:00:00.000+0000", body: adf("[herdr-factory question: demo/7/3]\nWhich path should win?") }] }),
+        headers: new Headers(),
+      } as Response;
+    }) as typeof fetch;
+
+    const res = await src().askHuman({ repo: "demo", runId: 7, questionId: 3, key: "RWR-1", step: "fix", question: "Which path should win?" });
+
+    expect(res.externalId).toBe("9999"); // the earlier post, found by its marker
+    expect(fetchCalls.every((c) => c.method === "GET")).toBe(true); // nothing re-posted
   });
 
   it("pollHumanReply returns the first later non-question Jira comment", async () => {

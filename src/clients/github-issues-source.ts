@@ -50,13 +50,28 @@ const MAX_MEDIA_BYTES = 50 * 1024 * 1024;
 
 /** Hosts we download embedded media from. private-user-images + camo are what body_html
  *  (full+json) rewrites private-repo attachments to — the ONLY form that resolves under a PAT;
- *  the raw-body forms work for public repos. Anything else is left as a link. */
-const MEDIA_HOSTS = [
+ *  the raw-body forms work for public repos. Anything else is left as a link.
+ *  SECURITY: matching is on the PARSED hostname (exact, or github.com + the /user-attachments/
+ *  path) — issue bodies/comments are attacker-controlled, and a substring check would let
+ *  `https://camo.githubusercontent.com.evil.net/x` or a path-embedded lookalike turn materialize
+ *  into an SSRF/content-smuggling primitive from the operator's machine. */
+const MEDIA_HOSTNAMES = new Set([
   "private-user-images.githubusercontent.com",
   "user-images.githubusercontent.com",
   "camo.githubusercontent.com",
-  "github.com/user-attachments/",
-];
+]);
+
+function isAllowedMediaUrl(raw: string): boolean {
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    return false;
+  }
+  if (url.protocol !== "https:") return false;
+  if (MEDIA_HOSTNAMES.has(url.hostname)) return true;
+  return url.hostname === "github.com" && url.pathname.startsWith("/user-attachments/");
+}
 
 /** Strip HTML comments + invisible/bidi characters from untrusted text before it reaches a
  *  prompt (INV-4; the raw payload stays in issue.json). */
@@ -83,12 +98,14 @@ export class GithubIssuesSource implements WorkSource {
   private readonly gh: GithubIssuesClient;
   private readonly cfg: GithubIssuesSourceCfg;
   private readonly prRepo: string; // the repo PRs are opened against (may differ from cfg.repo)
+  private readonly log: Logger;
   private readonly ensuredLabels = new Set<string>(); // memoized ensureLabel results (per process)
 
-  constructor(cfg: GithubIssuesSourceCfg, gh: GithubIssuesClient, prRepo: string) {
+  constructor(cfg: GithubIssuesSourceCfg, gh: GithubIssuesClient, prRepo: string, log: Logger = () => {}) {
     this.cfg = cfg;
     this.gh = gh;
     this.prRepo = prRepo;
+    this.log = log;
   }
 
   readonly spec: WorkSourceSpec = {
@@ -148,16 +165,27 @@ export class GithubIssuesSource implements WorkSource {
 
   async listEligible(): Promise<MatchItem[]> {
     const out: GithubIssuesMatchItem[] = [];
-    const inFlight = new Set([this.cfg.stateLabels.inDevelopment, this.cfg.stateLabels.inReview]);
+    // GitHub label names are case-insensitively unique and the API returns the repo's CANONICAL
+    // casing — every membership check here (and in transition) must fold case, or a config that
+    // spells "herdr" against a repo label "Herdr" silently breaks the guards.
+    const inFlight = new Set([this.cfg.stateLabels.inDevelopment, this.cfg.stateLabels.inReview].map((l) => l.toLowerCase()));
     for (let page = 1; page <= this.cfg.maxPages; page++) {
       const batch = await this.gh.listOpenIssuesByLabel(this.cfg.triggerLabel, page);
+      let kept = 0;
       for (const issue of batch) {
         if (issue.pull_request) continue; // the list endpoint interleaves PRs — never claimable
         // Belt-and-braces: an in-flight state label means a claim's label swap partially landed
         // (or a human hand-edited) — don't double-claim. The aborted label deliberately does NOT
         // gate here: re-adding the trigger is the whole retry affordance.
-        if (labelNames(issue).some((l) => inFlight.has(l))) continue;
+        if (labelNames(issue).some((l) => inFlight.has(l.toLowerCase()))) continue;
         out.push(this.toItem(issue));
+        kept += 1;
+      }
+      if (batch.length === 100 && kept === 0) {
+        // A FULL page yielded nothing claimable (e.g. 100 trigger-labeled PRs occupying the
+        // oldest-first slots) — eligible issues beyond this page would starve silently at the
+        // max_pages cap. Surface it; the operator fixes the stray labels or raises max_pages.
+        this.log("warn", `github_issues: page ${page} of "${this.cfg.triggerLabel}" was entirely non-claimable (PRs/in-flight) — newer issues may be starving; check for trigger-labeled PRs or raise max_pages`);
       }
       if (batch.length < 100) break;
     }
@@ -189,29 +217,33 @@ export class GithubIssuesSource implements WorkSource {
       // Idempotent GET → diff → apply. The GET is also the stale probe: 301/410/404 end here.
       const issue = await this.gh.getIssue(n);
       if (issue.pull_request) return { kind: "stale", detail: `#${n} is a pull request` };
-      const have = new Set(labelNames(issue));
+      // Case-folded membership (GitHub's label namespace is case-insensitive and the API returns
+      // the repo's canonical casing); writes keep the configured spelling — GitHub matches them.
+      const have = new Set(labelNames(issue).map((l) => l.toLowerCase()));
+      const has = (label: string) => have.has(label.toLowerCase());
       const want = this.stateLabelFor(to);
       let applied = false;
 
       if (to === "in_development" || to === "in_review") {
         if (issue.state === "closed") {
           // A closed issue at claim time (in_development) is a cancel signal — abort via stale.
-          // At in_review time, state_reason disambiguates: not_planned = a human killed the work
-          // → stale (park); completed = almost always Fixes-#n auto-close racing a fast merge
-          // ahead of this delayed write-back → noop (the PR watch is the real signal and will
-          // tear the run down; parking here would false-positive on every fast merge).
-          if (to === "in_review" && issue.state_reason !== "not_planned") return { kind: "noop" };
+          // At in_review time, state_reason disambiguates: "completed" is what Fixes-#n
+          // auto-close writes, so it's almost always the auto-close racing a fast merge ahead of
+          // this delayed write-back → noop (the PR watch owns the real signal). EVERYTHING else
+          // (not_planned, duplicate, null — none producible by auto-close) is a human cancel →
+          // stale (park).
+          if (to === "in_review" && issue.state_reason === "completed") return { kind: "noop" };
           return { kind: "stale", detail: `issue #${n} was closed (${issue.state_reason ?? "no reason"}) before ${to}` };
         }
         await this.ensureLabel(want!);
-        if (!have.has(want!)) {
+        if (!has(want!)) {
           await this.gh.addLabels(n, [want!]);
           applied = true;
         }
         for (const l of this.allStateLabels()) {
-          if (l !== want && have.has(l)) applied = (await this.gh.removeLabel(n, l)) || applied;
+          if (l !== want && has(l)) applied = (await this.gh.removeLabel(n, l)) || applied;
         }
-        if (to === "in_development" && have.has(this.cfg.triggerLabel)) {
+        if (to === "in_development" && has(this.cfg.triggerLabel)) {
           // Consume the trigger LAST: if the swap partially fails and retries, the still-present
           // trigger keeps the item filtered by the in-flight guard, never double-claimed.
           applied = (await this.gh.removeLabel(n, this.cfg.triggerLabel)) || applied;
@@ -219,17 +251,21 @@ export class GithubIssuesSource implements WorkSource {
         return { kind: applied ? "applied" : "noop" };
       }
 
-      // Terminal states: strip in-flight labels; aborted gains its artifact label; close per config.
+      // Terminal states. An already-CLOSED issue is converged (auto-close / a human beat us):
+      // pure noop for `aborted` (never decorate work a human deliberately killed — the aborted
+      // label is a retriage affordance for OPEN issues, DP-5); for merged/done only strip
+      // leftover in-flight labels (hygiene). Never reopen, never complain.
+      if (issue.state === "closed" && to === "aborted") return { kind: "noop" };
       for (const l of [this.cfg.stateLabels.inDevelopment, this.cfg.stateLabels.inReview]) {
-        if (have.has(l)) applied = (await this.gh.removeLabel(n, l)) || applied;
+        if (has(l)) applied = (await this.gh.removeLabel(n, l)) || applied;
       }
       if (to === "aborted") {
         await this.ensureLabel(want!);
-        if (!have.has(want!)) {
+        if (!has(want!)) {
           await this.gh.addLabels(n, [want!]);
           applied = true;
         }
-      } else if (have.has(this.cfg.stateLabels.aborted)) {
+      } else if (has(this.cfg.stateLabels.aborted)) {
         applied = (await this.gh.removeLabel(n, this.cfg.stateLabels.aborted)) || applied;
       }
       const close = to === "merged" ? this.cfg.closeOn.merged : to === "done" ? this.cfg.closeOn.done : this.cfg.closeOn.aborted;
@@ -237,7 +273,6 @@ export class GithubIssuesSource implements WorkSource {
         await this.gh.closeIssue(n, to === "aborted" ? "not_planned" : "completed");
         applied = true;
       }
-      // Already closed (auto-close / a human beat us): converged — never reopen, never complain.
       return { kind: applied ? "applied" : "noop" };
     } catch (e) {
       const gone = classifyGone(e);
@@ -387,27 +422,44 @@ class MediaCollector {
   }
 
   /** Every downloadable URL in `text`, with the html variant (when given) consulted first so
-   *  private-repo signed URLs win over their raw-body 404-under-PAT counterparts. */
+   *  private-repo signed URLs win over their raw-body 404-under-PAT counterparts. Once one form
+   *  of an asset downloads, the OTHER forms of the same asset id are rewritten to the local copy
+   *  and never fetched — on a private repo the raw-body form 404s by design, and fetching it
+   *  anyway would both waste budget and footnote a false failure. */
   async rewrite(text: string, html?: string): Promise<string> {
     const urls = new Set<string>([...extractMediaUrls(html ?? ""), ...extractMediaUrls(text)]);
     let out = text;
     for (const url of urls) {
-      const local = await this.fetch(url);
+      const assetId = assetIdOf(url);
+      const already = assetId ? this.byAssetId.get(assetId) : undefined;
+      const local = already ?? (await this.fetch(url));
       if (!local) continue;
-      // Rewrite BOTH the exact url and its raw-body counterpart when the asset id matches.
       out = out.split(url).join(local);
-      const assetId = url.match(/user-attachments\/assets\/([\w-]+)/)?.[1] ?? url.match(/\/(\d+)-([\w-]+)\.(\w+)/)?.[2];
+      // Rewrite the asset's OTHER url forms too — but anchored to the allowlisted hosts, never a
+      // bare "any https:// containing the id" scan (a short id would eat unrelated links).
       if (assetId) {
-        out = out.replace(new RegExp(`https://[^\\s)"']*${assetId}[^\\s)"']*`, "g"), local);
+        this.byAssetId.set(assetId, local);
+        out = out.replace(
+          new RegExp(`https://[^\\s)"'<>\\]]*${assetId}[^\\s)"'<>\\]]*`, "g"),
+          (m) => (isAllowedMediaUrl(m) ? local : m),
+        );
       }
     }
     return out;
   }
 
+  private readonly byAssetId = new Map<string, string>(); // asset id -> local relative path
+
   private async fetch(url: string): Promise<string | null> {
     const cached = this.seen.get(url);
     if (cached) return cached;
-    if (this.count >= MAX_ATTACHMENTS) return null;
+    if (this.count >= MAX_ATTACHMENTS) {
+      // Over the cap = an attachment the agent will NOT have locally — that must show in the
+      // footnote, not silently read as "everything captured" (INV-4 honesty).
+      this.failed += 1;
+      this.log("warn", `${this.key}: attachment cap (${MAX_ATTACHMENTS}) reached — leaving the link (${url.slice(0, 120)})`);
+      return null;
+    }
     try {
       const bytes = await this.gh.downloadBytes(url);
       if (bytes.length > MAX_MEDIA_BYTES) {
@@ -429,13 +481,22 @@ class MediaCollector {
   }
 }
 
+/** The durable id shared by an asset's URL forms (raw /user-attachments/assets/<uuid> vs the
+ *  signed private-user-images form). Minimum 8 chars — a short capture ("1-a.png" → "a") would
+ *  make the rewrite regex match unrelated URLs. */
+function assetIdOf(url: string): string | null {
+  const id = url.match(/user-attachments\/assets\/([\w-]{8,})/)?.[1] ?? url.match(/\/\d+-([\w-]{8,})\.\w+/)?.[1];
+  return id ?? null;
+}
+
 function extensionOf(url: string): string {
   const m = url.match(/\.(png|jpe?g|gif|webp|svg|mp4|mov|webm)(\?|$)/i);
   return m ? `.${m[1]!.toLowerCase()}` : "";
 }
 
-/** Markdown/HTML image + asset URLs on the allowlisted hosts. */
-export function extractMediaUrls(text: string): string[] {
+/** Markdown/HTML image + asset URLs on the allowlisted hosts (parsed-hostname check — see
+ *  MEDIA_HOSTNAMES). */
+function extractMediaUrls(text: string): string[] {
   const urls = text.match(/https:\/\/[^\s)"'<>\]]+/g) ?? [];
-  return urls.filter((u) => MEDIA_HOSTS.some((h) => u.includes(h)));
+  return urls.filter(isAllowedMediaUrl);
 }

@@ -53,7 +53,7 @@ export interface HealthInfo {
 /** Everything the HTTP layer needs from the resident lifecycle (implemented in serve.ts). */
 export interface ServerContext {
   health(): HealthInfo;
-  reload(): Promise<string[]>;
+  reload(): Promise<{ repos: string[]; failures: { name: string; error: string }[] }>;
   requestShutdown(why: string): void;
   getRepo(name: string): RepoRuntime | undefined;
   knownRepos(): string[];
@@ -162,7 +162,9 @@ export function createApp(ctx: ServerContext): OpenAPIHono {
     runHandler(
       c,
       Effect.tryPromise({ try: () => ctx.reload(), catch: (cause) => cause }),
-      (repos) => c.json({ ok: true, repos }, 200),
+      // ok reflects "every configured repo is actually running" — a repo whose sources failed to
+      // construct must not be reported as a clean reload.
+      (r) => c.json({ ok: r.failures.length === 0, repos: r.repos, failures: r.failures }, 200),
     ),
   );
   app.openapi(shutdownRoute, (c) =>

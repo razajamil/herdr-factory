@@ -42,7 +42,13 @@ const HealthResponse = z
   })
   .openapi("Health");
 
-const ReloadResponse = z.object({ ok: z.boolean(), repos: z.array(z.string()) }).openapi("Reload");
+const ReloadResponse = z
+  .object({
+    ok: z.boolean(), // false ⇒ at least one configured repo failed to load (see failures)
+    repos: z.array(z.string()),
+    failures: z.array(z.object({ name: z.string(), error: z.string() })),
+  })
+  .openapi("Reload");
 const TickResponse = z.object({ ran: z.boolean() }).openapi("Tick");
 const StepDoneResponse = z
   .object({ ok: z.boolean(), advanced: z.boolean().optional(), message: z.string().optional() })

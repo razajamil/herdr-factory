@@ -1,25 +1,26 @@
 // PROCESS-WIDE GitHub REST budget. Module singletons on purpose: every repo runtime in this
 // process spends the same authenticated user's rate budget (one PAT / gh login), so per-instance
-// buckets would multiply the pressure by the repo count. The gh-CLI PR watcher shares the same
-// primary budget but a different transport; only the REST issue traffic flows through here.
+// buckets would multiply the pressure by the repo count.
 //
-// Shapes guarded (docs.github.com/rest/using-the-rest-api/rate-limits-for-the-rest-api):
-//  - primary: 5,000 req/hr for a PAT — reads ride this; the sustained read rate below is far under.
-//  - secondary content-generating: 80/min AND 500/hr — mutations (comments, labels, close) chain
-//    BOTH buckets; a per-minute bucket alone would allow ~3,600/hr, 7x the hourly cap.
+// What this layer actually guarantees (docs.github.com/rest/using-the-rest-api/rate-limits-for-the-rest-api):
+//  - reads: BURST SMOOTHING ONLY. The 5,000 req/hr primary is NOT enforced here — it is shared
+//    with the gh-CLI PR watcher and the operator's own tooling, none of which flow through these
+//    buckets. Primary exhaustion is handled reactively instead: the client treats a rate-limit
+//    error whose reset is far away as non-retryable and fails fast to the poll/outbox backoffs.
+//  - mutations (comments, labels, close): kept under BOTH documented secondary caps — 80/min and
+//    500/hr — by chaining two buckets. A per-minute bucket alone would allow ~3,600/hr.
 // httpWithPolicy acquires the buckets per attempt (retries included) and records the wait time
-// (herdr_factory.rate_limit.wait_ms), so budget back-pressure is visible, not a silent slowdown.
+// (herdr_factory.rate_limit.wait_ms, labeled by host), so back-pressure is visible.
 import { TokenBucket } from "./http.ts";
 
-/** Reads: 5/s sustained, burst 10 — a claim-heavy tick's GET fan-out smooths to ~300/min peak,
- *  well inside the 5,000/hr primary. */
+/** Reads: 5/s sustained, burst 10 — smooths a claim-heavy tick's GET fan-out into a steady
+ *  trickle. (Burst shaping only; see the header for what is NOT enforced.) */
 export const githubReadBucket = new TokenBucket(5, 10);
 
-/** Mutations, per-minute half: ~60/min sustained (burst 2) under the 80/min secondary cap. */
-export const githubMutationMinuteBucket = new TokenBucket(1, 2);
-
-/** Mutations, per-hour half: 500/hr sustained (burst 10) — the documented hourly
- *  content-generating cap a saturated per-minute bucket would blow through. */
-export const githubMutationHourBucket = new TokenBucket(500 / 3600, 10);
+/** Mutations: chained per-minute AND per-hour caps. The hourly bucket's sustained rate leaves
+ *  room for its own burst — a bucket starts FULL, so rate 500/3600 + burst 10 could admit 510 in
+ *  a rolling hour; (500 - 10)/3600 + burst 10 stays ≤ 500 in every window. */
+const githubMutationMinuteBucket = new TokenBucket(1, 2); // ~60/min sustained vs the 80/min cap
+const githubMutationHourBucket = new TokenBucket((500 - 10) / 3600, 10);
 
 export const GITHUB_MUTATION_BUCKETS = [githubMutationMinuteBucket, githubMutationHourBucket] as const;

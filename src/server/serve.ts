@@ -30,14 +30,18 @@ let httpServer: ReturnType<typeof nodeServe> | undefined;
 let startedAt = 0;
 let shuttingDown = false;
 
-/** (Re)build the per-repo runtimes from config. Clears any existing tick timers first. */
-async function loadRepos(): Promise<void> {
+/** (Re)build the per-repo runtimes from config. Clears any existing tick timers first. Returns
+ *  the repos that FAILED to load (schema-valid config whose source construction threw, etc.) —
+ *  a failed repo silently vanishing from the tick loop while the TUI reports "saved · reloaded"
+ *  is how a whole repo stops working with positive feedback. */
+async function loadRepos(): Promise<{ name: string; error: string }[]> {
   return runEffect(
     withTelemetrySpan(
       "server.load_repos",
       {},
       Effect.tryPromise({
         try: async () => {
+          const failures: { name: string; error: string }[] = [];
           for (const rt of repos.values()) if (rt.timer) clearInterval(rt.timer);
           repos.clear();
           for (const name of listConfiguredRepos()) {
@@ -46,8 +50,10 @@ async function loadRepos(): Promise<void> {
               repos.set(name, { deps, ticking: false });
             } catch (e) {
               slog("error", `repo "${name}": failed to load — ${msg(e)}`);
+              failures.push({ name, error: msg(e) });
             }
           }
+          return failures;
         },
         catch: (cause) => cause,
       }),
@@ -163,9 +169,9 @@ async function serveImpl(): Promise<void> {
   const ctx: ServerContext = {
     health,
     reload: async () => {
-      await loadRepos();
+      const failures = await loadRepos();
       startLoops();
-      return [...repos.keys()];
+      return { repos: [...repos.keys()], failures };
     },
     // Defer briefly so the HTTP /shutdown response flushes before the drain + process.exit
     // (with no in-flight ticks the drain returns instantly, which would race the response).

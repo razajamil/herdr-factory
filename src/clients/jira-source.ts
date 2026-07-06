@@ -172,6 +172,12 @@ export class JiraSource implements WorkSource {
   }
 
   async askHuman(input: HumanAskInput): Promise<HumanAskResult> {
+    // Idempotent per questionId (INV-5): askHuman is re-invoked every tick until an externalId is
+    // PERSISTED — if an earlier POST succeeded but the response was lost, re-posting would ask
+    // the human twice. Scan for this question's marker first.
+    const marker = `${QUESTION_MARKER} ${input.repo}/${input.runId}/${input.questionId}]`;
+    const existing = (await this.jira.listComments(input.key)).find((c) => commentText(c).includes(marker));
+    if (existing) return { externalId: existing.id, externalCreatedAt: existing.created ?? null };
     const comment = await this.jira.addComment(input.key, humanQuestionComment(input));
     return { externalId: comment.id, externalCreatedAt: comment.created ?? null };
   }

@@ -100,7 +100,10 @@ export async function repoGroup(repo: string, deep = false): Promise<DoctorGroup
   const checks: DoctorCheck[] = [];
   let deps: Deps | undefined;
   checks.push(
-    await attempt("config loads + valid", async () => {
+    // Naming matters: buildDeps also CONSTRUCTS each source client, and a descriptor's create()
+    // may throw on an unbuildable source (e.g. github_issues with no resolvable repo) even when
+    // the YAML itself is schema-valid — the label must not send the operator to the config file.
+    await attempt("config loads + sources buildable", async () => {
       deps = await buildDeps(repo);
     }),
   );
