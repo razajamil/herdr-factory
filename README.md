@@ -245,8 +245,10 @@ Pictured at the top. The engine owns the stations _and_ ships their prompts:
   workflow **and** the login/test account so it exercises the flow as the right persona, drives
   `playwright-cli` for before/after screenshots and video, publishes the captures to S3/CloudFront,
   and records a per-criterion verdict table (with the public URLs) in its handoff. If the evidence
-  doesn't prove a criterion it **bounces the run back to fix** with findings; a flaky app that can't
-  be captured cleanly parks for attention past `max_capture_attempts`. This station runs only when
+  doesn't prove a criterion it **bounces the run back to fix** with findings. A flaky app that keeps
+  re-capturing past `max_capture_attempts` parks for attention — but only as a backstop against a
+  stuck agent: if the evidence step then genuinely finishes and signals `step-done`, the run un-parks
+  and advances (evidence is non-gating — the cap never vetoes completed evidence). This station runs only when
   your herdr layout provides its pane (`tab` + `pane` in config) — without one the belt is simply
   fix → review → pr.
 - **review** — a strict read-only gate with fresh eyes: it never edits or commits, it either

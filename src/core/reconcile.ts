@@ -944,6 +944,14 @@ export async function recordCaptureAttempt(
  *  are allowed to be slow). At the 5-min backoff cap this is ~100 min of a failing source. */
 const HUMAN_POLL_ERROR_ESCALATE = 20;
 
+/** Attention reasons raised by a STEP's own execution watchdog — the evidence flaky-capture cap, the
+ *  per-step budget, the commit-stall heartbeat, and the layout-pane wait. These are backstops against
+ *  a stuck agent, NOT a veto on finished work: an agent that reaches step-done is by definition not
+ *  looping, so a genuine step-done from the parked step un-parks the run and lets the pipeline advance
+ *  (reconcileAttention). Every OTHER park — source item gone, PR closed, bounce oscillation, human
+ *  loop, config error — needs a human decision and is never auto-rescued. */
+const STEP_WATCHDOG_ATTENTION = new Set(["capture_limit", "step_budget", "step_stalled", "layout_wait_timeout"]);
+
 /** The item backing a pending human question is gone (deleted/transferred) — the reply can never
  *  arrive. Park for a human; no source note (the item it would go to is what's gone). */
 function humanLoopStale(deps: Deps, run: Run, q: HumanQuestion, why: string): Promise<void> {
@@ -1275,6 +1283,33 @@ async function reconcileReviewing(deps: Deps, run: Run, src: SourceRuntime, ctx:
  * to miss, and a parked run must never go silently stale.
  */
 async function reconcileAttention(deps: Deps, run: Run, belt: BeltRuntime, src: SourceRuntime, ctx: TickCtx): Promise<void> {
+  // A step-execution watchdog (evidence flaky-capture cap, per-step budget/stall, layout wait) parked
+  // this run — but its agent went on to genuinely FINISH the step and signal step-done, which set
+  // rs.done while the run sat here. Since that watchdog is a backstop against a stuck agent, not a
+  // veto on completed work, honor the step-done: un-park and delegate to reconcileStep, which sees
+  // rs.done and advances forward normally (the evidence step → review, etc.). This is what keeps a
+  // non-gating step (evidence) from wedging the pipeline when a flaky app needed more than the capped
+  // number of takes. Fires on the step-done nudge AND on any later tick, so a nudge dropped on run-lock
+  // contention still heals here. Guarded to a still-active belt step that reports done, and only for
+  // the watchdog reasons — a source-stale / pr-closed / bounce / human / config park is left for a human.
+  if (run.step) {
+    const step = stepByName(belt, run.step);
+    const rs = deps.store.getRunStep(run.id, run.step);
+    if (step && rs?.done && STEP_WATCHDOG_ATTENTION.has(deps.store.lastAttentionReasonCode(run.id) ?? "")) {
+      deps.store.updateRun(run.id, { phase: "running", attentionReason: null });
+      deps.store.recordEvent({
+        runId: run.id,
+        repo: deps.config.repoName,
+        ticketKey: run.ticketKey,
+        type: "resumed",
+        detail: { reason: "step_done_after_watchdog_park", step: run.step },
+      });
+      // Restore the pane label the escalation overwrote with "⚠ ATTENTION …" (best-effort).
+      if (run.paneId) await deps.herdr.agentRename(run.paneId, `${run.step}:${run.ticketKey}`).catch(() => {});
+      deps.log("info", `${run.ticketKey}: ${run.step} finished after a watchdog park — un-parking and advancing`);
+      return reconcileStep(deps, deps.store.getRun(run.id)!, belt, src, step);
+    }
+  }
   if (belt.watchPr && run.prNumber) {
     const pr = ctx.prSnapshots?.get(run.prNumber) ?? (await currentPr(deps, run));
     if (pr?.state === "MERGED") return teardown(deps, run, "merged", src);

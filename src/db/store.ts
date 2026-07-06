@@ -435,6 +435,25 @@ export class Store {
     }[];
   }
 
+  /** The machine `reason` of the run's most recent `attention` escalation (read from the event log —
+   *  the run row carries only the human-readable string). Lets reconcileAttention tell a
+   *  step-execution watchdog park (evidence capture cap / per-step budget / stall / layout wait —
+   *  auto-rescuable by a genuine step-done) apart from a source-stale / pr-closed / bounce / human /
+   *  config park, which a human must resolve. null if the run was never parked (or the reason is
+   *  unrecorded). */
+  lastAttentionReasonCode(runId: number): string | null {
+    const row = this.db
+      .prepare("SELECT detail FROM events WHERE run_id = ? AND type = 'attention' ORDER BY id DESC LIMIT 1")
+      .get(runId) as { detail: string | null } | undefined;
+    if (!row?.detail) return null;
+    try {
+      const reason = (JSON.parse(row.detail) as { reason?: unknown }).reason;
+      return typeof reason === "string" ? reason : null;
+    } catch {
+      return null;
+    }
+  }
+
   // --- run steps (one row per belt step the run has reached) ------------------
 
   getRunStep(runId: number, step: StepName): RunStep | undefined {

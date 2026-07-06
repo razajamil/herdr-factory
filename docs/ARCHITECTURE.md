@@ -606,7 +606,11 @@ so they re-run, and counts toward `max_bounces` (default 6; per-belt override; `
 past the cap the run parks for `attention`). The evidence step separately signals each capture try
 via `capture-attempt`; past `max_capture_attempts` (default 5, reset per fresh pass into the step)
 the run parks for `attention` — a flaky app that can't be captured cleanly surfaces instead of
-looping. After the last step, the run enters the `reviewing`
+looping. That park is a backstop, not a gate: it's raised by a step-execution watchdog (the capture
+cap, the per-step budget/stall, or the layout-pane wait), and if the parked step's agent goes on to
+signal `step-done`, `reconcileAttention` un-parks the run and lets the pipeline advance — an agent
+that reaches `step-done` is by definition not looping, so completed evidence is never vetoed (a
+source-stale / PR-closed / bounce-limit / human / config park stays put for a human). After the last step, the run enters the `reviewing`
 human-review watch (watches the PR, wakes a resolver). A **custom** belt runs the same machinery
 over user-defined steps with no PR watch — its last `step-done` tears the run down with outcome
 `completed`.

@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openDb } from "../src/db/index.ts";
 import { Store } from "../src/db/store.ts";
-import { applyPendingFocus, bounceStep, claimTicket, flushTransitionOutbox, reconcileRepo, reconcileRun, requestHumanInput, resumeRun, withRunLock, withRunLockWaiting, withTickLock } from "../src/core/reconcile.ts";
+import { applyPendingFocus, bounceStep, claimTicket, flushTransitionOutbox, reconcileRepo, reconcileRun, recordCaptureAttempt, requestHumanInput, resumeRun, withRunLock, withRunLockWaiting, withTickLock } from "../src/core/reconcile.ts";
 import { HerdrUnreachableError, type BeltRuntime, type Deps, type GitApi, type GitHubApi, type HerdrApi, type SourceRuntime, type WorkSource } from "../src/core/deps.ts";
 import type { Config, StepConfig } from "../src/config.ts";
 import type { FocusedPane, HumanAskInput, HumanPollInput, HumanReply, JiraMatchItem, LocalMarkdownMatchItem, Phase, PrInfo, PrSnapshot, ReviewSig, Ticket, WorkState } from "../src/types.ts";
@@ -512,6 +512,46 @@ describe("reconcile pipeline (work_to_pull_request belt)", () => {
     expect(got.phase).toBe("attention");
     expect(got.attentionReason).toContain("max");
     expect(calls.notify).toBeGreaterThan(0);
+  });
+
+  it("evidence parked by the flaky-capture cap is un-parked by a genuine step-done → advances to review", async () => {
+    // The RWR-17832 regression: the evidence agent hit the capture cap (parked → attention), then
+    // went on to actually finish and signalled step-done. Evidence is a non-gating backstop step, so a
+    // real step-done must un-park the run and let the pipeline advance — not wedge it forever.
+    const { deps, store, worktree, shipBelt } = build();
+    shipBelt.steps = [stepCfg("fix"), stepCfg("evidence"), stepCfg("review"), stepCfg("pr")]; // 4-step belt (adds evidence)
+    const run = seed(store, worktree, "K-EV", "running", "evidence", { paneId: "w1:pev" });
+    store.upsertRunStep(run.id, "evidence", { paneId: "w1:pev" });
+    // maxCaptureAttempts = 5 → the 6th signalled attempt parks the run for attention (capture_limit).
+    for (let i = 0; i < 6; i++) await recordCaptureAttempt(deps, store.getRun(run.id)!, shipBelt);
+    expect(store.getRun(run.id)!.phase).toBe("attention");
+    expect(store.getRun(run.id)!.attentionReason).toContain("capture attempt");
+
+    // The agent finishes anyway and signals step-done; the next reconcile must rescue + advance.
+    store.markStepDone(run.id, "evidence");
+    await reconcileRun(deps, store.getRun(run.id)!);
+    const got = store.getRun(run.id)!;
+    expect(got.phase).toBe("running");
+    expect(got.step).toBe("review"); // evidence → review, the forward advance ran
+    expect(got.attentionReason).toBeNull();
+    expect(store.getRunStep(run.id, "review")?.paneId).toBeTruthy(); // review was spawned
+  });
+
+  it("a NON-watchdog attention park (e.g. PR closed) is NOT rescued by a stray step-done", async () => {
+    // The rescue is scoped to step-execution watchdogs. A park a human must resolve (source item gone,
+    // PR closed, bounce oscillation, …) must stay parked even if a run_step happens to be `done`.
+    const { deps, store, worktree, shipBelt } = build();
+    shipBelt.steps = [stepCfg("fix"), stepCfg("evidence"), stepCfg("review"), stepCfg("pr")]; // 4-step belt (adds evidence)
+    const run = seed(store, worktree, "K-EVN", "attention", "evidence", { paneId: "w1:pev" });
+    store.upsertRunStep(run.id, "evidence", { paneId: "w1:pev", done: true });
+    // Simulate a non-watchdog escalation reason on the record (what escalateAttention would log).
+    store.recordEvent({ runId: run.id, repo: "demo", ticketKey: "K-EVN", type: "attention", detail: { reason: "pr_closed" } });
+    store.updateRun(run.id, { attentionReason: "PR #7 closed without merging" });
+
+    await reconcileRun(deps, store.getRun(run.id)!);
+    const got = store.getRun(run.id)!;
+    expect(got.phase).toBe("attention"); // stays parked — a human must decide
+    expect(got.step).toBe("evidence");
   });
 
   it("rejects a bounce that isn't strictly backward, isn't allowed, or isn't from a running step", async () => {
