@@ -45,6 +45,8 @@ export interface RepoStatus {
   belts: { name: string; beltType: string; source: string; priority: number }[];
   active: ActiveRun[];
   finished: { id: number; ticketKey: string; phase: string; outcome: string | null; prNumber: number | null }[];
+  /** Evidence-upload credential (AWS SSO) health for the dashboard light. "na" = no evidence config. */
+  evidenceSso?: { state: "ok" | "down" | "na"; detail?: string };
 }
 
 export interface Health {

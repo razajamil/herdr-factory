@@ -725,6 +725,18 @@ describe("reconcile pipeline (work_to_pull_request belt)", () => {
     expect(calls.branchDelete).toContain("fix/K-9-s");
   });
 
+  it("teardown drops a still-pending evidence upload (best-effort — worktree about to be removed)", async () => {
+    const { deps, store, state, worktree } = build();
+    const run = seed(store, worktree, "K-EVD", "reviewing", null, { watchDeadline: 99999 });
+    // An evidence upload never landed (SSO down through merge) — still pending at teardown.
+    store.enqueueEvidenceUpload({ runId: run.id, repo: "demo", ticketKey: "K-EVD", keyPrefix: "p/A", evidenceDir: join(worktree, ".memory/herdr-factory/evidence") });
+    expect(store.undeliveredEvidenceUploadsForRun(run.id)).toHaveLength(1);
+    state.pr = { number: 42, state: "MERGED", url: "u" };
+    await reconcileRun(deps, store.getRun(run.id)!);
+    expect(store.getRun(run.id)!.phase).toBe("done");
+    expect(store.undeliveredEvidenceUploadsForRun(run.id)).toHaveLength(0); // dropped at teardown
+  });
+
   it("reviewing polls by PR number — a merge is still detected after the head branch is deleted", async () => {
     const { deps, store, state, worktree, calls } = build();
     const run = seed(store, worktree, "K-9b", "reviewing", null, { watchDeadline: 99999, prNumber: 9 });

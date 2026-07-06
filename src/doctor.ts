@@ -7,6 +7,7 @@ import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
 import { fromNodeProviderChain } from "@aws-sdk/credential-providers";
+import { classifyS3Error } from "./clients/evidence.ts";
 import { run } from "./clients/exec.ts";
 import { assertMainCheckout, globalDbPath, isManagedNode } from "./config.ts";
 import { descriptorFor } from "./sources/registry.ts";
@@ -151,6 +152,18 @@ export async function repoGroup(repo: string, deep = false): Promise<DoctorGroup
       const folder = ["herdr-factory", ev.githubUsername ?? "<gh-login>", ev.keyPrefix].filter(Boolean).join("/");
       checks.push({ name: "evidence", ok: true, detail: `configured: s3://${ev.bucket}/${folder}/ (${ev.region}) — --deep to write-probe` });
     }
+    // Evidence-upload outbox health (local, no network): pending uploads still retrying. An auth-class
+    // stuck upload almost always means the AWS SSO session expired — the actionable fix.
+    if (ev) {
+      const pending = d.store.pendingEvidenceUploads(repo);
+      if (pending.length === 0) {
+        checks.push({ name: "evidence uploads", ok: true, detail: "none pending" });
+      } else if (pending.some((u) => u.errorKind === "auth")) {
+        checks.push({ name: "evidence uploads", ok: false, detail: `${pending.length} stuck — AWS SSO/creds expired; run \`aws sso login${ev.profile ? ` --profile ${ev.profile}` : ""}\`` });
+      } else {
+        checks.push({ name: "evidence uploads", ok: true, detail: `${pending.length} pending — retrying (last: ${pending[pending.length - 1]!.lastError ?? "not yet attempted"})` });
+      }
+    }
   }
   return { title: `repo ${repo}`, checks };
 }
@@ -185,20 +198,8 @@ async function probeEvidenceBucket(ev: NonNullable<Deps["config"]["evidence"]>, 
   }
 }
 
-/** Map an AWS SDK error to a short, actionable doctor reason. */
+/** Map an AWS SDK error to a short, actionable doctor reason. Delegates to the shared classifier so the
+ *  S3 taxonomy lives in exactly one place (src/clients/evidence.ts). */
 function explainS3Error(e: unknown): string {
-  const err = e as { name?: string; message?: string; $metadata?: { httpStatusCode?: number } };
-  const name = err.name ?? "";
-  const status = err.$metadata?.httpStatusCode;
-  const msg = err.message ?? String(e);
-  if (/Credential|Token/i.test(name) || /could not load credentials|credential/i.test(msg)) {
-    return "no AWS credentials resolved (checked env, SSO, ~/.aws, IMDS) — configure creds or the `profile`";
-  }
-  if (name === "NoSuchBucket") return "bucket does not exist";
-  if (name === "PermanentRedirect" || /AuthorizationHeaderMalformed|the bucket is in this region|expecting.*region/i.test(msg)) {
-    return "wrong region — the bucket is in a different AWS region";
-  }
-  if (status === 403 || /AccessDenied|Forbidden/i.test(name)) return "access denied — credentials lack s3:PutObject on this bucket/prefix";
-  if (/Timeout|Abort/i.test(name) || /timed out|aborted/i.test(msg)) return "timed out reaching S3";
-  return `${name || "error"}: ${msg}`.slice(0, 160);
+  return classifyS3Error(e).reason;
 }

@@ -74,7 +74,10 @@ evidence is a **bounce or a recapture — never a pass**.
      `@@EVIDENCE_DIR@@` and prints one public URL per asset (each URL ends with its filename, so bind
      it to the right row; if upload isn't configured it prints a skip notice and produces no URLs —
      that's fine). Put each URL in the table against the criterion its asset proves, so the pr and
-     review steps can use them. Then run `@@STEP_DONE_CMD@@`.
+     review steps can use them. **Use the printed URLs even if the command says the upload was
+     "deferred"** (e.g. AWS creds are down) — the URLs are final and the engine retries the bytes in the
+     background until they land, so do NOT ask-human, bounce, or retry the command for an upload/infra
+     hiccup. Then run `@@STEP_DONE_CMD@@`.
    - **BOUNCE — any criterion is not proven.** The work isn't done; do **not** run step-done. Per
      "Sending the work back for rework", write to `@@MEMORY_DIR@@/bounce-@@STEP@@.md` exactly which
      criteria failed, the asset you checked, what you saw vs. expected, and steps to reproduce.

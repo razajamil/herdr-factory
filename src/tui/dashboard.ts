@@ -185,6 +185,13 @@ export function createDashboard(renderer: CliRenderer, actions: { confirm: Confi
           const active = st?.active ?? [];
           const belts = st ? st.belts.map((b) => b.name).join(", ") || "—" : "—";
           specs.push({ content: `${name}   active ${active.length}/${st?.limits.maxActive ?? "?"}   belts: ${belts}`, fg: theme.accent, target: { repo: name, kind: "repo" } });
+          // SSO light for evidence upload — green when creds are good, red when down. Omitted when the
+          // repo has no evidence config (state "na"), so it's noise-free where it doesn't apply.
+          const sso = st?.evidenceSso;
+          if (sso && sso.state !== "na") {
+            const down = sso.state === "down";
+            specs.push({ content: `  SSO ●${down ? `  down — ${sso.detail ?? "AWS creds expired — run \`aws sso login\`"}` : "  ok"}`, fg: down ? theme.status.bad : theme.status.good });
+          }
           if (!st) {
             specs.push({ content: "  (status unavailable)", fg: theme.text.tertiary });
             continue;

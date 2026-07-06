@@ -11,6 +11,7 @@ import { withExtractedTelemetryContext } from "../telemetry/index.ts";
 import { annotateCurrentSpan, recordHttpServerDurationEffect, withHttpServerSpan } from "../telemetry/effect.ts";
 import { runEffect } from "../runtime/effect.ts";
 import { bounceStep, claimTicket, reconcileRepo, reconcileRun, recordCaptureAttempt, requestHumanInput, resumeRun, teardownTicket, withRunLock, withRunLockWaiting, withTickLock } from "../core/reconcile.ts";
+import { probeEvidenceCreds } from "../clients/evidence.ts";
 import { stepByName } from "../core/step.ts";
 import { resolveActiveRun, resolveBeltName } from "../resolve.ts";
 import type { Deps } from "../core/deps.ts";
@@ -62,6 +63,32 @@ export interface ServerContext {
 
 const msg = (e: unknown): string => (e instanceof Error ? e.message : String(e));
 
+/** Cached AWS creds probe per repo (the dashboard polls /status every ~3s; a HeadBucket must not run
+ *  per poll). TTL keeps the light responsive without hammering AWS. */
+const SSO_PROBE_TTL_SECONDS = 90;
+const ssoProbeCache = new Map<string, { at: number; auth: boolean; reason: string }>();
+
+/** Evidence-upload credential (SSO) health for the dashboard light. `down` when a cached read-only
+ *  HeadBucket probe reports a creds/token failure, OR when the outbox already has an auth-stuck upload
+ *  (immediate, even between probes). A transient/timeout probe or a permanent bucket/perms error is NOT
+ *  "SSO down" (creds are fine — surfaced by doctor). `na` when the repo has no evidence config. */
+async function evidenceSsoStatus(rt: RepoRuntime): Promise<{ state: "ok" | "down" | "na"; detail?: string }> {
+  const cfg = rt.deps.config;
+  const ev = cfg.evidence;
+  if (!ev) return { state: "na" };
+  if (rt.deps.store.authStuckEvidenceUpload(cfg.repoName)) {
+    return { state: "down", detail: `an evidence upload is stuck on expired AWS creds — run \`aws sso login${ev.profile ? ` --profile ${ev.profile}` : ""}\`` };
+  }
+  const now = rt.deps.now();
+  let cached = ssoProbeCache.get(cfg.repoName);
+  if (!cached || now - cached.at >= SSO_PROBE_TTL_SECONDS) {
+    const probe = await probeEvidenceCreds(ev).catch(() => ({ auth: false, reason: "probe failed" }));
+    cached = { at: now, auth: probe.auth, reason: probe.reason };
+    ssoProbeCache.set(cfg.repoName, cached);
+  }
+  return cached.auth ? { state: "down", detail: cached.reason } : { state: "ok" };
+}
+
 /** The structured status payload — same data the CLI `status` renders, exposed for the web UI.
  *  Hits herdr for live pane state, so it's async. */
 async function statusPayload(rt: RepoRuntime) {
@@ -94,6 +121,7 @@ async function statusPayload(rt: RepoRuntime) {
       outcome: r.outcome as string | null,
       prNumber: r.prNumber,
     })),
+    evidenceSso: await evidenceSsoStatus(rt),
   };
 }
 

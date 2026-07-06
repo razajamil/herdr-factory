@@ -60,6 +60,8 @@ export type EventType =
   | "step_done"
   | "bounced"
   | "capture_attempt" // an evidence agent signalled a capture attempt (flaky-capture cap)
+  | "evidence_uploaded" // the evidence-upload outbox delivered a capture's media to S3
+  | "evidence_upload_failed" // the evidence-upload outbox hit a permanent (non-retryable) failure
   | "stale" // a write-back found the item gone at the source (deleted/transferred)
   | "human_question"
   | "human_reply"
@@ -184,6 +186,28 @@ export interface TransitionIntent {
    *  staleHandledAt so one gone item never double-fires. */
   staleAt: number | null;
   staleHandledAt: number | null;
+}
+
+/** One capture's pending S3 media upload — the durable evidence-upload outbox row (see migration v16).
+ *  URLs are published to the handoff/PR immediately (deterministic from `keyPrefix` + filenames); the
+ *  bytes are retried until S3 accepts them or a permanent config error stops it. */
+export interface EvidenceUpload {
+  id: number;
+  runId: number;
+  repo: string;
+  ticketKey: string;
+  keyPrefix: string; // persisted so retry URLs stay stable
+  evidenceDir: string; // absolute path in the worktree (gone ⇒ abandon)
+  attempts: number;
+  nextAttemptAt: number; // also the enqueue lease (CLI inline attempt vs Phase 0 flush)
+  lastError: string | null;
+  errorKind: "auth" | "transient" | "permanent" | null; // classifyS3Error kind of the last failure
+  notifiedAt: number | null; // SSO/permanent notify throttle (per row, never the run)
+  permanentFailedAt: number | null; // non-retryable config error / dir-gone; stop retrying
+  abandonedAt: number | null; // superseded by a re-capture, or dropped at teardown
+  createdAt: number;
+  updatedAt: number;
+  deliveredAt: number | null;
 }
 
 export type HumanQuestionStatus = "pending" | "answered";

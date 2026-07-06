@@ -1,11 +1,8 @@
-import { createReadStream, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
-import { dirname, join, sep } from "node:path";
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { Command } from "commander";
-import { S3Client } from "@aws-sdk/client-s3";
-import { Upload } from "@aws-sdk/lib-storage";
-import { fromNodeProviderChain } from "@aws-sdk/credential-providers";
-import { lookup as mimeLookup } from "mime-types";
 import { configJsonSchema, configSchemaPath, evidenceKeyPrefix, globalDbPath, isManagedNode, managedNodePath, nodePathFile, writeConfigSchema } from "../config.ts";
+import { classifyS3Error, enumerateEvidenceFiles, evidenceUrls, resolveGithubUsername, uploadEvidence } from "../clients/evidence.ts";
 import { baseGroups, repoGroup, type DoctorGroup } from "../doctor.ts";
 import { openDb } from "../db/index.ts";
 import { Store } from "../db/store.ts";
@@ -576,7 +573,7 @@ program
 
 program
   .command("evidence-upload <key>")
-  .description("publish this run's captured evidence to S3 + print the CloudFront URLs (reads the repo's `evidence:` config; uses the ambient AWS credential chain)")
+  .description("publish this run's captured evidence to S3 + print the CloudFront URLs (reads the repo's `evidence:` config; uses the ambient AWS credential chain; retries in the background if creds are down)")
   .option("--source <name>", "the work source the run belongs to (passed by the agent)")
   .action(cliAction("evidence-upload", async (key: string, opts: { source?: string }) => {
     try {
@@ -593,13 +590,7 @@ program
         return;
       }
       const dir = join(activeRun.worktreePath, MEMORY_DIR, "evidence");
-      // Enumerate the tree RECURSIVELY (posix-normalized relative paths) to match `aws s3 cp
-      // --recursive` below — otherwise a nested asset (e.g. a video in a subdir) would be uploaded
-      // with no URL, or an all-nested dir would look empty and upload nothing.
-      const files = (existsSync(dir) ? (readdirSync(dir, { recursive: true }) as string[]) : [])
-        .map((r) => r.split(sep).join("/"))
-        .filter((r) => statSync(join(dir, r)).isFile())
-        .sort();
+      const files = enumerateEvidenceFiles(dir);
       if (files.length === 0) {
         console.log("evidence-upload: no files in the evidence dir — nothing to upload");
         return;
@@ -609,38 +600,34 @@ program
       // override, else the gh-authenticated login (best-effort — omitted if gh can't resolve it). The
       // run id + timestamp mean a re-capture (e.g. after a bounce) never overwrites an earlier upload.
       const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-      const githubUsername = ev.githubUsername ?? (await deps.github.currentLogin()) ?? undefined;
+      const githubUsername = await resolveGithubUsername(ev, () => deps.github.currentLogin());
       if (!githubUsername) {
         console.log("evidence-upload: could not resolve github_username (set evidence.github_username or authenticate gh) — uploading under herdr-factory/ with no per-user folder");
       }
       const prefix = evidenceKeyPrefix({ githubUsername, keyPrefix: ev.keyPrefix, ticketKey: activeRun.ticketKey, runId: activeRun.id, stamp });
-      // Upload via the AWS SDK (was `aws s3 cp --recursive`) — so AWS is a pnpm dep the self-updater
-      // manages, not an unmanaged system binary. No `credentials` ⇒ the SDK's default provider chain
-      // (env → SSO → ~/.aws → process → IMDS/role) — the SAME ambient chain the CLI read; a named
-      // `profile` resolves through that chain (handles the SSO/assume-role case a bare fromIni misses).
-      // No creds are stored or logged. `Upload` does multipart automatically for large evidence video.
-      const s3 = new S3Client({
-        region: ev.region,
-        ...(ev.profile ? { credentials: fromNodeProviderChain({ profile: ev.profile }) } : {}),
-      });
-      for (const rel of files) {
-        // ContentType is load-bearing: `aws s3 cp` guessed MIME on upload; the SDK defaults to
-        // application/octet-stream, which makes CloudFront serve screenshots/video as downloads.
-        await new Upload({
-          client: s3,
-          params: {
-            Bucket: ev.bucket,
-            Key: `${prefix}/${rel}`, // posix `rel` ⇒ keys match the CloudFront URLs printed below
-            Body: createReadStream(join(dir, rel)),
-            ContentType: mimeLookup(rel) || "application/octet-stream",
-          },
-        }).done();
-      }
-      console.log(`uploaded ${files.length} evidence file(s) to s3://${ev.bucket}/${prefix}/`);
-      console.log("public URLs:");
-      for (const f of files) {
-        const encoded = f.split("/").map(encodeURIComponent).join("/"); // safe for spaces/specials in names
-        console.log(`https://${ev.cloudfrontDomain}/${prefix}/${encoded}`);
+
+      // Enqueue the upload as a durable outbox intent (persisting `prefix` so retry URLs stay stable),
+      // then ALWAYS print the deterministic URLs — the handoff/PR get correct links regardless of whether
+      // the byte upload lands now. The engine's Phase 0 flush retries until S3 accepts it.
+      const job = deps.store.enqueueEvidenceUpload({ runId: activeRun.id, repo, ticketKey: activeRun.ticketKey, keyPrefix: prefix, evidenceDir: dir });
+      console.log("public URLs (use these in your handoff even if the upload is deferred — they resolve once the bytes land):");
+      for (const url of evidenceUrls(ev.cloudfrontDomain, prefix, files)) console.log(url);
+
+      // Inline fast path: upload now (succeeds when creds are valid). On failure DON'T hard-fail — the
+      // outbox owns retry from here, so the agent proceeds with the URLs above.
+      try {
+        await uploadEvidence({ evidence: ev, dir, prefix });
+        deps.store.markEvidenceDelivered(job.id);
+        console.log(`uploaded ${files.length} evidence file(s) to s3://${ev.bucket}/${prefix}/`);
+      } catch (e) {
+        const c = classifyS3Error(e);
+        if (c.kind === "permanent") {
+          deps.store.markEvidencePermanentFailed(job.id, c.reason);
+          console.log(`evidence-upload: upload FAILED (config error) — ${c.reason}. Run \`herdr-factory --repo ${repo} doctor --deep\`. The URLs above will not resolve until this is fixed.`);
+        } else {
+          deps.store.recordEvidenceAttempt(job.id, c.reason, c.kind);
+          console.log(`evidence-upload: upload deferred — ${c.reason}. The engine will retry automatically; the URLs above resolve once it lands.`);
+        }
       }
     } catch (e) {
       fail(e);

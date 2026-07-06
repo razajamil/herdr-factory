@@ -2,6 +2,7 @@ import type { DatabaseSync } from "node:sqlite";
 import type {
   Clock,
   EventType,
+  EvidenceUpload,
   HumanQuestion,
   HumanQuestionPatch,
   Outcome,
@@ -150,6 +151,31 @@ interface TransitionIntentRow {
   stale_at: number | null;
   stale_handled_at: number | null;
 }
+
+interface EvidenceUploadRow {
+  id: number;
+  run_id: number;
+  repo: string;
+  ticket_key: string;
+  key_prefix: string;
+  evidence_dir: string;
+  attempts: number;
+  next_attempt_at: number;
+  last_error: string | null;
+  error_kind: string | null;
+  notified_at: number | null;
+  permanent_failed_at: number | null;
+  abandoned_at: number | null;
+  created_at: number;
+  updated_at: number;
+  delivered_at: number | null;
+}
+
+/** Enqueue lease for an evidence upload: the CLI's inline attempt runs UNLOCKED in the agent process,
+ *  concurrently with the server's Phase 0 flush. Setting next_attempt_at this far out at enqueue keeps
+ *  the flush from claiming the row mid inline-upload; a failed inline attempt resets it to the 60s
+ *  backoff so the server picks it up promptly, and it doubles as crash-recovery if the CLI dies mid-upload. */
+const EVIDENCE_UPLOAD_LEASE_SECONDS = 300;
 
 interface HumanQuestionRow {
   id: number;
@@ -672,6 +698,161 @@ export class Store {
     const row = this.db
       .prepare("SELECT 1 AS x FROM transition_outbox WHERE repo = ? AND work_source = ? AND ticket_key = ? AND delivered_at IS NULL LIMIT 1")
       .get(repo, source, key) as { x: number } | undefined;
+    return row !== undefined;
+  }
+
+  // --- evidence-upload outbox -----------------------------------------------
+  // Durable S3 media upload, mirroring the transition outbox: an intent retried at Phase 0 with backoff
+  // until S3 accepts it (or a permanent config error stops it). Leaner than transitions — no
+  // stale two-phase columns; permanent_failed_at is the single terminal-failure state.
+
+  private toEvidenceUpload(r: EvidenceUploadRow): EvidenceUpload {
+    return {
+      id: r.id,
+      runId: r.run_id,
+      repo: r.repo,
+      ticketKey: r.ticket_key,
+      keyPrefix: r.key_prefix,
+      evidenceDir: r.evidence_dir,
+      attempts: r.attempts,
+      nextAttemptAt: r.next_attempt_at,
+      lastError: r.last_error,
+      errorKind: r.error_kind as EvidenceUpload["errorKind"],
+      notifiedAt: r.notified_at,
+      permanentFailedAt: r.permanent_failed_at,
+      abandonedAt: r.abandoned_at,
+      createdAt: r.created_at,
+      updatedAt: r.updated_at,
+      deliveredAt: r.delivered_at,
+    };
+  }
+
+  getEvidenceUpload(id: number): EvidenceUpload | undefined {
+    const row = this.db.prepare("SELECT * FROM evidence_uploads WHERE id = ?").get(id) as EvidenceUploadRow | undefined;
+    return row ? this.toEvidenceUpload(row) : undefined;
+  }
+
+  /** Record the INTENT to upload one capture's media. Idempotent per (run, key_prefix): re-enqueue of
+   *  the SAME prefix re-opens the row (the S3 upload is idempotent). A DIFFERENT prefix (a re-capture
+   *  after a bounce) supersedes prior undelivered rows for the run — only the latest handoff's URLs are
+   *  ever embedded, so retrying an older capture's bytes forever is waste. Sets the enqueue lease. */
+  enqueueEvidenceUpload(input: { runId: number; repo: string; ticketKey: string; keyPrefix: string; evidenceDir: string }): EvidenceUpload {
+    const t = this.now();
+    return tx(this.db, () => {
+      // Supersede prior undelivered captures for this run (different prefix).
+      this.db
+        .prepare(
+          `UPDATE evidence_uploads SET abandoned_at = ?, last_error = 'superseded by re-capture', updated_at = ?
+           WHERE run_id = ? AND key_prefix <> ? AND delivered_at IS NULL AND permanent_failed_at IS NULL AND abandoned_at IS NULL`,
+        )
+        .run(t, t, input.runId, input.keyPrefix);
+      this.db
+        .prepare(
+          `INSERT INTO evidence_uploads (run_id, repo, ticket_key, key_prefix, evidence_dir, attempts, next_attempt_at, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?)
+           ON CONFLICT(run_id, key_prefix) DO UPDATE SET evidence_dir = excluded.evidence_dir, next_attempt_at = excluded.next_attempt_at,
+             delivered_at = NULL, permanent_failed_at = NULL, abandoned_at = NULL, updated_at = excluded.updated_at`,
+        )
+        .run(input.runId, input.repo, input.ticketKey, input.keyPrefix, input.evidenceDir, t + EVIDENCE_UPLOAD_LEASE_SECONDS, t, t);
+      const row = this.db
+        .prepare("SELECT * FROM evidence_uploads WHERE run_id = ? AND key_prefix = ?")
+        .get(input.runId, input.keyPrefix) as EvidenceUploadRow | undefined;
+      if (!row) throw new Error("enqueueEvidenceUpload: row vanished after upsert");
+      telemetryEvent("store.evidence_upload.enqueue", { repo: input.repo, "run.id": input.runId, "work.key": input.ticketKey });
+      return this.toEvidenceUpload(row);
+    });
+  }
+
+  /** Undelivered uploads due for a retry attempt (repo-scoped, ordered like the transition outbox). */
+  dueEvidenceUploads(repo: string, limit = 25): EvidenceUpload[] {
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM evidence_uploads WHERE repo = ? AND delivered_at IS NULL AND permanent_failed_at IS NULL
+         AND abandoned_at IS NULL AND next_attempt_at <= ? ORDER BY run_id, id LIMIT ?`,
+      )
+      .all(repo, this.now(), limit) as unknown as EvidenceUploadRow[];
+    return rows.map((r) => this.toEvidenceUpload(r));
+  }
+
+  /** Record a failed upload attempt: bump the counter, stamp the classified kind, push next_attempt_at
+   *  out (60s doubling, cap 1h). Guarded so a late failure can't reopen a row the other process (CLI vs
+   *  flush) already delivered/permanent-failed. */
+  recordEvidenceAttempt(id: number, error: string, kind: EvidenceUpload["errorKind"]): EvidenceUpload | undefined {
+    const t = this.now();
+    const current = this.getEvidenceUpload(id);
+    const attempts = (current?.attempts ?? 0) + 1;
+    const delay = Math.min(60 * 2 ** (attempts - 1), 3600);
+    this.db
+      .prepare(
+        `UPDATE evidence_uploads SET attempts = ?, next_attempt_at = ?, last_error = ?, error_kind = ?, updated_at = ?
+         WHERE id = ? AND delivered_at IS NULL AND permanent_failed_at IS NULL`,
+      )
+      .run(attempts, t + delay, error.slice(0, 500), kind, t, id);
+    telemetryEvent("store.evidence_upload.attempt_failed", { "evidence_upload.attempts": attempts, "evidence_upload.kind": kind ?? undefined });
+    return this.getEvidenceUpload(id);
+  }
+
+  markEvidenceDelivered(id: number): void {
+    const t = this.now();
+    this.db.prepare("UPDATE evidence_uploads SET delivered_at = ?, updated_at = ? WHERE id = ? AND delivered_at IS NULL").run(t, t, id);
+    const e = this.getEvidenceUpload(id);
+    telemetryEvent("store.evidence_upload.delivered", { repo: e?.repo, "run.id": e?.runId, "work.key": e?.ticketKey });
+  }
+
+  markEvidencePermanentFailed(id: number, reason: string): void {
+    const t = this.now();
+    this.db
+      .prepare("UPDATE evidence_uploads SET permanent_failed_at = ?, last_error = ?, error_kind = 'permanent', updated_at = ? WHERE id = ? AND delivered_at IS NULL")
+      .run(t, reason.slice(0, 500), t, id);
+    const e = this.getEvidenceUpload(id);
+    telemetryEvent("store.evidence_upload.permanent_failed", { repo: e?.repo, "run.id": e?.runId, "work.key": e?.ticketKey });
+  }
+
+  /** Stamp the notify throttle (SSO/permanent human alert already sent). */
+  markEvidenceNotified(id: number): void {
+    const t = this.now();
+    this.db.prepare("UPDATE evidence_uploads SET notified_at = ?, updated_at = ? WHERE id = ?").run(t, t, id);
+  }
+
+  /** Undelivered uploads for a run — teardown's drop input. */
+  undeliveredEvidenceUploadsForRun(runId: number): EvidenceUpload[] {
+    const rows = this.db
+      .prepare("SELECT * FROM evidence_uploads WHERE run_id = ? AND delivered_at IS NULL AND permanent_failed_at IS NULL AND abandoned_at IS NULL ORDER BY id")
+      .all(runId) as unknown as EvidenceUploadRow[];
+    return rows.map((r) => this.toEvidenceUpload(r));
+  }
+
+  /** Best-effort drop at teardown: abandon any still-pending uploads (the worktree + evidence dir are
+   *  about to be removed). Returns how many were dropped so the caller can log the loss. */
+  abandonEvidenceUploadsForRun(runId: number, reason: string): number {
+    const t = this.now();
+    const info = this.db
+      .prepare(
+        `UPDATE evidence_uploads SET abandoned_at = ?, last_error = ?, updated_at = ?
+         WHERE run_id = ? AND delivered_at IS NULL AND permanent_failed_at IS NULL AND abandoned_at IS NULL`,
+      )
+      .run(t, reason.slice(0, 500), t, runId);
+    return Number(info.changes);
+  }
+
+  /** All undelivered (still-retrying) uploads for a repo — the doctor snapshot (regardless of whether
+   *  each is currently due). */
+  pendingEvidenceUploads(repo: string): EvidenceUpload[] {
+    const rows = this.db
+      .prepare("SELECT * FROM evidence_uploads WHERE repo = ? AND delivered_at IS NULL AND permanent_failed_at IS NULL AND abandoned_at IS NULL ORDER BY id")
+      .all(repo) as unknown as EvidenceUploadRow[];
+    return rows.map((r) => this.toEvidenceUpload(r));
+  }
+
+  /** Is an evidence upload currently stuck on an AUTH failure (expired SSO)? Drives the dashboard SSO
+   *  light (red) and the doctor stuck-upload check. */
+  authStuckEvidenceUpload(repo: string): boolean {
+    const row = this.db
+      .prepare(
+        `SELECT 1 AS x FROM evidence_uploads WHERE repo = ? AND error_kind = 'auth'
+         AND delivered_at IS NULL AND permanent_failed_at IS NULL AND abandoned_at IS NULL LIMIT 1`,
+      )
+      .get(repo) as { x: number } | undefined;
     return row !== undefined;
   }
 

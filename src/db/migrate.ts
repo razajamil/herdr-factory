@@ -257,6 +257,44 @@ const MIGRATIONS: { version: number; sql: string }[] = [
     // NOT NULL DEFAULT 0 backfills every existing run_steps row.
     sql: `ALTER TABLE run_steps ADD COLUMN capture_attempts INTEGER NOT NULL DEFAULT 0;`,
   },
+  {
+    version: 16,
+    // Evidence-upload outbox: the S3 media upload is now a durable INTENT retried until it lands, not a
+    // one-shot the agent fires. When the AWS SSO session expired mid-run, the upload threw, the CLI
+    // hard-failed, the bytes never reached S3, and the PR shipped with broken evidence links. Now the
+    // CLI enqueues here (URLs are deterministic, published immediately) + attempts inline; the reconciler
+    // retries undelivered rows at Phase 0 with exponential backoff (attempts / next_attempt_at, mirroring
+    // transition_outbox) until S3 accepts them — and notifies the human to `aws sso login` when auth keeps
+    // failing. `key_prefix` is persisted so retry URLs stay stable. `error_kind` (auth/transient/permanent)
+    // drives the dashboard SSO light + the doctor stuck-upload check. `permanent_failed_at` is the single
+    // terminal-failure state (no source-stale two-phase machinery — evidence has no "gone at source").
+    // `next_attempt_at` doubles as an enqueue LEASE so the CLI's unlocked inline attempt and the server's
+    // Phase 0 flush don't double-claim a row. UNIQUE(run_id, key_prefix) keeps enqueue idempotent while
+    // still allowing several captures per run (a bounce re-enters evidence with a fresh prefix).
+    sql: `
+      CREATE TABLE evidence_uploads (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        run_id INTEGER NOT NULL REFERENCES runs(id),
+        repo TEXT NOT NULL,
+        ticket_key TEXT NOT NULL,
+        key_prefix TEXT NOT NULL,
+        evidence_dir TEXT NOT NULL,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        next_attempt_at INTEGER NOT NULL,
+        last_error TEXT,
+        error_kind TEXT,
+        notified_at INTEGER,
+        permanent_failed_at INTEGER,
+        abandoned_at INTEGER,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        delivered_at INTEGER,
+        UNIQUE(run_id, key_prefix)
+      );
+      CREATE INDEX idx_evidence_uploads_pending ON evidence_uploads(repo, next_attempt_at)
+        WHERE delivered_at IS NULL AND permanent_failed_at IS NULL AND abandoned_at IS NULL;
+    `,
+  },
 ];
 
 /** Apply pending migrations in a transaction. Idempotent. */

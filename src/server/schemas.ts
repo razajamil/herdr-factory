@@ -113,6 +113,8 @@ const StatusResponse = z
         prNumber: z.number().nullable(),
       }),
     ),
+    // Evidence-upload credential (AWS SSO) health, for the dashboard SSO light. "na" = no evidence config.
+    evidenceSso: z.object({ state: z.enum(["ok", "down", "na"]), detail: z.string().optional() }),
   })
   .openapi("Status");
 

@@ -189,4 +189,68 @@ describe("Store", () => {
     store.releaseLock("capture", "B");
     expect(store.acquireLock("capture", "C", 100)).toBe(true);
   });
+
+  describe("evidence-upload outbox", () => {
+    function seedRun(store: Store) {
+      return store.createRun({ repo: "r", workSource: "jira", belt: "ship", ticketKey: "K-EV", summary: "s", issueType: "Bug", branch: "fix/K-EV" });
+    }
+
+    it("enqueue sets the lease (not due until it elapses) and is idempotent per prefix", () => {
+      const { store, setNow } = makeStore(1000);
+      const run = seedRun(store);
+      const job = store.enqueueEvidenceUpload({ runId: run.id, repo: "r", ticketKey: "K-EV", keyPrefix: "p/A", evidenceDir: "/wt/ev" });
+      expect(job.nextAttemptAt).toBe(1000 + 300); // lease
+      expect(store.dueEvidenceUploads("r")).toHaveLength(0); // leased — not yet due
+      setNow(1300);
+      expect(store.dueEvidenceUploads("r").map((u) => u.id)).toEqual([job.id]);
+      // Re-enqueue the SAME prefix reopens the same row (no duplicate).
+      const again = store.enqueueEvidenceUpload({ runId: run.id, repo: "r", ticketKey: "K-EV", keyPrefix: "p/A", evidenceDir: "/wt/ev" });
+      expect(again.id).toBe(job.id);
+    });
+
+    it("a fresh prefix supersedes prior undelivered uploads for the run (re-capture)", () => {
+      const { store, setNow } = makeStore(1000);
+      const run = seedRun(store);
+      const a = store.enqueueEvidenceUpload({ runId: run.id, repo: "r", ticketKey: "K-EV", keyPrefix: "p/A", evidenceDir: "/wt/ev" });
+      const b = store.enqueueEvidenceUpload({ runId: run.id, repo: "r", ticketKey: "K-EV", keyPrefix: "p/B", evidenceDir: "/wt/ev" });
+      setNow(1300);
+      const due = store.dueEvidenceUploads("r").map((u) => u.id);
+      expect(due).toContain(b.id);
+      expect(due).not.toContain(a.id); // A abandoned
+      expect(store.getEvidenceUpload(a.id)!.abandonedAt).not.toBeNull();
+    });
+
+    it("recordEvidenceAttempt backs off + stamps kind; auth kind is SSO-stuck; delivered can't reopen", () => {
+      const { store, setNow } = makeStore(1000);
+      const run = seedRun(store);
+      const job = store.enqueueEvidenceUpload({ runId: run.id, repo: "r", ticketKey: "K-EV", keyPrefix: "p/A", evidenceDir: "/wt/ev" });
+      setNow(1300);
+      const after = store.recordEvidenceAttempt(job.id, "sso expired", "auth")!;
+      expect(after.attempts).toBe(1);
+      expect(after.errorKind).toBe("auth");
+      expect(after.nextAttemptAt).toBe(1300 + 60); // first backoff
+      expect(store.authStuckEvidenceUpload("r")).toBe(true);
+      // Deliver, then a late failure must NOT reopen it (guard).
+      store.markEvidenceDelivered(job.id);
+      expect(store.authStuckEvidenceUpload("r")).toBe(false);
+      store.recordEvidenceAttempt(job.id, "late", "transient");
+      expect(store.getEvidenceUpload(job.id)!.deliveredAt).not.toBeNull();
+      expect(store.pendingEvidenceUploads("r")).toHaveLength(0);
+    });
+
+    it("permanent-fail and teardown-abandon both remove a row from pending/due", () => {
+      const { store, setNow } = makeStore(1000);
+      const run = seedRun(store);
+      const perm = store.enqueueEvidenceUpload({ runId: run.id, repo: "r", ticketKey: "K-EV", keyPrefix: "p/A", evidenceDir: "/wt/ev" });
+      store.markEvidencePermanentFailed(perm.id, "bucket does not exist");
+      setNow(1300);
+      expect(store.dueEvidenceUploads("r")).toHaveLength(0);
+      expect(store.pendingEvidenceUploads("r")).toHaveLength(0);
+      // A second, still-pending upload gets dropped by teardown.
+      const live = store.enqueueEvidenceUpload({ runId: run.id, repo: "r", ticketKey: "K-EV", keyPrefix: "p/B", evidenceDir: "/wt/ev" });
+      expect(store.undeliveredEvidenceUploadsForRun(run.id).map((u) => u.id)).toEqual([live.id]);
+      expect(store.abandonEvidenceUploadsForRun(run.id, "torn down")).toBe(1);
+      expect(store.undeliveredEvidenceUploadsForRun(run.id)).toHaveLength(0);
+    });
+  });
 });

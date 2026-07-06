@@ -1,6 +1,7 @@
-import { mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import * as Effect from "effect/Effect";
+import { classifyS3Error, uploadEvidence } from "../clients/evidence.ts";
 import { runEffect } from "../runtime/effect.ts";
 import { HerdrUnreachableError, type BeltRuntime, type Deps, type SourceRuntime } from "./deps.ts";
 import type { StepConfig } from "../config.ts";
@@ -121,6 +122,58 @@ export async function flushTransitionOutbox(deps: Deps): Promise<void> {
     // would let a retried in_development land after in_review and walk the source backward.
     if (deps.store.undeliveredTransitionBefore(intent.runId, intent.id)) continue;
     await deliverTransition(deps, src, intent);
+  }
+}
+
+/**
+ * Retry every due evidence-upload intent (Phase 0, alongside the transition outbox). The evidence
+ * agent published deterministic URLs into its handoff immediately; this lands the actual bytes in S3,
+ * retrying with backoff until AWS accepts them — so an expired SSO session defers the upload instead of
+ * losing it (the PR #6541 bug). LOCK-FREE like flushTransitionOutbox: it must never mutate a run (only
+ * the evidence_uploads row + events + best-effort notify). A creds/token (`auth`) failure that keeps
+ * recurring notifies the human to `aws sso login` (throttled per row via attentionRenotifySeconds).
+ */
+export async function flushEvidenceUploads(deps: Deps): Promise<void> {
+  const repo = deps.config.repoName;
+  const ev = deps.config.evidence;
+  for (const job of deps.store.dueEvidenceUploads(repo)) {
+    if (!ev) {
+      deps.store.markEvidencePermanentFailed(job.id, "evidence config removed");
+      continue;
+    }
+    // Best-effort drop policy: the bytes live in the worktree, which teardown removes. If the dir is
+    // gone the upload can never land — stop retrying (this also covers the manual-teardown race).
+    if (!existsSync(job.evidenceDir)) {
+      deps.store.markEvidencePermanentFailed(job.id, "evidence dir gone (torn down before upload)");
+      deps.log("warn", `${job.ticketKey}: evidence upload dropped — worktree removed before the upload landed`);
+      continue;
+    }
+    try {
+      const { files } = await uploadEvidence({ evidence: ev, dir: job.evidenceDir, prefix: job.keyPrefix });
+      deps.store.markEvidenceDelivered(job.id);
+      deps.store.recordEvent({ runId: job.runId, repo, ticketKey: job.ticketKey, type: "evidence_uploaded", detail: { files: files.length, prefix: job.keyPrefix, attempts: job.attempts } });
+      deps.log("info", `${job.ticketKey}: evidence uploaded (${files.length} file(s)) after ${job.attempts} retr${job.attempts === 1 ? "y" : "ies"}`);
+    } catch (e) {
+      const c = classifyS3Error(e);
+      // Notify on the FIRST failure, then throttle re-notifies by attentionRenotifySeconds (a null
+      // notifiedAt means never-notified — must always fire, not be read as "notified at epoch 0").
+      const notifyDue = job.notifiedAt == null || deps.now() - job.notifiedAt >= deps.config.limits.attentionRenotifySeconds;
+      if (c.kind === "permanent") {
+        deps.store.markEvidencePermanentFailed(job.id, c.reason);
+        deps.store.recordEvent({ runId: job.runId, repo, ticketKey: job.ticketKey, type: "evidence_upload_failed", detail: { reason: c.reason } });
+        if (notifyDue) {
+          await deps.herdr.notify(`herdr-factory: ${job.ticketKey} evidence upload failed`, `Evidence upload can't proceed: ${c.reason}. Run \`herdr-factory --repo ${repo} doctor --deep\`; the published URLs won't resolve until it's fixed.`).catch(() => {});
+          deps.store.markEvidenceNotified(job.id);
+        }
+      } else {
+        const updated = deps.store.recordEvidenceAttempt(job.id, c.reason, c.kind);
+        deps.log("warn", `${job.ticketKey}: evidence upload deferred (attempt ${updated?.attempts}): ${c.reason}`);
+        if (c.kind === "auth" && notifyDue) {
+          await deps.herdr.notify(`herdr-factory: AWS SSO expired`, `Evidence upload for ${job.ticketKey} is blocked on AWS creds — run \`aws sso login${ev.profile ? ` --profile ${ev.profile}` : ""}\`. It uploads automatically on the next tick.`).catch(() => {});
+          deps.store.markEvidenceNotified(job.id);
+        }
+      }
+    }
   }
 }
 
@@ -272,6 +325,12 @@ async function reconcileRepoImpl(deps: Deps): Promise<void> {
     await flushTransitionOutbox(deps);
   } catch (e) {
     deps.log("error", `transition outbox flush failed: ${err(e)}`);
+  }
+  // Phase 0 (cont.) — retry undelivered evidence-upload intents (durable S3 upload; survives SSO expiry).
+  try {
+    await flushEvidenceUploads(deps);
+  } catch (e) {
+    deps.log("error", `evidence upload flush failed: ${err(e)}`);
   }
 
   // Phase A — advance everything in flight, in parallel with bounded concurrency (most of a
@@ -1425,6 +1484,11 @@ async function teardownImpl(deps: Deps, run: Run, outcome: Outcome, src: SourceR
   }
   await deps.git.worktreePrune(deps.config.repo.path).catch(() => {});
   if (run.branch) await deps.git.branchDelete(deps.config.repo.path, run.branch);
+
+  // Best-effort drop of any still-pending evidence upload: the worktree (and its evidence dir) is gone,
+  // so the bytes can't be uploaded anymore. Log the loss so it's visible rather than silent.
+  const dropped = deps.store.abandonEvidenceUploadsForRun(run.id, `run torn down (${outcome}) before upload landed`);
+  if (dropped > 0) deps.log("warn", `${run.ticketKey}: ${dropped} evidence upload(s) dropped at teardown — bytes never reached S3 (likely SSO was down through merge)`);
 
   deps.store.endRun(run.id, outcome);
   deps.store.recordEvent({ runId: run.id, repo, ticketKey: run.ticketKey, type: "torn_down", detail: { outcome } });
