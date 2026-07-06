@@ -205,6 +205,14 @@ export const RepoConfigSchema = z
         // before escalating to attention. 0 disables bouncing (first bounce escalates). Per-belt
         // `max_bounces` overrides this.
         max_bounces: z.coerce.number().int().nonnegative().default(6),
+        // SAFETY BACKSTOP for the evidence step's capture loop — not the intended terminator. The
+        // evidence prompt's cooperative guidance is "re-record a flaky take, then ask a human"; this
+        // cap catches an agent stuck re-capturing a nondeterministic app. Max capture attempts the
+        // evidence agent may SIGNAL (via `capture-attempt`) in one pass before escalating to
+        // attention. Reset per fresh pass into the step (unlike max_bounces, which is cumulative). 0
+        // parks on the first attempt (effectively disables capture) — leave the default unless you
+        // mean that.
+        max_capture_attempts: z.coerce.number().int().nonnegative().default(5),
         // Default budget for a custom belt's step when it sets no `budget_seconds` of its own.
         step_budget_seconds: z.coerce.number().int().positive().default(3600),
         tick_interval_seconds: z.coerce.number().int().positive().default(60),
@@ -325,6 +333,7 @@ export interface Config {
     evidenceBudgetSeconds: number;
     prBudgetSeconds: number;
     maxBounces: number;
+    maxCaptureAttempts: number;
     stepBudgetSeconds: number;
     tickIntervalSeconds: number;
     reconcileConcurrency: number;
@@ -692,6 +701,7 @@ export function loadConfig(repoName: string): Loaded {
       evidenceBudgetSeconds: parsed.limits.evidence_budget_seconds,
       prBudgetSeconds: parsed.limits.pr_budget_seconds,
       maxBounces: parsed.limits.max_bounces,
+      maxCaptureAttempts: parsed.limits.max_capture_attempts,
       stepBudgetSeconds: parsed.limits.step_budget_seconds,
       tickIntervalSeconds: parsed.limits.tick_interval_seconds,
       reconcileConcurrency: parsed.limits.reconcile_concurrency,

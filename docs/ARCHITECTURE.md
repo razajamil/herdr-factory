@@ -589,7 +589,7 @@ herdr agent in its own tab/pane, dispatched and gated by the reconciler. The run
 | Step | Does | Hands off |
 |---|---|---|
 | **fix** | read the work doc + attachments → implement → lint/type/tests → commit | `handoff-fix.md` + `step-done fix` |
-| **evidence** *(opt-in)* | capture the running app (dev server + playwright screenshots/video) → publish to S3 → judge: pass forward or **bounce to fix** | `handoff-evidence.md` + `step-done` / `bounce` |
+| **evidence** *(opt-in)* | derive a test plan from acceptance criteria → run the app via the repo's dev-server/credentials skills (right persona) → capture before/after screenshots+video (`capture-attempt` signals each try) → publish to S3 → per-criterion verdict: pass forward or **bounce to fix** | `handoff-evidence.md` + `step-done` / `bounce` |
 | **review** | fresh-eyes **read-only** gate — never edits or commits: pass forward, or **bounce to fix** with findings | `handoff-review.md` + `step-done` / `bounce` |
 | **pr** | push + open the PR (evidence URLs embedded) → drive the automated round (CI green + bot comments) | `step-done pr` → human review |
 
@@ -603,7 +603,10 @@ pipeline is fix → review → pr; it never spawns its own pane. A **bounce**
 (`bounce <KEY> fix --reason-file …`) rewinds `run.step`, writes the findings to
 `feedback-fix.md` in the worktree, clears the target's *and* the intermediate steps' completion
 so they re-run, and counts toward `max_bounces` (default 6; per-belt override; `0` disables —
-past the cap the run parks for `attention`). After the last step, the run enters the `reviewing`
+past the cap the run parks for `attention`). The evidence step separately signals each capture try
+via `capture-attempt`; past `max_capture_attempts` (default 5, reset per fresh pass into the step)
+the run parks for `attention` — a flaky app that can't be captured cleanly surfaces instead of
+looping. After the last step, the run enters the `reviewing`
 human-review watch (watches the PR, wakes a resolver). A **custom** belt runs the same machinery
 over user-defined steps with no PR watch — its last `step-done` tears the run down with outcome
 `completed`.
@@ -880,6 +883,7 @@ from being claimed again).
       **working** runs — parked `attention`/`waiting_for_human` runs hold no slot) / `watch_hours`
       / `attention_renotify_seconds` / `develop_budget_seconds` (fix) / `evidence_budget_seconds`
       / `review_budget_seconds` / `pr_budget_seconds` / `stall_seconds` / `max_bounces`
+      / `max_capture_attempts` (evidence capture attempts per pass before `attention`)
       / `step_budget_seconds` (custom-step default) / `tick_interval_seconds`
       / `reconcile_concurrency` (Phase-A parallelism, default 8) / `max_claims_per_tick`
       (claim admission, default 10) / `layout_wait_seconds`.
@@ -967,6 +971,7 @@ herdr-factory --repo <name> resume <KEY> [--source <name>]        # un-park an `
 herdr-factory --repo <name> step-done <KEY> <step> [--source <name>]  # agent → dispatcher (event-nudges)
 herdr-factory --repo <name> ask-human <KEY> <step> --question[-file] …  # agent → park until a human replies
 herdr-factory --repo <name> bounce <KEY> <toStep> --reason[-file] …     # agent → send work back for rework
+herdr-factory --repo <name> capture-attempt <KEY> [--source <name>]   # evidence agent → count a capture try (flaky-capture cap)
 herdr-factory --repo <name> evidence-upload <KEY> [--source <name>]    # publish captured evidence (S3)
 herdr-factory --repo <name> runs [--all] | timeline <KEY> | logs [n]   # read the DB / repo log
 # machine-wide (no --repo)

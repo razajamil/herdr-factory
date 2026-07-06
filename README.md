@@ -240,11 +240,15 @@ A **belt** pairs a work source with an ordered pipeline of agent steps. Two belt
 Pictured at the top. The engine owns the stations _and_ ships their prompts:
 
 - **fix** — implements the change and commits as it goes (a commit-HEAD heartbeat catches stalls).
-- **evidence** _(opt-in)_ — films the running app (dev server + `playwright-cli` screenshots and
-  video), publishes the captures to S3/CloudFront, and records the public URLs in its handoff. If
-  the footage shows the issue isn't actually fixed, it **bounces the run back to fix** with
-  findings. This station runs only when your herdr layout provides its pane (`tab` + `pane` in
-  config) — without one the belt is simply fix → review → pr.
+- **evidence** _(opt-in)_ — derives a test plan from the work item's acceptance criteria, then films
+  the running app to prove each one. It follows the repo's own skills/runbooks for the dev-server
+  workflow **and** the login/test account so it exercises the flow as the right persona, drives
+  `playwright-cli` for before/after screenshots and video, publishes the captures to S3/CloudFront,
+  and records a per-criterion verdict table (with the public URLs) in its handoff. If the evidence
+  doesn't prove a criterion it **bounces the run back to fix** with findings; a flaky app that can't
+  be captured cleanly parks for attention past `max_capture_attempts`. This station runs only when
+  your herdr layout provides its pane (`tab` + `pane` in config) — without one the belt is simply
+  fix → review → pr.
 - **review** — a strict read-only gate with fresh eyes: it never edits or commits, it either
   passes the work forward or **bounces back to fix**. Keeping all rework in fix is deliberate.
 - **pr** — pushes the branch, opens the PR with the evidence URLs embedded, and drives the
@@ -382,6 +386,7 @@ is pure data (`herdr-factory reload` picks it up without a restart).
 | `step_budget_seconds`        | 3600    | default budget for a custom step                                |
 | `stall_seconds`              | 2700    | no new commits for this long → attention (heartbeat steps only) |
 | `max_bounces`                | 6       | bounces to any one step before attention; `0` disables bouncing |
+| `max_capture_attempts`       | 5       | evidence capture attempts per pass before attention (flaky-capture cap) |
 | `tick_interval_seconds`      | 60      | reconcile cadence per repo                                      |
 | `reconcile_concurrency`      | 8       | active runs reconciled in parallel per tick                     |
 | `max_claims_per_tick`        | 10      | new-claim admission per tick (cold-start smoothing)             |

@@ -84,6 +84,7 @@ interface RunStepRow {
   started_at: number | null;
   done_at: number | null;
   bounces: number;
+  capture_attempts: number;
   absent_at: number | null;
 }
 
@@ -100,6 +101,7 @@ function toRunStep(r: RunStepRow): RunStep {
     startedAt: r.started_at,
     doneAt: r.done_at,
     bounces: r.bounces,
+    captureAttempts: r.capture_attempts,
     absentAt: r.absent_at,
   };
 }
@@ -465,6 +467,7 @@ export class Store {
     if (patch.progressSig !== undefined) set("progress_sig", patch.progressSig);
     if (patch.progressAt !== undefined) set("progress_at", patch.progressAt);
     if (patch.startedAt !== undefined) set("started_at", patch.startedAt);
+    if (patch.captureAttempts !== undefined) set("capture_attempts", patch.captureAttempts);
     if (patch.absentAt !== undefined) set("absent_at", patch.absentAt);
     if (patch.done !== undefined) {
       set("done", patch.done ? 1 : 0);
@@ -499,6 +502,19 @@ export class Store {
     const row = this.getRunStep(runId, step)!;
     telemetryEvent("store.run_step.bounce", { "run.id": runId, step, "step.bounces": row.bounces });
     return row.bounces;
+  }
+
+  /** Increment (and return) the capture-attempt count for an evidence step — how many capture
+   *  attempts its agent has signalled THIS pass. Ensures the row exists first. The reconciler parks
+   *  the run for attention once this exceeds limits.maxCaptureAttempts. Unlike `bounces`, it is reset
+   *  to 0 on each fresh entry into the step (see reconcileStep / resumeRun), so a legitimate re-pass
+   *  after a fix rework gets a full budget rather than inheriting the last pass's count. */
+  bumpCaptureAttempts(runId: number, step: StepName): number {
+    this.upsertRunStep(runId, step); // ensure the row exists
+    this.db.prepare("UPDATE run_steps SET capture_attempts = capture_attempts + 1 WHERE run_id = ? AND step = ?").run(runId, step);
+    const row = this.getRunStep(runId, step)!;
+    telemetryEvent("store.run_step.capture_attempt", { "run.id": runId, step, "step.capture_attempts": row.captureAttempts });
+    return row.captureAttempts;
   }
 
   // --- transition outbox (source status write-backs, retried until delivered) --

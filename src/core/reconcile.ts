@@ -902,6 +902,44 @@ export async function bounceStep(
   return { ok: true };
 }
 
+/**
+ * The evidence agent signals it is starting a capture attempt. Bumps the running step's
+ * capture-attempt counter and — once it exceeds `limits.maxCaptureAttempts` — parks the run for a
+ * human (a flaky app that can't be captured cleanly should surface, not loop forever). This is the
+ * ENGINE BACKSTOP behind the evidence prompt's cooperative "re-record a bad take, then ask-human"
+ * guidance — the analog of the bounce cap, but the counter is reset on each fresh pass INTO the step
+ * (reconcileStep's forward advance + resumeRun), so a legitimate re-capture after a fix rework gets a
+ * full budget instead of inheriting the previous pass's count. Only valid for a `gathersEvidence`
+ * step that is currently running.
+ */
+export async function recordCaptureAttempt(
+  deps: Deps,
+  run: Run,
+  belt: BeltRuntime,
+): Promise<{ ok: boolean; attempts?: number; escalated?: boolean; message?: string }> {
+  const step = run.step;
+  if (run.phase !== "running" || !step) return { ok: false, message: "no running step to record a capture attempt for" };
+  const s = stepByName(belt, step);
+  if (!s) return { ok: false, message: `step "${step}" is not in belt "${belt.name}"` };
+  if (!s.gathersEvidence) return { ok: false, message: `the ${step} step does not gather evidence` };
+
+  const repo = deps.config.repoName;
+  const cap = deps.config.limits.maxCaptureAttempts;
+  const attempts = deps.store.bumpCaptureAttempts(run.id, step);
+  deps.store.recordEvent({ runId: run.id, repo, ticketKey: run.ticketKey, type: "capture_attempt", detail: { step, attempts, cap } });
+  if (attempts > cap) {
+    await escalateAttention(deps, run, {
+      reason: "capture_limit",
+      attentionReason: `capture attempt ${attempts} over cap (${cap}) on ${step}`,
+      body: `${run.ticketKey}: the ${step} step has begun ${attempts} capture attempts (cap ${cap}) without passing evidence forward. The app may be too flaky to capture cleanly, or the change isn't demonstrable — a human should look.`,
+      detail: { step, attempts, cap },
+    });
+    return { ok: true, attempts, escalated: true, message: `capture attempt cap (${cap}) exceeded — parked for attention` };
+  }
+  deps.log("info", `${run.ticketKey}: ${step} capture attempt #${attempts}/${cap}`);
+  return { ok: true, attempts };
+}
+
 /** Consecutive pollHumanReply THROWS before a waiting run escalates (misses never count — humans
  *  are allowed to be slow). At the 5-min backoff cap this is ~100 min of a failing source. */
 const HUMAN_POLL_ERROR_ESCALATE = 20;
@@ -1074,6 +1112,10 @@ async function reconcileStep(deps: Deps, run: Run, belt: BeltRuntime, src: Sourc
     const next = nextStep(belt, step.name);
     if (next) {
       deps.store.updateRun(run.id, { phase: "running", step: next.name });
+      // Fresh pass into an evidence step ⇒ reset its flaky-capture budget (this is the ONLY reset on
+      // the forward path; a crash-recovery respawn below deliberately does NOT reset, so a self-crash
+      // can't refill the cap). Cheap + scoped: only a gathersEvidence step ever holds a nonzero count.
+      if (next.gathersEvidence) deps.store.upsertRunStep(run.id, next.name, { captureAttempts: 0 });
       deps.log("info", `${run.ticketKey}: ${step.name} done -> ${next.name}`);
       await spawnStep(deps, run, belt, src, next.name);
       return;
@@ -1281,7 +1323,9 @@ export async function resumeRun(deps: Deps, run: Run): Promise<{ ok: boolean; ph
     deps.store.resetHumanPollBackoff(pendingQuestion.id);
     phase = "waiting_for_human";
   } else if (run.step && stepByName(belt, run.step)) {
-    deps.store.upsertRunStep(run.id, run.step, { startedAt: deps.now(), progressSig: null, progressAt: null, absentAt: null });
+    // Fresh slate on human resume: reset the step budget clocks AND the flaky-capture counter — a
+    // human just intervened, so a capture-cap park must not immediately re-park on the next attempt.
+    deps.store.upsertRunStep(run.id, run.step, { startedAt: deps.now(), progressSig: null, progressAt: null, absentAt: null, captureAttempts: 0 });
     phase = "running";
   } else if (belt.watchPr && run.prNumber) {
     deps.store.updateRun(run.id, { watchDeadline: deps.now() + deps.config.limits.watchHours * 3600, lastThreadSig: null });

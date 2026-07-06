@@ -231,6 +231,10 @@ async function renderStepPromptImpl(
   // Publishes @@EVIDENCE_DIR@@ to S3/CloudFront and prints the public URLs (no-op if `evidence:` is
   // unconfigured). Available to every step; the evidence step is the one that uses it.
   const evidenceUploadCmd = `${CLI_PATH} --repo ${deps.config.repoName} evidence-upload ${run.ticketKey} --source ${src.name}`;
+  // The evidence step calls this at the start of each capture attempt; the engine bumps a per-run
+  // counter and parks the run past limits.maxCaptureAttempts (a flaky app can't loop re-capturing
+  // forever). No-op-ish for any step that never calls it. Available to every step; evidence uses it.
+  const captureAttemptCmd = `${CLI_PATH} --repo ${deps.config.repoName} capture-attempt ${run.ticketKey} --source ${src.name}`;
   // For a step that may bounce (evidence/review), a ready-made command that returns the run to its
   // first `canBounceTo` target with a findings file. Empty for steps that can't bounce.
   const bounceTarget = step.canBounceTo[0];
@@ -258,6 +262,7 @@ async function renderStepPromptImpl(
     "@@WORK_DOC_KIND@@": workDocKind,
     "@@EVIDENCE_DIR@@": `${MEMORY_DIR}/evidence`,
     "@@EVIDENCE_UPLOAD_CMD@@": evidenceUploadCmd,
+    "@@CAPTURE_ATTEMPT_CMD@@": captureAttemptCmd,
     "@@BOUNCE_CMD@@": bounceCmd,
     "@@BOUNCE_TARGET@@": bounceTarget ?? "",
     "@@CLI@@": CLI_PATH,

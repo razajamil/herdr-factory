@@ -57,6 +57,9 @@ const AskHumanResponse = z
   .object({ ok: z.boolean(), questionId: z.number().optional(), posted: z.boolean().optional(), message: z.string().optional() })
   .openapi("AskHuman");
 const BounceResponse = z.object({ ok: z.boolean(), escalated: z.boolean().optional(), message: z.string().optional() }).openapi("Bounce");
+const CaptureAttemptResponse = z
+  .object({ ok: z.boolean(), attempts: z.number().optional(), escalated: z.boolean().optional(), message: z.string().optional() })
+  .openapi("CaptureAttempt");
 const ResumeResponse = z.object({ ok: z.boolean(), phase: z.string().optional(), message: z.string().optional() }).openapi("Resume");
 
 const RunSchema = z
@@ -141,6 +144,9 @@ export const AskHumanBody = z
 export const BounceBody = z
   .object({ key: z.string(), toStep: z.string(), source: z.string().optional(), reason: z.string().min(1) })
   .openapi("BounceBody");
+// No step field: the attempt always applies to the run's current running step (the engine validates
+// it is a gathersEvidence step), so the agent can't misattribute it.
+export const CaptureAttemptBody = z.object({ key: z.string(), source: z.string().optional() }).openapi("CaptureAttemptBody");
 export const ClaimBody = z.object({ key: z.string(), belt: z.string().optional() }).openapi("ClaimBody");
 export const TeardownBody = z.object({ key: z.string(), source: z.string().optional() }).openapi("TeardownBody");
 export const ResumeBody = z.object({ key: z.string(), source: z.string().optional() }).openapi("ResumeBody");
@@ -218,6 +224,18 @@ export const bounceRoute = createRoute({
   request: { params: RepoParam, ...jsonBody(BounceBody) },
   responses: {
     200: { description: "Bounce recorded", content: { "application/json": { schema: BounceResponse } } },
+    ...repoErrors,
+  },
+});
+
+export const captureAttemptRoute = createRoute({
+  method: "post",
+  path: "/repos/{repo}/capture-attempt",
+  tags: ["repo"],
+  summary: "An evidence agent signals a capture attempt — the engine caps flaky-capture loops",
+  request: { params: RepoParam, ...jsonBody(CaptureAttemptBody) },
+  responses: {
+    200: { description: "Attempt recorded", content: { "application/json": { schema: CaptureAttemptResponse } } },
     ...repoErrors,
   },
 });

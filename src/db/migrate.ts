@@ -247,6 +247,16 @@ const MIGRATIONS: { version: number; sql: string }[] = [
       CREATE INDEX idx_transition_outbox_stale ON transition_outbox(run_id) WHERE stale_at IS NOT NULL AND stale_handled_at IS NULL;
     `,
   },
+  {
+    version: 15,
+    // Capture-attempt safety cap for the evidence step. Each `capture-attempt` signal from an
+    // evidence-gathering agent increments this; the reconciler parks the run for attention once it
+    // exceeds limits.max_capture_attempts — so a flaky / nondeterministic app can't burn the run in
+    // an endless re-record loop. Reset to 0 on each FRESH pass into the step (reconcileStep's forward
+    // advance + resumeRun), NOT on crash-recovery respawn (which would let a self-crash game the cap).
+    // NOT NULL DEFAULT 0 backfills every existing run_steps row.
+    sql: `ALTER TABLE run_steps ADD COLUMN capture_attempts INTEGER NOT NULL DEFAULT 0;`,
+  },
 ];
 
 /** Apply pending migrations in a transaction. Idempotent. */

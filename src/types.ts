@@ -59,6 +59,7 @@ export type EventType =
   | "step_spawned"
   | "step_done"
   | "bounced"
+  | "capture_attempt" // an evidence agent signalled a capture attempt (flaky-capture cap)
   | "stale" // a write-back found the item gone at the source (deleted/transferred)
   | "human_question"
   | "human_reply"
@@ -121,7 +122,9 @@ export type RunPatch = Partial<
 
 /** One agent step of a run's pipeline (fix/evidence/review/pr for work_to_pull_request), each in its
  *  own herdr pane. `bounces` counts how many times a LATER step sent the run back to this step for
- *  rework — the loop-safety counter the reconciler escalates on past `limits.maxBounces`. */
+ *  rework — the loop-safety counter the reconciler escalates on past `limits.maxBounces`.
+ *  `captureAttempts` counts capture attempts an evidence step has signalled this PASS (reset on fresh
+ *  entry, unlike bounces); the reconciler parks past `limits.maxCaptureAttempts`. */
 export interface RunStep {
   id: number;
   runId: number;
@@ -134,6 +137,7 @@ export interface RunStep {
   startedAt: number | null;
   doneAt: number | null;
   bounces: number; // times a later step bounced work back to this step (loop-safety counter)
+  captureAttempts: number; // capture attempts this evidence step signalled this pass (flaky-capture cap)
   /** When this step's pane was first CONFIRMED absent (herdr answered without it); null = believed
    *  alive. Respawn requires a second confirmed absence past the confirmation window. */
   absentAt: number | null;
@@ -141,7 +145,7 @@ export interface RunStep {
 
 /** Fields the reconciler may patch on a run step. */
 export type RunStepPatch = Partial<
-  Pick<RunStep, "paneId" | "sessionId" | "progressSig" | "progressAt" | "done" | "startedAt" | "absentAt">
+  Pick<RunStep, "paneId" | "sessionId" | "progressSig" | "progressAt" | "done" | "startedAt" | "absentAt" | "captureAttempts">
 >;
 
 /** A local_markdown work item's internally-tracked lifecycle row (the `work_items` table).

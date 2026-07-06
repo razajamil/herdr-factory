@@ -11,7 +11,7 @@ import { openDb } from "../db/index.ts";
 import { Store } from "../db/store.ts";
 import { systemClock, type Run } from "../types.ts";
 import type { Deps } from "../core/deps.ts";
-import { bounceStep, claimTicket, reconcileRepo, reconcileRun, requestHumanInput, resumeRun, teardownTicket, withRunLock, withRunLockWaiting, withTickLock } from "../core/reconcile.ts";
+import { bounceStep, claimTicket, reconcileRepo, reconcileRun, recordCaptureAttempt, requestHumanInput, resumeRun, teardownTicket, withRunLock, withRunLockWaiting, withTickLock } from "../core/reconcile.ts";
 import { MEMORY_DIR, stepByName } from "../core/step.ts";
 import * as service from "../watchers/service.ts";
 import { buildDeps, today } from "../build-deps.ts";
@@ -469,6 +469,46 @@ program
         return;
       }
       console.log(`${key}: bounced to ${toStep}${d.message ? ` — ${d.message}` : ""}`);
+    } catch (e) {
+      fail(e);
+    }
+  }));
+
+program
+  .command("capture-attempt <key>")
+  .description("an evidence agent signals the start of a capture attempt — the engine caps flaky-capture loops")
+  .option("--source <name>", "the work source the run belongs to (passed by the agent)")
+  .action(cliAction("capture-attempt", async (key: string, opts: { source?: string }) => {
+    try {
+      const repo = requireRepo();
+      const { data } = await viaServerOrLocal(
+        { method: "POST", path: `/repos/${encodeURIComponent(repo)}/capture-attempt`, body: { key, source: opts.source } },
+        async () => {
+          const deps = await buildDeps(repo);
+          const run = resolveActiveRun(deps, key, opts.source);
+          if (!run) {
+            deps.log("warn", `${key}: no active run to record a capture attempt`);
+            return { ok: false, message: "no active run" };
+          }
+          const belt = deps.resolveBelt(run.belt);
+          if (!belt) return { ok: false, message: `run has no configured belt "${run.belt}"` };
+          // Past the cap this parks the run (a non-monotonic phase flip), so run it UNDER the run
+          // lock — serialized against the tick's pass over this run, like bounce.
+          const { ran, result } = await withRunLockWaiting(deps, run.id, () => recordCaptureAttempt(deps, deps.store.getRun(run.id)!, belt));
+          if (!ran) return { ok: false, message: "run busy — retry the capture-attempt in a moment" };
+          return result!;
+        },
+      );
+      const d = data as { ok?: boolean; attempts?: number; escalated?: boolean; message?: string };
+      if (d.ok === false) {
+        console.log(`${key}: ${d.message ?? "capture-attempt failed"}`);
+        return;
+      }
+      if (d.escalated) {
+        console.log(`${key}: ${d.message}`); // cap hit → parked for attention, NOT cleared to capture
+        return;
+      }
+      console.log(`${key}: capture attempt #${d.attempts} recorded`);
     } catch (e) {
       fail(e);
     }

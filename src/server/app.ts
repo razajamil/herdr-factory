@@ -10,12 +10,13 @@ import { VERSION } from "../version.ts";
 import { withExtractedTelemetryContext } from "../telemetry/index.ts";
 import { annotateCurrentSpan, recordHttpServerDurationEffect, withHttpServerSpan } from "../telemetry/effect.ts";
 import { runEffect } from "../runtime/effect.ts";
-import { bounceStep, claimTicket, reconcileRepo, reconcileRun, requestHumanInput, resumeRun, teardownTicket, withRunLock, withRunLockWaiting, withTickLock } from "../core/reconcile.ts";
+import { bounceStep, claimTicket, reconcileRepo, reconcileRun, recordCaptureAttempt, requestHumanInput, resumeRun, teardownTicket, withRunLock, withRunLockWaiting, withTickLock } from "../core/reconcile.ts";
 import { stepByName } from "../core/step.ts";
 import { resolveActiveRun, resolveBeltName } from "../resolve.ts";
 import type { Deps } from "../core/deps.ts";
 import {
   bounceRoute,
+  captureAttemptRoute,
   claimRoute,
   askHumanRoute,
   eligibleRoute,
@@ -246,6 +247,23 @@ export function createApp(ctx: ServerContext): OpenAPIHono {
     // Serialize the bounce (step rewind + pane re-dispatch) against anything else touching this run.
     const { ran, result } = await withRunLockWaiting(rt.deps, run.id, () => bounceStep(rt.deps, rt.deps.store.getRun(run.id)!, belt, src, toStep, reason));
     if (!ran) return c.json({ ok: false, message: `${key}: run busy — retry the bounce` }, 200);
+    return c.json(result!, 200);
+  });
+
+  app.openapi(captureAttemptRoute, async (c) => {
+    const { repo } = c.req.valid("param");
+    const { key, source } = c.req.valid("json");
+    const rt = ctx.getRepo(repo);
+    if (!rt) return c.json({ error: notConfigured(repo) }, 404);
+    const run = resolveActiveRun(rt.deps, key, source);
+    if (!run) return c.json({ ok: false, message: `${key}: no active run` }, 200);
+    const belt = rt.deps.resolveBelt(run.belt);
+    if (!belt) return c.json({ ok: false, message: `${key}: run has no configured belt` }, 200);
+    // Past the cap this parks the run (running → attention) — a non-monotonic flip, so hold the run
+    // lock like bounce/ask-human: a concurrent reconcile on a stale `running` snapshot must not
+    // overwrite the escalation.
+    const { ran, result } = await withRunLockWaiting(rt.deps, run.id, () => recordCaptureAttempt(rt.deps, rt.deps.store.getRun(run.id)!, belt));
+    if (!ran) return c.json({ ok: false, message: `${key}: run busy — retry the capture-attempt` }, 200);
     return c.json(result!, 200);
   });
 
