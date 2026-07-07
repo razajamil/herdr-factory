@@ -393,7 +393,7 @@ async function reconcileRepoImpl(deps: Deps): Promise<void> {
   // belts see disjoint items; a label-less source ignores it and collapses to one fetch).
   const eligibleCache = new Map<string, MatchItem[]>();
   const getEligible = async (src: SourceRuntime, label: string | undefined): Promise<MatchItem[]> => {
-    const cacheKey = `${src.name} ${label ?? ""}`;
+    const cacheKey = `${src.name}\0${label ?? ""}`;
     const cached = eligibleCache.get(cacheKey);
     if (cached) return cached;
     let items: MatchItem[];

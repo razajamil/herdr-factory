@@ -268,7 +268,7 @@ export const RepoConfigSchema = z
     // unique within their belt; the per-belt pickup `label` matches its source's label semantics
     // and is unique per (source, label).
     const beltNames = new Set<string>();
-    const sourceLabelPairs = new Map<string, string>(); // "source label" -> first belt using it
+    const sourceLabelPairs = new Map<string, string>(); // "source\0label" -> first belt using it
     cfg.belt.forEach((b, i) => {
       if (beltNames.has(b.name)) {
         ctx.addIssue({ code: "custom", message: `duplicate belt name "${b.name}" — give each belt a unique name`, path: ["belt", i, "name"] });
@@ -292,7 +292,7 @@ export const RepoConfigSchema = z
       // would contend for the very same items (first-match-wins arbitrarily starves the other) —
       // split one source across belts with DISTINCT labels instead.
       if (b.label != null) {
-        const key = `${b.source} ${b.label}`;
+        const key = `${b.source}\0${b.label}`;
         const first = sourceLabelPairs.get(key);
         if (first) {
           ctx.addIssue({ code: "custom", message: `belts "${first}" and "${b.name}" both pick up "${b.source}" work by label "${b.label}" — they'd contend for the same items; give each belt a distinct label`, path: ["belt", i, "label"] });
