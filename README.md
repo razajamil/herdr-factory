@@ -278,15 +278,24 @@ ends when the **last** step signals `step-done` — no PR machinery, no CI watch
 set `budget_seconds` and a `heartbeat` (both off/default-safe), and the same worktree, handoff,
 and ask-human machinery applies.
 
-### Routing — many belts, one source
+### Multiple belts
 
-At claim time belts are walked in `priority` order (lower first); the first belt whose `match`
-predicate accepts an item claims it — **first match wins**, and a belt with no `match` accepts
-everything from its source. `match` is a `.ts` file in the repo's config folder whose default
-export is `(ctx) => boolean` (sync or async), with `ctx = { item, source: { name, type } }` — the
-item carries `labels` uniformly plus source-native routing metadata (Jira's status + raw fields,
-a GitHub issue's number/author/body, a markdown brief's front-matter). Route
-bugs to one belt and stories to another, programmatically.
+A repo runs **as many belts as you like, all ticking in parallel** — several belts on the same
+source, belts across different sources, `work_to_pull_request` and `custom` types side by side. A
+belt can even **generate work for another belt**: below, a `custom` belt turns a folder of Markdown
+ideas into Jira tickets, and the `work_to_pull_request` belt beside it claims and ships them — while
+a third `custom` belt runs experiments from its own Markdown folder, entirely independently.
+
+![Top-down view of three conveyor belts running in parallel on one factory floor. On the left, a custom belt reads Markdown ideas and runs research → propose → file_ticket to generate Jira tickets; those tickets loop across to the middle belt — a work_to_pull_request belt on the Jira source running fix → review → pr to a merged pull request. On the right, a separate custom belt reads a Markdown experiments folder and runs its own steps. A labelled arrow shows the ticket-generator belt feeding work into the Jira belt.](docs/images/multiple-belts.svg)
+
+When more than one belt draws from the **same** source, claim order decides who gets each item:
+belts are walked in `priority` order (lower first) and the first belt whose `match` predicate
+accepts an item claims it — **first match wins**, and a belt with no `match` accepts everything from
+its source. `match` is a `.ts` file in the repo's config folder whose default export is
+`(ctx) => boolean` (sync or async), with `ctx = { item, source: { name, type } }` — the item
+carries `labels` uniformly plus source-native routing metadata (Jira's status + raw fields, a
+GitHub issue's number/author/body, a markdown brief's front-matter). Route bugs to one belt and
+stories to another, programmatically.
 
 ## Highlights
 
@@ -436,7 +445,7 @@ reference it), and a type block:
 ### `belt` (≥ 1)
 
 Common fields: `name` (unique), `belt_type`, `source` (a `work_sources` name), `priority`
-(default 100, lower = matched first), optional `match` (see [Routing](#routing--many-belts-one-source)),
+(default 100, lower = matched first), optional `match` (see [Multiple belts](#multiple-belts)),
 optional `max_bounces` override, and optional `workspace_name` — the branch/worktree name
 template, default `{{semantic_work_prefix}}/{{work_id}}-{{work_full_slug}}`. It must contain
 `{{work_id}}`; other vars: `{{work_slug}}` (≤20), `{{work_full_slug}}` (≤50), `{{work_type}}`,
