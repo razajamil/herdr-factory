@@ -89,7 +89,10 @@ export interface Run {
   paneId: string | null;
   worktreePath: string | null;
   prNumber: number | null;
-  watchDeadline: number | null; // epoch seconds
+  /** True while this reviewing run's resolver agent is actively addressing review comments — the
+   *  ONLY time a reviewing run holds a max_active_workspaces slot (idle-watching holds none). Set
+   *  when a resolver is woken, cleared when its pane goes idle / the PR resolves. */
+  resolverActive: boolean;
   lastThreadSig: string | null;
   attentionReason: string | null;
   attentionNotifiedAt: number | null; // when the operator was last notified about a parked run
@@ -113,7 +116,7 @@ export type RunPatch = Partial<
     | "paneId"
     | "worktreePath"
     | "prNumber"
-    | "watchDeadline"
+    | "resolverActive"
     | "lastThreadSig"
     | "attentionReason"
     | "attentionNotifiedAt"

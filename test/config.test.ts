@@ -86,7 +86,7 @@ describe("loadConfig — work sources + belts", () => {
     expect((jira as unknown as Record<string, unknown>).label).toBeUndefined(); // label is per-belt now, not on the source
     expect(jira.statusInDev).toBe("In development");
     expect(config.limits.stallSeconds).toBe(2700); // default
-    expect(config.limits.maxActive).toBe(3); // default
+    expect(config.limits.maxActiveWorkspaces).toBe(3); // default
     expect(config.limits.stepBudgetSeconds).toBe(3600); // default
     expect(config.guidance).toContain("use the X skill");
     expect(env.JIRA_EMAIL).toBe("me@x.com"); // auth still per-repo env

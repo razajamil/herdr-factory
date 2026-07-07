@@ -61,6 +61,29 @@ describe("Store", () => {
     expect(store.runStepsFor(run.id).map((s) => s.step)).toEqual(["fix", "review"]);
   });
 
+  it("countOccupying: parks and idle PR-watches hold no slot; a reviewing run counts only while resolving", () => {
+    const { store } = makeStore();
+    const mk = (key: string, phase: string, extra: Record<string, unknown> = {}) => {
+      const r = store.createRun({ repo: "r", workSource: "jira", belt: "ship", ticketKey: key });
+      store.updateRun(r.id, { phase: phase as never, ...extra });
+      return r;
+    };
+    mk("W-run", "running", { step: "fix" }); // actively worked → occupies
+    mk("W-park", "attention"); // parked → no slot
+    mk("W-human", "waiting_for_human"); // parked → no slot
+    const rev = mk("W-rev", "reviewing", { prNumber: 1, resolverActive: false }); // idle watch → no slot
+    expect(store.countActive("r")).toBe(4);
+    expect(store.countOccupying("r")).toBe(1); // only the running one
+
+    // The resolver starts working → the reviewing run now occupies a slot.
+    store.updateRun(rev.id, { resolverActive: true });
+    expect(store.countOccupying("r")).toBe(2);
+
+    // It finishes and goes idle again → slot released, PR still watched.
+    store.updateRun(rev.id, { resolverActive: false });
+    expect(store.countOccupying("r")).toBe(1);
+  });
+
   it("ends a run -> not active, has outcome + ended_at", () => {
     const { store } = makeStore();
     const run = store.createRun({ repo: "r", workSource: "jira", belt: "ship", ticketKey: "K-3" });
@@ -157,13 +180,13 @@ describe("Store", () => {
   it("migration v6 backfills pre-existing runs to 'jira' and adds work_items (idempotent)", () => {
     const db = new DatabaseSync(":memory:");
     // Simulate a pre-v6 DB: schema_version=5, a runs table WITHOUT work_source, one in-flight row.
-    // Also seed run_steps (created back in v4) so later migrations that ALTER it (v9) apply cleanly —
-    // a genuine v5 DB always has this table.
+    // Include watch_deadline (part of the v1 CREATE TABLE) so v17's DROP COLUMN applies cleanly, and
+    // seed run_steps (created back in v4) so v9's ALTER applies — a genuine v5 DB always has both.
     db.exec(`
       CREATE TABLE schema_version (version INTEGER NOT NULL);
       INSERT INTO schema_version (version) VALUES (5);
       CREATE TABLE runs (id INTEGER PRIMARY KEY AUTOINCREMENT, repo TEXT, ticket_key TEXT, phase TEXT,
-        created_at INTEGER, updated_at INTEGER, ended_at INTEGER);
+        watch_deadline INTEGER, created_at INTEGER, updated_at INTEGER, ended_at INTEGER);
       INSERT INTO runs (repo, ticket_key, phase, created_at, updated_at) VALUES ('r','OLD-1','fixing',1,1);
       CREATE TABLE run_steps (id INTEGER PRIMARY KEY AUTOINCREMENT, run_id INTEGER NOT NULL, step TEXT NOT NULL,
         pane_id TEXT, session_id TEXT, progress_sig TEXT, progress_at INTEGER,

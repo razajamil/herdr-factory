@@ -34,7 +34,7 @@ interface RunRow {
   pane_id: string | null;
   worktree_path: string | null;
   pr_number: number | null;
-  watch_deadline: number | null;
+  resolver_active: number;
   last_thread_sig: string | null;
   attention_reason: string | null;
   attention_notified_at: number | null;
@@ -61,7 +61,7 @@ function toRun(r: RunRow): Run {
     paneId: r.pane_id,
     worktreePath: r.worktree_path,
     prNumber: r.pr_number,
-    watchDeadline: r.watch_deadline,
+    resolverActive: r.resolver_active !== 0,
     lastThreadSig: r.last_thread_sig,
     attentionReason: r.attention_reason,
     attentionNotifiedAt: r.attention_notified_at,
@@ -242,14 +242,20 @@ export class Store {
     return row.n;
   }
 
-  /** Runs actually consuming a machine slot (claiming/running/reviewing/tearing_down). Parked
-   *  runs — attention, waiting_for_human — keep their worktree but no agent is doing work, so
-   *  they don't count against max_active: a pile of runs waiting on humans must not starve the
-   *  belt of new claims. */
+  /** Runs actually consuming a machine slot, counted against max_active_workspaces. A slot is held
+   *  by a run that is actively being worked: claiming/running/tearing_down always, plus a
+   *  `reviewing` run ONLY while its resolver is actively addressing review comments
+   *  (resolver_active). Runs that hold their worktree but do no work hold no slot — the parks
+   *  (attention, waiting_for_human) and an idle PR-watch (reviewing with no active resolver) — so
+   *  neither a pile of human-blocked runs nor a long-lived PR in review starves the belt of new
+   *  claims. This is what lets the PR watch ride with no time limit (there is no watch_hours). */
   countOccupying(repo: string): number {
     const row = this.db
       .prepare(
-        "SELECT COUNT(*) AS n FROM runs WHERE repo = ? AND ended_at IS NULL AND phase NOT IN ('attention', 'waiting_for_human')",
+        `SELECT COUNT(*) AS n FROM runs
+         WHERE repo = ? AND ended_at IS NULL
+           AND phase NOT IN ('attention', 'waiting_for_human')
+           AND NOT (phase = 'reviewing' AND resolver_active = 0)`,
       )
       .get(repo) as { n: number };
     return row.n;
@@ -330,7 +336,7 @@ export class Store {
     if (patch.paneId !== undefined) set("pane_id", patch.paneId);
     if (patch.worktreePath !== undefined) set("worktree_path", patch.worktreePath);
     if (patch.prNumber !== undefined) set("pr_number", patch.prNumber);
-    if (patch.watchDeadline !== undefined) set("watch_deadline", patch.watchDeadline);
+    if (patch.resolverActive !== undefined) set("resolver_active", patch.resolverActive ? 1 : 0);
     if (patch.lastThreadSig !== undefined) set("last_thread_sig", patch.lastThreadSig);
     if (patch.attentionReason !== undefined) set("attention_reason", patch.attentionReason);
     if (patch.attentionNotifiedAt !== undefined) set("attention_notified_at", patch.attentionNotifiedAt);

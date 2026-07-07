@@ -374,10 +374,12 @@ async function reconcileRepoImpl(deps: Deps): Promise<void> {
   // WORKING runs — parked runs (attention / waiting_for_human) keep their worktree but no agent
   // is consuming machine resources, and a pile of them must not starve the belt.
   const occupying = deps.store.countOccupying(repo);
-  const parked = deps.store.countActive(repo) - occupying;
-  let slots = deps.config.limits.maxActive - occupying;
+  // Active-but-not-occupying: the parks (attention, waiting_for_human) plus idle PR-watches
+  // (reviewing with no active resolver). None hold a slot; all still own a worktree on disk.
+  const idleOrParked = deps.store.countActive(repo) - occupying;
+  let slots = deps.config.limits.maxActiveWorkspaces - occupying;
   if (slots <= 0) {
-    deps.log("info", `at capacity (${occupying}/${deps.config.limits.maxActive} working, ${parked} parked)`);
+    deps.log("info", `at capacity (${occupying}/${deps.config.limits.maxActiveWorkspaces} working, ${idleOrParked} idle/parked)`);
     deps.store.touchTick(repo);
     return;
   }
@@ -448,7 +450,7 @@ async function reconcileRepoImpl(deps: Deps): Promise<void> {
       }
     }
   }
-  deps.log("info", `claimed ${claimed}; working ${deps.store.countOccupying(repo)}/${deps.config.limits.maxActive}, parked ${parked}`);
+  deps.log("info", `claimed ${claimed}; working ${deps.store.countOccupying(repo)}/${deps.config.limits.maxActiveWorkspaces}, idle/parked ${idleOrParked}`);
   deps.store.touchTick(repo);
 }
 
@@ -1231,8 +1233,15 @@ async function reconcileStep(deps: Deps, run: Run, belt: BeltRuntime, src: Sourc
       }
       throw e;
     }
-    if (!stalled && ws === "working") {
-      deps.log("info", `${run.ticketKey}: ${step.name} past budget but still working — extending`);
+    // A worker that is still actively working is not stuck — extend regardless of budget OR stall.
+    // (Long-horizon policy: a LIVE agent is never parked by a timer; only a genuinely idle or dead
+    // one is. This is deliberately more permissive than the old budget-only extension — an agent
+    // doing a long stretch between commits, e.g. a big refactor or a slow build/test cycle, keeps
+    // going instead of being parked at the stall window. The trade: a working-but-wedged agent that
+    // never commits is no longer caught by the stall timer — the dead-pane/liveness recovery below
+    // and the operator remain its backstops.)
+    if (ws === "working") {
+      deps.log("info", `${run.ticketKey}: ${step.name} past ${stalled ? "stall window" : "budget"} but still working — extending`);
       return;
     }
     await escalateAttention(deps, run, {
@@ -1290,8 +1299,9 @@ async function enterReviewing(deps: Deps, run: Run, src: SourceRuntime, prNumber
   await requestTransition(deps, run, src, "in_review");
   // Clear the active step: in `reviewing` there's no belt step running (the engine watches the PR
   // by number). Record prNumber here too so the watch is self-sufficient even if step-adoption was
-  // skipped.
-  deps.store.updateRun(run.id, { phase: "reviewing", step: null, prNumber, watchDeadline: deps.now() + deps.config.limits.watchHours * 3600 });
+  // skipped. The watch starts idle (resolverActive=false) — it holds no slot until an actionable
+  // review state wakes the resolver. There is no time limit; the watch rides until the PR resolves.
+  deps.store.updateRun(run.id, { phase: "reviewing", step: null, prNumber, resolverActive: false });
   deps.store.recordEvent({ runId: run.id, repo, ticketKey: run.ticketKey, type: "pr_opened", detail: { number: prNumber } });
   deps.log("info", `${run.ticketKey}: PR #${prNumber} -> reviewing`);
 }
@@ -1308,18 +1318,18 @@ async function reconcileReviewing(deps: Deps, run: Run, src: SourceRuntime, ctx:
   if (pr.state === "MERGED") return teardown(deps, run, "merged", src);
   if (pr.state === "CLOSED") return prClosedAttention(deps, run, pr);
 
-  if (run.watchDeadline && deps.now() > run.watchDeadline) {
-    await escalateAttention(deps, run, {
-      reason: "watch_timeout",
-      attentionReason: "review watch expired",
-      body: `${deps.config.limits.watchHours}h review watch expired; PR left open.`,
-    });
-    return;
-  }
-
+  // The watch has NO time limit (there is no watch_hours) — it rides until the PR merges or closes.
   const sig = snap?.sig ?? (await deps.github.reviewSignature(deps.ghRepo, pr.number));
-  if (sig.unresolved === 0 && sig.failing === 0) return; // nothing actionable
-  if (sig.sig === run.lastThreadSig) return; // already handled this state
+  const actionable = sig.unresolved > 0 || sig.failing > 0;
+  // A review state we haven't handled yet — the trigger to (re)wake the resolver.
+  const fresh = actionable && sig.sig !== run.lastThreadSig;
+
+  // Dynamic occupancy: a reviewing run holds a max_active_workspaces slot ONLY while its resolver
+  // is actively working. We need the resolver's live pane state only when there's fresh work to
+  // hand it, OR when we currently believe it's active (to notice it going idle and release the
+  // slot). Pure idle-watching — nothing fresh, resolver already idle — skips the pane call entirely
+  // and holds no slot, so a PR can sit in review indefinitely without starving new claims.
+  if (!fresh && !run.resolverActive) return;
 
   let wstate: string;
   try {
@@ -1328,16 +1338,33 @@ async function reconcileReviewing(deps: Deps, run: Run, src: SourceRuntime, ctx:
     if (e instanceof HerdrUnreachableError) return; // can't tell if the resolver is mid-fix — retry next tick
     throw e;
   }
-  if (wstate === "working") return; // don't pile on mid-fix
+  const working = wstate === "working";
 
-  // Only record the signature as handled if the resolver actually launched — otherwise a
-  // failed spawn would mark it done and never retry, silently dropping the review round.
+  if (!fresh) {
+    // Reached only when we believed the resolver was active (guard above): once it goes idle, drop
+    // the flag so the watch stops holding a slot. The PR keeps being watched — just for free.
+    if (!working) {
+      deps.store.updateRun(run.id, { resolverActive: false });
+      deps.log("info", `${run.ticketKey}: resolver idle — PR #${pr.number} watch no longer holds a slot`);
+    }
+    return;
+  }
+
+  // Fresh review state to address.
+  if (working) {
+    // Resolver already mid-fix — it holds a slot; don't pile on. Ensure the flag reflects that.
+    if (!run.resolverActive) deps.store.updateRun(run.id, { resolverActive: true });
+    return;
+  }
+
+  // Only record the signature as handled (and claim a slot) if the resolver actually launched —
+  // otherwise a failed spawn would mark it done and never retry, silently dropping the review round.
   const woke = await wakeResolver(deps, run, pr.number);
   if (!woke) {
     deps.log("warn", `${run.ticketKey}: resolver spawn failed; retrying next tick`);
     return;
   }
-  deps.store.updateRun(run.id, { lastThreadSig: sig.sig });
+  deps.store.updateRun(run.id, { lastThreadSig: sig.sig, resolverActive: true });
   deps.store.recordEvent({ runId: run.id, repo, ticketKey: run.ticketKey, type: "resolver_woken", detail: { unresolved: sig.unresolved, failing: sig.failing } });
 }
 
@@ -1403,8 +1430,8 @@ async function reconcileAttention(deps: Deps, run: Run, belt: BeltRuntime, src: 
  * The return target is derived from what the run had already reached:
  *   - an active step (`run.step` still in the belt) → `running` with that step's clocks reset
  *     (fresh budget/heartbeat/absence — the stale ones are usually why it parked);
- *   - a PR being watched (`prNumber` on a watchPr belt) → `reviewing` with a fresh watch deadline
- *     and cleared thread signature (so the next actionable review state re-wakes the resolver);
+ *   - a PR being watched (`prNumber` on a watchPr belt) → `reviewing`, idle, with a cleared thread
+ *     signature (so the next actionable review state re-wakes the resolver);
  *   - neither → back to `claiming` (materialize + first dispatch are idempotent).
  * The caller reconciles right after, so the re-dispatch happens on this same pass.
  */
@@ -1431,7 +1458,9 @@ export async function resumeRun(deps: Deps, run: Run): Promise<{ ok: boolean; ph
     deps.store.upsertRunStep(run.id, run.step, { startedAt: deps.now(), progressSig: null, progressAt: null, absentAt: null, captureAttempts: 0 });
     phase = "running";
   } else if (belt.watchPr && run.prNumber) {
-    deps.store.updateRun(run.id, { watchDeadline: deps.now() + deps.config.limits.watchHours * 3600, lastThreadSig: null });
+    // Back to watching the PR: clear the handled-signature so the next actionable review state
+    // re-wakes the resolver, and start idle (holds no slot until it's actually resolving again).
+    deps.store.updateRun(run.id, { lastThreadSig: null, resolverActive: false });
     phase = "reviewing";
   } else {
     phase = "claiming";

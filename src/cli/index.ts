@@ -214,12 +214,12 @@ program
       // The phase column shows the active step when running (phase is just "running" otherwise).
       const fmt = (r: Run, statusCol: string) =>
         `    ${r.ticketKey.padEnd(16)} ${(r.belt ?? "?").padEnd(16)} ${(r.phase === "running" && r.step ? r.step : r.phase).padEnd(12)} ${statusCol.padEnd(16)} PR:${(r.prNumber ? `#${r.prNumber}` : "-").padEnd(6)} ${(r.summary ?? "").slice(0, 50)}`;
-      console.log(`herdr-factory [${c.repoName}] — cap ${c.limits.maxActive}, watch ${c.limits.watchHours}h`);
+      console.log(`herdr-factory [${c.repoName}] — cap ${c.limits.maxActiveWorkspaces} workspaces`);
       console.log(`Sources: ${c.sources.map((s) => `${s.name}(${s.type})`).join(" · ")}`);
       console.log(
         `Belts (priority order): ${c.belts.map((b) => `${b.name}(${b.beltType}, src:${b.source}, p${b.priority})`).join(" · ")}`,
       );
-      console.log(`Runs: ${active.length} running (cap ${c.limits.maxActive}) · ${finished.length} finished`);
+      console.log(`Runs: ${active.length} running (cap ${c.limits.maxActiveWorkspaces}) · ${finished.length} finished`);
       console.log("");
       console.log(`  ACTIVE (${active.length})`);
       if (active.length === 0) console.log("    (none in flight)");

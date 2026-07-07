@@ -184,7 +184,7 @@ export function createDashboard(renderer: CliRenderer, actions: { confirm: Confi
           if (st) statusBelts.set(name, st.belts);
           const active = st?.active ?? [];
           const belts = st ? st.belts.map((b) => b.name).join(", ") || "—" : "—";
-          specs.push({ content: `${name}   active ${active.length}/${st?.limits.maxActive ?? "?"}   belts: ${belts}`, fg: theme.accent, target: { repo: name, kind: "repo" } });
+          specs.push({ content: `${name}   active ${active.length}/${st?.limits.maxActiveWorkspaces ?? "?"}   belts: ${belts}`, fg: theme.accent, target: { repo: name, kind: "repo" } });
           // SSO light for evidence upload — green when creds are good, red when down. Omitted when the
           // repo has no evidence config (state "na"), so it's noise-free where it doesn't apply.
           const sso = st?.evidenceSso;

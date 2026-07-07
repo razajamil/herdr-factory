@@ -11,8 +11,7 @@ repo:
 
 # Repo-global limits (shared across every belt below).
 limits:
-  max_active: 3 # global concurrency cap across ALL belts
-  watch_hours: 7
+  max_active_workspaces: 3 # cap on concurrently WORKED workspaces (one worktree per run), across ALL belts; parked + idle-watching runs hold no slot
   develop_budget_seconds: 5400 # work_to_pull_request fix-step budget
   stall_seconds: 2700 # no new commits for this long → stalled → attention
   review_budget_seconds: 1800 # work_to_pull_request review-step budget

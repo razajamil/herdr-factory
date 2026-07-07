@@ -36,8 +36,7 @@ const defaultStep = (name: string) => ({ name, prompt_file: "", prompt_file_sour
 const prAgents = () => ({ fix: {}, evidence: {}, review: {}, pr: {} });
 
 const LIMITS: [string, string][] = [
-  ["max_active", "3"],
-  ["watch_hours", "7"],
+  ["max_active_workspaces", "3"],
   ["develop_budget_seconds", "5400"],
   ["stall_seconds", "2700"],
   ["review_budget_seconds", "1800"],

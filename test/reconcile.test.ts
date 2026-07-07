@@ -188,7 +188,7 @@ function build(opts: { multi?: boolean } = {}) {
   const config: Config = {
     repoName: "demo",
     repo: { path: "/main-checkout", baseRef: "origin/master" },
-    limits: { maxActive: 3, watchHours: 7, attentionRenotifySeconds: 3600, developBudgetSeconds: 5400, stallSeconds: 2700, reviewBudgetSeconds: 1800, evidenceBudgetSeconds: 2400, prBudgetSeconds: 3600, maxBounces: 3, maxCaptureAttempts: 5, stepBudgetSeconds: 3600, tickIntervalSeconds: 60, reconcileConcurrency: 8, maxClaimsPerTick: 10, layoutWaitSeconds: 600 },
+    limits: { maxActiveWorkspaces: 3, attentionRenotifySeconds: 3600, developBudgetSeconds: 5400, stallSeconds: 2700, reviewBudgetSeconds: 1800, evidenceBudgetSeconds: 2400, prBudgetSeconds: 3600, maxBounces: 3, maxCaptureAttempts: 5, stepBudgetSeconds: 3600, tickIntervalSeconds: 60, reconcileConcurrency: 8, maxClaimsPerTick: 10, layoutWaitSeconds: 600 },
     sources: sources.map((s) => ({ name: s.name, type: s.type, cfg: {} })),
     belts,
     guidance: undefined,
@@ -333,7 +333,7 @@ describe("reconcile pipeline (work_to_pull_request belt)", () => {
 
   it("respects the concurrency cap", async () => {
     const { deps, store, state } = build();
-    deps.config.limits.maxActive = 1;
+    deps.config.limits.maxActiveWorkspaces = 1;
     state.eligible = [ticket("K-1"), ticket("K-2")];
     await reconcileRepo(deps);
     expect(store.countActive("demo")).toBe(1);
@@ -569,7 +569,7 @@ describe("reconcile pipeline (work_to_pull_request belt)", () => {
     expect((await bounceStep(deps, store.getRun(run.id)!, shipBelt, src, "fix", "x")).ok).toBe(false);
   });
 
-  it("running pr + PR open + step-done pr → reviewing (review transition + deadline)", async () => {
+  it("running pr + PR open + step-done pr → reviewing (review transition; watch starts idle, no deadline)", async () => {
     const { deps, store, state, worktree, calls } = build();
     const run = seed(store, worktree, "K-6", "running", "pr", { prNumber: 13 });
     store.markStepDone(run.id, "pr");
@@ -578,7 +578,7 @@ describe("reconcile pipeline (work_to_pull_request belt)", () => {
     const got = store.getRun(run.id)!;
     expect(got.phase).toBe("reviewing");
     expect(got.step).toBeNull(); // no belt step active during the PR watch
-    expect(got.watchDeadline).toBe(1000 + 7 * 3600);
+    expect(got.resolverActive).toBe(false); // starts idle — holds no slot until it's resolving
     expect(calls.transitions).toContainEqual(["K-6", "in_review"]);
   });
 
@@ -605,13 +605,25 @@ describe("reconcile pipeline (work_to_pull_request belt)", () => {
     expect(calls.notify).toBe(1);
   });
 
-  it("fix step 'working' but no commit progress past stall → attention (heartbeat)", async () => {
+  it("fix step past the stall window but still working → extended (a live agent is never parked by a timer)", async () => {
     const { deps, store, state, worktree, calls, setNow } = build();
     const run = seed(store, worktree, "K-H1", "running", "fix");
     store.upsertRunStep(run.id, "fix", { progressSig: "sha0", progressAt: 1000 });
-    state.headSha = "sha0"; // HEAD frozen → no progress
-    state.paneState = "working"; // claims to be working...
-    setNow(1000 + 2701); // ...but stalled past stall_seconds
+    state.headSha = "sha0"; // HEAD frozen → no new commits...
+    state.paneState = "working"; // ...but the agent is actively working (long stretch between commits)
+    setNow(1000 + 2701); // past stall_seconds
+    await reconcileRun(deps, store.getRun(run.id)!);
+    expect(store.getRun(run.id)!.phase).toBe("running");
+    expect(calls.notify).toBe(0);
+  });
+
+  it("fix step stalled AND idle (no commits, worker not working) → attention", async () => {
+    const { deps, store, state, worktree, calls, setNow } = build();
+    const run = seed(store, worktree, "K-H1b", "running", "fix");
+    store.upsertRunStep(run.id, "fix", { progressSig: "sha0", progressAt: 1000 });
+    state.headSha = "sha0"; // HEAD frozen → no new commits
+    state.paneState = "idle"; // AND not working → genuinely stuck
+    setNow(1000 + 2701); // past stall_seconds
     await reconcileRun(deps, store.getRun(run.id)!);
     expect(store.getRun(run.id)!.phase).toBe("attention");
     expect(calls.notify).toBe(1);
@@ -713,7 +725,7 @@ describe("reconcile pipeline (work_to_pull_request belt)", () => {
 
   it("reviewing + merged PR → teardown (worktree remove + branch delete, ended merged)", async () => {
     const { deps, store, state, worktree, calls } = build();
-    const run = seed(store, worktree, "K-9", "reviewing", null, { watchDeadline: 99999 });
+    const run = seed(store, worktree, "K-9", "reviewing", null, {});
     state.pr = { number: 9, state: "MERGED", url: "u" };
     await reconcileRun(deps, store.getRun(run.id)!);
     const got = store.getRun(run.id)!;
@@ -727,7 +739,7 @@ describe("reconcile pipeline (work_to_pull_request belt)", () => {
 
   it("teardown drops a still-pending evidence upload (best-effort — worktree about to be removed)", async () => {
     const { deps, store, state, worktree } = build();
-    const run = seed(store, worktree, "K-EVD", "reviewing", null, { watchDeadline: 99999 });
+    const run = seed(store, worktree, "K-EVD", "reviewing", null, {});
     // An evidence upload never landed (SSO down through merge) — still pending at teardown.
     store.enqueueEvidenceUpload({ runId: run.id, repo: "demo", ticketKey: "K-EVD", keyPrefix: "p/A", evidenceDir: join(worktree, ".memory/herdr-factory/evidence") });
     expect(store.undeliveredEvidenceUploadsForRun(run.id)).toHaveLength(1);
@@ -739,7 +751,7 @@ describe("reconcile pipeline (work_to_pull_request belt)", () => {
 
   it("reviewing polls by PR number — a merge is still detected after the head branch is deleted", async () => {
     const { deps, store, state, worktree, calls } = build();
-    const run = seed(store, worktree, "K-9b", "reviewing", null, { watchDeadline: 99999, prNumber: 9 });
+    const run = seed(store, worktree, "K-9b", "reviewing", null, { prNumber: 9 });
     state.pr = null; // head branch deleted on merge → branch discovery finds nothing
     state.prByNumber = { number: 9, state: "MERGED", url: "u" }; // …but the number still resolves
     await reconcileRun(deps, store.getRun(run.id)!);
@@ -751,7 +763,7 @@ describe("reconcile pipeline (work_to_pull_request belt)", () => {
 
   it("reviewing + PR closed without merging → attention (worktree preserved, not torn down)", async () => {
     const { deps, store, state, worktree, calls } = build();
-    const run = seed(store, worktree, "K-9c", "reviewing", null, { watchDeadline: 99999, prNumber: 9 });
+    const run = seed(store, worktree, "K-9c", "reviewing", null, { prNumber: 9 });
     state.pr = { number: 9, state: "CLOSED", url: "u" };
     await reconcileRun(deps, store.getRun(run.id)!);
     const got = store.getRun(run.id)!;
@@ -764,8 +776,8 @@ describe("reconcile pipeline (work_to_pull_request belt)", () => {
 
   it("attention + our PR merges out-of-band → teardown (attention is not a dead end)", async () => {
     const { deps, store, state, worktree, calls } = build();
-    // Parked in attention (e.g. the review watch expired) but the PR then merged.
-    const run = seed(store, worktree, "K-A1", "attention", null, { prNumber: 21, attentionReason: "review watch expired" });
+    // Parked in attention (e.g. a resolver stalled) but the PR then merged out-of-band.
+    const run = seed(store, worktree, "K-A1", "attention", null, { prNumber: 21, attentionReason: "parked for attention" });
     state.pr = { number: 21, state: "MERGED", url: "u" };
     await reconcileRun(deps, store.getRun(run.id)!);
     const got = store.getRun(run.id)!;
@@ -800,7 +812,7 @@ describe("reconcile pipeline (work_to_pull_request belt)", () => {
   it("teardown falls back to workspace close + dir removal when worktree remove leaves the workspace", async () => {
     const { deps, store, state, worktree, calls } = build();
     state.workspaceExists = true; // herdr deregistered the git worktree but left the workspace
-    const run = seed(store, worktree, "K-12", "reviewing", null, { watchDeadline: 99999 });
+    const run = seed(store, worktree, "K-12", "reviewing", null, {});
     state.pr = { number: 12, state: "MERGED", url: "u" };
     await reconcileRun(deps, store.getRun(run.id)!);
     const got = store.getRun(run.id)!;
@@ -812,20 +824,51 @@ describe("reconcile pipeline (work_to_pull_request belt)", () => {
     expect(calls.branchDelete).toContain("fix/K-12-s"); // branch still deleted
   });
 
-  it("reviewing + actionable new signature + idle → wakes resolver", async () => {
+  it("reviewing + actionable new signature + idle → wakes resolver (claims a slot)", async () => {
     const { deps, store, state, worktree, calls } = build();
-    const run = seed(store, worktree, "K-10", "reviewing", null, { watchDeadline: 99999, lastThreadSig: "old" });
+    const run = seed(store, worktree, "K-10", "reviewing", null, { lastThreadSig: "old" });
     state.pr = { number: 10, state: "OPEN", url: "u" };
     state.sig = { unresolved: 2, failing: 0, sig: "newsig" };
     state.paneState = "idle";
     await reconcileRun(deps, store.getRun(run.id)!);
     expect(calls.agentSend.length).toBe(1); // re-prompted the live pr-agent pane
-    expect(store.getRun(run.id)!.lastThreadSig).toBe("newsig");
+    const got = store.getRun(run.id)!;
+    expect(got.lastThreadSig).toBe("newsig");
+    expect(got.resolverActive).toBe(true); // now actively resolving → holds a slot
+    expect(store.countOccupying("demo")).toBe(1);
+  });
+
+  it("reviewing + resolver finished (went idle) → releases its slot, keeps watching (no time limit)", async () => {
+    const { deps, store, state, worktree } = build();
+    // Was actively resolving a prior round; now nothing actionable and the pane has gone idle.
+    const run = seed(store, worktree, "K-10b", "reviewing", null, { prNumber: 10, resolverActive: true, lastThreadSig: "s0" });
+    expect(store.countOccupying("demo")).toBe(1); // occupying while it was resolving
+    state.pr = { number: 10, state: "OPEN", url: "u" };
+    state.sig = { unresolved: 0, failing: 0, sig: "s0" }; // resolved — nothing to do
+    state.paneState = "idle";
+    await reconcileRun(deps, store.getRun(run.id)!);
+    const got = store.getRun(run.id)!;
+    expect(got.phase).toBe("reviewing"); // still watching the PR — no teardown, no attention
+    expect(got.resolverActive).toBe(false); // slot released
+    expect(store.countOccupying("demo")).toBe(0);
+  });
+
+  it("an idle PR-watch holds no slot — new work is claimed at the cap while it rides indefinitely", async () => {
+    const { deps, store, state, worktree } = build();
+    deps.config.limits.maxActiveWorkspaces = 1;
+    // A PR sitting in review with no active resolver: it keeps its worktree but occupies no slot.
+    seed(store, worktree, "K-WATCH", "reviewing", null, { prNumber: 50 });
+    state.pr = { number: 50, state: "OPEN", url: "u" }; // open, nothing actionable → stays idle
+    state.eligible = [ticket("K-NEW")];
+    await reconcileRepo(deps);
+    expect(store.activeRunForTicket("demo", "jira", "K-NEW")).toBeDefined(); // claimed despite the watch
+    expect(store.countActive("demo")).toBe(2);
+    expect(store.countOccupying("demo")).toBe(1); // only the newly-claimed run; the watch holds no slot
   });
 
   it("reviewing + still working → does not pile on", async () => {
     const { deps, store, state, worktree, calls } = build();
-    const run = seed(store, worktree, "K-11", "reviewing", null, { watchDeadline: 99999, lastThreadSig: "old" });
+    const run = seed(store, worktree, "K-11", "reviewing", null, { lastThreadSig: "old" });
     state.pr = { number: 11, state: "OPEN", url: "u" };
     state.sig = { unresolved: 1, failing: 0, sig: "newsig" };
     state.paneState = "working";
@@ -921,7 +964,7 @@ describe("belt routing (match predicates, first match wins)", () => {
 describe("multi-belt claim (Phase B)", () => {
   it("drains the higher-priority belt first under a shared cap", async () => {
     const { deps, store, state } = build({ multi: true });
-    deps.config.limits.maxActive = 1;
+    deps.config.limits.maxActiveWorkspaces = 1;
     state.eligible = [ticket("J-1")]; // ship belt (jira), priority 1
     state.eligible2 = [ticket("M-1")]; // lmship belt (lm), priority 2
     await reconcileRepo(deps);
@@ -932,7 +975,7 @@ describe("multi-belt claim (Phase B)", () => {
 
   it("the cap is global across belts (not per belt)", async () => {
     const { deps, store, state } = build({ multi: true });
-    deps.config.limits.maxActive = 2;
+    deps.config.limits.maxActiveWorkspaces = 2;
     state.eligible = [ticket("J-1"), ticket("J-2")];
     state.eligible2 = [ticket("M-1")];
     await reconcileRepo(deps);
@@ -942,7 +985,7 @@ describe("multi-belt claim (Phase B)", () => {
 
   it("the same key in two sources is claimed as two distinct runs", async () => {
     const { deps, store, state } = build({ multi: true });
-    deps.config.limits.maxActive = 5;
+    deps.config.limits.maxActiveWorkspaces = 5;
     state.eligible = [ticket("DUP")];
     state.eligible2 = [ticket("DUP")];
     await reconcileRepo(deps);
@@ -1084,7 +1127,7 @@ describe("transition outbox — source write-backs retried until delivered", () 
 
   it("an item whose write-back is still pending is NOT re-claimed (no duplicate work)", async () => {
     const { deps, store, state, worktree, calls, setNow } = build();
-    const run = seed(store, worktree, "K-T3", "reviewing", null, { watchDeadline: 99999, prNumber: 7 });
+    const run = seed(store, worktree, "K-T3", "reviewing", null, { prNumber: 7 });
     state.pr = { number: 7, state: "MERGED", url: "u" };
     state.failTransitions = true;
     await reconcileRun(deps, store.getRun(run.id)!);
@@ -1184,7 +1227,7 @@ describe("stale write-backs — two-phase policy (lock-free stamp, run-locked re
     const { deps, store, state, calls, worktree } = build();
     // The in_development write-back threw at claim time and backed off; meanwhile the run
     // advanced all the way to reviewing with an open PR. Then the issue was deleted.
-    const run = seed(store, worktree, "K-S4", "reviewing", null, { prNumber: 42, watchDeadline: 99999 });
+    const run = seed(store, worktree, "K-S4", "reviewing", null, { prNumber: 42 });
     state.staleTransitionStates = new Set(["in_development"]);
     store.enqueueTransition({ runId: run.id, repo: "demo", workSource: "jira", ticketKey: "K-S4", toState: "in_development" });
     await flushTransitionOutbox(deps);
@@ -1373,14 +1416,14 @@ describe("attention workflow — resume, parked slots, re-notification", () => {
     expect(calls.notify).toBe(0);
   });
 
-  it("resume returns a PR-watch-parked run to reviewing with a fresh deadline", async () => {
+  it("resume returns a PR-watch-parked run to reviewing, idle (no slot until it resolves again)", async () => {
     const { deps, store, worktree } = build();
-    const run = seed(store, worktree, "K-A2", "attention", null, { prNumber: 12, watchDeadline: 5, attentionReason: "review watch expired" });
+    const run = seed(store, worktree, "K-A2", "attention", null, { prNumber: 12, resolverActive: true, attentionReason: "parked" });
     const res = await resumeRun(deps, store.getRun(run.id)!);
     expect(res).toMatchObject({ ok: true, phase: "reviewing" });
     const got = store.getRun(run.id)!;
     expect(got.phase).toBe("reviewing");
-    expect(got.watchDeadline).toBe(1000 + 7 * 3600);
+    expect(got.resolverActive).toBe(false); // idle watch — holds no slot until an actionable state re-wakes it
     expect(got.lastThreadSig).toBeNull(); // next actionable review state re-wakes the resolver
   });
 
@@ -1393,7 +1436,7 @@ describe("attention workflow — resume, parked slots, re-notification", () => {
 
   it("parked runs do not hold claim slots — new work is still claimed at the cap", async () => {
     const { deps, store, state, worktree } = build();
-    // Three parked runs (the whole max_active=3 cap under the old accounting).
+    // Three parked runs (the whole max_active_workspaces=3 cap under the old accounting).
     seed(store, worktree, "K-P1", "attention", "fix");
     seed(store, worktree, "K-P2", "attention", "fix");
     seed(store, worktree, "K-P3", "waiting_for_human", "fix", {});
@@ -1471,7 +1514,7 @@ describe("per-run locks — nudges land while a tick is mid-pass", () => {
 
   it("phase A reconciles all runs in parallel and still claims new work", async () => {
     const { deps, store, state, worktree } = build();
-    deps.config.limits.maxActive = 5;
+    deps.config.limits.maxActiveWorkspaces = 5;
     seed(store, worktree, "K-M1", "running", "fix");
     seed(store, worktree, "K-M2", "running", "fix");
     seed(store, worktree, "K-M3", "running", "fix");
@@ -1485,8 +1528,8 @@ describe("per-run locks — nudges land while a tick is mid-pass", () => {
 describe("rate limiting — batched PR polling, claim admission, poll backoff", () => {
   it("a tick batches PR state for all reviewing runs and acts on it (no per-run gh calls)", async () => {
     const { deps, store, state, worktree, calls } = build();
-    seed(store, worktree, "K-R1", "reviewing", null, { watchDeadline: 99999, prNumber: 41 });
-    seed(store, worktree, "K-R2", "reviewing", null, { watchDeadline: 99999, prNumber: 42 });
+    seed(store, worktree, "K-R1", "reviewing", null, { prNumber: 41 });
+    seed(store, worktree, "K-R2", "reviewing", null, { prNumber: 42 });
     state.prByNumber = { number: 41, state: "OPEN", url: "u" }; // fake snapshot source
     await reconcileRepo(deps);
     expect(calls.prSnapshots).toHaveLength(1); // ONE batched fetch for the whole pass
@@ -1496,7 +1539,7 @@ describe("rate limiting — batched PR polling, claim admission, poll backoff", 
 
   it("a merged PR detected via the batch tears the run down", async () => {
     const { deps, store, state, worktree } = build();
-    const run = seed(store, worktree, "K-R3", "reviewing", null, { watchDeadline: 99999, prNumber: 55 });
+    const run = seed(store, worktree, "K-R3", "reviewing", null, { prNumber: 55 });
     state.prByNumber = { number: 55, state: "MERGED", url: "u" };
     await reconcileRepo(deps);
     const got = store.getRun(run.id)!;
@@ -1506,7 +1549,7 @@ describe("rate limiting — batched PR polling, claim admission, poll backoff", 
 
   it("claims per tick are capped (max_claims_per_tick), remaining backlog fills next passes", async () => {
     const { deps, store, state } = build();
-    deps.config.limits.maxActive = 20;
+    deps.config.limits.maxActiveWorkspaces = 20;
     deps.config.limits.maxClaimsPerTick = 2;
     state.eligible = [ticket("K-C1"), ticket("K-C2"), ticket("K-C3"), ticket("K-C4"), ticket("K-C5")];
     await reconcileRepo(deps);

@@ -40,7 +40,7 @@ export interface ActiveRun {
 
 export interface RepoStatus {
   repo: string;
-  limits: { maxActive: number; watchHours: number };
+  limits: { maxActiveWorkspaces: number };
   sources: { name: string; type: string }[];
   belts: { name: string; beltType: string; source: string; priority: number }[];
   active: ActiveRun[];

@@ -295,6 +295,23 @@ const MIGRATIONS: { version: number; sql: string }[] = [
         WHERE delivered_at IS NULL AND permanent_failed_at IS NULL AND abandoned_at IS NULL;
     `,
   },
+  {
+    version: 17,
+    // Dynamic reviewing occupancy — the death of the fixed `watch_hours` deadline. A run in the
+    // `reviewing` PR-watch used to hold a max_active_workspaces slot for the WHOLE watch, so
+    // `watch_hours` existed only to eventually park it and reclaim that slot (at the cost of also
+    // silencing the resolver). Occupancy is now per-run and dynamic: a reviewing run holds a slot
+    // ONLY while its resolver agent is actively working. `resolver_active` is that flag — set when a
+    // resolver is woken, cleared when its pane goes idle / the PR merges — and countOccupying counts
+    // `reviewing AND resolver_active`. A PR can now be watched + auto-resolved for as long as review
+    // takes without starving new claims, so the deadline is gone: `watch_deadline` is dropped
+    // (nothing reads it). NOT NULL DEFAULT 0 backfills existing runs as "resolver idle" — correct,
+    // since a genuinely mid-fix resolver re-asserts the flag on the next tick's pane-state check.
+    sql: `
+      ALTER TABLE runs ADD COLUMN resolver_active INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE runs DROP COLUMN watch_deadline;
+    `,
+  },
 ];
 
 /** Apply pending migrations in a transaction. Idempotent. */

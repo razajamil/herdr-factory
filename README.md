@@ -259,10 +259,12 @@ Pictured at the top. The engine owns the stations _and_ ships their prompts:
 
 The run then enters the **reviewing watch**: one batched GitHub GraphQL query per tick covers
 every watched PR, and whenever the review signature changes — new unresolved threads, newly
-failing checks — a resolver agent is woken in the worktree to address them. Merge → teardown
-(worktree removed, branch deleted; re-claiming the same ticket later gets a fresh branch and a
-fresh PR). Closed without merge, or `watch_hours` (default 7) exceeded → parked for
-[attention](#highlights).
+failing checks — a resolver agent is woken in the worktree to address them. The watch has **no time
+limit** — it rides until the PR merges or closes, however long review takes — and it holds a
+[`max_active_workspaces`](#limits-all-optional) slot **only while a resolver is actively working**,
+so an idle PR-in-review never starves the belt of new claims. Merge → teardown (worktree removed,
+branch deleted; re-claiming the same ticket later gets a fresh branch and a fresh PR). Closed
+without merge → parked for [attention](#highlights).
 
 Bounces are per-target-step counted; past `max_bounces` (default 6, per-belt override, `0`
 disables bouncing) the run parks for attention instead of oscillating. Each station's engine
@@ -392,8 +394,7 @@ is pure data (`herdr-factory reload` picks it up without a restart).
 
 | Key                          | Default | Meaning                                                         |
 | ---------------------------- | ------- | --------------------------------------------------------------- |
-| `max_active`                 | 3       | cap on concurrently **working** runs; parked runs hold no slot  |
-| `watch_hours`                | 7       | how long the PR watch rides before parking for attention        |
+| `max_active_workspaces`      | 3       | cap on concurrently **worked** workspaces (one per run); parked + idle PR-watch runs hold no slot |
 | `attention_renotify_seconds` | 3600    | re-notify cadence for parked runs                               |
 | `develop_budget_seconds`     | 5400    | fix-step budget                                                 |
 | `evidence_budget_seconds`    | 2400    | evidence-step budget                                            |

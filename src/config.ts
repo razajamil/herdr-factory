@@ -193,11 +193,14 @@ export const RepoConfigSchema = z
     }),
     limits: z
       .object({
-        // Concurrent WORKING runs (claiming/running/reviewing/tearing_down). Parked runs —
-        // attention, waiting_for_human — keep their worktree but hold no slot, so work waiting
-        // on humans never starves the belt of new claims.
-        max_active: z.coerce.number().int().positive().default(3),
-        watch_hours: z.coerce.number().positive().default(7),
+        // Cap on concurrently WORKED workspaces (one worktree per run). A slot is held by a run
+        // being actively worked — claiming/running/tearing_down, and a `reviewing` run ONLY while
+        // its resolver is actively addressing review comments. Runs that keep their worktree but do
+        // no work hold no slot: the parks (attention, waiting_for_human) and an idle PR-watch. So
+        // neither human-blocked runs nor long-lived PRs-in-review starve the belt of new claims.
+        // NOT a cap on total worktrees on disk (parked/watching runs add to that) nor on agents (a
+        // run spawns one pane per step). The PR watch has no time limit — see reviewing occupancy.
+        max_active_workspaces: z.coerce.number().int().positive().default(3),
         // Re-notify the operator about a run parked in `attention` every this-many seconds (the
         // escalation notify is easy to miss; a parked run should never go silently stale).
         attention_renotify_seconds: z.coerce.number().int().positive().default(3600),
@@ -364,8 +367,7 @@ export interface Config {
   repoName: string;
   repo: { path: string; baseRef: string; github?: string };
   limits: {
-    maxActive: number;
-    watchHours: number;
+    maxActiveWorkspaces: number;
     attentionRenotifySeconds: number;
     developBudgetSeconds: number;
     stallSeconds: number;
@@ -733,8 +735,7 @@ export function loadConfig(repoName: string): Loaded {
     repoName,
     repo: { path: repoPath, baseRef: parsed.repo.base_ref, github: parsed.repo.github },
     limits: {
-      maxActive: parsed.limits.max_active,
-      watchHours: parsed.limits.watch_hours,
+      maxActiveWorkspaces: parsed.limits.max_active_workspaces,
       attentionRenotifySeconds: parsed.limits.attention_renotify_seconds,
       developBudgetSeconds: parsed.limits.develop_budget_seconds,
       stallSeconds: parsed.limits.stall_seconds,

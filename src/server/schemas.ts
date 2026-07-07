@@ -86,7 +86,7 @@ const RunsResponse = z.object({ runs: z.array(RunSchema) }).openapi("Runs");
 const StatusResponse = z
   .object({
     repo: z.string(),
-    limits: z.object({ maxActive: z.number(), watchHours: z.number() }),
+    limits: z.object({ maxActiveWorkspaces: z.number() }),
     sources: z.array(z.object({ name: z.string(), type: z.string() })),
     belts: z.array(z.object({ name: z.string(), beltType: z.string(), source: z.string(), priority: z.number() })),
     active: z.array(

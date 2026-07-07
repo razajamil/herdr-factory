@@ -24,16 +24,11 @@
       "default": {},
       "type": "object",
       "properties": {
-        "max_active": {
+        "max_active_workspaces": {
           "default": 3,
           "type": "integer",
           "exclusiveMinimum": 0,
           "maximum": 9007199254740991
-        },
-        "watch_hours": {
-          "default": 7,
-          "type": "number",
-          "exclusiveMinimum": 0
         },
         "attention_renotify_seconds": {
           "default": 3600,

@@ -443,7 +443,8 @@ CREATE TABLE runs(                       -- ONE attempt at a work item (history 
   ticket_key TEXT NOT NULL,
   summary TEXT, issue_type TEXT, branch TEXT, phase TEXT NOT NULL,
   workspace_id TEXT, pane_id TEXT, worktree_path TEXT, pr_number INTEGER,
-  watch_deadline INTEGER, last_thread_sig TEXT,
+  resolver_active INTEGER NOT NULL DEFAULT 0, -- reviewing run holds a slot only while resolving (v17; replaced watch_deadline)
+  last_thread_sig TEXT,
   focus_pending INTEGER NOT NULL DEFAULT 0, -- active step changed; focus shift deferred (v5)
   -- worker_done/review_done/review_pane/progress_* (migrations v2-v3) are superseded
   -- by run_steps and left in place for history only.
@@ -884,8 +885,12 @@ from being claimed again).
   - `config.yml` — parsed with `yaml`, validated with `zod` → typed `Config`:
     - `repo` — `path` / `base_ref` / `github` (repo-global). `path` (and any source path) supports
       `~` / `$HOME` expansion (`expandHome`), a safe no-op when already absolute.
-    - `limits` — repo-global, shared across every source: `max_active` (the cap on concurrently
-      **working** runs — parked `attention`/`waiting_for_human` runs hold no slot) / `watch_hours`
+    - `limits` — repo-global, shared across every source: `max_active_workspaces` (the cap on
+      concurrently **worked** workspaces — one worktree per run; a run holds a slot while
+      claiming/running/tearing_down, and while `reviewing` ONLY when its resolver is actively working
+      (`resolver_active`); parked `attention`/`waiting_for_human` runs and idle PR-watches hold no
+      slot, so neither human-blocked runs nor long-lived PRs-in-review starve the belt. The PR watch
+      has no time limit — there is no `watch_hours`.)
       / `attention_renotify_seconds` / `develop_budget_seconds` (fix) / `evidence_budget_seconds`
       / `review_budget_seconds` / `pr_budget_seconds` / `stall_seconds` / `max_bounces`
       / `max_capture_attempts` (evidence capture attempts per pass before `attention`)

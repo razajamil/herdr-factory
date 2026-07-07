@@ -110,7 +110,7 @@ async function statusPayload(rt: RepoRuntime) {
   });
   return {
     repo: cfg.repoName,
-    limits: { maxActive: cfg.limits.maxActive, watchHours: cfg.limits.watchHours },
+    limits: { maxActiveWorkspaces: cfg.limits.maxActiveWorkspaces },
     sources: cfg.sources.map((s) => ({ name: s.name, type: s.type as string })),
     belts: cfg.belts.map((b) => ({ name: b.name, beltType: b.beltType as string, source: b.source, priority: b.priority })),
     active: await Promise.all(active.map(runView)),
