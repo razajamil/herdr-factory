@@ -326,7 +326,9 @@ brief's front-matter). Route bugs to one belt and stories to another, programmat
   a tick can be killed anywhere and the next one converges. The server is a coordinator, not a
   source of truth: every command falls back to running in-process when it's down, so a worker's
   `step-done` lands even mid-restart. Workers live in herdr and survive factory restarts. Source
-  status write-backs are persisted intents, retried until the source confirms.
+  status write-backs **and S3 evidence uploads** are persisted intents, retried in the background
+  until confirmed — an upload survives an AWS SSO session expiring mid-run instead of shipping a PR
+  with broken evidence links (a persistent auth failure pings you to `aws sso login`).
 - **Built to scale.** Active runs reconcile in parallel under per-run locks; Jira and GitHub
   traffic flows through token buckets (GitHub's is a process-wide budget) with
   `Retry-After`-honoring retries; all watched PRs share one batched
@@ -617,14 +619,18 @@ keys jump to a numbered section, arrows move within it, `Esc` pops back out, `q`
 
 - **Dashboard** — live runs from the server's API: `↑↓` navigate, `↵` opens a run's event
   timeline, `t` tick, `c` claim an eligible item, `x` teardown, `r` refresh (each action behind a
-  confirmation).
+  confirmation). A per-repo evidence-upload **SSO light** goes red when AWS creds have expired (the
+  fix: `aws sso login`), and is hidden for repos with no evidence configured.
 - **Config** — a repo list and a full `config.yml` editor: edits the YAML surgically (comments
   and the schema modeline preserved), validates against the engine schema, `^S` saves, `[`/`]`
   reorder list entries. Credentials appear as masked, replace-only `secrets (env)` fields —
   declared per source type (`JIRA_EMAIL`/`JIRA_API_TOKEN` for jira, `GITHUB_TOKEN` for
   github_issues) — written separately to the `env` file (`chmod 600`).
 - **Doctor** — the same checks as the CLI: `r` re-runs, `d` toggles deep mode (live herdr/gh/S3
-  probes).
+  probes). The `herdr`/`gh`/`claude`/`git` presence checks resolve against the **service's** PATH
+  (the environment the resident server runs its tools in), not the TUI's own — so they read the
+  same whether you open the TUI from a terminal or a GUI launcher (Spotlight, a dock icon, a
+  hotkey), which otherwise inherits only the bare system PATH.
 
 The TUI renders through opentui's native core, which needs FFI — the launcher adds the flags and
 resolves the same vendored Node the engine uses, so there's nothing to set up.

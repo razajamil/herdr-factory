@@ -12,6 +12,9 @@ interface ServiceBackend {
   start(): Promise<void>;
   stop(): Promise<void>;
   isLoaded(): Promise<boolean>;
+  /** The PATH the installed service runs with (baked into the plist/unit); undefined if not
+   *  installed / unreadable / unsupported platform. */
+  servicePath(): string | undefined;
 }
 
 function backend(): ServiceBackend {
@@ -37,4 +40,10 @@ export function stop(): Promise<void> {
 }
 export function isLoaded(): Promise<boolean> {
   return backend().isLoaded();
+}
+/** The PATH the installed supervisor service runs with, or undefined when there's no readable
+ *  service (not installed, or an unsupported platform — so no throw). */
+export function servicePath(): string | undefined {
+  if (process.platform !== "darwin" && process.platform !== "linux") return undefined;
+  return backend().servicePath();
 }

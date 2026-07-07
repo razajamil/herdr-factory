@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -39,6 +39,26 @@ function domain(): string {
 
 function xmlEscape(s: string): string {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&apos;");
+}
+function xmlUnescape(s: string): string {
+  return s.replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&amp;/g, "&");
+}
+
+/** The PATH baked into the installed plist — i.e. the environment the supervisor and the resident
+ *  `serve` resolve tools in. Undefined if the plist is absent (service not installed) or unreadable.
+ *  Used by the doctor so a run from a leaner context (a GUI-launched TUI) checks tool presence
+ *  against where the work actually happens, not its own PATH. */
+export function servicePath(): string | undefined {
+  const file = plistFile(LABEL);
+  if (!existsSync(file)) return undefined;
+  try {
+    // plistXml emits `<key>PATH</key><string>…</string>` on one line; the value is xml-escaped, so
+    // it contains no literal '<' and `[^<]*` captures it whole.
+    const value = readFileSync(file, "utf8").match(/<key>PATH<\/key>\s*<string>([^<]*)<\/string>/)?.[1];
+    return value === undefined ? undefined : xmlUnescape(value);
+  } catch {
+    return undefined;
+  }
 }
 
 function passthroughEnvXml(): string {

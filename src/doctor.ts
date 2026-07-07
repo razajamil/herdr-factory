@@ -41,9 +41,12 @@ async function attempt(name: string, fn: () => Promise<string | void>): Promise<
   }
 }
 
-/** Is a tool on PATH? Presence only — doesn't invoke it (so no network/side effects). */
-async function onPath(tool: string): Promise<void> {
-  await run("sh", ["-c", `command -v ${JSON.stringify(tool)} >/dev/null 2>&1`]);
+/** Is a tool on PATH? Presence only — doesn't invoke it (so no network/side effects). Resolves
+ *  against `env` (the server's PATH) when given, so the answer doesn't depend on how THIS process
+ *  was launched — a GUI-opened TUI has a leaner PATH than a terminal, but both should report the
+ *  environment where the factory actually runs its tools. */
+async function onPath(tool: string, env?: NodeJS.ProcessEnv): Promise<void> {
+  await run("sh", ["-c", `command -v ${JSON.stringify(tool)} >/dev/null 2>&1`], { env });
 }
 
 /** Machine-wide checks, grouped by ownership. No repo needed.
@@ -74,17 +77,26 @@ export async function baseGroups(deep = false): Promise<DoctorGroup[]> {
     }),
   ]);
 
+  // These tools are resolved against the SERVICE's PATH, not this process's. The checks run
+  // in-process (CLI command or TUI tab), but the tools are found/invoked by the resident `serve`,
+  // which runs with the PATH baked into the launchd plist / systemd unit at install. A terminal has
+  // that rich PATH; a GUI-launched TUI inherits the bare `/usr/bin:/bin:…` and would otherwise
+  // report herdr/gh/claude as "missing" while `serve` finds them fine (git survives only via its
+  // /usr/bin fallback). Falling back to process.env when the service isn't installed keeps the old
+  // behavior (and the "supervisor service" check above already flags a missing service).
   // Default: presence on PATH (local, no network). Deep: actually interact (gh auth verifies the
   // GitHub token; herdr `workspace list` verifies the daemon responds).
+  const toolPath = service.servicePath();
+  const toolEnv = toolPath ? { ...process.env, PATH: toolPath } : undefined;
   const provided = await Promise.all([
-    attempt("git", () => onPath("git")),
+    attempt("git", () => onPath("git", toolEnv)),
     deep
-      ? attempt("herdr (daemon responds)", async () => void (await run(herdrBin, ["workspace", "list"])))
-      : attempt("herdr", () => onPath(herdrBin)),
+      ? attempt("herdr (daemon responds)", async () => void (await run(herdrBin, ["workspace", "list"], { env: toolEnv })))
+      : attempt("herdr", () => onPath(herdrBin, toolEnv)),
     deep
-      ? attempt("gh (authenticated)", async () => void (await run("gh", ["auth", "status"])))
-      : attempt("gh", () => onPath("gh")),
-    attempt("claude", () => onPath("claude")),
+      ? attempt("gh (authenticated)", async () => void (await run("gh", ["auth", "status"], { env: toolEnv })))
+      : attempt("gh", () => onPath("gh", toolEnv)),
+    attempt("claude", () => onPath("claude", toolEnv)),
   ]);
 
   return [

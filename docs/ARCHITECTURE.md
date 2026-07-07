@@ -168,7 +168,8 @@ herdr-factory/
       schemas.ts          zod request/response schemas + createRoute defs (validation + the doc)
       client.ts           CLI side: readServerInfo / pingHealth / serverFetch / viaServerOrLocal
     watchers/
-      service.ts          platform dispatch: darwin → launchd.ts · linux → systemd.ts
+      service.ts          platform dispatch: darwin → launchd.ts · linux → systemd.ts (+ servicePath():
+                          the baked PATH the doctor resolves you-provide tools against)
       launchd.ts          the macOS LaunchAgent (com.herdr-factory.server) running `ensure-up`
       systemd.ts          the Linux systemd --user service + timer (herdr-factory.timer)
       supervisor.ts       stateless `ensure-up` / killServer (health-check + detached serve spawn)
@@ -244,8 +245,10 @@ If a future need looks like "manage a pane/tab/worktree/agent," it belongs in
 Thin, typed wrappers. Types encode the real `herdr --json` shapes
 reverse-engineered during the bash prototype.
 
-- **`exec.ts`** — `run(cmd,args,{cwd,allowFail,timeoutMs})`, `runJson<T>()` over
-  `execFile` (promisified; arg arrays → no shell injection). **Every subprocess is time-bounded**
+- **`exec.ts`** — `run(cmd,args,{cwd,allowFail,timeoutMs,env})`, `runJson<T>()` over
+  `execFile` (promisified; arg arrays → no shell injection). `env` overrides the child's
+  environment (default: inherit the parent's) — used by `doctor` to resolve the you-provide tools
+  against the **service's** PATH rather than the checking process's (§11). **Every subprocess is time-bounded**
   (default 60s; herdr worktree ops pass 180s) via execFile's native `timeout` — which actually
   kills the child, unlike a promise race. A timeout throws `ExecTimeoutError` **even under
   `allowFail`**: `allowFail` means "a non-zero exit is expected data"; a timeout is
@@ -502,6 +505,22 @@ CREATE TABLE transition_outbox(          -- source status write-backs as persist
   stale_handled_at INTEGER,              -- the run-locked stale policy consumed it (v14)
   UNIQUE(run_id, to_state));             -- enqueue is idempotent across retried ticks
 
+CREATE TABLE evidence_uploads(           -- S3 evidence uploads as persisted INTENTS (v16) — the
+  id INTEGER PRIMARY KEY AUTOINCREMENT,  -- upload analog of transition_outbox (durable, retried)
+  run_id INTEGER NOT NULL REFERENCES runs(id),
+  repo TEXT NOT NULL, ticket_key TEXT NOT NULL,
+  key_prefix TEXT NOT NULL,              -- persisted so retry URLs stay stable (published up-front)
+  evidence_dir TEXT NOT NULL,            -- abs worktree path; gone ⇒ abandon
+  attempts INTEGER NOT NULL DEFAULT 0, next_attempt_at INTEGER NOT NULL,  -- backoff + enqueue LEASE
+  last_error TEXT, error_kind TEXT,      -- classifyS3Error: auth|transient|permanent (drives SSO light)
+  notified_at INTEGER,                   -- SSO/permanent-fail notify throttle (per row, never the run)
+  permanent_failed_at INTEGER,           -- terminal: non-retryable config error / dir-gone
+  abandoned_at INTEGER,                  -- superseded by a re-capture, or dropped at teardown
+  created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, delivered_at INTEGER,
+  UNIQUE(run_id, key_prefix));           -- idempotent enqueue; a bounce re-captures with a fresh prefix
+CREATE INDEX idx_evidence_uploads_pending ON evidence_uploads(repo, next_attempt_at)
+  WHERE delivered_at IS NULL AND permanent_failed_at IS NULL AND abandoned_at IS NULL;
+
 CREATE TABLE locks(name TEXT PRIMARY KEY, owner TEXT, acquired_at INTEGER, expires_at INTEGER);
 CREATE TABLE schema_version(version INTEGER);
 ```
@@ -517,7 +536,11 @@ locks: `acquireLock/extendLock/releaseLock` (extend = the heartbeat; owner-check
 (`enqueueTransition`, `dueTransitions`, `undeliveredTransitionBefore` — in-order-per-run guard,
 `markTransitionDelivered`, `recordTransitionAttempt` — 60s-doubling backoff capped 1h,
 `pendingTransitionForKey` — the claim guard, and the stale two-phase:
-`markTransitionStale`/`unhandledStaleIntentForRun`/`markTransitionStaleHandled`), the human
+`markTransitionStale`/`unhandledStaleIntentForRun`/`markTransitionStaleHandled`), the
+**evidence-upload outbox** (`enqueueEvidenceUpload`, `dueEvidenceUploads` — `next_attempt_at`-leased
+so the CLI's inline attempt and the Phase-0 flush never double-claim a row, `recordEvidenceAttempt`
+— backoff + `error_kind`, `markEvidenceDelivered`/`markEvidencePermanentFailed`,
+`undeliveredEvidenceUploadsForRun`), the human
 questions (`createHumanQuestion`/`pendingHumanQuestionForRun`/`answerHumanQuestion`/
 `recordHumanPollMiss`/`recordHumanPollError`),
 and the `work_items` ledger: `getWorkItem`, `listWorkItems(repo,source,status?)`,
@@ -557,7 +580,13 @@ run-locked half consumes an unhandled stale intent **exactly once** at the top o
 Phase-A pass (`stale_handled_at`): an `in_development` stale — the claim write-back found the
 item deleted/closed, i.e. "don't do this work" — aborts the run promptly; a mid-flight stale
 (e.g. `in_review` — a PR may be up) parks it for `attention` with **no source note** (the item
-the note would go to is what's gone). **Phase A** advances every active run one idempotent step, **in parallel
+the note would go to is what's gone). Phase 0 then also flushes the **evidence-upload outbox**
+(`flushEvidenceUploads`, same due/backoff/lease machinery): every undelivered S3 evidence upload is
+retried until it lands, so an AWS SSO session expiring mid-run no longer ships a PR with broken
+evidence links (the `evidence-upload` CLI publishes the deterministic URLs + attempts inline
+up-front, then enqueues the bytes here). A persistent auth failure notifies the human to
+`aws sso login`; a non-retryable error or a vanished capture dir is marked permanently failed —
+there's no source-stale two-phase, as evidence has no "gone at source". **Phase A** advances every active run one idempotent step, **in parallel
 with bounded concurrency** (`limits.reconcile_concurrency`, default 8, via `Effect.forEach` —
 most of a run's reconcile is subprocess/network wait, so pass wall-clock stays roughly flat as
 the active-run count grows). Each run is reconciled **under its own `run:<id>` lock**; a run
@@ -1023,8 +1052,16 @@ reports three groups: **managed** (node runtime ≥26 — vendored or ambient, a
 supervisor service loaded, server responding, DB present), **you-provide** (`git` / `herdr` /
 `gh` / `claude` on PATH; `--deep` exercises herdr and `gh auth status`), and — with `--repo` —
 **per-repo** (config loads + valid, main checkout, origin resolved, per-source `health()`, the
-descriptor-declared required secrets present, and a `--deep` S3 write-probe of the evidence
-bucket). `claim` takes `--belt` (defaulted when there's a single belt, required
+descriptor-declared required secrets present, a local **evidence-upload-outbox** health check
+(pending uploads still retrying; an auth-class stuck upload is flagged ✗ with the `aws sso login`
+fix — the AWS session expired), and a `--deep` S3 write-probe of the evidence
+bucket). The you-provide tools are resolved against the **service's** PATH (`service.servicePath()`
+reads the PATH baked into the launchd plist / systemd unit — §12), not the checking process's,
+falling back to `process.env.PATH` only when no service is installed. So the answer reflects the
+environment `serve` actually runs its tools in and is identical whether `doctor` runs from a
+terminal (CLI or a terminal-launched TUI) or a GUI-launched TUI — the latter inherits only the bare
+`/usr/bin:/bin:…` launchd PATH, under which every you-provide tool except `git` (which has a
+`/usr/bin` fallback) would otherwise read as missing while `serve` finds them fine. `claim` takes `--belt` (defaulted when there's a single belt, required
 when >1); `teardown`/`step-done`/`ask-human`/`bounce`/`resume` resolve the run by key and take
 `--source` to disambiguate when a key is active in more than one source (the agent's rendered
 commands always carry `--source`).
@@ -1103,7 +1140,9 @@ lock heartbeat so its locks expire.
   reinstalling the service. Environment = captured `PATH` + `HOME` plus the
   `HERDR_FACTORY_*`/`OTEL_*` allowlist (no experimental flags needed — native type stripping and
   `node:sqlite` are flag-free on Node ≥26). Secrets aren't in the service definition; `serve`
-  re-reads the env file per repo.
+  re-reads the env file per repo. That captured `PATH` is also read back out — `service.servicePath()`
+  parses it from the plist/unit — so `doctor` checks tool presence against the environment `serve`
+  actually runs in, not the (possibly leaner, GUI-launched) environment the checker inherited (§11).
 - **Why a scheduled one-shot, not `KeepAlive` on `serve`.** A one-shot supervisor is itself immune
   to the per-user launchd interval-timer wedging that bit the old resident `watch` after sleep/wake
   (a missed beat is harmless — `serve` self-sustains between runs), it detects a **wedged-but-alive**

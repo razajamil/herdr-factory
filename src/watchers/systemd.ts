@@ -2,7 +2,7 @@
 // on a 60s cadence — the same stateless-supervisor model as the macOS launchd job. Uses the baked
 // node-path (vendored `runtime/current/bin/node`) so a Node bump propagates without rewriting the
 // unit. `loginctl enable-linger` is set best-effort so the timer runs without an active session.
-import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, userInfo } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -96,6 +96,22 @@ Persistent=true
 [Install]
 WantedBy=timers.target
 `;
+}
+
+/** The PATH baked into the installed .service unit — the environment the supervisor and resident
+ *  `serve` resolve tools in. Undefined if the unit is absent (service not installed) or unreadable.
+ *  Mirrors launchd.servicePath(); see that comment for why the doctor uses it. */
+export function servicePath(): string | undefined {
+  const file = serviceFile();
+  if (!existsSync(file)) return undefined;
+  try {
+    // envAssign writes `Environment="PATH=<escaped>"`; reverse the \, " and %% escaping. (Newlines
+    // became spaces at write time and can't be recovered — PATH never contains them anyway.)
+    const value = readFileSync(file, "utf8").match(/^Environment="PATH=(.*)"$/m)?.[1];
+    return value === undefined ? undefined : value.replace(/%%/g, "%").replace(/\\"/g, '"').replace(/\\\\/g, "\\");
+  } catch {
+    return undefined;
+  }
 }
 
 export async function install(): Promise<void> {

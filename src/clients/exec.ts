@@ -30,6 +30,10 @@ export interface RunOpts {
   maxBuffer?: number;
   /** Kill the subprocess (SIGTERM, then SIGKILL after killAfterMs) past this budget. */
   timeoutMs?: number;
+  /** Child environment. Omit to inherit the parent's (the default). Pass `{ ...process.env, PATH }`
+   *  to resolve a command against a different PATH than this process runs with — e.g. the doctor
+   *  checking tool presence against the server's PATH, not a leaner GUI-launched one. */
+  env?: NodeJS.ProcessEnv;
 }
 
 /** Run a command (no shell — args are an array). Throws on non-zero unless allowFail; throws
@@ -49,6 +53,7 @@ export async function run(cmd: string, args: string[], opts: RunOpts = {}): Prom
       // KILLS the child — a promise-level timeout would leave the hung subprocess running.
       const { stdout, stderr } = await pexecFile(cmd, args, {
         cwd: opts.cwd,
+        env: opts.env,
         encoding: "utf8",
         maxBuffer: opts.maxBuffer ?? 64 * 1024 * 1024,
         timeout: timeoutMs,
