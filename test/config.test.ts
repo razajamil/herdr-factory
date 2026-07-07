@@ -24,10 +24,12 @@ const LM_SRC = `  - type: local_markdown
     name: ideas
     local_markdown: { folder: ~/work }
 `;
-// A work_to_pull_request belt: layout-only agents (the engine ships the prompts).
+// A work_to_pull_request belt: layout-only agents (the engine ships the prompts). `label` is the
+// per-belt pickup label — REQUIRED for a belt on a label-driven source (jira here).
 const SHIP_BELT = `  - name: ship
     belt_type: work_to_pull_request
     source: jira
+    label: agent
     agents:
       fix:    { tab: fix,    pane: agent }
       review: { tab: review, pane: agent }
@@ -81,7 +83,7 @@ describe("loadConfig — work sources + belts", () => {
     expect(jira.baseUrl).toBe("https://x.atlassian.net"); // trailing slash stripped
     expect(jira.project).toBe("RWR");
     expect(jira.board).toBe("254"); // coerced number → string
-    expect(jira.label).toBe("agent"); // default
+    expect((jira as unknown as Record<string, unknown>).label).toBeUndefined(); // label is per-belt now, not on the source
     expect(jira.statusInDev).toBe("In development");
     expect(config.limits.stallSeconds).toBe(2700); // default
     expect(config.limits.maxActive).toBe(3); // default
@@ -94,6 +96,7 @@ describe("loadConfig — work sources + belts", () => {
     expect(belt.name).toBe("ship");
     expect(belt.beltType).toBe("work_to_pull_request");
     expect(belt.source).toBe("jira");
+    expect(belt.label).toBe("agent"); // per-belt pickup label (no default — set in SHIP_BELT)
     expect(belt.priority).toBe(100); // default
     expect(belt.watchPr).toBe(true);
   });
@@ -103,11 +106,12 @@ describe("loadConfig — work sources + belts", () => {
       cfg(
         `  - type: github_issues
     name: gh
-    github_issues: { repo: acme/tracker, trigger_label: factory }
+    github_issues: { repo: acme/tracker }
 `,
         `  - name: ship
     belt_type: work_to_pull_request
     source: gh
+    label: factory
     agents:
       fix:    { tab: fix,    pane: agent }
       review: { tab: review, pane: agent }
@@ -122,13 +126,14 @@ describe("loadConfig — work sources + belts", () => {
     expect(s.type).toBe("github_issues");
     const gh = s.cfg as GithubIssuesSourceCfg;
     expect(gh.repo).toBe("acme/tracker");
-    expect(gh.triggerLabel).toBe("factory");
+    expect((gh as unknown as Record<string, unknown>).triggerLabel).toBeUndefined(); // trigger label is per-belt now
     expect(gh.stateLabels).toEqual({ inDevelopment: "herdr:in-development", inReview: "herdr:in-review", aborted: "herdr:aborted" });
     expect(gh.closeOn).toEqual({ merged: true, done: true, aborted: false });
     expect(gh.typeLabels.bug).toBe("Bug");
     expect(gh.defaultType).toBe("Feature");
     expect(gh.maxPages).toBe(1);
     expect(config.belts[0]!.source).toBe("gh");
+    expect(config.belts[0]!.label).toBe("factory"); // the belt's trigger/pickup label
   });
 
   it("github_issues: repo may be omitted (defaults to the PR repo at build time); bad shapes rejected", () => {
@@ -140,6 +145,7 @@ describe("loadConfig — work sources + belts", () => {
         `  - name: ship
     belt_type: work_to_pull_request
     source: github_issues
+    label: herdr
     agents:
       fix:    { tab: fix,    pane: agent }
       review: { tab: review, pane: agent }
@@ -213,6 +219,7 @@ describe("loadConfig — work sources + belts", () => {
       cfg(JIRA_SRC, `  - name: ship
     belt_type: work_to_pull_request
     source: jira
+    label: agent
     agents:
       fix:      { tab: fix,      pane: agent }
       evidence: { tab: evidence, pane: agent }
@@ -239,6 +246,7 @@ describe("loadConfig — work sources + belts", () => {
       cfg(JIRA_SRC, `  - name: ship
     belt_type: work_to_pull_request
     source: jira
+    label: agent
     max_bounces: 2
     agents: { fix: { tab: fix, pane: agent }, review: { tab: review, pane: agent }, pr: { tab: pr, pane: agent } }
 `),
@@ -283,6 +291,7 @@ describe("loadConfig — work sources + belts", () => {
         `  - name: gh-ship
     belt_type: work_to_pull_request
     source: github_issues
+    label: herdr
     agents:
       fix:    { tab: fix,    pane: agent }
       review: { tab: review, pane: agent }
@@ -347,6 +356,7 @@ describe("loadConfig — work sources + belts", () => {
       cfg(JIRA_SRC, `  - name: ship
     belt_type: work_to_pull_request
     source: jira
+    label: agent
     match: match.ts
     agents: { fix: { tab: fix, pane: agent }, review: { tab: review, pane: agent }, pr: { tab: pr, pane: agent } }
 `),
@@ -360,6 +370,7 @@ describe("loadConfig — work sources + belts", () => {
       cfg(JIRA_SRC, `  - name: ship
     belt_type: work_to_pull_request
     source: jira
+    label: agent
     match: nope.ts
     agents: { fix: { tab: fix, pane: agent }, review: { tab: review, pane: agent }, pr: { tab: pr, pane: agent } }
 `),
@@ -378,6 +389,7 @@ describe("loadConfig — work sources + belts", () => {
   - name: high
     belt_type: work_to_pull_request
     source: jira
+    label: agent
     priority: 1
     agents: { fix: { tab: fix, pane: agent }, review: { tab: review, pane: agent }, pr: { tab: pr, pane: agent } }
 `),
@@ -428,15 +440,79 @@ describe("loadConfig — work sources + belts", () => {
       cfg(JIRA_SRC, `  - name: dup
     belt_type: work_to_pull_request
     source: jira
+    label: agent
     agents: { fix: { tab: fix, pane: agent }, review: { tab: review, pane: agent }, pr: { tab: pr, pane: agent } }
   - name: dup
+    belt_type: work_to_pull_request
+    source: jira
+    label: agent2
+    agents: { fix: { tab: fix, pane: agent }, review: { tab: review, pane: agent }, pr: { tab: pr, pane: agent } }
+`),
+      { prompts: {} },
+    );
+    expect(() => loadConfig("demo")).toThrow(/duplicate belt name/);
+  });
+
+  it("rejects a belt on a label-driven source that sets no label (there is no default)", () => {
+    setup(
+      cfg(JIRA_SRC, `  - name: ship
     belt_type: work_to_pull_request
     source: jira
     agents: { fix: { tab: fix, pane: agent }, review: { tab: review, pane: agent }, pr: { tab: pr, pane: agent } }
 `),
       { prompts: {} },
     );
-    expect(() => loadConfig("demo")).toThrow(/duplicate belt name/);
+    expect(() => loadConfig("demo")).toThrow(/there is no default/);
+  });
+
+  it("rejects a `label` on a belt whose source has no label concept (local_markdown)", () => {
+    setup(
+      cfg(LM_SRC, `  - name: gen
+    belt_type: custom
+    source: ideas
+    label: whatever
+    steps:
+      - { name: research, prompt_file: r.md, prompt_file_source: config }
+`),
+      { prompts: { "r.md": "r\n" } },
+    );
+    expect(() => loadConfig("demo")).toThrow(/no label concept/);
+  });
+
+  it("rejects two belts that pick up the same source by the same label (contention)", () => {
+    setup(
+      cfg(JIRA_SRC, `  - name: a
+    belt_type: work_to_pull_request
+    source: jira
+    label: agent
+    agents: { fix: { tab: fix, pane: agent }, review: { tab: review, pane: agent }, pr: { tab: pr, pane: agent } }
+  - name: b
+    belt_type: work_to_pull_request
+    source: jira
+    label: agent
+    agents: { fix: { tab: fix, pane: agent }, review: { tab: review, pane: agent }, pr: { tab: pr, pane: agent } }
+`),
+      { prompts: {} },
+    );
+    expect(() => loadConfig("demo")).toThrow(/contend for the same items/);
+  });
+
+  it("allows ONE source split across belts by DISTINCT labels", () => {
+    setup(
+      cfg(JIRA_SRC, `  - name: bugs
+    belt_type: work_to_pull_request
+    source: jira
+    label: agent-bug
+    agents: { fix: { tab: fix, pane: agent }, review: { tab: review, pane: agent }, pr: { tab: pr, pane: agent } }
+  - name: chores
+    belt_type: work_to_pull_request
+    source: jira
+    label: agent-chore
+    agents: { fix: { tab: fix, pane: agent }, review: { tab: review, pane: agent }, pr: { tab: pr, pane: agent } }
+`),
+      { prompts: {} },
+    );
+    expect(loadConfig("demo").config.belts.map((b) => b.label)).toEqual(["agent-bug", "agent-chore"]);
   });
 
   it("rejects a custom belt with duplicate step names", () => {
@@ -631,6 +707,7 @@ describe("loadConfig — work sources + belts", () => {
       cfg(JIRA_SRC, `  - name: ship
     belt_type: work_to_pull_request
     source: jira
+    label: agent
     workspace_name: "fix/{{work_id}}-{{work_slug}}"
     agents: { fix: { tab: fix, pane: agent }, review: { tab: review, pane: agent }, pr: { tab: pr, pane: agent } }
 `),

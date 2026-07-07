@@ -378,10 +378,11 @@ reverse-engineered during the bash prototype.
   `task/`; `health` stats the folder.
 - **`github-issues-source.ts`** (+ **`github-issues.ts`**, **`github-budget.ts`**) — the
   `github_issues` source. GitHub is the **status of record** (spec `external`; `work_items`
-  never touched), projected onto the issue: eligible = open + `trigger_label` (default `herdr`)
-  + not a PR + no in-flight state label, listed **oldest-first**; `in_development` swaps in its
-  state label then **consumes the trigger label last** (a partial swap keeps the item filtered,
-  never double-claimed; re-adding the trigger is the retry affordance); `in_review` swaps
+  never touched), projected onto the issue: eligible = open + the belt's pickup label (`belt.label`,
+  the trigger — passed into `listEligible`) + not a PR + no in-flight state label, listed
+  **oldest-first**; `in_development` swaps in its state label then **consumes the trigger label
+  last** (a partial swap keeps the item filtered, never double-claimed; re-adding the trigger is the
+  retry affordance); `in_review` swaps
   labels; `merged`/`done` strip state labels and close the issue as `completed` per `close_on` —
   the idempotent backstop over the PR's `Fixes #n` auto-close (which only fires on
   default-branch merges and can be disabled repo-wide); it never reopens. `aborted` strips
@@ -900,21 +901,29 @@ from being claimed again).
         (validated on the *resolved* names, so two unnamed `jira` sources collide). Stored on each
         run's `work_source`. **The pre-existing Jira source must keep the default name `jira`** so
         v6-backfilled in-flight runs resolve.
-      - type block: `jira` (`base_url` / `project` / `board` / `label`, default `agent` / 3
-        `status` names, defaulted `To Do`/`In Progress`/`In Review` — `merged`/`aborted` are
-        intentionally absent, so teardown never transitions Jira) **or** `local_markdown`
-        (`folder`) **or** `github_issues` (`repo` — optional, default = the PR repo, throws at
-        startup when neither resolves / `trigger_label`, default `herdr` /
+      - type block: `jira` (`base_url` / `project` / `board` / 3 `status` names, defaulted
+        `To Do`/`In Progress`/`In Review` — `merged`/`aborted` are intentionally absent, so teardown
+        never transitions Jira) **or** `local_markdown` (`folder`) **or** `github_issues` (`repo` —
+        optional, default = the PR repo, throws at startup when neither resolves /
         `state_labels.{in_development,in_review,aborted}`, defaulted `herdr:*` /
         `close_on.{merged,done,aborted}`, defaults `true`/`true`/`false` / `type_labels` map +
-        `default_type` (native GitHub issue type wins when present) / `max_pages`, default 1).
+        `default_type` (native GitHub issue type wins when present) / `max_pages`, default 1). The
+        **pickup label is per-belt** (`belt.label`), not a source field — one source can feed
+        several belts, each claiming a different label. `descriptor.pickupLabel` marks the
+        label-driven types (jira, github_issues) so config validation can require/forbid it.
     - `belt` — **required, ≥1** (`zod` discriminated union on `belt_type`, `.strict()` members —
       `agents` on a `custom` belt is a parse error, not silently ignored). Common fields:
       - `name` (unique) · `source` (must reference a `work_sources` name) · `priority` (optional,
         default `100`; **lower = matched first**; ties keep config order — stable sort).
+      - `label` — the belt's pickup label, threaded into `listEligible`/`transition`/`health`.
+        **Required** (no default) for a belt on a label-driven source (`descriptor.pickupLabel` set:
+        jira, github_issues); **forbidden** for one without (local_markdown). Two belts sharing the
+        same `(source, label)` are rejected — they'd contend for identical items; split a source
+        across belts with **distinct** labels.
       - `match` — optional path (relative to the repo's config folder) to a `.ts` module whose
         default export is `(ctx) => boolean` (sync or async),
-        `ctx = { item, source: { name, type } }`; no `match` ⇒ accept everything from the source.
+        `ctx = { item, source: { name, type } }`; no `match` ⇒ accept everything the belt's `label`
+        surfaces from the source.
       - `workspace_name` — optional branch-name template (worktree + workspace derive from it).
         Vars: `{{work_id}}` (required by zod) `{{work_slug}}` (≤20) `{{work_full_slug}}` (≤50)
         `{{work_type}}` `{{semantic_work_prefix}}` (`fix`/`chore`/`feature`). Default

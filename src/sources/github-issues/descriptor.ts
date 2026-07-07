@@ -13,7 +13,8 @@ const GithubIssuesBlockSchema = z.object({
     .trim()
     .regex(/^[\w.-]+\/[\w.-]+$/, "owner/name")
     .optional(),
-  trigger_label: z.string().trim().min(1).default("herdr"),
+  // The trigger label is NOT here — it's per-belt now (belt.label). It's threaded into
+  // listEligible (the poll filter) AND transition (consumed on in_development) AND health.
   state_labels: z
     .object({
       in_development: z.string().trim().min(1).default("herdr:in-development"),
@@ -35,7 +36,7 @@ const GithubIssuesBlockSchema = z.object({
     .default({ bug: "Bug", defect: "Bug", chore: "Chore", task: "Chore", enhancement: "Feature" }),
   default_type: z.string().trim().min(1).default("Feature"),
   max_pages: z.coerce.number().int().min(1).max(10).default(1),
-}).strict(); // an unknown key in the block is a typo (`labels:` for `trigger_label`) — reject loudly
+}).strict(); // an unknown key in the block is a typo (`labels:` for `state_labels`) — reject loudly
 
 const sourceName = z.string().trim().min(1).optional();
 
@@ -50,6 +51,7 @@ type ResolvedBlock = Omit<GithubIssuesSourceCfg, "repo"> & { repo?: string };
 
 export const githubIssuesDescriptor: SourceDescriptor<ResolvedBlock> = {
   type: "github_issues",
+  pickupLabel: { noun: "trigger label" },
   configSchema: z
     .object({ type: z.literal("github_issues"), name: sourceName, github_issues: GithubIssuesBlockSchema })
     .strict(),
@@ -57,7 +59,6 @@ export const githubIssuesDescriptor: SourceDescriptor<ResolvedBlock> = {
     const b = (parsed as unknown as GithubIssuesParsed).github_issues;
     return {
       repo: b.repo,
-      triggerLabel: b.trigger_label,
       stateLabels: {
         inDevelopment: b.state_labels.in_development,
         inReview: b.state_labels.in_review,
@@ -90,10 +91,9 @@ export const githubIssuesDescriptor: SourceDescriptor<ResolvedBlock> = {
     },
   ],
   tui: {
-    defaultBlock: () => ({ trigger_label: "herdr" }),
+    defaultBlock: () => ({}),
     fields: [
       { label: "repo", path: ["github_issues", "repo"], placeholder: "(optional; default = PR repo)" },
-      { label: "trigger_label", path: ["github_issues", "trigger_label"], placeholder: "herdr" },
       { label: "state_labels.in_development", path: ["github_issues", "state_labels", "in_development"], placeholder: "herdr:in-development" },
       { label: "state_labels.in_review", path: ["github_issues", "state_labels", "in_review"], placeholder: "herdr:in-review" },
       { label: "state_labels.aborted", path: ["github_issues", "state_labels", "aborted"], placeholder: "herdr:aborted" },

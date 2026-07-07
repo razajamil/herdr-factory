@@ -127,9 +127,17 @@ async function statusPayload(rt: RepoRuntime) {
 
 async function eligiblePayload(rt: RepoRuntime): Promise<{ source: string; key: string; summary: string; type: string }[]> {
   const out: { source: string; key: string; summary: string; type: string }[] = [];
-  for (const src of rt.deps.sources) {
+  // Eligibility is per BELT now — each belt polls its source with its own pickup label. Walk belts
+  // (not sources) so a label-driven source's items are surfaced under the belt(s) that claim them;
+  // dedup by (source, key) since two belts could name the same source (with distinct labels).
+  const seen = new Set<string>();
+  for (const belt of rt.deps.belts) {
+    const src = rt.deps.resolveSource(belt.source);
+    if (!src) continue;
     try {
-      for (const t of await src.client.listEligible()) {
+      for (const t of await src.client.listEligible(belt.label)) {
+        if (seen.has(`${src.name} ${t.key}`)) continue;
+        seen.add(`${src.name} ${t.key}`);
         out.push({ source: src.name, key: t.key, summary: t.summary, type: t.type });
       }
     } catch (e) {

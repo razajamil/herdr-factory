@@ -118,9 +118,12 @@ export async function repoGroup(repo: string, deep = false): Promise<DoctorGroup
       }),
     );
     for (const src of d.sources) {
+      // The pickup labels of every belt feeding this source (deduped) — a label-driven source
+      // health-checks each one is usable; a label-less source ignores them.
+      const pickupLabels = [...new Set(d.belts.filter((b) => b.source === src.name).map((b) => b.label).filter((l): l is string => !!l))];
       // Default: it's configured (local). Deep: hit the backend's health endpoint (network).
       if (deep) {
-        checks.push(await attempt(`source ${src.name} (${src.type})`, async () => void (await src.client.health())));
+        checks.push(await attempt(`source ${src.name} (${src.type})`, async () => void (await src.client.health(pickupLabels))));
       } else {
         checks.push({ name: `source ${src.name} (${src.type})`, ok: true, detail: "configured (--deep to health-check)" });
       }

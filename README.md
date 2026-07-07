@@ -104,13 +104,13 @@ work_sources:
       base_url: https://your-org.atlassian.net
       project: APP
       board: "42"
-      # label: agent    (default) — tickets carrying this label are eligible
       # status:         (defaults) — todo: To Do · in_development: In Progress · review: In Review
 
 belt:
   - name: tickets-to-prs
     belt_type: work_to_pull_request
     source: jira
+    label: agent # tickets carrying this label are eligible for this belt (required — no default)
     agents: { fix: {}, review: {}, pr: {} } # no layout yet → the factory spawns each step's pane
 ```
 
@@ -214,18 +214,19 @@ extra credentials (it uses your authenticated `gh` CLI's token unless you set `G
 ```yaml
 work_sources:
   - type: github_issues
-    github_issues: {} # polls the PR repo's open issues labelled `herdr`; all fields optional
+    github_issues: {} # all fields optional (repo defaults to the PR repo)
 
 belt:
   - name: issues-to-prs
     belt_type: work_to_pull_request
     source: github_issues
+    label: herdr # the trigger label — issues carrying it are eligible (required, no default)
     agents: { fix: {}, review: {}, pr: {} }
 ```
 
-Label an issue `herdr` (the `trigger_label`) and the factory claims it — swapping the label for
-`herdr:in-development` and **consuming the trigger**, so re-adding `herdr` later is how you retry
-a run. The agents get the issue body, the whole comment thread, and any embedded
+Label an issue `herdr` (the belt's `label` — its trigger) and the factory claims it — swapping the
+label for `herdr:in-development` and **consuming the trigger**, so re-adding `herdr` later is how you
+retry a run. The agents get the issue body, the whole comment thread, and any embedded
 images/screen-recordings as the spec; the PR carries a `Fixes #n` line so the merge auto-closes
 the issue (the factory closes it as completed anyway, as a backstop). A failed run leaves the
 issue open, labelled `herdr:aborted`, for retriage; questions and attention notes arrive as
@@ -288,14 +289,18 @@ a third `custom` belt runs experiments from its own Markdown folder, entirely in
 
 ![Top-down view of three conveyor belts running in parallel on one factory floor. On the left, a custom belt reads Markdown ideas and runs research → propose → file_ticket to generate Jira tickets; those tickets loop across to the middle belt — a work_to_pull_request belt on the Jira source running fix → review → pr to a merged pull request. On the right, a separate custom belt reads a Markdown experiments folder and runs its own steps. A labelled arrow shows the ticket-generator belt feeding work into the Jira belt.](docs/images/multiple-belts.svg)
 
-When more than one belt draws from the **same** source, claim order decides who gets each item:
-belts are walked in `priority` order (lower first) and the first belt whose `match` predicate
-accepts an item claims it — **first match wins**, and a belt with no `match` accepts everything from
-its source. `match` is a `.ts` file in the repo's config folder whose default export is
-`(ctx) => boolean` (sync or async), with `ctx = { item, source: { name, type } }` — the item
-carries `labels` uniformly plus source-native routing metadata (Jira's status + raw fields, a
-GitHub issue's number/author/body, a markdown brief's front-matter). Route bugs to one belt and
-stories to another, programmatically.
+When more than one belt draws from the **same** label-driven source, each belt uses a **distinct
+`label`** to carve out its own slice of the queue — the factory rejects two belts sharing the same
+source _and_ label (they'd contend for the same items). So one Jira board can feed a `bugs` belt
+(`label: agent-bug`) and a `chores` belt (`label: agent-chore`) that never overlap.
+
+Within a single label, `match` gives finer-grained routing: belts are walked in `priority` order
+(lower first) and the first belt whose `match` predicate accepts an item claims it — **first match
+wins**, and a belt with no `match` accepts everything its `label` surfaces. `match` is a `.ts` file
+in the repo's config folder whose default export is `(ctx) => boolean` (sync or async), with
+`ctx = { item, source: { name, type } }` — the item carries `labels` uniformly plus source-native
+routing metadata (Jira's status + raw fields, a GitHub issue's number/author/body, a markdown
+brief's front-matter). Route bugs to one belt and stories to another, programmatically.
 
 ## Highlights
 
@@ -408,26 +413,27 @@ is pure data (`herdr-factory reload` picks it up without a restart).
 Each entry: a `type`, an optional `name` (default = the type; must be unique per repo — belts
 reference it), and a type block:
 
-- **`jira`** — `base_url`, `project`, `board`, `label` (default `agent`), and a `status` map:
-  `todo` (default `To Do`), `in_development` (default `In Progress`), `review` (default
-  `In Review`). The status of record lives in Jira; the factory deliberately never writes a
-  terminal status (merged/closed is owned by Jira's GitHub integration). Ticket description,
-  comments, and image/video attachments are materialized into the worktree for the agents.
+- **`jira`** — `base_url`, `project`, `board`, and a `status` map: `todo` (default `To Do`),
+  `in_development` (default `In Progress`), `review` (default `In Review`). The label that flags a
+  ticket for pickup is set per **belt** (`label` — see [`belt`](#belt--1)), not here. The status of
+  record lives in Jira; the factory deliberately never writes a terminal status (merged/closed is
+  owned by Jira's GitHub integration). Ticket description, comments, and image/video attachments are
+  materialized into the worktree for the agents.
 - **`local_markdown`** — `folder`: a directory where each top-level `*.md` file _or_ top-level
   subdirectory containing at least one top-level `*.md` is one work item (key = filename stem /
   dir name; names starting `__` are skipped as still-being-drafted). Title/type come from YAML
   front-matter, else the first H1, else the filename. Lifecycle is tracked in the factory's own
   DB — **the folder is never modified**. A file materializes as `task.md`; a directory is copied
   whole as `task/`, so multi-file briefs (spec + assets) work.
-- **`github_issues`** — polls a repo's open issues carrying `trigger_label` (default `herdr`),
-  oldest first; the status of record stays on GitHub, projected as labels. Fields (all optional):
-  `repo` (`owner/name`; default = the repo PRs are opened against), `trigger_label`,
-  `state_labels` (`in_development`/`in_review`/`aborted`, defaults `herdr:in-development` /
-  `herdr:in-review` / `herdr:aborted`; created on demand), `close_on`
-  (`merged`/`done`/`aborted`, defaults `true`/`true`/`false`), `type_labels` (issue label →
-  work type; GitHub's native issue type wins when present) + `default_type` (default `Feature`),
-  `max_pages` (pages of 100 per poll, default 1). Lifecycle: claiming swaps in the
-  in-development label and **consumes the trigger label** — re-adding it is the retry; success
+- **`github_issues`** — polls a repo's open issues carrying the belt's pickup label (its `label`,
+  which acts as the trigger — set per **belt**, see [`belt`](#belt--1)), oldest first; the status of
+  record stays on GitHub, projected as labels. Fields (all optional): `repo` (`owner/name`; default
+  = the repo PRs are opened against), `state_labels` (`in_development`/`in_review`/`aborted`,
+  defaults `herdr:in-development` / `herdr:in-review` / `herdr:aborted`; created on demand),
+  `close_on` (`merged`/`done`/`aborted`, defaults `true`/`true`/`false`), `type_labels` (issue label
+  → work type; GitHub's native issue type wins when present) + `default_type` (default `Feature`),
+  `max_pages` (pages of 100 per poll, default 1). Lifecycle: claiming swaps in the in-development
+  label and **consumes the trigger label** (the belt's `label`) — re-adding it is the retry; success
   strips the state labels and closes the issue as completed (a backstop over the PR's `Fixes #n`
   auto-close — it never reopens); an aborted run leaves the issue **open** with the aborted
   label unless `close_on.aborted` (then closed as not-planned). The issue body, all human
@@ -439,15 +445,18 @@ reference it), and a type block:
     - type: github_issues
       github_issues:
         repo: my-org/my-app # optional — defaults to the PR repo
-        trigger_label: herdr
+  # the trigger label is the belt's `label` (below), not a source field
   ```
 
 ### `belt` (≥ 1)
 
-Common fields: `name` (unique), `belt_type`, `source` (a `work_sources` name), `priority`
-(default 100, lower = matched first), optional `match` (see [Multiple belts](#multiple-belts)),
-optional `max_bounces` override, and optional `workspace_name` — the branch/worktree name
-template, default `{{semantic_work_prefix}}/{{work_id}}-{{work_full_slug}}`. It must contain
+Common fields: `name` (unique), `belt_type`, `source` (a `work_sources` name), `label` (the pickup
+label — the tag the factory looks for to claim this belt's work; **required** for a belt on a
+label-driven source — `jira` / `github_issues` — with **no default**, and omitted for a source with
+no label concept — `local_markdown`), `priority` (default 100, lower = matched first), optional
+`match` (see [Multiple belts](#multiple-belts)), optional `max_bounces` override, and optional
+`workspace_name` — the branch/worktree name template, default
+`{{semantic_work_prefix}}/{{work_id}}-{{work_full_slug}}`. It must contain
 `{{work_id}}`; other vars: `{{work_slug}}` (≤20), `{{work_full_slug}}` (≤50), `{{work_type}}`,
 `{{semantic_work_prefix}}` (fix/chore/feature). A short unique suffix is always appended, so
 re-claiming a previously-merged item gets a fresh branch and PR.

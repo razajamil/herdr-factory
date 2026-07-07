@@ -8,11 +8,12 @@ const CFG: JiraSourceCfg = {
   baseUrl: "https://x.atlassian.net",
   project: "RWR",
   board: "254",
-  label: "agent",
   statusTodo: "To Do",
   statusInDev: "In development",
   statusReview: "Ready for Code Review",
 };
+// The belt's pickup label — a per-belt arg to listEligible now, not source config.
+const LABEL = "agent";
 
 const tmps: string[] = [];
 let fetchCalls: { url: string; method: string }[] = [];
@@ -101,7 +102,7 @@ describe("JiraSource", () => {
       }
       return { ok: true, status: 200, text: async () => JSON.stringify(({})), headers: new Headers() } as Response;
     }) as typeof fetch;
-    const items = await src().listEligible();
+    const items = await src().listEligible(LABEL);
     expect(items.length).toBe(1);
     expect(items[0]!).toMatchObject({ sourceType: "jira", key: "RWR-9", summary: "Crash on save", type: "Bug", status: "To Do", labels: ["agent", "p1"] });
   });

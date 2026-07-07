@@ -52,6 +52,12 @@ export interface SourceBuildCtx<TCfg> {
 
 export interface SourceDescriptor<TCfg = unknown> {
   readonly type: SourceType;
+  /** How this source picks up work by a belt-configured label. When set, a belt on this source
+   *  MUST configure `label` (no default) and it's threaded into listEligible/transition/health;
+   *  `noun` names it in config errors, docs, and the TUI ("label" for jira, "trigger label" for
+   *  github_issues). Absent ⇒ the source has no label concept (local_markdown): a belt on it must
+   *  NOT set `label`. The single source of truth for the config's per-belt label validation. */
+  readonly pickupLabel?: { readonly noun: string };
   /** The FULL `.strict()` source object schema: { type: literal, name?, <type>: block }. Joined
    *  into the config discriminated union; flows into config.schema.json via `npm run schema`. */
   readonly configSchema: ZodType;

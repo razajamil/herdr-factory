@@ -255,9 +255,18 @@ program
     try {
       const deps = await buildDeps(requireRepo());
       const out: { source: string; key: string; summary: string; type: string }[] = [];
-      for (const src of deps.sources) {
+      // Per-belt eligibility: each belt polls its source with its own pickup label. Dedup by
+      // (source, key) since two belts could name the same source (with distinct labels).
+      const seen = new Set<string>();
+      for (const belt of deps.belts) {
+        const src = deps.resolveSource(belt.source);
+        if (!src) continue;
         try {
-          for (const t of await src.client.listEligible()) out.push({ source: src.name, key: t.key, summary: t.summary, type: t.type });
+          for (const t of await src.client.listEligible(belt.label)) {
+            if (seen.has(`${src.name} ${t.key}`)) continue;
+            seen.add(`${src.name} ${t.key}`);
+            out.push({ source: src.name, key: t.key, summary: t.summary, type: t.type });
+          }
         } catch (e) {
           deps.log("warn", `${src.name}: eligible query failed: ${e instanceof Error ? e.message : String(e)}`);
         }

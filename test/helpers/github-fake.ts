@@ -3,6 +3,26 @@
 import { GithubIssuesClient } from "../../src/clients/github-issues.ts";
 import { GithubIssuesSource, type GithubIssuesSourceCfg } from "../../src/clients/github-issues-source.ts";
 import { TokenBucket } from "../../src/clients/http.ts";
+import type { WorkState } from "../../src/types.ts";
+
+/** The pickup (trigger) label a github_issues belt would carry — it's a per-belt arg now, not
+ *  source config. The helper binds it as the default for listEligible/transition/health so existing
+ *  call sites read as before while still exercising the label threading. */
+export const TRIGGER_LABEL = "herdr";
+
+/** Wrap a source so the three label-taking methods default to `trigger` when a test omits it —
+ *  mirroring how a belt threads its `label` into the real reconcile/doctor paths. */
+function bindTrigger(src: GithubIssuesSource, trigger: string): GithubIssuesSource {
+  return new Proxy(src, {
+    get(target, prop, receiver) {
+      if (prop === "listEligible") return (label?: string) => target.listEligible(label ?? trigger);
+      if (prop === "transition") return (key: string, to: WorkState, label?: string) => target.transition(key, to, label ?? trigger);
+      if (prop === "health") return (labels?: string[]) => target.health(labels ?? [trigger]);
+      const v = Reflect.get(target, prop, receiver);
+      return typeof v === "function" ? v.bind(target) : v;
+    },
+  });
+}
 
 export interface FakeIssue {
   number: number;
@@ -47,7 +67,6 @@ export interface FakeGithub {
 
 export const DEFAULT_CFG: GithubIssuesSourceCfg = {
   repo: "acme/tracker",
-  triggerLabel: "herdr",
   stateLabels: { inDevelopment: "herdr:in-development", inReview: "herdr:in-review", aborted: "herdr:aborted" },
   closeOn: { merged: true, done: true, aborted: false },
   typeLabels: { bug: "Bug", defect: "Bug", chore: "Chore", task: "Chore", enhancement: "Feature" },
@@ -248,7 +267,7 @@ export function makeWired(
   _fake: FakeGithub,
   cfg: Partial<GithubIssuesSourceCfg> = {},
   prRepo?: string,
-  opts: { envToken?: string; buckets?: { read: TokenBucket[]; mutation: TokenBucket[] } } = {},
+  opts: { envToken?: string; buckets?: { read: TokenBucket[]; mutation: TokenBucket[] }; triggerLabel?: string } = {},
 ) {
   const merged = { ...DEFAULT_CFG, ...cfg };
   const tokenCalls = { n: 0 };
@@ -262,5 +281,6 @@ export function makeWired(
     },
     budget,
   );
-  return { src: new GithubIssuesSource(merged, client, prRepo ?? merged.repo), client, tokenCalls };
+  const raw = new GithubIssuesSource(merged, client, prRepo ?? merged.repo);
+  return { src: bindTrigger(raw, opts.triggerLabel ?? TRIGGER_LABEL), client, tokenCalls };
 }

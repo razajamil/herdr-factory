@@ -106,7 +106,7 @@ function jiraHarness(): ContractCtx {
   }) as typeof fetch;
 
   const src = new JiraSource(
-    { baseUrl: "https://x.atlassian.net", project: "RWR", board: "254", label: "agent", statusTodo: "To Do", statusInDev: "In development", statusReview: "Ready for Code Review" },
+    { baseUrl: "https://x.atlassian.net", project: "RWR", board: "254", statusTodo: "To Do", statusInDev: "In development", statusReview: "Ready for Code Review" },
     "me@x.com",
     "tok",
   );

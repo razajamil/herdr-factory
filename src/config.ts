@@ -156,6 +156,14 @@ const beltBase = {
   priority: z.coerce.number().int().default(100),
   workspace_name: WorkspaceNameSchema,
   match: z.string().optional(),
+  // The label this belt picks up work by — the tag on a source item that flags it for this belt.
+  // NO DEFAULT (deliberate: you name the label explicitly). REQUIRED for a belt whose source picks
+  // up by label (jira, github_issues), FORBIDDEN for one whose source has no label concept
+  // (local_markdown) — both enforced in superRefine, which knows each belt's source type. It's
+  // threaded into the source's listEligible/transition/health, so it filters SERVER-SIDE (jira JQL,
+  // GitHub's label query), not after the fact. Two belts may share a source only via DISTINCT
+  // labels — the same (source, label) in two belts is contention (also rejected below).
+  label: z.string().trim().min(1).optional(),
   // Optional per-belt override of the repo-wide max_bounces safety cap (the loop-safety backstop for
   // the fix↔evidence/review rework loop). Unset ⇒ falls back to limits.max_bounces.
   max_bounces: z.coerce.number().int().nonnegative().optional(),
@@ -241,18 +249,23 @@ export const RepoConfigSchema = z
   })
   .superRefine((cfg, ctx) => {
     // Work source names unique on the RESOLVED name (name ?? type), so two unnamed jira sources
-    // correctly collide on "jira" rather than both passing as undefined.
+    // correctly collide on "jira" rather than both passing as undefined. Keep the name→type map so
+    // the belt loop below can look up each source's descriptor (label-driven or not).
     const sourceNames = new Set<string>();
+    const sourceTypeByName = new Map<string, SourceType>();
     cfg.work_sources.forEach((s, i) => {
       const name = s.name ?? s.type;
       if (sourceNames.has(name)) {
         ctx.addIssue({ code: "custom", message: `duplicate work source name "${name}" — give each source a unique name`, path: ["work_sources", i, "name"] });
       }
       sourceNames.add(name);
+      sourceTypeByName.set(name, s.type);
     });
     // Belt names unique; each belt.source references a configured work source; custom step names
-    // unique within their belt.
+    // unique within their belt; the per-belt pickup `label` matches its source's label semantics
+    // and is unique per (source, label).
     const beltNames = new Set<string>();
+    const sourceLabelPairs = new Map<string, string>(); // "source label" -> first belt using it
     cfg.belt.forEach((b, i) => {
       if (beltNames.has(b.name)) {
         ctx.addIssue({ code: "custom", message: `duplicate belt name "${b.name}" — give each belt a unique name`, path: ["belt", i, "name"] });
@@ -260,6 +273,29 @@ export const RepoConfigSchema = z
       beltNames.add(b.name);
       if (!sourceNames.has(b.source)) {
         ctx.addIssue({ code: "custom", message: `belt "${b.name}" references unknown work source "${b.source}" (configured: ${[...sourceNames].join(", ") || "none"})`, path: ["belt", i, "source"] });
+      }
+      // Per-belt pickup label: required exactly when the belt's source picks up by label. The
+      // descriptor.pickupLabel manifest is the single source of truth for which types those are.
+      const sourceType = sourceTypeByName.get(b.source);
+      const pickup = sourceType ? descriptorFor(sourceType).pickupLabel : undefined;
+      if (sourceType) {
+        if (pickup && b.label == null) {
+          ctx.addIssue({ code: "custom", message: `belt "${b.name}": source "${b.source}" (${sourceType}) picks up work by a ${pickup.noun} — set the belt's \`label\` (there is no default)`, path: ["belt", i, "label"] });
+        } else if (!pickup && b.label != null) {
+          ctx.addIssue({ code: "custom", message: `belt "${b.name}": source "${b.source}" (${sourceType}) has no label concept — remove \`label\``, path: ["belt", i, "label"] });
+        }
+      }
+      // A belt is fed the items its source lists for (source, label); two belts on the SAME pair
+      // would contend for the very same items (first-match-wins arbitrarily starves the other) —
+      // split one source across belts with DISTINCT labels instead.
+      if (b.label != null) {
+        const key = `${b.source} ${b.label}`;
+        const first = sourceLabelPairs.get(key);
+        if (first) {
+          ctx.addIssue({ code: "custom", message: `belts "${first}" and "${b.name}" both pick up "${b.source}" work by label "${b.label}" — they'd contend for the same items; give each belt a distinct label`, path: ["belt", i, "label"] });
+        } else {
+          sourceLabelPairs.set(key, b.name);
+        }
       }
       if (b.belt_type === "custom") {
         const stepNames = new Set<string>();
@@ -314,6 +350,10 @@ export interface BeltConfig {
   priority: number;
   workspaceName?: string;
   matchFile?: string;
+  /** The label this belt picks up work by, threaded into its source's listEligible/transition/
+   *  health. Set for belts on a label-driven source (jira, github_issues); undefined for one whose
+   *  source has no label concept (local_markdown). Enforced at parse time (see superRefine). */
+  label?: string;
   steps: StepConfig[];
   watchPr: boolean;
   /** Per-belt override of the repo-wide bounce safety cap; undefined ⇒ use limits.maxBounces. */
@@ -638,6 +678,7 @@ export function loadConfig(repoName: string): Loaded {
       priority: b.priority,
       workspaceName: b.workspace_name,
       matchFile: b.match ? resolveFile(b.name, "match", b.match) : undefined,
+      label: b.label,
     };
     if (b.belt_type === "work_to_pull_request") {
       const steps: StepConfig[] = PR_STEPS.flatMap((d) => {

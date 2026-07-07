@@ -31,10 +31,11 @@ import {
 } from "../types.ts";
 import { classifyGone, GithubIssuesClient, labelNames, type GhComment, type GhIssue } from "./github-issues.ts";
 
-/** Resolved github_issues-source config (the client/source own the shape; the descriptor maps YAML onto it). */
+/** Resolved github_issues-source config (the client/source own the shape; the descriptor maps YAML
+ *  onto it). The trigger (pickup) label is NOT here — it's per-belt and arrives as an argument to
+ *  listEligible/transition/health. */
 export interface GithubIssuesSourceCfg {
   repo: string; // "owner/name" the issues live in
-  triggerLabel: string;
   stateLabels: { inDevelopment: string; inReview: string; aborted: string };
   closeOn: { merged: boolean; done: boolean; aborted: boolean };
   typeLabels: Record<string, string>; // issue label (lowercased) -> Ticket.type
@@ -163,14 +164,17 @@ export class GithubIssuesSource implements WorkSource {
     };
   }
 
-  async listEligible(): Promise<MatchItem[]> {
+  async listEligible(pickupLabel?: string): Promise<MatchItem[]> {
+    // The belt's `label` IS the trigger label here — the poll filter. A github_issues belt always
+    // carries one (config enforces it); guard so a stray call can't silently poll every open issue.
+    if (!pickupLabel) throw new Error("github_issues: listEligible needs the belt's pickup label (its `label`)");
     const out: GithubIssuesMatchItem[] = [];
     // GitHub label names are case-insensitively unique and the API returns the repo's CANONICAL
     // casing — every membership check here (and in transition) must fold case, or a config that
     // spells "herdr" against a repo label "Herdr" silently breaks the guards.
     const inFlight = new Set([this.cfg.stateLabels.inDevelopment, this.cfg.stateLabels.inReview].map((l) => l.toLowerCase()));
     for (let page = 1; page <= this.cfg.maxPages; page++) {
-      const batch = await this.gh.listOpenIssuesByLabel(this.cfg.triggerLabel, page);
+      const batch = await this.gh.listOpenIssuesByLabel(pickupLabel, page);
       let kept = 0;
       for (const issue of batch) {
         if (issue.pull_request) continue; // the list endpoint interleaves PRs — never claimable
@@ -185,7 +189,7 @@ export class GithubIssuesSource implements WorkSource {
         // A FULL page yielded nothing claimable (e.g. 100 trigger-labeled PRs occupying the
         // oldest-first slots) — eligible issues beyond this page would starve silently at the
         // max_pages cap. Surface it; the operator fixes the stray labels or raises max_pages.
-        this.log("warn", `github_issues: page ${page} of "${this.cfg.triggerLabel}" was entirely non-claimable (PRs/in-flight) — newer issues may be starving; check for trigger-labeled PRs or raise max_pages`);
+        this.log("warn", `github_issues: page ${page} of "${pickupLabel}" was entirely non-claimable (PRs/in-flight) — newer issues may be starving; check for trigger-labeled PRs or raise max_pages`);
       }
       if (batch.length < 100) break;
     }
@@ -210,7 +214,7 @@ export class GithubIssuesSource implements WorkSource {
     this.ensuredLabels.add(name);
   }
 
-  async transition(key: string, to: WorkState): Promise<TransitionResult> {
+  async transition(key: string, to: WorkState, pickupLabel?: string): Promise<TransitionResult> {
     if (!this.spec.mappedStates.includes(to)) return { kind: "noop" }; // unmapped (todo) → ZERO network (INV-3)
     const n = Number(key);
     try {
@@ -243,10 +247,12 @@ export class GithubIssuesSource implements WorkSource {
         for (const l of this.allStateLabels()) {
           if (l !== want && has(l)) applied = (await this.gh.removeLabel(n, l)) || applied;
         }
-        if (to === "in_development" && has(this.cfg.triggerLabel)) {
-          // Consume the trigger LAST: if the swap partially fails and retries, the still-present
-          // trigger keeps the item filtered by the in-flight guard, never double-claimed.
-          applied = (await this.gh.removeLabel(n, this.cfg.triggerLabel)) || applied;
+        if (to === "in_development" && pickupLabel && has(pickupLabel)) {
+          // Consume the trigger (the belt's pickup label) LAST: if the swap partially fails and
+          // retries, the still-present trigger keeps the item filtered by the in-flight guard,
+          // never double-claimed. Skipped only if the belt (hence its label) is gone — an
+          // already-stranded run (INV-9); the item can't re-list while the run is active anyway.
+          applied = (await this.gh.removeLabel(n, pickupLabel)) || applied;
         }
         return { kind: applied ? "applied" : "noop" };
       }
@@ -384,7 +390,7 @@ export class GithubIssuesSource implements WorkSource {
     }
   }
 
-  async health(): Promise<void> {
+  async health(pickupLabels: string[] = []): Promise<void> {
     let repo: { has_issues?: boolean; permissions?: { push?: boolean } };
     try {
       repo = await this.gh.getRepo();
@@ -395,8 +401,12 @@ export class GithubIssuesSource implements WorkSource {
     if (repo.permissions && repo.permissions.push === false) {
       throw new Error(`github_issues: the token has no push/write access to ${this.cfg.repo} — labels and comments will fail`);
     }
-    if (!(await this.gh.labelExists(this.cfg.triggerLabel))) {
-      throw new Error(`github_issues: trigger label "${this.cfg.triggerLabel}" does not exist in ${this.cfg.repo} — create it (or set trigger_label) and add it to issues you want worked`);
+    // Each feeding belt's trigger label (its `label`) must exist in the repo, or that belt's poll
+    // can never surface work. Case-fold to match GitHub's case-insensitive label namespace.
+    for (const label of pickupLabels) {
+      if (!(await this.gh.labelExists(label))) {
+        throw new Error(`github_issues: trigger label "${label}" does not exist in ${this.cfg.repo} — create it (or fix the belt's \`label\`) and add it to issues you want worked`);
+      }
     }
   }
 }

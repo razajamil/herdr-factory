@@ -144,10 +144,6 @@
                   "board": {
                     "type": "string"
                   },
-                  "label": {
-                    "default": "agent",
-                    "type": "string"
-                  },
                   "status": {
                     "default": {},
                     "type": "object",
@@ -226,11 +222,6 @@
                   "repo": {
                     "type": "string",
                     "pattern": "^[\\w.-]+\\/[\\w.-]+$"
-                  },
-                  "trigger_label": {
-                    "default": "herdr",
-                    "type": "string",
-                    "minLength": 1
                   },
                   "state_labels": {
                     "default": {},
@@ -345,6 +336,10 @@
               },
               "match": {
                 "type": "string"
+              },
+              "label": {
+                "type": "string",
+                "minLength": 1
               },
               "max_bounces": {
                 "type": "integer",
@@ -485,6 +480,10 @@
               },
               "match": {
                 "type": "string"
+              },
+              "label": {
+                "type": "string",
+                "minLength": 1
               },
               "max_bounces": {
                 "type": "integer",

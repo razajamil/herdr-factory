@@ -133,6 +133,9 @@ export function buildDescriptors(draft: Document, rebuild: () => void, confirm: 
   d.push({ kind: "header", label: "belt", level: 1 });
   const belts: any[] = Array.isArray(cfg.belt) ? cfg.belt : [];
   const beltNames = belts.map((b, i) => String(b?.name ?? `belt${i}`));
+  // Which pickup-label noun (if any) each source name uses — drives whether a belt on it shows a
+  // `label` field. Falls back to no-label for hand-edited/unknown source types.
+  const sourceTypeByName = new Map(sources.map((s, i) => [sourceNames[i]!, String(s?.type ?? "")]));
   belts.forEach((b, i) => {
     const beltType = String(b?.belt_type ?? "custom");
     d.push({ kind: "group", label: `${beltNames[i]} [${beltType}]`, node: node(["belt", i]), expanded: isOpen(["belt", i]), indent: 1, ...mover(["belt"], i, belts.length) });
@@ -162,6 +165,10 @@ export function buildDescriptors(draft: Document, rebuild: () => void, confirm: 
     });
     d.push({ kind: "ref", label: "source", value: String(b?.source ?? ""), choices: sourceNames.length ? sourceNames : [""], indent: 2, apply: (next) => { draft.setIn(["belt", i, "source"], next); rebuild(); } });
     d.push({ kind: "text", label: "priority", path: ["belt", i, "priority"], placeholder: "100", numeric: true, indent: 2 });
+    // The per-belt pickup label — shown only for a label-driven source (jira/github_issues), where
+    // it's REQUIRED; a source with no label concept (local_markdown) has none, so it's hidden.
+    const pickup = SOURCE_DESCRIPTORS.find((x) => x.type === sourceTypeByName.get(String(b?.source ?? "")))?.pickupLabel;
+    if (pickup) d.push({ kind: "text", label: "label", path: ["belt", i, "label"], placeholder: `${pickup.noun} — required (no default)`, indent: 2 });
     d.push({ kind: "text", label: "workspace_name", path: ["belt", i, "workspace_name"], placeholder: "{{work_id}}-{{work_slug}}", indent: 2 });
     d.push({ kind: "text", label: "match", path: ["belt", i, "match"], placeholder: "match.ts (optional)", indent: 2 });
 

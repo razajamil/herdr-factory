@@ -109,7 +109,9 @@ export function bearsHerdrMarker(body: string): boolean {
  * INV-1  RE-CLAIM CONVERGENCE: whatever listEligible filters on MUST be moved by a delivered
  *        transition(in_development | terminal). The engine's only other guards — an active run
  *        for (source, key) and a pending write-back — eventually clear, after which a still-listed
- *        item is claimed again and the work re-done.
+ *        item is claimed again and the work re-done. When the filter is the per-belt `pickupLabel`
+ *        (passed to listEligible), the SAME label is passed to transition so in_development can
+ *        clear it (github_issues consumes the trigger label; jira moves status instead).
  * INV-2  transition is IDEMPOTENT and retry-safe: the outbox re-calls it after partial failures,
  *        strictly in-order per run. applied/noop/stale = delivered; throw = retry with 60s→1h
  *        backoff, never abandoned.
@@ -154,14 +156,20 @@ export interface WorkSource {
    *  admission-capped per tick anyway); [] when there's none. MAY throw on hard backend failure:
    *  every caller try/catches per source and degrades to [], so one source's outage never starves
    *  the others. MUST exclude items the factory already moved (INV-1), items that are not
-   *  claimable work, and items whose keys violate INV-7 (skip + warn). */
-  listEligible(): Promise<MatchItem[]>;
+   *  claimable work, and items whose keys violate INV-7 (skip + warn). `pickupLabel` is the calling
+   *  belt's `label` (see config's descriptor.pickupLabel): a label-driven source filters on it
+   *  server-side and MUST honour it (a distinct belt polls the same source with a distinct label);
+   *  a source with no label concept ignores it. */
+  listEligible(pickupLabel?: string): Promise<MatchItem[]>;
   /** Metadata for one item by key (the manual `claim` path). THROWS for unknown keys, including
    *  "exists but is not claimable work". INV-11. */
   describe(key: string): Promise<Ticket>;
   /** Move an item to a canonical lifecycle state. See TransitionResult + INV-1..3. Never reverse
-   *  the backend's own automation (never reopen a closed issue). */
-  transition(key: string, to: WorkState): Promise<TransitionResult>;
+   *  the backend's own automation (never reopen a closed issue). `pickupLabel` is the run's belt's
+   *  `label`, threaded so a label-driven source can clear what listEligible filtered on (INV-1;
+   *  github_issues consumes the trigger label on in_development). Undefined when the belt is gone
+   *  or the source has no label concept. */
+  transition(key: string, to: WorkState, pickupLabel?: string): Promise<TransitionResult>;
   /** Write the item's work doc (+ any media) into `memDir` for the fix agent. INV-4. */
   materialize(key: string, memDir: string, log: Logger): Promise<void>;
   /** Describe what materialize wrote (drives @@WORK_DOC@@/@@WORK_DOC_KIND@@). Local-fs-only (may
@@ -184,8 +192,10 @@ export interface WorkSource {
    *  as a poll error with backoff) but must not be routine; StaleItemError escalates. */
   pollHumanReply(input: HumanPollInput): Promise<HumanReply | null>;
   /** Throw with an ACTIONABLE message when misconfigured/unreachable (the `doctor` per-source
-   *  check): bad auth vs missing repo vs missing label — say which. */
-  health(): Promise<void>;
+   *  check): bad auth vs missing repo vs missing label — say which. `pickupLabels` are the labels
+   *  of every belt feeding this source (deduped by the caller); a label-driven source checks each
+   *  one is usable, a source with no label concept ignores them. */
+  health(pickupLabels?: string[]): Promise<void>;
 }
 
 /** A configured source's identity + its live client. Resolved from `run.workSource` (or a belt's

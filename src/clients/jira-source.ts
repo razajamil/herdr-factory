@@ -24,12 +24,12 @@ const isMedia = (mime: string): boolean => mime.startsWith("image/") || mime.sta
 
 const QUESTION_MARKER = `${HERDR_MARKER} question:`;
 
-/** Resolved Jira-source config (the client owns its config shape; the descriptor maps YAML onto it). */
+/** Resolved Jira-source config (the client owns its config shape; the descriptor maps YAML onto it).
+ *  The pickup label is NOT here — it's per-belt and arrives as an argument to listEligible/health. */
 export interface JiraSourceCfg {
   baseUrl: string;
   project: string;
   board: string;
-  label: string;
   statusTodo: string;
   statusInDev: string;
   statusReview: string;
@@ -84,8 +84,8 @@ export class JiraSource implements WorkSource {
     terminalAutomation: "Jira's GitHub integration owns terminal closure (merged/aborted/done are unmapped)",
   };
 
-  async listEligible(): Promise<MatchItem[]> {
-    const items = await this.jira.listEligible(this.cfg.board, this.cfg.label, this.cfg.statusTodo);
+  async listEligible(pickupLabel?: string): Promise<MatchItem[]> {
+    const items = await this.jira.listEligible(this.cfg.board, pickupLabel, this.cfg.statusTodo);
     return items.map(
       (i): JiraMatchItem => ({
         sourceType: "jira",
@@ -208,7 +208,11 @@ export class JiraSource implements WorkSource {
     return null;
   }
 
-  async health(): Promise<void> {
-    await this.jira.listEligible(this.cfg.board, this.cfg.label, this.cfg.statusTodo);
+  async health(pickupLabels: string[] = []): Promise<void> {
+    // Probe the board query for each belt's label (auth + board + JQL reachability); with none, a
+    // label-less probe still exercises the connection. Jira belts always carry a label in practice.
+    for (const label of pickupLabels.length ? pickupLabels : [undefined]) {
+      await this.jira.listEligible(this.cfg.board, label, this.cfg.statusTodo);
+    }
   }
 }

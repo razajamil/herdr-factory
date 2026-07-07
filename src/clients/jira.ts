@@ -96,11 +96,14 @@ export class JiraClient {
     return JSON.parse(res.text) as T;
   }
 
-  /** On board `board`, status `todoStatus`, label `label`. Returns each issue's routing fields
-   *  (status/labels + the raw fields object) so a belt's match predicate can route at claim time. */
-  async listEligible(board: string, label: string, todoStatus: string): Promise<JiraEligible[]> {
+  /** On board `board`, status `todoStatus`, and (when given) label `label` — the belt's pickup
+   *  label, filtered server-side. Returns each issue's routing fields (status/labels + the raw
+   *  fields object) so a belt's match predicate can route at claim time. `label` is omitted only by
+   *  the doctor's connectivity probe; the real belt flow always passes one. */
+  async listEligible(board: string, label: string | undefined, todoStatus: string): Promise<JiraEligible[]> {
     this.requireAuth();
-    const jql = `status = "${todoStatus}" AND labels = "${label}" ORDER BY created ASC`;
+    const labelClause = label ? ` AND labels = "${label}"` : "";
+    const jql = `status = "${todoStatus}"${labelClause} ORDER BY created ASC`;
     const data = await this.getJson<{
       issues?: {
         key: string;

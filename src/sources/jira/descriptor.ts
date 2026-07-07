@@ -3,12 +3,12 @@ import { JiraSource, type JiraSourceCfg } from "../../clients/jira-source.ts";
 import type { SourceDescriptor } from "../registry.ts";
 
 // The Jira source's where-to-poll block. base_url is the Atlassian site (not a secret; auth —
-// email + token — lives in the per-repo env file, declared in the secrets manifest below).
+// email + token — lives in the per-repo env file, declared in the secrets manifest below). The
+// pickup label is NOT here — it's per-belt now (belt.label, threaded into listEligible/health).
 const JiraBlockSchema = z.object({
   base_url: z.url().transform((s) => s.replace(/\/+$/, "")),
   project: z.string(),
   board: z.coerce.string(),
-  label: z.string().default("agent"),
   status: z
     .object({
       todo: z.string().default("To Do"),
@@ -29,6 +29,7 @@ interface JiraParsed {
 
 export const jiraDescriptor: SourceDescriptor<JiraSourceCfg> = {
   type: "jira",
+  pickupLabel: { noun: "label" },
   configSchema: z.object({ type: z.literal("jira"), name: sourceName, jira: JiraBlockSchema }).strict(),
   resolveConfig(parsed) {
     const s = parsed as unknown as JiraParsed;
@@ -36,7 +37,6 @@ export const jiraDescriptor: SourceDescriptor<JiraSourceCfg> = {
       baseUrl: s.jira.base_url,
       project: s.jira.project,
       board: s.jira.board,
-      label: s.jira.label,
       statusTodo: s.jira.status.todo,
       statusInDev: s.jira.status.in_development,
       statusReview: s.jira.status.review,
@@ -54,14 +54,12 @@ export const jiraDescriptor: SourceDescriptor<JiraSourceCfg> = {
       base_url: "",
       project: "",
       board: "",
-      label: "agent",
       status: { todo: "To Do", in_development: "In Progress", review: "In Review" },
     }),
     fields: [
       { label: "jira.base_url", path: ["jira", "base_url"], placeholder: "https://org.atlassian.net" },
       { label: "jira.project", path: ["jira", "project"], placeholder: "PROJ" },
       { label: "jira.board", path: ["jira", "board"], placeholder: "123" },
-      { label: "jira.label", path: ["jira", "label"], placeholder: "agent" },
       { label: "status.todo", path: ["jira", "status", "todo"], placeholder: "To Do" },
       { label: "status.in_development", path: ["jira", "status", "in_development"], placeholder: "In Progress" },
       { label: "status.review", path: ["jira", "status", "review"], placeholder: "In Review" },

@@ -32,7 +32,8 @@ work_sources:
       base_url: https://your-org.atlassian.net # the Atlassian site (auth — email+token — lives in this repo's env file)
       project: PROJ
       board: "123"
-      label: agent
+      # NOTE: the pickup label is per-BELT now (belt.label below), not here — so one board can feed
+      # several belts, each claiming a different label.
       status:
         todo: To Do
         in_development: In Progress
@@ -43,14 +44,15 @@ work_sources:
     local_markdown:
       folder: $HOME/dev/my-repo-work-items # a folder of *.md task briefs; ~ and $HOME expand
 
-  # A GitHub Issues work source: label an issue with the trigger label → eligible. GitHub is the
+  # A GitHub Issues work source: an issue carrying a belt's pickup label (belt.label) is eligible;
+  # that label is the "trigger" — consumed at claim, re-add it to retry a failed run. GitHub is the
   # status of record (labels + open/closed); auth is the gh CLI's token unless GITHUB_TOKEN is set
   # in this repo's env file. Every field below is optional — `github_issues: {}` works.
   # - type: github_issues
   #   name: gh-issues
   #   github_issues:
   #     # repo: owner/name                # default: the repo PRs are opened against
-  #     trigger_label: herdr # consumed at claim — re-add it to retry a failed run
+  #     # (the trigger label is the belt's `label` — set it on the belt, not here)
   #     # state_labels:                   # lifecycle projection on the issue (created on demand)
   #     #   in_development: herdr:in-development
   #     #   in_review: herdr:in-review
@@ -66,6 +68,10 @@ work_sources:
 # `match` predicate accepts an item claims it (first match wins). `match` is a path (relative to
 # this folder) to a .ts module whose default export is `(ctx) => boolean` — ctx = { item, source }.
 # Each belt owns its own `workspace_name` branch template (the worktree name reflects the belt).
+# `label` is the belt's pickup label — the tag the factory looks for to claim work. REQUIRED for a
+# belt on a label-driven source (jira / github_issues); there is NO default. A source with no label
+# concept (local_markdown) takes none. Two belts on one source must use DISTINCT labels (splitting
+# its work); the same source+label in two belts is rejected (they'd contend for the same items).
 belt:
   # ── work_to_pull_request: the fix → evidence → review → pr flow with the "walk away" PR watch. ──
   # The engine owns the steps + their prompts and rides the PR through CI/review to merge, then tears
@@ -83,8 +89,9 @@ belt:
   - name: ship_bugs
     belt_type: work_to_pull_request
     source: jira
+    label: agent # pickup label — REQUIRED (no default); tickets carrying it are eligible for this belt
     priority: 1
-    match: match-bugs.ts # optional; omit ⇒ this belt accepts anything from `jira`
+    match: match-bugs.ts # optional; omit ⇒ this belt accepts anything from `jira` carrying `label`
     workspace_name: "{{semantic_work_prefix}}/{{work_id}}-{{work_slug}}"
     agents:
       fix: { tab: fix, pane: agent }

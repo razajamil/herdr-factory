@@ -35,7 +35,13 @@ const PANE_ABSENCE_CONFIRM_SECONDS = 45;
  *  On a throw it records the attempt + backoff and returns false (throw = retry me). */
 async function deliverTransition(deps: Deps, src: SourceRuntime, intent: TransitionIntent): Promise<boolean> {
   try {
-    const result = await src.client.transition(intent.ticketKey, intent.toState);
+    // The run's belt's pickup label, so a label-driven source can clear what listEligible filtered
+    // on (INV-1; github_issues consumes the trigger label on in_development). Lock-free read — the
+    // run row is only read here, never mutated. Undefined when the belt was renamed/removed (a
+    // stranded run, INV-9) or the source has no label concept; the source treats that as "nothing
+    // to clear". Terminal transitions don't use it (they strip state labels + close).
+    const pickupLabel = deps.resolveBelt(deps.store.getRun(intent.runId)?.belt ?? null)?.label;
+    const result = await src.client.transition(intent.ticketKey, intent.toState, pickupLabel);
     switch (result.kind) {
       case "applied":
         deps.store.markTransitionDelivered(intent.id);
@@ -380,20 +386,23 @@ async function reconcileRepoImpl(deps: Deps): Promise<void> {
   // start with a big backlog into successive ticks instead of one source-hammering mega-tick.
   if (slots > deps.config.limits.maxClaimsPerTick) slots = deps.config.limits.maxClaimsPerTick;
 
-  // One eligible query per source per pass (a source feeding several belts is fetched once).
+  // One eligible query per (source, pickup label) per pass: a source feeding several belts is
+  // fetched once PER DISTINCT label (label-driven sources filter server-side on it, so different
+  // belts see disjoint items; a label-less source ignores it and collapses to one fetch).
   const eligibleCache = new Map<string, MatchItem[]>();
-  const getEligible = async (src: SourceRuntime): Promise<MatchItem[]> => {
-    const cached = eligibleCache.get(src.name);
+  const getEligible = async (src: SourceRuntime, label: string | undefined): Promise<MatchItem[]> => {
+    const cacheKey = `${src.name} ${label ?? ""}`;
+    const cached = eligibleCache.get(cacheKey);
     if (cached) return cached;
     let items: MatchItem[];
     try {
-      items = await src.client.listEligible();
+      items = await src.client.listEligible(label);
     } catch (e) {
       // One source's backend hiccup must not starve the others — log and move on.
       deps.log("warn", `${src.name}: eligible query failed: ${err(e)}`);
       items = [];
     }
-    eligibleCache.set(src.name, items);
+    eligibleCache.set(cacheKey, items);
     return items;
   };
 
@@ -405,7 +414,7 @@ async function reconcileRepoImpl(deps: Deps): Promise<void> {
       deps.log("warn", `belt ${belt.name}: source "${belt.source}" not configured — skipping`);
       continue;
     }
-    for (const item of await getEligible(src)) {
+    for (const item of await getEligible(src, belt.label)) {
       if (slots <= 0) break;
       // Dedup is per (source, key): once any belt has an active run for the item, no other belt
       // claims it — which is exactly what makes "first matching belt wins" hold across the pass.
