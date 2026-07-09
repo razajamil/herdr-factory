@@ -41,18 +41,35 @@ interface FakeState {
 
 /** A resolved belt step for the fakes. Budgets/heartbeat/opensPr mirror what config.ts derives for
  *  a work_to_pull_request belt; override via `opts` for custom-belt steps. */
-const stepCfg = (name: string, opts: Partial<StepConfig> = {}): StepConfig => ({
-  name,
-  tab: name,
-  pane: "agent",
-  enginePrompt: `${name.toUpperCase()} prompt`,
-  budgetSeconds: name === "fix" ? 5400 : name === "review" ? 1800 : 3600,
-  heartbeat: name === "fix" || name === "pr",
-  opensPr: name === "pr",
-  gathersEvidence: name === "evidence",
-  canBounceTo: name === "evidence" || name === "review" ? ["fix"] : [],
-  ...opts,
-});
+const stepCfg = (name: string, opts: Partial<StepConfig> = {}): StepConfig => {
+  const heartbeat = opts.heartbeat ?? (name === "fix" || name === "pr");
+  const opensPr = opts.opensPr ?? name === "pr";
+  const gathersEvidence = opts.gathersEvidence ?? name === "evidence";
+  const produces: StepConfig["produces"] = ["handoff"];
+  if (heartbeat) produces.push("commits");
+  if (opensPr) produces.push("pull_request");
+  if (gathersEvidence) produces.push("evidence");
+  return {
+    name,
+    type: name === "fix" ? "work" : name,
+    tab: name,
+    pane: "agent",
+    enginePrompt: `${name.toUpperCase()} prompt`,
+    budgetSeconds: name === "fix" ? 5400 : name === "review" ? 1800 : 3600,
+    heartbeat,
+    opensPr,
+    gathersEvidence,
+    canBounceTo: name === "evidence" || name === "review" ? ["fix"] : [],
+    readOnly: false,
+    requiresLayout: false,
+    consumes: [],
+    produces,
+    guards: [],
+    effects: [],
+    posture: {},
+    ...opts,
+  };
+};
 const prSteps = (): StepConfig[] => [stepCfg("fix"), stepCfg("review"), stepCfg("pr")];
 
 function build(opts: { multi?: boolean } = {}) {
@@ -188,7 +205,7 @@ function build(opts: { multi?: boolean } = {}) {
   const config: Config = {
     repoName: "demo",
     repo: { path: "/main-checkout", baseRef: "origin/master" },
-    limits: { maxActiveWorkspaces: 3, attentionRenotifySeconds: 3600, developBudgetSeconds: 5400, stallSeconds: 2700, reviewBudgetSeconds: 1800, evidenceBudgetSeconds: 2400, prBudgetSeconds: 3600, maxBounces: 3, maxCaptureAttempts: 5, stepBudgetSeconds: 3600, tickIntervalSeconds: 60, reconcileConcurrency: 8, maxClaimsPerTick: 10, layoutWaitSeconds: 600 },
+    limits: { maxActiveWorkspaces: 3, attentionRenotifySeconds: 3600, stallSeconds: 2700, maxBounces: 3, maxCaptureAttempts: 5, stepBudgetSeconds: 3600, tickIntervalSeconds: 60, reconcileConcurrency: 8, maxClaimsPerTick: 10, layoutWaitSeconds: 600 },
     sources: sources.map((s) => ({ name: s.name, type: s.type, cfg: {} })),
     belts,
     guidance: undefined,
@@ -292,6 +309,32 @@ describe("reconcile pipeline (work_to_pull_request belt)", () => {
     expect(calls.agentStart).toBe(0); // and crucially did NOT spawn its own
     expect(store.getRunStep(run.id, "fix")?.paneId).toBeNull();
     expect(calls.transitions).not.toContainEqual(["W-1", "in_development"]);
+  });
+
+  it("read_only enforcement: a read-only step that moves HEAD (commits) parks for attention", async () => {
+    const { deps, store, state, worktree, shipBelt } = build();
+    shipBelt.steps[1]!.readOnly = true; // make the review step read-only for this test
+    state.headSha = "sha-baseline";
+    const run = seed(store, worktree, "RO-1", "running", "review");
+    store.upsertRunStep(run.id, "review", { progressSig: "sha-baseline" }); // baseline captured at spawn
+    state.headSha = "sha-moved"; // the read-only agent illicitly committed
+    await reconcileRun(deps, store.getRun(run.id)!);
+    const after = store.getRun(run.id)!;
+    expect(after.phase).toBe("attention");
+    expect(after.attentionReason).toMatch(/read-only/i);
+    expect(after.step).toBe("review"); // did NOT advance to pr
+  });
+
+  it("read_only step whose HEAD is unchanged advances normally", async () => {
+    const { deps, store, state, worktree, shipBelt } = build();
+    shipBelt.steps[1]!.readOnly = true;
+    state.headSha = "sha-baseline";
+    const run = seed(store, worktree, "RO-2", "running", "review");
+    store.upsertRunStep(run.id, "review", { progressSig: "sha-baseline", done: true }); // finished, no commit
+    await reconcileRun(deps, store.getRun(run.id)!);
+    const after = store.getRun(run.id)!;
+    expect(after.phase).toBe("running");
+    expect(after.step).toBe("pr"); // advanced past the read-only step
   });
 
   it("claiming + configured pane never comes up past layout_wait → attention (no own pane)", async () => {

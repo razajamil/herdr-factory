@@ -24,16 +24,16 @@ const LM_SRC = `  - type: local_markdown
     name: ideas
     local_markdown: { folder: ~/work }
 `;
-// A work_to_pull_request belt: layout-only agents (the engine ships the prompts). `label` is the
-// per-belt pickup label — REQUIRED for a belt on a label-driven source (jira here).
+// A belt is one ordered steps[] list referencing registered step primitives by `type` (the engine
+// ships their prompts). `label` is the per-belt pickup label — REQUIRED for a belt on a label-driven
+// source (jira here). No evidence step here ⇒ work → review → pr.
 const SHIP_BELT = `  - name: ship
-    belt_type: work_to_pull_request
     source: jira
     label: agent
-    agents:
-      fix:    { tab: fix,    pane: agent }
-      review: { tab: review, pane: agent }
-      pr:     { tab: pr,     pane: agent }
+    steps:
+      - { type: work,   tab: work,   pane: agent }
+      - { type: review, tab: review, pane: agent }
+      - { type: pr,     tab: pr,     pane: agent }
 `;
 
 /** Assemble a full config.yml from a `work_sources` body + a `belt` body (both list-item indented). */
@@ -59,7 +59,7 @@ function setup(yml: string, opts?: { guidance?: string; prompts?: Record<string,
 }
 
 describe("loadConfig — work sources + belts", () => {
-  it("maps a jira source + a work_to_pull_request belt + applies defaults + strips trailing slash", () => {
+  it("maps a jira source + a belt + applies defaults + strips trailing slash", () => {
     const { repoPath } = setup(
       cfg(`  - type: jira
     jira:
@@ -94,11 +94,11 @@ describe("loadConfig — work sources + belts", () => {
 
     const belt = config.belts[0]!;
     expect(belt.name).toBe("ship");
-    expect(belt.beltType).toBe("work_to_pull_request");
+    expect(belt.beltType).toBe("work_to_pull_request"); // DERIVED display label (a pr step ⇒ PR watch)
     expect(belt.source).toBe("jira");
     expect(belt.label).toBe("agent"); // per-belt pickup label (no default — set in SHIP_BELT)
     expect(belt.priority).toBe(100); // default
-    expect(belt.watchPr).toBe(true);
+    expect(belt.watchPr).toBe(true); // derived: a step produces pull_request
   });
 
   it("maps a github_issues source with defaults (labels, close_on, type map) and camelCase resolution", () => {
@@ -109,13 +109,12 @@ describe("loadConfig — work sources + belts", () => {
     github_issues: { repo: acme/tracker }
 `,
         `  - name: ship
-    belt_type: work_to_pull_request
     source: gh
     label: factory
-    agents:
-      fix:    { tab: fix,    pane: agent }
-      review: { tab: review, pane: agent }
-      pr:     { tab: pr,     pane: agent }
+    steps:
+      - { type: work,   tab: work,   pane: agent }
+      - { type: review, tab: review, pane: agent }
+      - { type: pr,     tab: pr,     pane: agent }
 `,
       ),
       { prompts: {} },
@@ -143,13 +142,12 @@ describe("loadConfig — work sources + belts", () => {
     github_issues: {}
 `,
         `  - name: ship
-    belt_type: work_to_pull_request
     source: github_issues
     label: herdr
-    agents:
-      fix:    { tab: fix,    pane: agent }
-      review: { tab: review, pane: agent }
-      pr:     { tab: pr,     pane: agent }
+    steps:
+      - { type: work,   tab: work,   pane: agent }
+      - { type: review, tab: review, pane: agent }
+      - { type: pr,     tab: pr,     pane: agent }
 `,
       ),
       { prompts: {} },
@@ -191,64 +189,91 @@ describe("loadConfig — work sources + belts", () => {
     expect(env.JIRA_API_TOKEN).toBe("tok");
   });
 
-  it("SKIPS the evidence step when it has no tab/pane (fix → review → pr) — evidence never self-spawns", () => {
-    setup(cfg(JIRA_SRC, SHIP_BELT), { prompts: {} }); // SHIP_BELT configures no evidence tab/pane
+  it("recreates work_to_pull_request byte-identically from primitives (work/evidence/review/pr)", () => {
+    // The anchor: the shipped primitives resolve to the historical PR_STEPS shape (fix→work rename).
+    setup(
+      cfg(JIRA_SRC, `  - name: ship
+    source: jira
+    label: agent
+    steps:
+      - { type: work,     tab: work,     pane: agent }
+      - { type: evidence, tab: evidence, pane: agent }
+      - { type: review,   tab: review,   pane: agent }
+      - { type: pr,       tab: pr,       pane: agent }
+`),
+      { prompts: {} },
+    );
+    const belt = loadConfig("demo").config.belts[0]!;
+    expect(belt.watchPr).toBe(true);
+    expect(belt.beltType).toBe("work_to_pull_request");
+    expect(belt.steps.map((s) => s.name)).toEqual(["work", "evidence", "review", "pr"]);
+    expect(belt.steps.map((s) => s.budgetSeconds)).toEqual([5400, 2400, 1800, 3600]);
+    expect(belt.steps.map((s) => s.heartbeat)).toEqual([true, false, false, true]);
+    expect(belt.steps.map((s) => s.opensPr)).toEqual([false, false, false, true]);
+    expect(belt.steps.map((s) => s.gathersEvidence)).toEqual([false, true, false, false]);
+    expect(belt.steps.map((s) => s.canBounceTo)).toEqual([[], ["work"], ["work"], []]);
+  });
+
+  it("SKIPS the evidence step when it has no tab/pane (work → review → pr) — evidence never self-spawns", () => {
+    setup(cfg(JIRA_SRC, SHIP_BELT), { prompts: {} }); // SHIP_BELT configures no evidence step
     const belt = loadConfig("demo").config.belts[0]!;
     const steps = belt.steps;
-    expect(steps.map((s) => s.name)).toEqual(["fix", "review", "pr"]); // evidence dropped entirely
-    const [fix, review, pr] = steps;
-    expect(fix!.tab).toBe("fix");
-    expect(fix!.pane).toBe("agent");
-    expect(fix!.enginePrompt).toContain("Fix agent"); // shipped engine prompt (src/prompts/fix.md)
-    expect(fix!.heartbeat).toBe(true);
-    expect(fix!.opensPr).toBe(false);
-    expect(fix!.budgetSeconds).toBe(5400); // develop_budget_seconds
-    expect(fix!.canBounceTo).toEqual([]);
+    expect(steps.map((s) => s.name)).toEqual(["work", "review", "pr"]); // no evidence step
+    const [work, review, pr] = steps;
+    expect(work!.tab).toBe("work");
+    expect(work!.pane).toBe("agent");
+    expect(work!.enginePrompt).toContain("ticket.json"); // shipped jira work prompt (src/prompts/jira/work.md)
+    expect(work!.heartbeat).toBe(true);
+    expect(work!.opensPr).toBe(false);
+    expect(work!.budgetSeconds).toBe(5400); // work descriptor default
+    expect(work!.canBounceTo).toEqual([]);
     expect(review!.enginePrompt).toContain("fresh-eyes");
     expect(review!.heartbeat).toBe(false);
     expect(review!.budgetSeconds).toBe(1800);
-    expect(review!.canBounceTo).toEqual(["fix"]); // review still bounces back to fix
-    expect(pr!.enginePrompt).toContain("PR agent");
+    expect(review!.canBounceTo).toEqual(["work"]); // review bounces back to work
+    expect(pr!.enginePrompt).toContain("push"); // shipped pr prompt
     expect(pr!.opensPr).toBe(true); // only the pr step watches GitHub
     expect(pr!.budgetSeconds).toBe(3600);
     expect(belt.maxBounces).toBeUndefined(); // no per-belt override → falls back to limits.maxBounces
   });
 
-  it("INCLUDES the evidence step only when its tab/pane are set (fix → evidence → review → pr)", () => {
+  it("INCLUDES the evidence step only when its tab/pane are set (work → evidence → review → pr)", () => {
     setup(
       cfg(JIRA_SRC, `  - name: ship
-    belt_type: work_to_pull_request
     source: jira
     label: agent
-    agents:
-      fix:      { tab: fix,      pane: agent }
-      evidence: { tab: evidence, pane: agent }
-      review:   { tab: review,   pane: agent }
-      pr:       { tab: pr,       pane: agent }
+    steps:
+      - { type: work,     tab: work,     pane: agent }
+      - { type: evidence, tab: evidence, pane: agent }
+      - { type: review,   tab: review,   pane: agent }
+      - { type: pr,       tab: pr,       pane: agent }
 `),
       { prompts: {} },
     );
     const steps = loadConfig("demo").config.belts[0]!.steps;
-    expect(steps.map((s) => s.name)).toEqual(["fix", "evidence", "review", "pr"]);
+    expect(steps.map((s) => s.name)).toEqual(["work", "evidence", "review", "pr"]);
     const evidence = steps.find((s) => s.name === "evidence")!;
     expect(evidence.tab).toBe("evidence"); // delivers to that pane's existing agent (no self-spawn)
     expect(evidence.pane).toBe("agent");
     expect(evidence.enginePrompt).toContain("Evidence agent"); // src/prompts/evidence.md
     expect(evidence.heartbeat).toBe(false);
     expect(evidence.opensPr).toBe(false);
-    expect(evidence.budgetSeconds).toBe(2400); // evidence_budget_seconds
+    expect(evidence.budgetSeconds).toBe(2400); // evidence descriptor default
     expect(evidence.gathersEvidence).toBe(true);
-    expect(evidence.canBounceTo).toEqual(["fix"]);
+    expect(evidence.readOnly).toBe(true);
+    expect(evidence.canBounceTo).toEqual(["work"]);
   });
 
   it("max_bounces defaults to 6 and a per-belt max_bounces overrides the repo limit", () => {
     setup(
       cfg(JIRA_SRC, `  - name: ship
-    belt_type: work_to_pull_request
     source: jira
     label: agent
     max_bounces: 2
-    agents: { fix: { tab: fix, pane: agent }, review: { tab: review, pane: agent }, pr: { tab: pr, pane: agent } }
+    steps:
+      - { type: work,   tab: work,   pane: agent }
+      - { type: review, tab: review, pane: agent }
+      - { type: pr,     tab: pr,     pane: agent }
 `),
       { prompts: {} },
     );
@@ -257,81 +282,78 @@ describe("loadConfig — work sources + belts", () => {
     expect(config.belts[0]!.maxBounces).toBe(2); // per-belt override
   });
 
-  it("a work_to_pull_request belt on a local_markdown source uses the per-type built-in fix prompt", () => {
+  it("a belt on a local_markdown source uses the neutral shared work prompt (no Jira wording)", () => {
     setup(
       cfg(LM_SRC, `  - name: lm-ship
-    belt_type: work_to_pull_request
     source: ideas
-    agents:
-      fix:    { tab: fix,    pane: agent }
-      review: { tab: review, pane: agent }
-      pr:     { tab: pr,     pane: agent }
+    steps:
+      - { type: work,   tab: work,   pane: agent }
+      - { type: review, tab: review, pane: agent }
+      - { type: pr,     tab: pr,     pane: agent }
 `),
       { prompts: {} },
     );
     const { config } = loadConfig("demo");
     expect(config.sources[0]!.type).toBe("local_markdown");
     expect((config.sources[0]!.cfg as LocalMarkdownSourceCfg).folder).toBe(join(homedir(), "work"));
-    const fix = config.belts[0]!.steps.find((s) => s.name === "fix")!;
-    // local_markdown has no per-type fix override anymore — the neutral SHARED fix prompt
-    // (WORK_DOC-based, no Jira wording) covers it, and now carries the rework/ask-human guidance.
-    expect(fix.enginePrompt).toContain("@@WORK_DOC@@");
-    expect(fix.enginePrompt).not.toContain("Jira");
-    expect(fix.enginePrompt).toContain("ask-human");
-    // review/pr have no per-type override → shared engine prompt
+    const work = config.belts[0]!.steps.find((s) => s.name === "work")!;
+    // local_markdown has no per-type work override — the neutral SHARED work prompt (WORK_DOC-based,
+    // no Jira wording) covers it, and carries the rework/ask-human guidance.
+    expect(work.enginePrompt).toContain("@@WORK_DOC@@");
+    expect(work.enginePrompt).not.toContain("Jira");
+    expect(work.enginePrompt).toContain("ask-human");
+    // review has no per-type override → shared engine prompt
     expect(config.belts[0]!.steps.find((s) => s.name === "review")!.enginePrompt).toContain("fresh-eyes");
   });
 
-  it("a work_to_pull_request belt on a github_issues source uses the per-type fix + pr prompts", () => {
+  it("a belt on a github_issues source uses the per-type work + pr prompts", () => {
     setup(
       cfg(
         `  - type: github_issues
     github_issues: { repo: acme/tracker }
 `,
         `  - name: gh-ship
-    belt_type: work_to_pull_request
     source: github_issues
     label: herdr
-    agents:
-      fix:    { tab: fix,    pane: agent }
-      review: { tab: review, pane: agent }
-      pr:     { tab: pr,     pane: agent }
+    steps:
+      - { type: work,   tab: work,   pane: agent }
+      - { type: review, tab: review, pane: agent }
+      - { type: pr,     tab: pr,     pane: agent }
 `,
       ),
       { prompts: {} },
     );
     const { config } = loadConfig("demo");
     const steps = config.belts[0]!.steps;
-    const fix = steps.find((s) => s.name === "fix")!;
-    expect(fix.enginePrompt).toContain("GitHub issue");
-    expect(fix.enginePrompt).toContain("issue.json");
+    const work = steps.find((s) => s.name === "work")!;
+    expect(work.enginePrompt).toContain("GitHub issue");
+    expect(work.enginePrompt).toContain("issue.json");
     const pr = steps.find((s) => s.name === "pr")!;
     expect(pr.enginePrompt).toContain("Closing reference"); // the auto-close linkage mandate
-    // review/evidence have no per-type override → shared engine prompts
+    // review has no per-type override → shared engine prompt
     expect(steps.find((s) => s.name === "review")!.enginePrompt).toContain("fresh-eyes");
   });
 
-  it("a jira belt keeps the Jira-flavored fix prompt (now under prompts/jira/)", () => {
+  it("a jira belt keeps the Jira-flavored work prompt (under prompts/jira/)", () => {
     setup(cfg(JIRA_SRC, SHIP_BELT), { prompts: {} });
-    const fix = loadConfig("demo").config.belts[0]!.steps.find((s) => s.name === "fix")!;
-    expect(fix.enginePrompt).toContain("Jira ticket");
-    expect(fix.enginePrompt).toContain("ticket.json");
+    const work = loadConfig("demo").config.belts[0]!.steps.find((s) => s.name === "work")!;
+    expect(work.enginePrompt).toContain("Jira ticket");
+    expect(work.enginePrompt).toContain("ticket.json");
   });
 
   it("resolves a custom belt's user-defined steps (prompt_file body, budget, heartbeat, no PR)", () => {
     setup(
       cfg(LM_SRC, `  - name: work_generation
-    belt_type: custom
     source: ideas
     workspace_name: "research/{{work_id}}-{{work_slug}}"
     steps:
-      - { name: research, tab: research, pane: agent, prompt_file: research.md, prompt_file_source: config }
-      - { name: create_jira_ticket, prompt_file: create.md, prompt_file_source: repo, budget_seconds: 1200, heartbeat: true }
+      - { type: custom, name: research, tab: research, pane: agent, prompt_file: research.md, prompt_file_source: config }
+      - { type: custom, name: create_jira_ticket, prompt_file: create.md, prompt_file_source: repo, budget_seconds: 1200, heartbeat: true }
 `),
       { prompts: { "research.md": "Do the research\n" } },
     );
     const belt = loadConfig("demo").config.belts[0]!;
-    expect(belt.beltType).toBe("custom");
+    expect(belt.beltType).toBe("custom"); // no pr step ⇒ display label "custom"
     expect(belt.watchPr).toBe(false);
     expect(belt.workspaceName).toBe("research/{{work_id}}-{{work_slug}}");
     expect(belt.steps.map((s) => s.name)).toEqual(["research", "create_jira_ticket"]);
@@ -339,26 +361,34 @@ describe("loadConfig — work sources + belts", () => {
     // The body is read at RENDER time now — config carries the file reference + source, not the text.
     expect(research!.promptFile).toBe("research.md");
     expect(research!.promptFileSource).toBe("config");
-    expect(research!.enginePrompt).toBeUndefined(); // custom belts have no engine base
+    expect(research!.enginePrompt).toBeUndefined(); // custom steps have no engine base
     expect(research!.tab).toBe("research");
-    expect(research!.budgetSeconds).toBe(3600); // default step_budget_seconds
+    expect(research!.budgetSeconds).toBe(3600); // default step_budget_seconds (no descriptor default)
     expect(research!.heartbeat).toBe(false); // default off for custom
     expect(research!.opensPr).toBe(false);
     expect(create!.promptFile).toBe("create.md");
     expect(create!.promptFileSource).toBe("repo"); // repo-sourced: not existence-checked at load
     expect(create!.budgetSeconds).toBe(1200); // per-step override
-    expect(create!.heartbeat).toBe(true);
+    expect(create!.heartbeat).toBe(true); // opted in
     expect(create!.tab).toBeUndefined(); // no layout → spawns its own pane
+  });
+
+  it("defaults a step's name to its type when omitted", () => {
+    setup(cfg(JIRA_SRC, SHIP_BELT), { prompts: {} });
+    const names = loadConfig("demo").config.belts[0]!.steps.map((s) => s.name);
+    expect(names).toEqual(["work", "review", "pr"]); // names default to the step `type`
   });
 
   it("loads a belt's match file path (existence verified, fn loaded later in buildDeps)", () => {
     const { repoDir } = setup(
       cfg(JIRA_SRC, `  - name: ship
-    belt_type: work_to_pull_request
     source: jira
     label: agent
     match: match.ts
-    agents: { fix: { tab: fix, pane: agent }, review: { tab: review, pane: agent }, pr: { tab: pr, pane: agent } }
+    steps:
+      - { type: work,   tab: work,   pane: agent }
+      - { type: review, tab: review, pane: agent }
+      - { type: pr,     tab: pr,     pane: agent }
 `),
       { prompts: { "match.ts": "export default () => true;\n" } },
     );
@@ -368,11 +398,13 @@ describe("loadConfig — work sources + belts", () => {
   it("throws when a belt's match file is missing on disk", () => {
     setup(
       cfg(JIRA_SRC, `  - name: ship
-    belt_type: work_to_pull_request
     source: jira
     label: agent
     match: nope.ts
-    agents: { fix: { tab: fix, pane: agent }, review: { tab: review, pane: agent }, pr: { tab: pr, pane: agent } }
+    steps:
+      - { type: work,   tab: work,   pane: agent }
+      - { type: review, tab: review, pane: agent }
+      - { type: pr,     tab: pr,     pane: agent }
 `),
       { prompts: {} },
     );
@@ -382,16 +414,20 @@ describe("loadConfig — work sources + belts", () => {
   it("sorts belts by priority (ties keep config order)", () => {
     setup(
       cfg(`${JIRA_SRC}${LM_SRC}`, `  - name: low
-    belt_type: work_to_pull_request
     source: ideas
     priority: 5
-    agents: { fix: { tab: fix, pane: agent }, review: { tab: review, pane: agent }, pr: { tab: pr, pane: agent } }
+    steps:
+      - { type: work,   tab: work,   pane: agent }
+      - { type: review, tab: review, pane: agent }
+      - { type: pr,     tab: pr,     pane: agent }
   - name: high
-    belt_type: work_to_pull_request
     source: jira
     label: agent
     priority: 1
-    agents: { fix: { tab: fix, pane: agent }, review: { tab: review, pane: agent }, pr: { tab: pr, pane: agent } }
+    steps:
+      - { type: work,   tab: work,   pane: agent }
+      - { type: review, tab: review, pane: agent }
+      - { type: pr,     tab: pr,     pane: agent }
 `),
       { prompts: {} },
     );
@@ -426,9 +462,11 @@ describe("loadConfig — work sources + belts", () => {
   it("rejects a belt referencing an unknown work source", () => {
     setup(
       cfg(JIRA_SRC, `  - name: ship
-    belt_type: work_to_pull_request
     source: nonexistent
-    agents: { fix: { tab: fix, pane: agent }, review: { tab: review, pane: agent }, pr: { tab: pr, pane: agent } }
+    steps:
+      - { type: work,   tab: work,   pane: agent }
+      - { type: review, tab: review, pane: agent }
+      - { type: pr,     tab: pr,     pane: agent }
 `),
       { prompts: {} },
     );
@@ -438,15 +476,13 @@ describe("loadConfig — work sources + belts", () => {
   it("rejects duplicate belt names", () => {
     setup(
       cfg(JIRA_SRC, `  - name: dup
-    belt_type: work_to_pull_request
     source: jira
     label: agent
-    agents: { fix: { tab: fix, pane: agent }, review: { tab: review, pane: agent }, pr: { tab: pr, pane: agent } }
+    steps: [{ type: work, tab: work, pane: agent }, { type: review, tab: review, pane: agent }, { type: pr, tab: pr, pane: agent }]
   - name: dup
-    belt_type: work_to_pull_request
     source: jira
     label: agent2
-    agents: { fix: { tab: fix, pane: agent }, review: { tab: review, pane: agent }, pr: { tab: pr, pane: agent } }
+    steps: [{ type: work, tab: work, pane: agent }, { type: review, tab: review, pane: agent }, { type: pr, tab: pr, pane: agent }]
 `),
       { prompts: {} },
     );
@@ -456,9 +492,8 @@ describe("loadConfig — work sources + belts", () => {
   it("rejects a belt on a label-driven source that sets no label (there is no default)", () => {
     setup(
       cfg(JIRA_SRC, `  - name: ship
-    belt_type: work_to_pull_request
     source: jira
-    agents: { fix: { tab: fix, pane: agent }, review: { tab: review, pane: agent }, pr: { tab: pr, pane: agent } }
+    steps: [{ type: work, tab: work, pane: agent }, { type: review, tab: review, pane: agent }, { type: pr, tab: pr, pane: agent }]
 `),
       { prompts: {} },
     );
@@ -468,11 +503,10 @@ describe("loadConfig — work sources + belts", () => {
   it("rejects a `label` on a belt whose source has no label concept (local_markdown)", () => {
     setup(
       cfg(LM_SRC, `  - name: gen
-    belt_type: custom
     source: ideas
     label: whatever
     steps:
-      - { name: research, prompt_file: r.md, prompt_file_source: config }
+      - { type: custom, name: research, prompt_file: r.md, prompt_file_source: config }
 `),
       { prompts: { "r.md": "r\n" } },
     );
@@ -482,15 +516,13 @@ describe("loadConfig — work sources + belts", () => {
   it("rejects two belts that pick up the same source by the same label (contention)", () => {
     setup(
       cfg(JIRA_SRC, `  - name: a
-    belt_type: work_to_pull_request
     source: jira
     label: agent
-    agents: { fix: { tab: fix, pane: agent }, review: { tab: review, pane: agent }, pr: { tab: pr, pane: agent } }
+    steps: [{ type: work, tab: work, pane: agent }, { type: review, tab: review, pane: agent }, { type: pr, tab: pr, pane: agent }]
   - name: b
-    belt_type: work_to_pull_request
     source: jira
     label: agent
-    agents: { fix: { tab: fix, pane: agent }, review: { tab: review, pane: agent }, pr: { tab: pr, pane: agent } }
+    steps: [{ type: work, tab: work, pane: agent }, { type: review, tab: review, pane: agent }, { type: pr, tab: pr, pane: agent }]
 `),
       { prompts: {} },
     );
@@ -500,65 +532,98 @@ describe("loadConfig — work sources + belts", () => {
   it("allows ONE source split across belts by DISTINCT labels", () => {
     setup(
       cfg(JIRA_SRC, `  - name: bugs
-    belt_type: work_to_pull_request
     source: jira
     label: agent-bug
-    agents: { fix: { tab: fix, pane: agent }, review: { tab: review, pane: agent }, pr: { tab: pr, pane: agent } }
+    steps: [{ type: work, tab: work, pane: agent }, { type: review, tab: review, pane: agent }, { type: pr, tab: pr, pane: agent }]
   - name: chores
-    belt_type: work_to_pull_request
     source: jira
     label: agent-chore
-    agents: { fix: { tab: fix, pane: agent }, review: { tab: review, pane: agent }, pr: { tab: pr, pane: agent } }
+    steps: [{ type: work, tab: work, pane: agent }, { type: review, tab: review, pane: agent }, { type: pr, tab: pr, pane: agent }]
 `),
       { prompts: {} },
     );
     expect(loadConfig("demo").config.belts.map((b) => b.label)).toEqual(["agent-bug", "agent-chore"]);
   });
 
-  it("rejects a custom belt with duplicate step names", () => {
+  it("rejects a belt with duplicate step names (name defaults to type — collide on two customs)", () => {
     setup(
       cfg(LM_SRC, `  - name: gen
-    belt_type: custom
     source: ideas
     steps:
-      - { name: research, prompt_file: a.md, prompt_file_source: config }
-      - { name: research, prompt_file: b.md, prompt_file_source: config }
+      - { type: custom, name: research, prompt_file: a.md, prompt_file_source: config }
+      - { type: custom, name: research, prompt_file: b.md, prompt_file_source: config }
 `),
       { prompts: { "a.md": "a\n", "b.md": "b\n" } },
     );
     expect(() => loadConfig("demo")).toThrow(/duplicate step name/);
   });
 
-  it("rejects a custom belt step with an invalid (non-slug) name", () => {
+  it("rejects a belt step with an invalid (non-slug) name", () => {
     setup(
       cfg(LM_SRC, `  - name: gen
-    belt_type: custom
     source: ideas
     steps:
-      - { name: "Bad Name", prompt_file: a.md, prompt_file_source: config }
+      - { type: custom, name: "Bad Name", prompt_file: a.md, prompt_file_source: config }
 `),
       { prompts: { "a.md": "a\n" } },
     );
     expect(() => loadConfig("demo")).toThrow();
   });
 
+  it("rejects a belt step referencing an unknown step type", () => {
+    setup(
+      cfg(JIRA_SRC, `  - name: ship
+    source: jira
+    label: agent
+    steps:
+      - { type: teleport, tab: t, pane: agent }
+`),
+      { prompts: {} },
+    );
+    expect(() => loadConfig("demo")).toThrow();
+  });
+
+  it("rejects a custom step with no prompt_file (it has no built-in prompt)", () => {
+    setup(
+      cfg(LM_SRC, `  - name: gen
+    source: ideas
+    steps:
+      - { type: custom, name: research }
+`),
+      { prompts: {} },
+    );
+    expect(() => loadConfig("demo")).toThrow(/needs a prompt_file/);
+  });
+
+  it("rejects a belt whose required dataflow is unsatisfied (review with no upstream commits)", () => {
+    // review requires `commits`; with no earlier work/pr step nothing produces them.
+    setup(
+      cfg(JIRA_SRC, `  - name: ship
+    source: jira
+    label: agent
+    steps:
+      - { type: review, tab: review, pane: agent }
+`),
+      { prompts: {} },
+    );
+    expect(() => loadConfig("demo")).toThrow(/requires "commits"/);
+  });
+
   it("throws when a custom belt step's prompt_file is missing on disk", () => {
     setup(
       cfg(LM_SRC, `  - name: gen
-    belt_type: custom
     source: ideas
     steps:
-      - { name: research, prompt_file: missing.md, prompt_file_source: config }
+      - { type: custom, name: research, prompt_file: missing.md, prompt_file_source: config }
 `),
       { prompts: {} },
     );
     expect(() => loadConfig("demo")).toThrow(/prompt_file.*not found/);
   });
 
-  it("rejects a custom belt with no steps", () => {
+  it("rejects a belt with no steps", () => {
     setup(
       cfg(LM_SRC, `  - name: gen
-    belt_type: custom
     source: ideas
     steps: []
 `),
@@ -567,53 +632,52 @@ describe("loadConfig — work sources + belts", () => {
     expect(() => loadConfig("demo")).toThrow();
   });
 
-  it("rejects a custom belt that carries an agents block (strict — the w2pr/custom mixup)", () => {
+  it("rejects a belt with no steps key at all", () => {
     setup(
-      cfg(LM_SRC, `  - name: gen
-    belt_type: custom
-    source: ideas
+      cfg(JIRA_SRC, `  - name: ship
+    source: jira
+    label: agent
+`),
+      { prompts: {} },
+    );
+    expect(() => loadConfig("demo")).toThrow();
+  });
+
+  it("rejects a stray `belt_type` key (removed in the clean break)", () => {
+    setup(
+      cfg(JIRA_SRC, `  - name: ship
+    belt_type: work_to_pull_request
+    source: jira
+    label: agent
+    steps: [{ type: work, tab: work, pane: agent }, { type: review, tab: review, pane: agent }, { type: pr, tab: pr, pane: agent }]
+`),
+      { prompts: {} },
+    );
+    expect(() => loadConfig("demo")).toThrow(/[Uu]nrecognized|belt_type/i);
+  });
+
+  it("rejects a stray `agents` block (removed in the clean break)", () => {
+    setup(
+      cfg(JIRA_SRC, `  - name: ship
+    source: jira
+    label: agent
+    steps: [{ type: work, tab: work, pane: agent }, { type: review, tab: review, pane: agent }, { type: pr, tab: pr, pane: agent }]
+    agents: { fix: { tab: fix, pane: agent } }
+`),
+      { prompts: {} },
+    );
+    expect(() => loadConfig("demo")).toThrow(/[Uu]nrecognized|agents/i);
+  });
+
+  it("rejects a step with tab but no pane (must be set together)", () => {
+    setup(
+      cfg(JIRA_SRC, `  - name: ship
+    source: jira
+    label: agent
     steps:
-      - { name: research, prompt_file: r.md, prompt_file_source: config }
-    agents: { fix: { tab: fix, pane: agent }, review: { tab: review, pane: agent }, pr: { tab: pr, pane: agent } }
-`),
-      { prompts: { "r.md": "r\n" } },
-    );
-    expect(() => loadConfig("demo")).toThrow(/Unrecognized key|agents/i);
-  });
-
-  it("rejects a work_to_pull_request belt that carries a steps array (strict)", () => {
-    setup(
-      cfg(JIRA_SRC, `  - name: ship
-    belt_type: work_to_pull_request
-    source: jira
-    agents: { fix: { tab: fix, pane: agent }, review: { tab: review, pane: agent }, pr: { tab: pr, pane: agent } }
-    steps: []
-`),
-      { prompts: {} },
-    );
-    expect(() => loadConfig("demo")).toThrow(/Unrecognized key|steps/i);
-  });
-
-  it("rejects a work_to_pull_request agent with tab but no pane (must be set together)", () => {
-    setup(
-      cfg(JIRA_SRC, `  - name: ship
-    belt_type: work_to_pull_request
-    source: jira
-    agents:
-      fix:    { tab: fix }
-      review: { tab: review, pane: agent }
-      pr:     { tab: pr, pane: agent }
-`),
-      { prompts: {} },
-    );
-    expect(() => loadConfig("demo")).toThrow();
-  });
-
-  it("rejects a work_to_pull_request belt missing its agents block", () => {
-    setup(
-      cfg(JIRA_SRC, `  - name: ship
-    belt_type: work_to_pull_request
-    source: jira
+      - { type: work, tab: work }
+      - { type: review, tab: review, pane: agent }
+      - { type: pr, tab: pr, pane: agent }
 `),
       { prompts: {} },
     );
@@ -656,9 +720,8 @@ describe("loadConfig — work sources + belts", () => {
     name: ideas
     local_markdown: {}
 `, `  - name: ship
-    belt_type: work_to_pull_request
     source: ideas
-    agents: { fix: { tab: fix, pane: agent }, review: { tab: review, pane: agent }, pr: { tab: pr, pane: agent } }
+    steps: [{ type: work, tab: work, pane: agent }, { type: review, tab: review, pane: agent }, { type: pr, tab: pr, pane: agent }]
 `),
       { prompts: {} },
     );
@@ -705,11 +768,10 @@ describe("loadConfig — work sources + belts", () => {
   it("maps a per-belt workspace_name through", () => {
     setup(
       cfg(JIRA_SRC, `  - name: ship
-    belt_type: work_to_pull_request
     source: jira
     label: agent
     workspace_name: "fix/{{work_id}}-{{work_slug}}"
-    agents: { fix: { tab: fix, pane: agent }, review: { tab: review, pane: agent }, pr: { tab: pr, pane: agent } }
+    steps: [{ type: work, tab: work, pane: agent }, { type: review, tab: review, pane: agent }, { type: pr, tab: pr, pane: agent }]
 `),
       { prompts: {} },
     );
@@ -719,10 +781,10 @@ describe("loadConfig — work sources + belts", () => {
   it("rejects a workspace_name template missing {{work_id}}", () => {
     setup(
       cfg(JIRA_SRC, `  - name: ship
-    belt_type: work_to_pull_request
     source: jira
+    label: agent
     workspace_name: "fix/{{work_slug}}"
-    agents: { fix: { tab: fix, pane: agent }, review: { tab: review, pane: agent }, pr: { tab: pr, pane: agent } }
+    steps: [{ type: work, tab: work, pane: agent }, { type: review, tab: review, pane: agent }, { type: pr, tab: pr, pane: agent }]
 `),
       { prompts: {} },
     );
@@ -736,16 +798,16 @@ describe("configJsonSchema", () => {
     const js = configJsonSchema() as any;
     expect(String(js.$schema)).toContain("json-schema.org");
     expect(js.required).toEqual(expect.arrayContaining(["repo", "work_sources", "belt"]));
-    const beltVariants = js.properties.belt.items.oneOf ?? js.properties.belt.items.anyOf;
-    expect(beltVariants.map((v: { properties: { belt_type: { const: string } } }) => v.properties.belt_type.const).sort()).toEqual([
-      "custom",
-      "work_to_pull_request",
-    ]);
-    // .strict() → additionalProperties:false, so editors flag unknown keys (the agents-on-custom mixup)
-    expect(beltVariants.every((v: { additionalProperties: unknown }) => v.additionalProperties === false)).toBe(true);
+    // A belt is now one ordered steps[] list (no belt_type discriminated union). The step `type`
+    // enum is generated from the step-primitive registry.
+    const step = js.properties.belt.items.properties.steps.items;
+    expect([...step.properties.type.enum].sort()).toEqual(["custom", "evidence", "pr", "review", "work"]);
     // the step-name slug regex survives into the schema
-    const custom = beltVariants.find((v: { properties: { belt_type: { const: string } } }) => v.properties.belt_type.const === "custom");
-    expect(custom.properties.steps.items.properties.name.pattern).toBeTruthy();
+    expect(step.properties.name.pattern).toBeTruthy();
+    // .strict() → additionalProperties:false, so editors flag unknown keys (a stray step key, or the
+    // removed belt_type/agents on a belt).
+    expect(step.additionalProperties).toBe(false);
+    expect(js.properties.belt.items.additionalProperties).toBe(false);
   });
 
   it("the committed repo-root config.schema.json is in sync (the example's modeline resolves to it)", () => {

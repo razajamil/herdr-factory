@@ -4,9 +4,11 @@ import { dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parse as parseYaml } from "yaml";
 import { z } from "zod";
-import type { SourceType } from "./types.ts";
+import type { EffectSpec, GuardSpec, InputSpec, ProductType, SourceType, StepPosture } from "./types.ts";
 import { expandHome } from "./paths.ts";
 import { SOURCE_DESCRIPTORS, descriptorFor } from "./sources/registry.ts";
+import { HEARTBEAT_GUARD, STEP_DESCRIPTORS, stepDescriptorFor, type StepDescriptor } from "./steps/registry.ts";
+import { productCapabilityFor } from "./products/registry.ts";
 
 // ── Work sources: where to poll work from (no agents/pipeline here anymore — that's a belt). ──
 // Each type's block schema + resolution lives on its descriptor (src/sources/<type>/descriptor.ts);
@@ -98,19 +100,9 @@ const promptSourceRefine = [
   { message: "prompt_file_source is required when prompt_file is set", path: ["prompt_file_source"] as string[] },
 ] as const;
 
-// work_to_pull_request belts have engine-defined steps (fix → evidence → review → pr) whose prompts
-// the engine ships; an agent block picks the layout pane and may OPTIONALLY add a `prompt_file`
-// (with a required `prompt_file_source`) that AUGMENTS the engine prompt for that step. fix/review/pr
-// are required; `evidence` is OPTIONAL (backward-compatible with pre-evidence configs — when omitted
-// the evidence step just spawns its own dedicated pane).
-const PrAgentSchema = z
-  .object({ ...layoutFields, ...promptFileFields })
-  .strict()
-  .refine(bothOrNeither, layoutRefine)
-  .refine(...promptSourceRefine);
-const PrAgentsSchema = z
-  .object({ fix: PrAgentSchema, evidence: PrAgentSchema.optional(), review: PrAgentSchema, pr: PrAgentSchema })
-  .strict();
+// Belt steps are references to registered step primitives (src/steps/registry.ts) — see
+// BeltStepSchema below. There is no belt_type / agents map (clean break): a belt is one ordered
+// steps[] list, and its lifecycle is derived from what the steps produce/declare.
 
 // Step names are used in file paths (prompt-<name>.md / handoff-<name>.md), pane labels, and the
 // step-done CLI arg — so keep them to a git/path-safe lowercase slug.
@@ -119,21 +111,25 @@ const StepNameSchema = z
   .trim()
   .regex(/^[a-z0-9][a-z0-9_-]*$/, "step name must be a lowercase slug ([a-z0-9_-], starting alphanumeric)");
 
-// A custom belt's user-defined step. `prompt_file` (required) is the WHOLE step body — the engine
-// adds only the handover scaffold — and `prompt_file_source` (required) says where to read it from.
-// Optional per-step budget + commit-stall heartbeat (off by default: research/proposal-style steps
-// legitimately make no commits).
-const CustomStepSchema = z
+// A belt step: a reference to a registered step primitive by `type` (work/evidence/review/pr/custom
+// today). `name` defaults to `type` and must be unique within the belt (step names key run_steps
+// rows, pane labels, prompt files). `prompt_file` is the WHOLE body for a `custom` step (required)
+// and an OPTIONAL augment for an engine-prompted one; `prompt_file_source` says where to read it.
+// Optional per-step budget (else the descriptor default, else limits.step_budget_seconds) and
+// commit-stall heartbeat (a `custom` step opts in; work/pr already have one).
+const StepTypeSchema = z.enum(STEP_DESCRIPTORS.map((d) => d.name) as [string, ...string[]]);
+const BeltStepSchema = z
   .object({
-    name: StepNameSchema,
-    prompt_file: z.string(),
-    prompt_file_source: PromptSourceSchema,
+    type: StepTypeSchema,
+    name: StepNameSchema.optional(),
+    ...layoutFields,
+    ...promptFileFields,
     budget_seconds: z.coerce.number().int().positive().optional(),
     heartbeat: z.boolean().default(false),
-    ...layoutFields,
   })
   .strict()
-  .refine(bothOrNeither, layoutRefine);
+  .refine(bothOrNeither, layoutRefine)
+  .refine(...promptSourceRefine);
 
 // A per-belt branch-name template (the worktree + workspace derive from it). Must include
 // {{work_id}} so the branch is identifiable by ticket; a short unique suffix is appended
@@ -169,20 +165,44 @@ const beltBase = {
   max_bounces: z.coerce.number().int().nonnegative().optional(),
 };
 
-// `.strict()` so a w2pr belt can't carry `steps`, a custom belt can't carry `agents`, and typos in
-// any belt field are rejected at parse time (the discriminated union routes on belt_type; strict
-// enforces that only that variant's fields are present).
-const WorkToPrBeltSchema = z
-  .object({ belt_type: z.literal("work_to_pull_request"), ...beltBase, agents: PrAgentsSchema })
-  .strict();
-const CustomBeltSchema = z
-  .object({
-    belt_type: z.literal("custom"),
-    ...beltBase,
-    steps: z.array(CustomStepSchema).min(1, "a custom belt needs at least one step"),
-  })
-  .strict();
-const BeltSchema = z.discriminatedUnion("belt_type", [WorkToPrBeltSchema, CustomBeltSchema]);
+// A belt is a (source + ordered steps) pairing. `.strict()` rejects typos AND the removed
+// belt_type/agents keys (clean break — no alias). Lifecycle (the terminal PR watch, the bounce cap,
+// source transitions) is DERIVED at load from what the steps produce/declare, never from a belt_type.
+const BeltSchema = z.object({ ...beltBase, steps: z.array(BeltStepSchema).min(1, "a belt needs at least one step") }).strict();
+
+// The products a source materializes at belt_start — the roots of the dataflow graph the loader
+// validates each step's `consumes` against (only work_spec is ever a REQUIRED consume; work_raw /
+// close_reference are optional, so this only needs to be right for required edges).
+const SOURCE_PRODUCTS: Record<SourceType, ProductType[]> = {
+  jira: ["work_spec", "work_raw", "human_reply"],
+  local_markdown: ["work_spec", "human_reply"],
+  github_issues: ["work_spec", "work_raw", "human_reply", "close_reference"],
+};
+
+/** A step ref is SKIPPED when its descriptor requires a layout pane (requiresLayout — the evidence
+ *  opt-in, generalized) but the ref supplies no tab/pane. Skipped steps don't run and don't
+ *  contribute products. */
+function stepSkipped(d: StepDescriptor, ref: { tab?: string; pane?: string }): boolean {
+  return !!d.controls.posture?.requiresLayout && !(ref.tab && ref.pane);
+}
+
+/** The products a step ref actually produces: the descriptor's, plus `commits` when a step opts
+ *  into a commit-stall heartbeat (heartbeat tracks commit HEAD movement, so it implies commits). */
+function stepProduces(d: StepDescriptor, ref: { heartbeat?: boolean }): ProductType[] {
+  const p = [...d.produces];
+  if (ref.heartbeat && !p.includes("commits")) p.push("commits");
+  return p;
+}
+
+/** Resolve a bounce emitter's targets to the earliest earlier NON-SKIPPED step that consumes
+ *  bounce_feedback (the receive side of the pair). [] ⇒ no valid target (a load error). */
+function resolveBounceTargets(kept: { type: string; name?: string }[], index: number): string[] {
+  for (let j = 0; j < index; j++) {
+    const jd = stepDescriptorFor(kept[j]!.type);
+    if (jd?.consumes.some((c) => c.type === "bounce_feedback")) return [kept[j]!.name ?? kept[j]!.type];
+  }
+  return [];
+}
 
 export const RepoConfigSchema = z
   .object({
@@ -204,12 +224,10 @@ export const RepoConfigSchema = z
         // Re-notify the operator about a run parked in `attention` every this-many seconds (the
         // escalation notify is easy to miss; a parked run should never go silently stale).
         attention_renotify_seconds: z.coerce.number().int().positive().default(3600),
-        develop_budget_seconds: z.coerce.number().int().positive().default(5400),
+        // Per-step budgets moved onto the step primitives (StepDescriptor.defaultBudgetSeconds) —
+        // clean break. A belt step ref overrides with `budget_seconds`; a step whose descriptor
+        // declares no default (custom) falls back to step_budget_seconds below.
         stall_seconds: z.coerce.number().int().positive().default(2700),
-        review_budget_seconds: z.coerce.number().int().positive().default(1800),
-        // The evidence step captures + (optionally) records video and uploads — generous by default.
-        evidence_budget_seconds: z.coerce.number().int().positive().default(2400),
-        pr_budget_seconds: z.coerce.number().int().positive().default(3600),
         // SAFETY BACKSTOP for the fix↔evidence/review rework loop — not the intended terminator. The
         // loop is meant to end when evidence/review pass (aligned) or the fix agent asks a human; this
         // cap only catches genuine oscillation. Max times a run may bounce back to any ONE earlier step
@@ -300,15 +318,45 @@ export const RepoConfigSchema = z
           sourceLabelPairs.set(key, b.name);
         }
       }
-      if (b.belt_type === "custom") {
-        const stepNames = new Set<string>();
-        b.steps.forEach((s, j) => {
-          if (stepNames.has(s.name)) {
-            ctx.addIssue({ code: "custom", message: `belt "${b.name}" has duplicate step name "${s.name}"`, path: ["belt", i, "steps", j, "name"] });
+      // Step validation for EVERY belt (previously custom-only). Each step references a registered
+      // primitive; resolve its descriptor and run the structural checks the reconciler relies on.
+      const kept = b.steps.filter((s) => {
+        const d = stepDescriptorFor(s.type);
+        return d ? !stepSkipped(d, s) : true;
+      });
+      const stepNames = new Set<string>();
+      b.steps.forEach((s, j) => {
+        const d = stepDescriptorFor(s.type);
+        if (!d) return; // the schema enum already rejected an unknown type
+        const name = s.name ?? s.type;
+        if (stepNames.has(name)) {
+          ctx.addIssue({ code: "custom", message: `belt "${b.name}" has duplicate step name "${name}" (name defaults to type — give one an explicit unique name)`, path: ["belt", i, "steps", j, "name"] });
+        }
+        stepNames.add(name);
+        if (d.promptFileRequired && !s.prompt_file) {
+          ctx.addIssue({ code: "custom", message: `belt "${b.name}" step "${name}" (type ${s.type}) needs a prompt_file — it has no built-in prompt`, path: ["belt", i, "steps", j, "prompt_file"] });
+        }
+        if (d.controls.posture?.readOnly && stepProduces(d, s).includes("commits")) {
+          ctx.addIssue({ code: "custom", message: `belt "${b.name}" step "${name}" (type ${s.type}) is read-only and cannot commit — remove heartbeat`, path: ["belt", i, "steps", j, "heartbeat"] });
+        }
+      });
+      // Dataflow over the KEPT steps in order: a REQUIRED consume must be produced by the source or
+      // an earlier step; a bounce emitter needs an earlier bounce_feedback consumer.
+      const available = new Set<ProductType>(sourceType ? SOURCE_PRODUCTS[sourceType] : []);
+      kept.forEach((s, ki) => {
+        const d = stepDescriptorFor(s.type)!;
+        const name = s.name ?? s.type;
+        const beltIdx = b.steps.indexOf(s);
+        for (const c of d.consumes) {
+          if (c.required && !available.has(c.type)) {
+            ctx.addIssue({ code: "custom", message: `belt "${b.name}" step "${name}" requires "${c.type}" but neither the source nor an earlier step produces it`, path: ["belt", i, "steps", beltIdx] });
           }
-          stepNames.add(s.name);
-        });
-      }
+        }
+        if (d.controls.bounce && resolveBounceTargets(kept, ki).length === 0) {
+          ctx.addIssue({ code: "custom", message: `belt "${b.name}" step "${name}" declares a bounce but no earlier step consumes bounce_feedback`, path: ["belt", i, "steps", beltIdx] });
+        }
+        for (const p of stepProduces(d, s)) available.add(p);
+      });
     });
   });
 
@@ -322,24 +370,33 @@ export interface WorkSourceConfig {
   cfg: unknown;
 }
 
-/** One resolved belt step. The body the agent gets is assembled at RENDER time (step.ts): the
- *  `enginePrompt` base (work_to_pull_request steps only — undefined for custom) PLUS, if
- *  `promptFile` is set, the user prompt read from `promptFileSource` (`config` ⇒ the repo's config
- *  folder; `repo` ⇒ the run's worktree) — augmenting the engine base for w2pr, or being the whole
- *  body for custom. The engine then adds the handover scaffold + @@TOKEN@@ substitution. `opensPr`
- *  is true only for the work_to_pull_request `pr` step (the one that watches GitHub for a PR). */
+/** One resolved belt step: a registered primitive (`type`) resolved against a belt step ref. The
+ *  body is assembled at RENDER time (step.ts): the `enginePrompt` base (from the descriptor's
+ *  basePrompt slug; undefined for a `custom` step) PLUS, if `promptFile` is set, the user prompt —
+ *  augmenting the base, or being the whole body when there is no base. The legacy flags
+ *  (`heartbeat`/`opensPr`/`gathersEvidence`/`canBounceTo`/`readOnly`) are DERIVED from the
+ *  declaration below so the reconciler keeps driving off them; the declaration fields
+ *  (`consumes`/`produces`/`guards`/`effects`/`posture`) drive the new machinery. */
 export interface StepConfig {
   name: string;
+  type: string; // the registered step primitive this step is (descriptor name)
   tab?: string;
   pane?: string;
-  enginePrompt?: string; // shipped base body (w2pr); undefined for custom
-  promptFile?: string; // user prompt path as written in config (optional for w2pr, required for custom)
+  enginePrompt?: string; // shipped base body from basePrompt.slug; undefined when the descriptor has none (custom)
+  promptFile?: string; // user prompt path as written in config (optional augment, or whole body for custom)
   promptFileSource?: "config" | "repo"; // present iff promptFile is
   budgetSeconds: number;
-  heartbeat: boolean; // commit-HEAD stall heartbeat applies to this step
-  opensPr: boolean;
-  gathersEvidence: boolean; // this step captures + publishes visual evidence (surfaces evidence guidance)
-  canBounceTo: string[]; // earlier step names this step may send the run back to for rework (bounce)
+  heartbeat: boolean; // commit-HEAD stall heartbeat applies to this step (derived: has a heartbeat guard)
+  opensPr: boolean; // derived: produces includes pull_request
+  gathersEvidence: boolean; // derived: produces includes evidence
+  canBounceTo: string[]; // derived: earlier bounce_feedback consumer(s) this step may bounce to
+  readOnly: boolean; // derived: posture.readOnly (never edits/commits — enforced)
+  requiresLayout: boolean; // derived: posture.requiresLayout (materialize only with a layout pane)
+  consumes: InputSpec[]; // declared typed inputs
+  produces: ProductType[]; // declared typed products (always includes handoff)
+  guards: GuardSpec[]; // resolved watchdogs that actually attach to this step
+  effects: EffectSpec[]; // declared source-lifecycle transitions
+  posture: StepPosture; // read_only / requiresLayout flags
 }
 
 /** One resolved belt: a (source + ordered steps) pairing with its lifecycle. `watchPr` true means
@@ -369,11 +426,7 @@ export interface Config {
   limits: {
     maxActiveWorkspaces: number;
     attentionRenotifySeconds: number;
-    developBudgetSeconds: number;
     stallSeconds: number;
-    reviewBudgetSeconds: number;
-    evidenceBudgetSeconds: number;
-    prBudgetSeconds: number;
     maxBounces: number;
     maxCaptureAttempts: number;
     stepBudgetSeconds: number;
@@ -655,75 +708,73 @@ export function loadConfig(repoName: string): Loaded {
     if (source === "config") resolveFile(belt, label, promptFile);
   };
 
-  // The engine steps of a work_to_pull_request belt (order = pipeline order):
-  //   fix → evidence → review → pr
-  // `evidence` captures + publishes visual proof and can bounce back to fix; `review` is a strict
-  // read-only gate that passes forward or bounces back to fix; `pr` opens the PR + rides CI.
-  const PR_STEPS = [
-    { name: "fix", budget: parsed.limits.develop_budget_seconds, heartbeat: true, opensPr: false },
-    { name: "evidence", budget: parsed.limits.evidence_budget_seconds, heartbeat: false, opensPr: false },
-    { name: "review", budget: parsed.limits.review_budget_seconds, heartbeat: false, opensPr: false },
-    { name: "pr", budget: parsed.limits.pr_budget_seconds, heartbeat: true, opensPr: true },
-  ] as const;
-  // Per-step capabilities for the w2pr pipeline (kept beside PR_STEPS so the pipeline shape lives in
-  // one place; `bounce`/evidence are belt-agnostic once resolved onto StepConfig, so custom belts
-  // can grow them later). evidence + review may send the run back to fix for rework.
-  const PR_CAN_BOUNCE_TO: Record<string, string[]> = { evidence: ["fix"], review: ["fix"] };
-  const PR_GATHERS_EVIDENCE = new Set<string>(["evidence"]);
+  // Resolve one belt step ref → StepConfig via its registered descriptor. `kept` is the belt's
+  // post-skip step list (evidence-opt-in removed); `index` is this step's position within it.
+  const resolveStep = (
+    beltName: string,
+    sourceType: SourceType,
+    ref: { type: string; name?: string; tab?: string; pane?: string; prompt_file?: string; prompt_file_source?: "config" | "repo"; budget_seconds?: number; heartbeat: boolean },
+    kept: { type: string; name?: string }[],
+    index: number,
+  ): StepConfig => {
+    const d = stepDescriptorFor(ref.type)!; // existence guaranteed by the schema step-type enum
+    const name = ref.name ?? ref.type;
+    if (ref.prompt_file) checkConfigPromptFile(beltName, `step "${name}" prompt_file`, ref.prompt_file_source!, ref.prompt_file);
+    const produces = stepProduces(d, ref);
+    // Guards that actually attach: descriptor guards whose conditions hold (layout_wait needs a
+    // tab/pane; heartbeat/capture_cap need their product) + a heartbeat guard if the ref opted in.
+    const guards: GuardSpec[] = [];
+    for (const g of d.guards) {
+      if (g.attachWhen === "layoutTarget" && !(ref.tab && ref.pane)) continue;
+      if (g.requiresProduct && !produces.includes(g.requiresProduct)) continue;
+      guards.push(g);
+    }
+    if (ref.heartbeat && !guards.some((g) => g.kind === "heartbeat")) guards.push(HEARTBEAT_GUARD);
+    const posture: StepPosture = d.controls.posture ?? {};
+    return {
+      name,
+      type: ref.type,
+      tab: ref.tab,
+      pane: ref.pane,
+      enginePrompt: d.basePrompt ? shippedPrompt(sourceType, d.basePrompt.slug) : undefined,
+      promptFile: ref.prompt_file,
+      promptFileSource: ref.prompt_file_source,
+      budgetSeconds: ref.budget_seconds ?? d.defaultBudgetSeconds ?? parsed.limits.step_budget_seconds,
+      heartbeat: guards.some((g) => g.kind === "heartbeat"),
+      opensPr: produces.includes("pull_request"),
+      gathersEvidence: produces.includes("evidence"),
+      canBounceTo: d.controls.bounce ? resolveBounceTargets(kept, index) : [],
+      readOnly: posture.readOnly ?? false,
+      requiresLayout: posture.requiresLayout ?? false,
+      consumes: [...d.consumes],
+      produces,
+      guards,
+      effects: [...d.effects],
+      posture,
+    };
+  };
 
   const belts: BeltConfig[] = parsed.belt.map((b) => {
     const sourceType = sourceTypeByName.get(b.source)!; // existence guaranteed by superRefine
-    const base = {
+    // Apply the evidence-opt-in skip (a requiresLayout step with no tab/pane), then resolve each.
+    const kept = b.steps.filter((s) => !stepSkipped(stepDescriptorFor(s.type)!, s));
+    const steps: StepConfig[] = kept.map((ref, i) => resolveStep(b.name, sourceType, ref, kept, i));
+    // Lifecycle is DERIVED, not written: a step producing pull_request (whose product carries a
+    // watch) gives the belt the terminal PR-watch. beltType is a display label only now.
+    const watchPr = steps.some((s) => s.produces.includes("pull_request") && productCapabilityFor("pull_request").watch != null);
+    const beltType: BeltType = watchPr ? "work_to_pull_request" : "custom";
+    return {
       name: b.name,
-      beltType: b.belt_type as BeltType,
+      beltType,
       source: b.source,
       priority: b.priority,
       workspaceName: b.workspace_name,
       matchFile: b.match ? resolveFile(b.name, "match", b.match) : undefined,
       label: b.label,
+      steps,
+      watchPr,
+      maxBounces: b.max_bounces,
     };
-    if (b.belt_type === "work_to_pull_request") {
-      const steps: StepConfig[] = PR_STEPS.flatMap((d) => {
-        const agent = b.agents[d.name] ?? {};
-        // `evidence` is opt-in + cooperative: it verifies fix's work using an EXISTING agent in the
-        // user's layout, so it runs ONLY when a tab/pane targets that agent. With no tab/pane it is
-        // SKIPPED entirely (fix → review → pr) — evidence never spawns its own agent. fix/review/pr
-        // always run (they spawn a dedicated pane when unconfigured).
-        if (d.name === "evidence" && !(agent.tab && agent.pane)) return [];
-        // schema guarantees prompt_file_source is present when prompt_file is.
-        if (agent.prompt_file) checkConfigPromptFile(b.name, `${d.name} prompt_file`, agent.prompt_file_source!, agent.prompt_file);
-        return [{
-          name: d.name,
-          tab: agent.tab,
-          pane: agent.pane,
-          enginePrompt: shippedPrompt(sourceType, d.name),
-          promptFile: agent.prompt_file,
-          promptFileSource: agent.prompt_file_source,
-          budgetSeconds: d.budget,
-          heartbeat: d.heartbeat,
-          opensPr: d.opensPr,
-          gathersEvidence: PR_GATHERS_EVIDENCE.has(d.name),
-          canBounceTo: PR_CAN_BOUNCE_TO[d.name] ?? [],
-        }];
-      });
-      return { ...base, steps, watchPr: true, maxBounces: b.max_bounces };
-    }
-    const steps: StepConfig[] = b.steps.map((s) => {
-      checkConfigPromptFile(b.name, `step "${s.name}" prompt_file`, s.prompt_file_source, s.prompt_file);
-      return {
-        name: s.name,
-        tab: s.tab,
-        pane: s.pane,
-        promptFile: s.prompt_file,
-        promptFileSource: s.prompt_file_source,
-        budgetSeconds: s.budget_seconds ?? parsed.limits.step_budget_seconds,
-        heartbeat: s.heartbeat, // schema default: false
-        opensPr: false,
-        gathersEvidence: false, // custom steps don't (yet) declare evidence/bounce — a fast-follow
-        canBounceTo: [],
-      };
-    });
-    return { ...base, steps, watchPr: false, maxBounces: b.max_bounces };
   });
   // Stable sort: equal priorities keep config order (V8 Array.sort is stable on Node >=24).
   belts.sort((a, b) => a.priority - b.priority);
@@ -737,11 +788,7 @@ export function loadConfig(repoName: string): Loaded {
     limits: {
       maxActiveWorkspaces: parsed.limits.max_active_workspaces,
       attentionRenotifySeconds: parsed.limits.attention_renotify_seconds,
-      developBudgetSeconds: parsed.limits.develop_budget_seconds,
       stallSeconds: parsed.limits.stall_seconds,
-      reviewBudgetSeconds: parsed.limits.review_budget_seconds,
-      evidenceBudgetSeconds: parsed.limits.evidence_budget_seconds,
-      prBudgetSeconds: parsed.limits.pr_budget_seconds,
       maxBounces: parsed.limits.max_bounces,
       maxCaptureAttempts: parsed.limits.max_capture_attempts,
       stepBudgetSeconds: parsed.limits.step_budget_seconds,

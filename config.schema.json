@@ -36,32 +36,8 @@
           "exclusiveMinimum": 0,
           "maximum": 9007199254740991
         },
-        "develop_budget_seconds": {
-          "default": 5400,
-          "type": "integer",
-          "exclusiveMinimum": 0,
-          "maximum": 9007199254740991
-        },
         "stall_seconds": {
           "default": 2700,
-          "type": "integer",
-          "exclusiveMinimum": 0,
-          "maximum": 9007199254740991
-        },
-        "review_budget_seconds": {
-          "default": 1800,
-          "type": "integer",
-          "exclusiveMinimum": 0,
-          "maximum": 9007199254740991
-        },
-        "evidence_budget_seconds": {
-          "default": 2400,
-          "type": "integer",
-          "exclusiveMinimum": 0,
-          "maximum": 9007199254740991
-        },
-        "pr_budget_seconds": {
-          "default": 3600,
           "type": "integer",
           "exclusiveMinimum": 0,
           "maximum": 9007199254740991
@@ -304,241 +280,96 @@
       "minItems": 1,
       "type": "array",
       "items": {
-        "oneOf": [
-          {
-            "type": "object",
-            "properties": {
-              "belt_type": {
-                "type": "string",
-                "const": "work_to_pull_request"
-              },
-              "name": {
-                "type": "string",
-                "minLength": 1
-              },
-              "source": {
-                "type": "string",
-                "minLength": 1
-              },
-              "priority": {
-                "default": 100,
-                "type": "integer",
-                "minimum": -9007199254740991,
-                "maximum": 9007199254740991
-              },
-              "workspace_name": {
-                "type": "string"
-              },
-              "match": {
-                "type": "string"
-              },
-              "label": {
-                "type": "string",
-                "minLength": 1
-              },
-              "max_bounces": {
-                "type": "integer",
-                "minimum": 0,
-                "maximum": 9007199254740991
-              },
-              "agents": {
-                "type": "object",
-                "properties": {
-                  "fix": {
-                    "type": "object",
-                    "properties": {
-                      "tab": {
-                        "type": "string"
-                      },
-                      "pane": {
-                        "type": "string"
-                      },
-                      "prompt_file": {
-                        "type": "string"
-                      },
-                      "prompt_file_source": {
-                        "type": "string",
-                        "enum": [
-                          "repo",
-                          "config"
-                        ]
-                      }
-                    },
-                    "additionalProperties": false
-                  },
-                  "evidence": {
-                    "type": "object",
-                    "properties": {
-                      "tab": {
-                        "type": "string"
-                      },
-                      "pane": {
-                        "type": "string"
-                      },
-                      "prompt_file": {
-                        "type": "string"
-                      },
-                      "prompt_file_source": {
-                        "type": "string",
-                        "enum": [
-                          "repo",
-                          "config"
-                        ]
-                      }
-                    },
-                    "additionalProperties": false
-                  },
-                  "review": {
-                    "type": "object",
-                    "properties": {
-                      "tab": {
-                        "type": "string"
-                      },
-                      "pane": {
-                        "type": "string"
-                      },
-                      "prompt_file": {
-                        "type": "string"
-                      },
-                      "prompt_file_source": {
-                        "type": "string",
-                        "enum": [
-                          "repo",
-                          "config"
-                        ]
-                      }
-                    },
-                    "additionalProperties": false
-                  },
-                  "pr": {
-                    "type": "object",
-                    "properties": {
-                      "tab": {
-                        "type": "string"
-                      },
-                      "pane": {
-                        "type": "string"
-                      },
-                      "prompt_file": {
-                        "type": "string"
-                      },
-                      "prompt_file_source": {
-                        "type": "string",
-                        "enum": [
-                          "repo",
-                          "config"
-                        ]
-                      }
-                    },
-                    "additionalProperties": false
-                  }
-                },
-                "required": [
-                  "fix",
-                  "review",
-                  "pr"
-                ],
-                "additionalProperties": false
-              }
-            },
-            "required": [
-              "belt_type",
-              "name",
-              "source",
-              "agents"
-            ],
-            "additionalProperties": false
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1
           },
-          {
-            "type": "object",
-            "properties": {
-              "belt_type": {
-                "type": "string",
-                "const": "custom"
-              },
-              "name": {
-                "type": "string",
-                "minLength": 1
-              },
-              "source": {
-                "type": "string",
-                "minLength": 1
-              },
-              "priority": {
-                "default": 100,
-                "type": "integer",
-                "minimum": -9007199254740991,
-                "maximum": 9007199254740991
-              },
-              "workspace_name": {
-                "type": "string"
-              },
-              "match": {
-                "type": "string"
-              },
-              "label": {
-                "type": "string",
-                "minLength": 1
-              },
-              "max_bounces": {
-                "type": "integer",
-                "minimum": 0,
-                "maximum": 9007199254740991
-              },
-              "steps": {
-                "minItems": 1,
-                "type": "array",
-                "items": {
-                  "type": "object",
-                  "properties": {
-                    "name": {
-                      "type": "string",
-                      "pattern": "^[a-z0-9][a-z0-9_-]*$"
-                    },
-                    "prompt_file": {
-                      "type": "string"
-                    },
-                    "prompt_file_source": {
-                      "type": "string",
-                      "enum": [
-                        "repo",
-                        "config"
-                      ]
-                    },
-                    "budget_seconds": {
-                      "type": "integer",
-                      "exclusiveMinimum": 0,
-                      "maximum": 9007199254740991
-                    },
-                    "heartbeat": {
-                      "default": false,
-                      "type": "boolean"
-                    },
-                    "tab": {
-                      "type": "string"
-                    },
-                    "pane": {
-                      "type": "string"
-                    }
-                  },
-                  "required": [
-                    "name",
-                    "prompt_file",
-                    "prompt_file_source"
-                  ],
-                  "additionalProperties": false
+          "source": {
+            "type": "string",
+            "minLength": 1
+          },
+          "priority": {
+            "default": 100,
+            "type": "integer",
+            "minimum": -9007199254740991,
+            "maximum": 9007199254740991
+          },
+          "workspace_name": {
+            "type": "string"
+          },
+          "match": {
+            "type": "string"
+          },
+          "label": {
+            "type": "string",
+            "minLength": 1
+          },
+          "max_bounces": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "steps": {
+            "minItems": 1,
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "type": {
+                  "type": "string",
+                  "enum": [
+                    "work",
+                    "evidence",
+                    "review",
+                    "pr",
+                    "custom"
+                  ]
+                },
+                "name": {
+                  "type": "string",
+                  "pattern": "^[a-z0-9][a-z0-9_-]*$"
+                },
+                "tab": {
+                  "type": "string"
+                },
+                "pane": {
+                  "type": "string"
+                },
+                "prompt_file": {
+                  "type": "string"
+                },
+                "prompt_file_source": {
+                  "type": "string",
+                  "enum": [
+                    "repo",
+                    "config"
+                  ]
+                },
+                "budget_seconds": {
+                  "type": "integer",
+                  "exclusiveMinimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "heartbeat": {
+                  "default": false,
+                  "type": "boolean"
                 }
-              }
-            },
-            "required": [
-              "belt_type",
-              "name",
-              "source",
-              "steps"
-            ],
-            "additionalProperties": false
+              },
+              "required": [
+                "type"
+              ],
+              "additionalProperties": false
+            }
           }
-        ]
+        },
+        "required": [
+          "name",
+          "source",
+          "steps"
+        ],
+        "additionalProperties": false
       }
     },
     "evidence": {

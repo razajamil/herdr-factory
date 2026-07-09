@@ -12,13 +12,12 @@ repo:
 # Repo-global limits (shared across every belt below).
 limits:
   max_active_workspaces: 3 # cap on concurrently WORKED workspaces (one worktree per run), across ALL belts; parked + idle-watching runs hold no slot
-  develop_budget_seconds: 5400 # work_to_pull_request fix-step budget
-  stall_seconds: 2700 # no new commits for this long → stalled → attention
-  review_budget_seconds: 1800 # work_to_pull_request review-step budget
-  evidence_budget_seconds: 2400 # work_to_pull_request evidence-step budget (capture + video + upload)
-  pr_budget_seconds: 3600 # work_to_pull_request pr-step budget (open PR + CI/bot round)
-  max_bounces: 3 # times a run may be bounced back to a step (evidence/review → fix) before → attention
-  step_budget_seconds: 3600 # default budget for a custom belt step (override per-step)
+  stall_seconds: 2700 # no new commits for this long → stalled → attention (heartbeat steps only)
+  max_bounces: 3 # times a run may be bounced back to an earlier step (evidence/review → work) before → attention
+  # Per-step budgets are a property of the step primitive now (work 5400 · evidence 2400 · review 1800 ·
+  # pr 3600); override per step with `budget_seconds`. step_budget_seconds is the fallback for a
+  # `custom` step that sets none.
+  step_budget_seconds: 3600
   tick_interval_seconds: 60
 
 # ── Work sources: WHERE work is pulled from. Backends only — no pipeline here. ─────────────────
@@ -72,44 +71,44 @@ work_sources:
 # concept (local_markdown) takes none. Two belts on one source must use DISTINCT labels (splitting
 # its work); the same source+label in two belts is rejected (they'd contend for the same items).
 belt:
-  # ── work_to_pull_request: the fix → evidence → review → pr flow with the "walk away" PR watch. ──
-  # The engine owns the steps + their prompts and rides the PR through CI/review to merge, then tears
-  # the worktree down. fix implements; evidence captures visual proof (dev server + playwright) and
-  # can bounce back to fix if the fix isn't proven; review is a strict read-only gate that passes or
-  # bounces back to fix; pr opens the PR (embedding the evidence URLs) + rides CI. An
-  # `agents.{fix,evidence,review,pr}` block picks each step's layout pane (set tab+pane together for a
-  # layout your herdr setup provisions; omit both to have herdr-factory spawn a dedicated pane —
-  # except `evidence`, which runs ONLY when a tab+pane targets an agent your layout provides; with
-  # no tab/pane the evidence step is skipped entirely and the belt is fix → review → pr).
-  # Each agent may OPTIONALLY add a `prompt_file` (+ a required
-  # `prompt_file_source`: `config` = this folder, `repo` = the target repo checkout, read from the
-  # worktree at run time) that AUGMENTS that step's engine prompt with repo-specific instructions —
-  # e.g. `fix: { tab: fix, pane: agent, prompt_file: .herdr/fix-notes.md, prompt_file_source: repo }`.
+  # ── A belt is one ordered `steps[]` list. Each step references a registered step PRIMITIVE by
+  # `type` (work · evidence · review · pr · custom); lifecycle is DERIVED from what the steps produce
+  # — a `pr` step produces a pull_request, which gives the belt the "walk away" PR watch (ride CI +
+  # review to merge, then tear the worktree down). `work` implements + commits; `evidence` captures
+  # visual proof (dev server + playwright) and can bounce back to `work` if the fix isn't proven;
+  # `review` is a strict read-only gate that passes or bounces back to `work`; `pr` opens the PR
+  # (embedding the evidence URLs) + rides CI. Set a step's `tab`+`pane` together for a layout your
+  # herdr setup provisions; omit both to have herdr-factory spawn a dedicated pane — except
+  # `evidence`, which runs ONLY when a tab+pane targets an agent your layout provides (drop it — or
+  # its tab/pane — and the belt is work → review → pr). A step may OPTIONALLY add a `prompt_file`
+  # (+ required `prompt_file_source`: `config` = this folder, `repo` = the target repo checkout, read
+  # from the worktree at run time) that AUGMENTS its engine prompt — e.g.
+  # `{ type: work, tab: work, pane: agent, prompt_file: .herdr/work-notes.md, prompt_file_source: repo }`.
   - name: ship_bugs
-    belt_type: work_to_pull_request
     source: jira
     label: agent # pickup label — REQUIRED (no default); tickets carrying it are eligible for this belt
     priority: 1
     match: match-bugs.ts # optional; omit ⇒ this belt accepts anything from `jira` carrying `label`
     workspace_name: "{{semantic_work_prefix}}/{{work_id}}-{{work_slug}}"
-    agents:
-      fix: { tab: fix, pane: agent }
-      evidence: { tab: evidence, pane: agent } # opt-in; omit tab/pane to SKIP the evidence step
-      review: { tab: review, pane: agent }
-      pr: { tab: pr, pane: agent }
+    steps:
+      - { type: work, tab: work, pane: agent }
+      - { type: evidence, tab: evidence, pane: agent } # opt-in; drop tab/pane (or the whole entry) to SKIP evidence
+      - { type: review, tab: review, pane: agent }
+      - { type: pr, tab: pr, pane: agent }
 
-  # ── custom: a fully user-defined, agent-driven flow. Each step's prompt_file is the whole step
+  # ── A fully user-defined, agent-driven flow: `custom` steps whose `prompt_file` is the whole step
   # body (the engine adds only a handover scaffold naming the belt + sibling steps); prompt_file +
-  # prompt_file_source (`config` = this folder, `repo` = the target repo checkout) are REQUIRED. The
-  # run ends when the LAST step signals step-done — no PR, no review watch. budget_seconds/heartbeat
-  # are optional per step (heartbeat off by default — these steps make no commits).
+  # prompt_file_source (`config` = this folder, `repo` = the target repo checkout) are REQUIRED for a
+  # `custom` step. No `pr` step ⇒ no PR / no review watch — the run ends when the LAST step signals
+  # step-done. budget_seconds/heartbeat are optional per step (heartbeat off by default — these steps
+  # make no commits).
   - name: work_generation
-    belt_type: custom
     source: ideas
     priority: 2
     workspace_name: "research/{{work_id}}-{{work_slug}}"
     steps:
       - {
+          type: custom,
           name: research,
           tab: research,
           pane: agent,
@@ -117,11 +116,13 @@ belt:
           prompt_file_source: config,
         }
       - {
+          type: custom,
           name: propose,
           prompt_file: prompts/work_generation/propose.md,
           prompt_file_source: config,
         }
       - {
+          type: custom,
           name: create_jira_ticket,
           prompt_file: prompts/work_generation/create-jira-ticket.md,
           prompt_file_source: config,

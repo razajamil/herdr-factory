@@ -318,6 +318,80 @@ export interface WorkDocInfo {
 export type Clock = () => number;
 export const systemClock: Clock = () => Math.floor(Date.now() / 1000);
 
+// --- step primitives: the declarative capability vocabulary ------------------
+// Steps, products, guards, effects and signals are DECLARED (not hardcoded per belt_type). The
+// reconciler branches on these declarations, never on a step name — mirroring how WorkSourceSpec
+// keeps the source lifecycle from drifting into a second state machine. The descriptors themselves
+// live in src/steps/registry.ts, src/products/registry.ts, src/signals/registry.ts.
+
+/** The closed vocabulary of typed artifacts a step consumes/produces. A product is the hook that
+ *  attaches engine machinery via the PRODUCT_CAPABILITIES registry: pull_request → PR adoption +
+ *  terminal watch; evidence → the S3 upload outbox + capture-cap guard; commits → the heartbeat is
+ *  meaningful; handoff → the forward handoff channel. Load-time dataflow validation checks a step's
+ *  consumes are satisfied by the source or an earlier step's produces. */
+export type ProductType =
+  | "work_spec" // the materialized work item (source-produced at belt_start)
+  | "work_raw" // the raw source payload sidecar (ticket.json / issue.json / front-matter)
+  | "commits" // code committed to the branch
+  | "handoff" // the cross-step handoff note — MANDATORY on every step (may be empty)
+  | "evidence" // captured + published visual proof
+  | "pull_request" // an opened PR (adoption identity + in_review effect + terminal watch)
+  | "bounce_feedback" // rework findings sent back to an earlier step
+  | "human_reply" // a human's answer to an ask-human question
+  | "close_reference"; // a "Fixes #n" line for PR-body auto-close (github_issues)
+
+/** A declared input: a product a step reads, tagged required|optional. A REQUIRED consume with no
+ *  upstream producer REJECTS the belt at load; an unsatisfied OPTIONAL consume drops its prompt
+ *  clause/token instead of rejecting. */
+export interface InputSpec {
+  type: ProductType;
+  required: boolean;
+}
+
+/** The watchdog kinds a step can attach. Each GuardSpec carries its own lifecycle so a flat set
+ *  can't lose the load-bearing per-guard semantics. */
+export type GuardKind = "budget" | "heartbeat" | "capture_cap" | "layout_wait" | "exclusive_resource";
+
+/** A watchdog attached to a step. `budget`/`heartbeat`/`layout_wait` are clock/liveness guards;
+ *  `capture_cap` is the only counter guard among the shipped set (`reset`/`cumulative` apply to it).
+ *  The bounce cap is NOT modelled here — it rides on `controls.bounce` (see StepControls). */
+export interface GuardSpec {
+  kind: GuardKind;
+  /** Reason code recorded when this guard trips. The union of guards with autoRescueOnDone===true
+   *  IS the STEP_WATCHDOG_ATTENTION set (a genuine step-done un-parks a run parked by such a guard). */
+  escalationReason: string;
+  autoRescueOnDone: boolean;
+  /** Counter guards only (capture_cap): when the counter resets. "forward_entry" = a fresh forward
+   *  pass into the step, NOT a crash-recovery respawn (a self-crash must not refill the cap). */
+  reset?: "forward_entry" | "never" | "resume";
+  cumulative?: boolean;
+  /** Guard attaches only when the step declares this product (heartbeat→commits, capture_cap→evidence). */
+  requiresProduct?: ProductType;
+  /** Guard attaches only when the step ref supplies a layout tab/pane (layout_wait). */
+  attachWhen?: "layoutTarget";
+  /** exclusive_resource: the machine-global lock name (capture-lock). */
+  resourceName?: string;
+}
+
+/** A source-lifecycle transition, fired FORWARD-ONLY + idempotently through the transition outbox:
+ *  a target <= the current source state is a noop (WorkState monotonicity). belt_start→in_development
+ *  is an engine default for every belt; produce→in_review lives on the pull_request product. */
+export type EffectTrigger = "belt_start" | { produce: ProductType } | { teardown: Outcome };
+export interface EffectSpec {
+  trigger: EffectTrigger;
+  to: WorkState;
+}
+
+/** Posture flags a step declares (and the engine enforces). */
+export interface StepPosture {
+  readOnly?: boolean; // declared AND enforced — HEAD movement during the step is a violation
+  requiresLayout?: boolean; // materialize only when a layout tab/pane targets it (evidence opt-in)
+}
+
+/** Where an agent→dispatcher signal is scoped — drives its route mounting, lock discipline, and
+ *  which outbox (if any) it feeds. */
+export type SignalScope = "run" | "machine" | "product-outbox";
+
 // --- client domain types ----------------------------------------------------
 
 /** Lean identity for claim + branch naming. `displayKey` is the pretty, possibly-mutable form

@@ -14,7 +14,7 @@ Merged PRs come out the other end.
 
 </div>
 
-![The work_to_pull_request belt: work sources drop items onto a conveyor that runs through fix, evidence, review and PR stations, through a CI + human-review gate, to merge and teardown](docs/images/belt-work-to-pull-request.svg)
+![The work_to_pull_request belt: work sources drop items onto a conveyor that runs through work, evidence, review and PR stations, through a CI + human-review gate, to merge and teardown](docs/images/belt-work-to-pull-request.svg)
 
 herdr-factory is an autonomous, worktree based, coding-agent factory built on top of [herdr](https://herdr.dev) that fits the workflow your team already has:
 
@@ -25,8 +25,11 @@ herdr-factory is an autonomous, worktree based, coding-agent factory built on to
 - **Local only.** No data leaves your machine: work queue, run history, logs, and even the
   opt-in telemetry stay on it. (herdr can also host the same factory on a remote machine — same
   guarantees, different hardware.)
-- **Opinionated _and_ customizable.** `work_to_pull_request` is the complete ticket → merged-PR
-  pipeline; `custom` belts run whatever workflow you define.
+- **Opinionated _and_ customizable.** A belt is an ordered pipeline of composable **step primitives**
+  (`work`, `evidence`, `review`, `pr`, `custom`); the shipped `work_to_pull_request` template is the
+  complete ticket → merged-PR flow, and you compose your own belts from the very same primitives —
+  with the pipeline's typed inputs/outputs checked at config-load so a hand-built belt is as reliable
+  as the shipped one.
 - **Works with all your favourite agent harnesses.** Claude Code, opencode, pi, codex, … — if it
   runs in a terminal pane, the factory can drive it.
 
@@ -108,10 +111,12 @@ work_sources:
 
 belt:
   - name: tickets-to-prs
-    belt_type: work_to_pull_request
     source: jira
     label: agent # tickets carrying this label are eligible for this belt (required — no default)
-    agents: { fix: {}, review: {}, pr: {} } # no layout yet → the factory spawns each step's pane
+    steps: # the canonical work → review → pr pipeline (add an { type: evidence } step to verify visually)
+      - { type: work } # no tab/pane → the factory spawns each step's pane
+      - { type: review }
+      - { type: pr }
 ```
 
 Everything else — branch naming, budgets, concurrency — has sensible defaults. The first line is a
@@ -122,8 +127,8 @@ as you type. (`examples/example-repo/` has a fully annotated config, and running
 ### 3. Feed it a ticket
 
 Label a ticket `agent`, move it to **To Do**, and walk away. The factory claims it (→ _In
-Progress_), spins up a herdr worktree, and runs it through the belt: **fix** implements and
-commits, **review** gates with fresh eyes (bouncing it back to fix with findings if it isn't
+Progress_), spins up a herdr worktree, and runs it through the belt: **work** implements and
+commits, **review** gates with fresh eyes (bouncing it back to work with findings if it isn't
 right), **pr** pushes, opens the PR (→ _In Review_), and drives CI green — then the factory
 watches the PR until it merges and recycles the worktree. The ticket's description, comments, and
 image/video attachments are all handed to the agent as its spec.
@@ -143,8 +148,8 @@ subdirectory of files, for multi-file briefs with assets) is one work item, keye
 Drop a brief in and the factory picks it up on the next tick; the folder itself is never
 modified. Two recipes — both can live in the same `config.yml`, alongside the Jira belt:
 
-**An idea inbox that files the Jira tickets for you.** A `custom` belt researches each idea
-inside a worktree and creates the tickets — which your `tickets-to-prs` belt then claims and
+**An idea inbox that files the Jira tickets for you.** A belt of `custom` steps researches each
+idea inside a worktree and creates the tickets — which your `tickets-to-prs` belt then claims and
 ships. The factory generates its own work:
 
 ```yaml
@@ -156,21 +161,23 @@ work_sources:
 
 belt:
   - name: ideas-to-tickets
-    belt_type: custom
     source: ideas
     workspace_name: "research/{{work_id}}-{{work_slug}}"
-    steps:
+    steps: # each `type: custom` step's prompt_file IS the whole body (the engine adds only a scaffold)
       - {
+          type: custom,
           name: research,
           prompt_file: prompts/research.md,
           prompt_file_source: config,
         }
       - {
+          type: custom,
           name: propose,
           prompt_file: prompts/propose.md,
           prompt_file_source: config,
         }
       - {
+          type: custom,
           name: create_jira_ticket,
           prompt_file: prompts/create-ticket.md,
           prompt_file_source: config,
@@ -194,17 +201,16 @@ work_sources:
 
 belt:
   - name: spikes-to-prs
-    belt_type: work_to_pull_request
     source: spikes
     workspace_name: "spike/{{work_id}}-{{work_slug}}"
-    agents: { fix: {}, review: {}, pr: {} }
+    steps: [{ type: work }, { type: review }, { type: pr }]
 ```
 
 ```sh
 echo "Try virtualizing the results table — does it fix the scroll jank?" > ~/factory/spikes/virtual-table.md
 ```
 
-The full fix → review → pr pipeline runs on the brief and hands you a reviewed PR.
+The full work → review → pr pipeline runs on the brief and hands you a reviewed PR.
 
 ## GitHub issues — label an issue, get a PR
 
@@ -218,10 +224,9 @@ work_sources:
 
 belt:
   - name: issues-to-prs
-    belt_type: work_to_pull_request
     source: github_issues
     label: herdr # the trigger label — issues carrying it are eligible (required, no default)
-    agents: { fix: {}, review: {}, pr: {} }
+    steps: [{ type: work }, { type: review }, { type: pr }]
 ```
 
 Label an issue `herdr` (the belt's `label` — its trigger) and the factory claims it — swapping the
@@ -234,26 +239,35 @@ issue comments — reply in a new comment and the run resumes.
 
 ## The belts
 
-A **belt** pairs a work source with an ordered pipeline of agent steps. Two belt types ship today.
+A **belt** pairs a work source with an ordered pipeline of **step primitives** listed in `steps[]`.
+Five ship — `work`, `evidence`, `review`, `pr`, and the generic `custom` — each declaring its typed
+inputs/outputs, its watchdogs, and how it can hand work back. A belt's lifecycle is **derived** from
+what its steps declare: it gets the terminal PR watch because a step produces a pull request, the
+bounce cap because a step declares a bounce, the `in_review` status write-back because the PR is
+opened. There is no `belt_type` — the same primitives compose the shipped pipeline below and any belt
+you build, and the composition is checked at config-load (a step whose input nothing upstream produces
+is rejected).
 
 ### `work_to_pull_request` — feed it a ticket, get a merged PR
 
-Pictured at the top. The engine owns the stations _and_ ships their prompts:
+Pictured at the top. The canonical belt is `steps: [{ type: work }, { type: evidence }, { type:
+review }, { type: pr }]` — the engine ships each primitive's prompt:
 
-- **fix** — implements the change and commits as it goes (a commit-HEAD heartbeat catches stalls).
+- **work** — implements the change and commits as it goes (a commit-HEAD heartbeat catches stalls).
 - **evidence** _(opt-in)_ — derives a test plan from the work item's acceptance criteria, then films
   the running app to prove each one. It follows the repo's own skills/runbooks for the dev-server
   workflow **and** the login/test account so it exercises the flow as the right persona, drives
   `playwright-cli` for before/after screenshots and video, publishes the captures to S3/CloudFront,
   and records a per-criterion verdict table (with the public URLs) in its handoff. If the evidence
-  doesn't prove a criterion it **bounces the run back to fix** with findings. A flaky app that keeps
+  doesn't prove a criterion it **bounces the run back to work** with findings. A flaky app that keeps
   re-capturing past `max_capture_attempts` parks for attention — but only as a backstop against a
   stuck agent: if the evidence step then genuinely finishes and signals `step-done`, the run un-parks
   and advances (evidence is non-gating — the cap never vetoes completed evidence). This station runs only when
   your herdr layout provides its pane (`tab` + `pane` in config) — without one the belt is simply
-  fix → review → pr.
-- **review** — a strict read-only gate with fresh eyes: it never edits or commits, it either
-  passes the work forward or **bounces back to fix**. Keeping all rework in fix is deliberate.
+  work → review → pr.
+- **review** — a strict read-only gate with fresh eyes: it never edits or commits (if it commits, the
+  run parks — read-only is enforced), it either passes the work forward or **bounces back to work**.
+  Keeping all rework in the work step is deliberate.
 - **pr** — pushes the branch, opens the PR with the evidence URLs embedded, and drives the
   automated round (CI green, bot comments addressed).
 
@@ -270,26 +284,29 @@ Bounces are per-target-step counted; past `max_bounces` (default 6, per-belt ove
 disables bouncing) the run parks for attention instead of oscillating. Each station's engine
 prompt can be augmented with your own `prompt_file` — see [Prompts](#prompts).
 
-### `custom` — your stations, your prompts
+### `custom` steps — your own stations
 
-![A custom belt: a match router claims items onto a conveyor of user-defined stations, each holding its own prompt file, with an ask-human cord above; the last station stamps step-done and the run ends with teardown](docs/images/belt-custom.svg)
+![A belt of custom steps: a match router claims items onto a conveyor of user-defined stations, each holding its own prompt file, with an ask-human cord above; the last station stamps step-done and the run ends with teardown](docs/images/belt-custom.svg)
 
-Your own ordered `steps[]`, fully agent-driven — e.g. `research → propose → create_jira_ticket`.
-Each step's `prompt_file` **is** the whole step body; the engine adds only a handover scaffold
-(where you are in the belt, the prior step's handoff, how to signal done or ask a human). The run
-ends when the **last** step signals `step-done` — no PR machinery, no CI watch. Per step you can
-set `budget_seconds` and a `heartbeat` (both off/default-safe), and the same worktree, handoff,
-and ask-human machinery applies.
+A belt whose steps are all `type: custom` is fully agent-driven — e.g. `research → propose →
+create_jira_ticket`. Each custom step's `prompt_file` **is** the whole step body; the engine adds
+only a handover scaffold (where you are in the belt, the prior step's handoff, how to signal done or
+ask a human). With no step producing a pull request, the run has no PR machinery or CI watch and
+ends when the **last** step signals `step-done`. Per step you can set `budget_seconds` and a
+`heartbeat` (both off/default-safe), and the same worktree, handoff, bounce, and ask-human machinery
+that the shipped primitives use applies — mix `custom` steps with `work`/`review`/`pr` freely, the
+config-load dataflow check keeps the composition honest.
 
 ### Multiple belts
 
 A repo runs **as many belts as you like, all ticking in parallel** — several belts on the same
-source, belts across different sources, `work_to_pull_request` and `custom` types side by side. A
-belt can even **generate work for another belt**: below, a `custom` belt turns a folder of Markdown
-ideas into Jira tickets, and the `work_to_pull_request` belt beside it claims and ships them — while
-a third `custom` belt runs experiments from its own Markdown folder, entirely independently.
+source, belts across different sources, a shipped `work → review → pr` pipeline and a belt of your
+own `custom` steps side by side. A belt can even **generate work for another belt**: below, a belt
+of `custom` steps turns a folder of Markdown ideas into Jira tickets, and the `work_to_pull_request`
+belt beside it claims and ships them — while a third belt runs experiments from its own Markdown
+folder, entirely independently.
 
-![Top-down view of three conveyor belts running in parallel on one factory floor. On the left, a custom belt reads Markdown ideas and runs research → propose → file_ticket to generate Jira tickets; those tickets loop across to the middle belt — a work_to_pull_request belt on the Jira source running fix → review → pr to a merged pull request. On the right, a separate custom belt reads a Markdown experiments folder and runs its own steps. A labelled arrow shows the ticket-generator belt feeding work into the Jira belt.](docs/images/multiple-belts.svg)
+![Top-down view of three conveyor belts running in parallel on one factory floor. On the left, a belt of custom steps reads Markdown ideas and runs research → propose → file_ticket to generate Jira tickets; those tickets loop across to the middle belt — a work_to_pull_request belt on the Jira source running work → review → pr to a merged pull request. On the right, a separate belt reads a Markdown experiments folder and runs its own steps. A labelled arrow shows the ticket-generator belt feeding work into the Jira belt.](docs/images/multiple-belts.svg)
 
 When more than one belt draws from the **same** label-driven source, each belt uses a **distinct
 `label`** to carve out its own slice of the queue — the factory rejects two belts sharing the same
@@ -315,7 +332,7 @@ brief's front-matter). Route bugs to one belt and stories to another, programmat
   the run as `waiting_for_human` — **freeing its concurrency slot** — polls for the reply with
   backoff, then writes the answer into the worktree and resumes the same step automatically.
 - **Bounce-back rework.** Evidence and review send flawed work _backward_ with written findings
-  instead of patching around it; the fix agent re-runs against the feedback file. The
+  instead of patching around it; the work agent re-runs against the feedback file. The
   `max_bounces` backstop keeps a disagreement loop from running forever.
 - **Attention is a workflow, not a dead end.** When something needs a person — budget exceeded,
   stalled commits, a closed PR, a pane that never appeared — the run parks: desktop notification,
@@ -398,11 +415,7 @@ is pure data (`herdr-factory reload` picks it up without a restart).
 | ---------------------------- | ------- | --------------------------------------------------------------- |
 | `max_active_workspaces`      | 3       | cap on concurrently **worked** workspaces (one per run); parked + idle PR-watch runs hold no slot |
 | `attention_renotify_seconds` | 3600    | re-notify cadence for parked runs                               |
-| `develop_budget_seconds`     | 5400    | fix-step budget                                                 |
-| `evidence_budget_seconds`    | 2400    | evidence-step budget                                            |
-| `review_budget_seconds`      | 1800    | review-step budget                                              |
-| `pr_budget_seconds`          | 3600    | pr-step budget                                                  |
-| `step_budget_seconds`        | 3600    | default budget for a custom step                                |
+| `step_budget_seconds`        | 3600    | fallback per-step budget — used when a step sets no `budget_seconds` and its primitive declares no default (`work` 5400 · `evidence` 2400 · `review` 1800 · `pr` 3600) |
 | `stall_seconds`              | 2700    | no new commits for this long → attention (heartbeat steps only) |
 | `max_bounces`                | 6       | bounces to any one step before attention; `0` disables bouncing |
 | `max_capture_attempts`       | 5       | evidence capture attempts per pass before attention (flaky-capture cap) |
@@ -453,7 +466,7 @@ reference it), and a type block:
 
 ### `belt` (≥ 1)
 
-Common fields: `name` (unique), `belt_type`, `source` (a `work_sources` name), `label` (the pickup
+Common fields: `name` (unique), `source` (a `work_sources` name), `label` (the pickup
 label — the tag the factory looks for to claim this belt's work; **required** for a belt on a
 label-driven source — `jira` / `github_issues` — with **no default**, and omitted for a source with
 no label concept — `local_markdown`), `priority` (default 100, lower = matched first), optional
@@ -464,48 +477,42 @@ no label concept — `local_markdown`), `priority` (default 100, lower = matched
 `{{semantic_work_prefix}}` (fix/chore/feature). A short unique suffix is always appended, so
 re-claiming a previously-merged item gets a fresh branch and PR.
 
-**`belt_type: work_to_pull_request`** — an `agents` block with one entry per station:
-
-```yaml
-agents:
-  fix:
-    {
-      tab: fix,
-      pane: agent,
-      prompt_file: .herdr/fix-notes.md,
-      prompt_file_source: repo,
-    }
-  evidence: { tab: evidence, pane: agent } # evidence runs ONLY when given a tab+pane
-  review: { tab: review, pane: agent }
-  pr: {} # no tab/pane → the factory spawns this pane itself
-```
-
-`fix`/`review`/`pr` are required (an empty `{}` is fine); `evidence` is **opt-in** — it verifies
-fix's work through an agent your layout provides, so without a `tab`+`pane` the station is skipped
-and the belt is fix → review → pr. Each agent's optional `prompt_file` (+ required
-`prompt_file_source`) _augments_ the engine's built-in prompt for that station.
-
-**`belt_type: custom`** — an ordered `steps` list:
+**`steps` (≥ 1)** — the ordered pipeline. Each step references a shipped primitive by `type`:
 
 ```yaml
 steps:
-  - {
-      name: research,
-      prompt_file: prompts/research.md,
-      prompt_file_source: config,
-    }
-  - {
-      name: propose,
-      prompt_file: prompts/propose.md,
-      prompt_file_source: config,
-      budget_seconds: 1800,
-    }
+  - type: work # implements + commits; the shipped work→evidence→review→pr template starts here
+    tab: work
+    pane: agent
+    prompt_file: .herdr/work-notes.md # OPTIONAL: augments the engine's built-in work prompt
+    prompt_file_source: repo
+  - { type: evidence, tab: evidence, pane: agent } # opt-in: runs ONLY when given a tab+pane
+  - { type: review, tab: review, pane: agent }
+  - { type: pr } # no tab/pane → the factory spawns this pane itself
 ```
 
-Each step: `name` (lowercase slug), **required** `prompt_file` + `prompt_file_source` (the whole
-step body), optional `tab`/`pane`, `budget_seconds` (default `limits.step_budget_seconds`), and
-`heartbeat` (commit-stall detection, default off). Custom steps don't declare evidence or bounce
-targets (yet).
+Per step: `type` (`work` | `evidence` | `review` | `pr` | `custom`), optional `name` (defaults to
+`type`, unique within the belt), optional `tab`/`pane` (both-or-neither — with them the factory
+waits for your layout's idle pane, without them it spawns a dedicated pane; `evidence` is **skipped**
+when it has no tab/pane), optional `budget_seconds` (else the primitive's default — `work` 5400 ·
+`evidence` 2400 · `review` 1800 · `pr` 3600 — else `limits.step_budget_seconds`), and `heartbeat`
+(commit-stall detection; on for `work`/`pr`, opt-in elsewhere).
+
+For `work`/`evidence`/`review`/`pr` the engine ships the prompt and `prompt_file` (+ required
+`prompt_file_source`) _augments_ it. A **`custom`** step ships no prompt, so its `prompt_file` is
+**required** and is the whole body — that's how you build your own stations:
+
+```yaml
+steps:
+  - { type: custom, name: research, prompt_file: prompts/research.md, prompt_file_source: config }
+  - { type: custom, name: propose, prompt_file: prompts/propose.md, prompt_file_source: config, budget_seconds: 1800 }
+```
+
+The belt's lifecycle is **derived** from its steps: a `pr` step (which produces a pull request) gives
+it the terminal PR watch + the `in_review` write-back; an `evidence`/`review` step gives it a bounce
+back to `work`. The composition is validated at config-load — a belt whose step needs an input no
+earlier step or the source produces (e.g. `review` with no upstream `work`) is rejected with a clear
+error. `evidence` and `review` are **read-only** (enforced: if one commits, the run parks).
 
 ### `evidence` (optional, repo-wide)
 
@@ -545,8 +552,9 @@ makes per-repo layouts reusable — and since each belt names its worktrees dist
 
 ### Prompts
 
-A step's body is the engine's built-in prompt (w2pr, per source type under `src/prompts/`),
-optionally augmented by your `prompt_file` — or your `prompt_file` alone (custom).
+A step's body is the engine's built-in prompt for its primitive (per source type under
+`src/prompts/`), optionally augmented by your `prompt_file` — or, for a `custom` step, your
+`prompt_file` alone.
 `prompt_file_source` says where it's read from: `config` = the repo's config folder (checked at
 load); `repo` = the target repo's checkout, read from the run's **worktree at render time**, so
 prompts can live version-controlled next to the code.

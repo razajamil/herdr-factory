@@ -8,6 +8,7 @@
 // (+ createNode for new nodes) preserve comments on untouched nodes — then call `rebuild`.
 import type { Document } from "yaml";
 import { SOURCE_DESCRIPTORS, descriptorFor } from "../sources/registry.ts";
+import { STEP_DESCRIPTORS } from "../steps/registry.ts";
 import type { SourceType } from "../types.ts";
 import type { ConfirmFn } from "./types.ts";
 
@@ -25,26 +26,31 @@ export type FieldDesc =
 // ── defaults for newly-created nodes ────────────────────────────────────────────────────────────
 // Source-type blocks come from the registry (descriptor.tui.defaultBlock); belts stay local.
 const SOURCE_TYPE_CHOICES = SOURCE_DESCRIPTORS.map((d) => d.type);
+// Belt steps reference a registered step primitive by `type` (mirrors the source-type choices above,
+// registry-driven so a new/plugin primitive appears without editing this file).
+const STEP_TYPE_CHOICES = STEP_DESCRIPTORS.map((d) => d.name);
 const sourceNode = (type: SourceType, name?: unknown) => ({
   type,
   ...(name != null ? { name } : {}),
   [type]: descriptorFor(type).tui.defaultBlock(),
 });
-const defaultStep = (name: string) => ({ name, prompt_file: "", prompt_file_source: "config" });
-// empty agent blocks are valid by default; `evidence` is shown so its tab/pane is discoverable, but
-// it only RUNS when its tab+pane are set (else the evidence step is skipped: fix → review → pr).
-const prAgents = () => ({ fix: {}, evidence: {}, review: {}, pr: {} });
+// A newly-added step defaults to the generic `custom` primitive (its prompt_file is the whole body);
+// the `type` field is editable to any registered primitive. A brand-new belt starts with one valid
+// `work` step (work needs no prompt_file), which the user extends.
+const defaultStep = (name: string) => ({ type: "custom", name, prompt_file: "", prompt_file_source: "config" });
 
+// Per-step budgets moved onto the step primitives (clean break), so the four *_budget_seconds limits
+// are gone from the schema and this list.
 const LIMITS: [string, string][] = [
   ["max_active_workspaces", "3"],
-  ["develop_budget_seconds", "5400"],
+  ["attention_renotify_seconds", "3600"],
   ["stall_seconds", "2700"],
-  ["review_budget_seconds", "1800"],
-  ["evidence_budget_seconds", "2400"],
-  ["pr_budget_seconds", "3600"],
-  ["max_bounces", "3"],
+  ["max_bounces", "6"],
+  ["max_capture_attempts", "5"],
   ["step_budget_seconds", "3600"],
   ["tick_interval_seconds", "60"],
+  ["reconcile_concurrency", "8"],
+  ["max_claims_per_tick", "10"],
   ["layout_wait_seconds", "600"],
 ];
 
@@ -136,32 +142,13 @@ export function buildDescriptors(draft: Document, rebuild: () => void, confirm: 
   // `label` field. Falls back to no-label for hand-edited/unknown source types.
   const sourceTypeByName = new Map(sources.map((s, i) => [sourceNames[i]!, String(s?.type ?? "")]));
   belts.forEach((b, i) => {
-    const beltType = String(b?.belt_type ?? "custom");
-    d.push({ kind: "group", label: `${beltNames[i]} [${beltType}]`, node: node(["belt", i]), expanded: isOpen(["belt", i]), indent: 1, ...mover(["belt"], i, belts.length) });
+    const steps: any[] = Array.isArray(b?.steps) ? b.steps : [];
+    // Group label shows the step pipeline (there is no belt_type anymore — the lifecycle is derived
+    // from what the steps produce; a belt with a `pr` step gets the terminal PR watch).
+    const pipeline = steps.map((s) => String(s?.type ?? "?")).join("→") || "empty";
+    d.push({ kind: "group", label: `${beltNames[i]} [${pipeline}]`, node: node(["belt", i]), expanded: isOpen(["belt", i]), indent: 1, ...mover(["belt"], i, belts.length) });
     if (!isOpen(["belt", i])) return;
     d.push({ kind: "text", label: "name", path: ["belt", i, "name"], placeholder: "my_belt", indent: 2 });
-    d.push({
-      kind: "enum",
-      label: "belt_type",
-      value: beltType,
-      choices: ["work_to_pull_request", "custom"],
-      indent: 2,
-      apply: (next) => {
-        if (next === beltType) return;
-        const base: Record<string, unknown> = {
-          belt_type: next,
-          name: b?.name ?? uniqueName("belt", beltNames),
-          source: b?.source ?? sourceNames[0] ?? "",
-          priority: b?.priority ?? 100,
-        };
-        if (b?.workspace_name != null) base.workspace_name = b.workspace_name;
-        if (b?.match != null) base.match = b.match;
-        const built = next === "work_to_pull_request" ? { ...base, agents: prAgents() } : { ...base, steps: [defaultStep("step")] };
-        draft.setIn(["belt", i], draft.createNode(built));
-        open(["belt", i]);
-        rebuild();
-      },
-    });
     d.push({ kind: "ref", label: "source", value: String(b?.source ?? ""), choices: sourceNames.length ? sourceNames : [""], indent: 2, apply: (next) => { draft.setIn(["belt", i, "source"], next); rebuild(); } });
     d.push({ kind: "text", label: "priority", path: ["belt", i, "priority"], placeholder: "100", numeric: true, indent: 2 });
     // The per-belt pickup label — shown only for a label-driven source (jira/github_issues), where
@@ -171,34 +158,26 @@ export function buildDescriptors(draft: Document, rebuild: () => void, confirm: 
     d.push({ kind: "text", label: "workspace_name", path: ["belt", i, "workspace_name"], placeholder: "{{work_id}}-{{work_slug}}", indent: 2 });
     d.push({ kind: "text", label: "match", path: ["belt", i, "match"], placeholder: "match.ts (optional)", indent: 2 });
 
-    if (beltType === "work_to_pull_request") {
-      for (const step of ["fix", "evidence", "review", "pr"] as const) {
-        // evidence runs ONLY when tab+pane are set (delivers to that pane's existing agent); blank ⇒ skipped.
-        const tabHint = step === "evidence" ? "(evidence runs only if tab+pane set; else skipped)" : "(optional; set with pane)";
-        const paneHint = step === "evidence" ? "(evidence runs only if tab+pane set; else skipped)" : "(optional; set with tab)";
-        d.push({ kind: "header", label: `agents.${step}`, level: 2, indent: 2 });
-        d.push({ kind: "text", label: "tab", path: ["belt", i, "agents", step, "tab"], placeholder: tabHint, indent: 3 });
-        d.push({ kind: "text", label: "pane", path: ["belt", i, "agents", step, "pane"], placeholder: paneHint, indent: 3 });
-        d.push({ kind: "text", label: "prompt_file", path: ["belt", i, "agents", step, "prompt_file"], placeholder: "(optional)", indent: 3 });
-        d.push(optionalSource(["belt", i, "agents", step, "prompt_file_source"], b?.agents?.[step]?.prompt_file_source, draft, rebuild, 3));
-      }
-    } else {
-      const steps: any[] = Array.isArray(b?.steps) ? b.steps : [];
-      const stepNames = steps.map((s, j) => String(s?.name ?? `step${j}`));
-      steps.forEach((st, j) => {
-        d.push({ kind: "group", label: stepNames[j]!, node: node(["belt", i, "steps", j]), expanded: isOpen(["belt", i, "steps", j]), indent: 2, ...mover(["belt", i, "steps"], j, steps.length) });
-        if (!isOpen(["belt", i, "steps", j])) return;
-        d.push({ kind: "text", label: "name", path: ["belt", i, "steps", j, "name"], placeholder: "research", indent: 3 });
-        d.push({ kind: "text", label: "prompt_file", path: ["belt", i, "steps", j, "prompt_file"], placeholder: "prompts/step.md", indent: 3 });
-        d.push({ kind: "enum", label: "prompt_file_source", value: String(st?.prompt_file_source ?? "config"), choices: ["config", "repo"], indent: 3, apply: (next) => { draft.setIn(["belt", i, "steps", j, "prompt_file_source"], next); rebuild(); } });
-        d.push({ kind: "text", label: "budget_seconds", path: ["belt", i, "steps", j, "budget_seconds"], placeholder: "(optional)", numeric: true, indent: 3 });
-        d.push({ kind: "bool", label: "heartbeat", value: st?.heartbeat === true, indent: 3, apply: (next) => { draft.setIn(["belt", i, "steps", j, "heartbeat"], next); rebuild(); } });
-        d.push({ kind: "text", label: "tab", path: ["belt", i, "steps", j, "tab"], placeholder: "(optional; set with pane)", indent: 3 });
-        d.push({ kind: "text", label: "pane", path: ["belt", i, "steps", j, "pane"], placeholder: "(optional; set with tab)", indent: 3 });
-        d.push({ kind: "action", label: "‹ remove step ›", indent: 3, run: () => { void confirm(`Remove step "${stepNames[j]}"?`).then((ok) => { if (ok) { draft.deleteIn(["belt", i, "steps", j]); rebuild(); } }); } });
-      });
-      d.push({ kind: "action", label: "+ add step", indent: 2, run: () => { draft.addIn(["belt", i, "steps"], draft.createNode(defaultStep(uniqueName("step", stepNames)))); open(["belt", i, "steps", steps.length]); rebuild(); } });
-    }
+    // steps[] — an ordered list of step-primitive references. `type` picks the primitive; a `custom`
+    // step's prompt_file is its whole body (required), an engine-prompted step's is an optional augment.
+    const stepNames = steps.map((s, j) => String(s?.name ?? s?.type ?? `step${j}`));
+    steps.forEach((st, j) => {
+      const stType = String(st?.type ?? "custom");
+      d.push({ kind: "group", label: `${stepNames[j]} (${stType})`, node: node(["belt", i, "steps", j]), expanded: isOpen(["belt", i, "steps", j]), indent: 2, ...mover(["belt", i, "steps"], j, steps.length) });
+      if (!isOpen(["belt", i, "steps", j])) return;
+      d.push({ kind: "enum", label: "type", value: stType, choices: STEP_TYPE_CHOICES, indent: 3, apply: (next) => { if (next !== stType) { draft.setIn(["belt", i, "steps", j, "type"], next); rebuild(); } } });
+      d.push({ kind: "text", label: "name", path: ["belt", i, "steps", j, "name"], placeholder: `${stType} (defaults to type)`, indent: 3 });
+      // evidence runs ONLY when tab+pane target an existing layout agent; without them it's skipped.
+      const layoutHint = stType === "evidence" ? "(evidence runs only if tab+pane set; else skipped)" : "(optional; set with the other)";
+      d.push({ kind: "text", label: "tab", path: ["belt", i, "steps", j, "tab"], placeholder: layoutHint, indent: 3 });
+      d.push({ kind: "text", label: "pane", path: ["belt", i, "steps", j, "pane"], placeholder: layoutHint, indent: 3 });
+      d.push({ kind: "text", label: "prompt_file", path: ["belt", i, "steps", j, "prompt_file"], placeholder: stType === "custom" ? "prompts/step.md (required)" : "(optional augment)", indent: 3 });
+      d.push(optionalSource(["belt", i, "steps", j, "prompt_file_source"], st?.prompt_file_source, draft, rebuild, 3));
+      d.push({ kind: "text", label: "budget_seconds", path: ["belt", i, "steps", j, "budget_seconds"], placeholder: "(optional; default per type)", numeric: true, indent: 3 });
+      d.push({ kind: "bool", label: "heartbeat", value: st?.heartbeat === true, indent: 3, apply: (next) => { draft.setIn(["belt", i, "steps", j, "heartbeat"], next); rebuild(); } });
+      d.push({ kind: "action", label: "‹ remove step ›", indent: 3, run: () => { void confirm(`Remove step "${stepNames[j]}"?`).then((ok) => { if (ok) { draft.deleteIn(["belt", i, "steps", j]); rebuild(); } }); } });
+    });
+    d.push({ kind: "action", label: "+ add step", indent: 2, run: () => { draft.addIn(["belt", i, "steps"], draft.createNode(defaultStep(uniqueName("step", stepNames)))); open(["belt", i, "steps", steps.length]); rebuild(); } });
     d.push({ kind: "action", label: "‹ remove belt ›", indent: 2, run: () => { void confirm(`Remove belt "${beltNames[i]}"?`).then((ok) => { if (ok) { draft.deleteIn(["belt", i]); rebuild(); } }); } });
   });
   d.push({
@@ -206,7 +185,7 @@ export function buildDescriptors(draft: Document, rebuild: () => void, confirm: 
     label: "+ add belt",
     indent: 1,
     run: () => {
-      draft.addIn(["belt"], draft.createNode({ belt_type: "custom", name: uniqueName("belt", beltNames), source: sourceNames[0] ?? "", priority: 100, steps: [defaultStep("step")] }));
+      draft.addIn(["belt"], draft.createNode({ name: uniqueName("belt", beltNames), source: sourceNames[0] ?? "", priority: 100, steps: [{ type: "work", name: "work" }] }));
       open(["belt", belts.length]);
       rebuild();
     },

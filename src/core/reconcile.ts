@@ -9,6 +9,7 @@ import type { HumanQuestion, HumanReply, MatchItem, Outcome, PrInfo, PrSnapshot,
 import { outcomeToWorkState, StaleItemError, ticketOf } from "../types.ts";
 import { branchName } from "./branch.ts";
 import { firstStep, indexOfStep, materializeWork, MEMORY_DIR, nextStep, spawnStep, stepByName } from "./step.ts";
+import { STEP_DESCRIPTORS } from "../steps/registry.ts";
 import { wakeResolver } from "./watch.ts";
 import { recordTick, recordTickDuration, recordTickLockSkipped, telemetryEvent, telemetrySpan } from "../telemetry/index.ts";
 
@@ -986,9 +987,13 @@ export async function recordCaptureAttempt(
   deps: Deps,
   run: Run,
   belt: BeltRuntime,
+  stepArg?: string,
 ): Promise<{ ok: boolean; attempts?: number; escalated?: boolean; message?: string }> {
   const step = run.step;
   if (run.phase !== "running" || !step) return { ok: false, message: "no running step to record a capture attempt for" };
+  // The signal now names its step explicitly (a belt may have >1 evidence step); reject one
+  // addressed to a step that isn't the one currently running (a stale/misaddressed capture-attempt).
+  if (stepArg && stepArg !== step) return { ok: false, message: `capture-attempt names step "${stepArg}" but the running step is "${step}"` };
   const s = stepByName(belt, step);
   if (!s) return { ok: false, message: `step "${step}" is not in belt "${belt.name}"` };
   if (!s.gathersEvidence) return { ok: false, message: `the ${step} step does not gather evidence` };
@@ -1020,7 +1025,15 @@ const HUMAN_POLL_ERROR_ESCALATE = 20;
  *  looping, so a genuine step-done from the parked step un-parks the run and lets the pipeline advance
  *  (reconcileAttention). Every OTHER park — source item gone, PR closed, bounce oscillation, human
  *  loop, config error — needs a human decision and is never auto-rescued. */
-const STEP_WATCHDOG_ATTENTION = new Set(["capture_limit", "step_budget", "step_stalled", "layout_wait_timeout"]);
+// DERIVED (not a hardcoded literal) as the union of every registered step primitive's guards whose
+// `autoRescueOnDone` is true. A plugin guard that parks a run participates automatically — no edit
+// to a literal Set. read_only_violation / source_item_stale / pr_closed / bounce_limit / human /
+// config parks are NOT guards, so they stay non-auto-rescued (a human decides).
+const STEP_WATCHDOG_ATTENTION = new Set(
+  STEP_DESCRIPTORS.flatMap((d) => d.guards)
+    .filter((g) => g.autoRescueOnDone)
+    .map((g) => g.escalationReason),
+);
 
 /** The item backing a pending human question is gone (deleted/transferred) — the reply can never
  *  arrive. Park for a human; no source note (the item it would go to is what's gone). */
@@ -1184,6 +1197,21 @@ async function reconcileStep(deps: Deps, run: Run, belt: BeltRuntime, src: Sourc
   if (pr && pr.state !== "CLOSED" && run.prNumber !== pr.number) deps.store.updateRun(run.id, { prNumber: pr.number });
   if (pr && pr.state === "CLOSED" && pr.number === run.prNumber) return prClosedAttention(deps, run, pr);
   const livePr = pr && pr.state !== "CLOSED" ? pr : null;
+
+  // read_only enforcement: a read-only step (review/evidence) must never edit or commit. The
+  // baseline HEAD was captured at spawn (progressSig); a moved HEAD means it committed — a contract
+  // violation. Park for a human (NOT auto-rescuable) rather than advancing a step that misbehaved.
+  if (step.readOnly && rs.progressSig && run.worktreePath) {
+    const head = await deps.git.headSha(run.worktreePath).catch(() => null);
+    if (head && head !== rs.progressSig) {
+      return escalateAttention(deps, run, {
+        reason: "read_only_violation",
+        attentionReason: `${step.name} is read-only but committed (HEAD moved)`,
+        body: `${run.ticketKey}: the ${step.name} step is read-only — it must never edit or commit — but the branch HEAD moved from ${rs.progressSig.slice(0, 8)} to ${head.slice(0, 8)}. A human should review; the agent violated the read-only contract.`,
+        detail: { step: step.name, baseline: rs.progressSig, head },
+      });
+    }
+  }
 
   // Advance when the agent signalled step-done (or its PR merged out from under us).
   if (rs.done || livePr?.state === "MERGED") {

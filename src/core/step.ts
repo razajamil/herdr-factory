@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 import type { StepConfig } from "../config.ts";
 import type { BeltRuntime, Deps, SourceRuntime } from "./deps.ts";
 import type { Run, RunStep } from "../types.ts";
+import { signalCommand } from "../signals/registry.ts";
 import { telemetrySpan } from "../telemetry/index.ts";
 
 export const CLAUDE_FLAGS = ["--dangerously-skip-permissions"];
@@ -224,22 +225,23 @@ async function renderStepPromptImpl(
 ): Promise<void> {
   const worktree = run.worktreePath;
   if (!worktree) throw new Error(`${run.ticketKey}: no worktree path`);
-  // The step-done command carries --source so the signal resolves to the right run even when two
-  // sources share a key (the worker only knows its key, via HERDR_FACTORY_TICKET).
-  const stepDoneCmd = `${CLI_PATH} --repo ${deps.config.repoName} step-done ${run.ticketKey} ${step.name} --source ${src.name}`;
-  const askHumanCmd = `${CLI_PATH} --repo ${deps.config.repoName} ask-human ${run.ticketKey} ${step.name} --source ${src.name} --question-file ${MEMORY_DIR}/human-question-${step.name}.md`;
-  // Publishes @@EVIDENCE_DIR@@ to S3/CloudFront and prints the public URLs (no-op if `evidence:` is
-  // unconfigured). Available to every step; the evidence step is the one that uses it.
-  const evidenceUploadCmd = `${CLI_PATH} --repo ${deps.config.repoName} evidence-upload ${run.ticketKey} --source ${src.name}`;
-  // The evidence step calls this at the start of each capture attempt; the engine bumps a per-run
-  // counter and parks the run past limits.maxCaptureAttempts (a flaky app can't loop re-capturing
-  // forever). No-op-ish for any step that never calls it. Available to every step; evidence uses it.
-  const captureAttemptCmd = `${CLI_PATH} --repo ${deps.config.repoName} capture-attempt ${run.ticketKey} --source ${src.name}`;
+  // Every agent-facing command token is RENDERED from the signal registry (signalCommand), so a
+  // token an agent runs can't drift from the mounted CLI/HTTP command. --source is always bound so
+  // the signal resolves to the right run even when two sources share a key (the worker only knows
+  // its key, via HERDR_FACTORY_TICKET).
+  const repo = deps.config.repoName;
+  const stepDoneCmd = signalCommand(CLI_PATH, repo, "step-done", { key: run.ticketKey, step: step.name, source: src.name });
+  const askHumanCmd = signalCommand(CLI_PATH, repo, "ask-human", { key: run.ticketKey, step: step.name, source: src.name, "question-file": `${MEMORY_DIR}/human-question-${step.name}.md` });
+  // evidence-upload publishes @@EVIDENCE_DIR@@ to S3/CloudFront (no-op if `evidence:` is unconfigured);
+  // capture-attempt signals the start of a capture so the engine caps flaky-capture loops. Both are
+  // capability-gated below (only injected for a step that produces/consumes evidence).
+  const evidenceUploadCmd = signalCommand(CLI_PATH, repo, "evidence-upload", { key: run.ticketKey, source: src.name });
+  const captureAttemptCmd = signalCommand(CLI_PATH, repo, "capture-attempt", { key: run.ticketKey, step: step.name, source: src.name });
   // For a step that may bounce (evidence/review), a ready-made command that returns the run to its
   // first `canBounceTo` target with a findings file. Empty for steps that can't bounce.
   const bounceTarget = step.canBounceTo[0];
   const bounceCmd = bounceTarget
-    ? `${CLI_PATH} --repo ${deps.config.repoName} bounce ${run.ticketKey} ${bounceTarget} --source ${src.name} --reason-file ${MEMORY_DIR}/bounce-${step.name}.md`
+    ? signalCommand(CLI_PATH, repo, "bounce", { key: run.ticketKey, toStep: bounceTarget, source: src.name, "reason-file": `${MEMORY_DIR}/bounce-${step.name}.md` })
     : "";
   // Where the work item's spec lives + how to describe it — the SOURCE owns this (workDoc pairs
   // with its materialize; the engine never branches on source type). It may stat the worktree's
@@ -260,11 +262,10 @@ async function renderStepPromptImpl(
     "@@MEMORY_DIR@@": MEMORY_DIR,
     "@@WORK_DOC@@": workDoc,
     "@@WORK_DOC_KIND@@": workDocKind,
-    "@@EVIDENCE_DIR@@": `${MEMORY_DIR}/evidence`,
-    "@@EVIDENCE_UPLOAD_CMD@@": evidenceUploadCmd,
-    "@@CAPTURE_ATTEMPT_CMD@@": captureAttemptCmd,
     "@@BOUNCE_CMD@@": bounceCmd,
     "@@BOUNCE_TARGET@@": bounceTarget ?? "",
+    "@@BOUNCE_REASON_FILE@@": bounceTarget ? `${MEMORY_DIR}/bounce-${step.name}.md` : "",
+    "@@ASK_HUMAN_CMD@@": askHumanCmd,
     "@@CLI@@": CLI_PATH,
     "@@HANDOFF_IN@@": prior ? `${MEMORY_DIR}/handoff-${prior.step}.md` : "(none — first step)",
     "@@HANDOFF_OUT@@": `${MEMORY_DIR}/handoff-${step.name}.md`,
@@ -272,6 +273,15 @@ async function renderStepPromptImpl(
     "@@PRIOR_SESSION@@": prior?.sessionId ?? "(none)",
     "@@STEP_DONE_CMD@@": stepDoneCmd,
   };
+  // Capability-scoped tokens: the evidence tokens are injected only for a step that produces or
+  // consumes evidence (the universal tokens above are always injected) — the registry-driven
+  // "universal ∪ capability tokens" map. A step that declares neither never sees @@EVIDENCE_*@@.
+  const usesEvidence = step.produces.includes("evidence") || step.consumes.some((c) => c.type === "evidence");
+  if (usesEvidence) {
+    sub["@@EVIDENCE_DIR@@"] = `${MEMORY_DIR}/evidence`;
+    sub["@@EVIDENCE_UPLOAD_CMD@@"] = evidenceUploadCmd;
+    sub["@@CAPTURE_ATTEMPT_CMD@@"] = captureAttemptCmd;
+  }
   let out = stepBody(deps, run, step);
   for (const [token, value] of Object.entries(sub)) out = out.replaceAll(token, () => value);
   if (deps.config.guidance) out += `\n\n## Repo-specific guidance\n\n${deps.config.guidance}\n`;
@@ -357,6 +367,13 @@ async function spawnStepImpl(
   // not cumulatively across crash-recovery re-spawns or the preceding layout wait), and clear
   // any pending absence confirmation — this pane is definitionally alive right now.
   deps.store.upsertRunStep(run.id, stepName, { paneId: result.paneId, startedAt: deps.now(), absentAt: null });
+  // read_only enforcement baseline: capture HEAD before the agent runs, so a later commit (a
+  // read-only-contract violation) is detectable as HEAD movement in reconcileStep. Read-only steps
+  // never have a heartbeat, so progressSig is free to hold this baseline.
+  if (step.readOnly && worktree) {
+    const head = await deps.git.headSha(worktree).catch(() => null);
+    if (head) deps.store.upsertRunStep(run.id, stepName, { progressSig: head });
+  }
   deps.store.updateRun(run.id, { paneId: result.paneId }); // latest active pane (reviewing/resolver reuse it)
   deps.store.recordEvent({
     runId: run.id,

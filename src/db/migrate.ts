@@ -312,6 +312,37 @@ const MIGRATIONS: { version: number; sql: string }[] = [
       ALTER TABLE runs DROP COLUMN watch_deadline;
     `,
   },
+  {
+    version: 18,
+    // run_products: PR-watch state (pr_number / resolver_active / last_thread_sig) moves OFF the
+    // `runs` table into a per-(run, product) table, so a future plugin product with a watch can
+    // carry its own state instead of squatting on run columns. Behavior is UNCHANGED: the store
+    // still exposes run.prNumber / resolverActive / lastThreadSig, now backed by this table via a
+    // LEFT JOIN on product='pull_request' (absent row ⇒ NULL number/signature, active=0). Backfill
+    // every run that had any of the three set into a 'pull_request' row (same transaction), then
+    // DROP the now-unread runs columns (SQLite DROP COLUMN, exactly as v17 dropped watch_deadline).
+    // UNIQUE(run_id, product) both dedups and indexes the join. Its created_at/updated_at seed from
+    // the run's so backfilled rows keep a sensible mtime.
+    sql: `
+      CREATE TABLE run_products (
+        run_id INTEGER NOT NULL REFERENCES runs(id),
+        product TEXT NOT NULL,
+        number INTEGER,
+        active INTEGER NOT NULL DEFAULT 0,
+        signature TEXT,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        UNIQUE(run_id, product)
+      );
+      INSERT INTO run_products (run_id, product, number, active, signature, created_at, updated_at)
+        SELECT id, 'pull_request', pr_number, resolver_active, last_thread_sig, created_at, updated_at
+        FROM runs
+        WHERE pr_number IS NOT NULL OR resolver_active <> 0 OR last_thread_sig IS NOT NULL;
+      ALTER TABLE runs DROP COLUMN pr_number;
+      ALTER TABLE runs DROP COLUMN resolver_active;
+      ALTER TABLE runs DROP COLUMN last_thread_sig;
+    `,
+  },
 ];
 
 /** Apply pending migrations in a transaction. Idempotent. */

@@ -481,14 +481,14 @@ program
   }));
 
 program
-  .command("capture-attempt <key>")
+  .command("capture-attempt <key> <step>")
   .description("an evidence agent signals the start of a capture attempt — the engine caps flaky-capture loops")
   .option("--source <name>", "the work source the run belongs to (passed by the agent)")
-  .action(cliAction("capture-attempt", async (key: string, opts: { source?: string }) => {
+  .action(cliAction("capture-attempt", async (key: string, step: string, opts: { source?: string }) => {
     try {
       const repo = requireRepo();
       const { data } = await viaServerOrLocal(
-        { method: "POST", path: `/repos/${encodeURIComponent(repo)}/capture-attempt`, body: { key, source: opts.source } },
+        { method: "POST", path: `/repos/${encodeURIComponent(repo)}/capture-attempt`, body: { key, step, source: opts.source } },
         async () => {
           const deps = await buildDeps(repo);
           const run = resolveActiveRun(deps, key, opts.source);
@@ -500,7 +500,7 @@ program
           if (!belt) return { ok: false, message: `run has no configured belt "${run.belt}"` };
           // Past the cap this parks the run (a non-monotonic phase flip), so run it UNDER the run
           // lock — serialized against the tick's pass over this run, like bounce.
-          const { ran, result } = await withRunLockWaiting(deps, run.id, () => recordCaptureAttempt(deps, deps.store.getRun(run.id)!, belt));
+          const { ran, result } = await withRunLockWaiting(deps, run.id, () => recordCaptureAttempt(deps, deps.store.getRun(run.id)!, belt, step));
           if (!ran) return { ok: false, message: "run busy — retry the capture-attempt in a moment" };
           return result!;
         },

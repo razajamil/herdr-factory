@@ -180,12 +180,14 @@ describe("Store", () => {
   it("migration v6 backfills pre-existing runs to 'jira' and adds work_items (idempotent)", () => {
     const db = new DatabaseSync(":memory:");
     // Simulate a pre-v6 DB: schema_version=5, a runs table WITHOUT work_source, one in-flight row.
-    // Include watch_deadline (part of the v1 CREATE TABLE) so v17's DROP COLUMN applies cleanly, and
+    // Include watch_deadline + pr_number + last_thread_sig (all part of the v1 CREATE TABLE) so v17's
+    // and v18's DROP COLUMNs apply cleanly (resolver_active is ADDED by v17, then dropped by v18), and
     // seed run_steps (created back in v4) so v9's ALTER applies — a genuine v5 DB always has both.
     db.exec(`
       CREATE TABLE schema_version (version INTEGER NOT NULL);
       INSERT INTO schema_version (version) VALUES (5);
       CREATE TABLE runs (id INTEGER PRIMARY KEY AUTOINCREMENT, repo TEXT, ticket_key TEXT, phase TEXT,
+        pr_number INTEGER, last_thread_sig TEXT,
         watch_deadline INTEGER, created_at INTEGER, updated_at INTEGER, ended_at INTEGER);
       INSERT INTO runs (repo, ticket_key, phase, created_at, updated_at) VALUES ('r','OLD-1','fixing',1,1);
       CREATE TABLE run_steps (id INTEGER PRIMARY KEY AUTOINCREMENT, run_id INTEGER NOT NULL, step TEXT NOT NULL,
@@ -199,6 +201,26 @@ describe("Store", () => {
     expect(row.work_source).toBe("jira"); // backfilled in the same migration
     expect(db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='work_items'").get()).toBeTruthy();
     expect(() => migrate(db)).not.toThrow(); // re-running is a no-op
+  });
+
+  it("run_products backs prNumber/resolverActive/lastThreadSig + gates reviewing occupancy (v18)", () => {
+    const { store } = makeStore(1000);
+    const run = store.createRun({ repo: "r", workSource: "jira", belt: "b", ticketKey: "K-1" });
+    // A fresh run has no pull_request row → the LEFT JOIN yields null/idle.
+    expect(store.getRun(run.id)!.prNumber).toBeNull();
+    expect(store.getRun(run.id)!.resolverActive).toBe(false);
+    // Adopting a PR + recording a thread signature routes into run_products (not the runs table).
+    store.updateRun(run.id, { prNumber: 42, lastThreadSig: "sig-1" });
+    const r = store.getRun(run.id)!;
+    expect(r.prNumber).toBe(42);
+    expect(r.lastThreadSig).toBe("sig-1");
+    expect(r.resolverActive).toBe(false); // partial upsert left active untouched
+    // A reviewing run with an idle resolver holds NO slot; an active resolver holds one.
+    store.updateRun(run.id, { phase: "reviewing", resolverActive: false });
+    expect(store.countOccupying("r")).toBe(0);
+    store.updateRun(run.id, { resolverActive: true });
+    expect(store.getRun(run.id)!.resolverActive).toBe(true);
+    expect(store.countOccupying("r")).toBe(1);
   });
 
   it("TTL lock: acquire, block, steal after expiry, release", () => {

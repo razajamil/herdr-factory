@@ -288,7 +288,7 @@ export function createApp(ctx: ServerContext): OpenAPIHono {
 
   app.openapi(captureAttemptRoute, async (c) => {
     const { repo } = c.req.valid("param");
-    const { key, source } = c.req.valid("json");
+    const { key, step, source } = c.req.valid("json");
     const rt = ctx.getRepo(repo);
     if (!rt) return c.json({ error: notConfigured(repo) }, 404);
     const run = resolveActiveRun(rt.deps, key, source);
@@ -298,7 +298,7 @@ export function createApp(ctx: ServerContext): OpenAPIHono {
     // Past the cap this parks the run (running → attention) — a non-monotonic flip, so hold the run
     // lock like bounce/ask-human: a concurrent reconcile on a stale `running` snapshot must not
     // overwrite the escalation.
-    const { ran, result } = await withRunLockWaiting(rt.deps, run.id, () => recordCaptureAttempt(rt.deps, rt.deps.store.getRun(run.id)!, belt));
+    const { ran, result } = await withRunLockWaiting(rt.deps, run.id, () => recordCaptureAttempt(rt.deps, rt.deps.store.getRun(run.id)!, belt, step));
     if (!ran) return c.json({ ok: false, message: `${key}: run busy — retry the capture-attempt` }, 200);
     return c.json(result!, 200);
   });

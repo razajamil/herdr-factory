@@ -73,6 +73,16 @@ function toRun(r: RunRow): Run {
   };
 }
 
+// Runs are read joined to their pull_request product row (run_products), so toRun() still receives
+// pr_number / resolver_active / last_thread_sig — that PR-watch state moved off `runs` into
+// run_products (product='pull_request') in migration v18. A run with no PR yet has no row, so the
+// LEFT JOIN yields NULL number/signature and COALESCE(active, 0)=0 (resolver idle). Callers keep
+// reading run.prNumber / run.resolverActive / run.lastThreadSig exactly as before. Columns are
+// qualified with `r.` in WHERE/ORDER BY because run_products also has created_at/updated_at.
+const RUN_SELECT =
+  "SELECT r.*, rp.number AS pr_number, COALESCE(rp.active, 0) AS resolver_active, rp.signature AS last_thread_sig " +
+  "FROM runs r LEFT JOIN run_products rp ON rp.run_id = r.id AND rp.product = 'pull_request'";
+
 interface RunStepRow {
   id: number;
   run_id: number;
@@ -250,12 +260,16 @@ export class Store {
    *  neither a pile of human-blocked runs nor a long-lived PR in review starves the belt of new
    *  claims. This is what lets the PR watch ride with no time limit (there is no watch_hours). */
   countOccupying(repo: string): number {
+    // Joins run_products so a `reviewing` run occupies a slot only while its pull_request watch is
+    // active (COALESCE(rp.active,0)) — the idleHoldsSlot=false posture. A future plugin watch-product
+    // would plug its declared occupancy posture in here rather than hardcoding 'pull_request'.
     const row = this.db
       .prepare(
-        `SELECT COUNT(*) AS n FROM runs
-         WHERE repo = ? AND ended_at IS NULL
-           AND phase NOT IN ('attention', 'waiting_for_human')
-           AND NOT (phase = 'reviewing' AND resolver_active = 0)`,
+        `SELECT COUNT(*) AS n FROM runs r
+         LEFT JOIN run_products rp ON rp.run_id = r.id AND rp.product = 'pull_request'
+         WHERE r.repo = ? AND r.ended_at IS NULL
+           AND r.phase NOT IN ('attention', 'waiting_for_human')
+           AND NOT (r.phase = 'reviewing' AND COALESCE(rp.active, 0) = 0)`,
       )
       .get(repo) as { n: number };
     return row.n;
@@ -263,7 +277,7 @@ export class Store {
 
   activeRuns(repo: string): Run[] {
     const rows = this.db
-      .prepare("SELECT * FROM runs WHERE repo = ? AND ended_at IS NULL ORDER BY created_at")
+      .prepare(`${RUN_SELECT} WHERE r.repo = ? AND r.ended_at IS NULL ORDER BY r.created_at`)
       .all(repo) as unknown as RunRow[];
     return rows.map(toRun);
   }
@@ -272,7 +286,7 @@ export class Store {
    *  two sources can legitimately carry the same key (e.g. a Jira ticket and a like-named .md). */
   activeRunForTicket(repo: string, source: string, key: string): Run | undefined {
     const row = this.db
-      .prepare("SELECT * FROM runs WHERE repo = ? AND work_source = ? AND ticket_key = ? AND ended_at IS NULL")
+      .prepare(`${RUN_SELECT} WHERE r.repo = ? AND r.work_source = ? AND r.ticket_key = ? AND r.ended_at IS NULL`)
       .get(repo, source, key) as RunRow | undefined;
     return row ? toRun(row) : undefined;
   }
@@ -281,13 +295,13 @@ export class Store {
    *  step-done) which is given only a key. The caller errors when this returns >1 (ambiguous). */
   activeRunsForKey(repo: string, key: string): Run[] {
     const rows = this.db
-      .prepare("SELECT * FROM runs WHERE repo = ? AND ticket_key = ? AND ended_at IS NULL ORDER BY id")
+      .prepare(`${RUN_SELECT} WHERE r.repo = ? AND r.ticket_key = ? AND r.ended_at IS NULL ORDER BY r.id`)
       .all(repo, key) as unknown as RunRow[];
     return rows.map(toRun);
   }
 
   getRun(id: number): Run | undefined {
-    const row = this.db.prepare("SELECT * FROM runs WHERE id = ?").get(id) as RunRow | undefined;
+    const row = this.db.prepare(`${RUN_SELECT} WHERE r.id = ?`).get(id) as RunRow | undefined;
     return row ? toRun(row) : undefined;
   }
 
@@ -335,16 +349,25 @@ export class Store {
     if (patch.workspaceId !== undefined) set("workspace_id", patch.workspaceId);
     if (patch.paneId !== undefined) set("pane_id", patch.paneId);
     if (patch.worktreePath !== undefined) set("worktree_path", patch.worktreePath);
-    if (patch.prNumber !== undefined) set("pr_number", patch.prNumber);
-    if (patch.resolverActive !== undefined) set("resolver_active", patch.resolverActive ? 1 : 0);
-    if (patch.lastThreadSig !== undefined) set("last_thread_sig", patch.lastThreadSig);
     if (patch.attentionReason !== undefined) set("attention_reason", patch.attentionReason);
     if (patch.attentionNotifiedAt !== undefined) set("attention_notified_at", patch.attentionNotifiedAt);
     if (patch.outcome !== undefined) set("outcome", patch.outcome);
     if (patch.focusPending !== undefined) set("focus_pending", patch.focusPending ? 1 : 0);
-    if (sets.length === 0) return;
-    set("updated_at", this.now());
-    this.db.prepare(`UPDATE runs SET ${sets.join(", ")} WHERE id = ?`).run(...vals, id);
+    // PR-watch state lives in run_products (v18), not on `runs` — route those three fields there.
+    const prod: { number?: number | null; active?: boolean; signature?: string | null } = {};
+    if (patch.prNumber !== undefined) prod.number = patch.prNumber;
+    if (patch.resolverActive !== undefined) prod.active = patch.resolverActive;
+    if (patch.lastThreadSig !== undefined) prod.signature = patch.lastThreadSig;
+    const hasProd = prod.number !== undefined || prod.active !== undefined || prod.signature !== undefined;
+    if (sets.length === 0 && !hasProd) return;
+    if (hasProd) this.setRunProduct(id, "pull_request", prod);
+    if (sets.length > 0) {
+      set("updated_at", this.now());
+      this.db.prepare(`UPDATE runs SET ${sets.join(", ")} WHERE id = ?`).run(...vals, id);
+    } else {
+      // product-only patch: still bump the run's mtime so it reflects the change.
+      this.db.prepare("UPDATE runs SET updated_at = ? WHERE id = ?").run(this.now(), id);
+    }
     const run = this.getRun(id);
     telemetryEvent("store.run.update", {
       repo: run?.repo,
@@ -355,6 +378,38 @@ export class Store {
       outcome: run?.outcome ?? undefined,
       "patch.fields": patchFields(patch),
     });
+  }
+
+  /** Upsert a run's per-product watch state (run_products, v18) — the store-layer backing for a
+   *  run's prNumber/resolverActive/lastThreadSig, keyed by product so a future plugin watch-product
+   *  carries its own. Partial: only the provided fields change; the row is created on first touch. */
+  private setRunProduct(runId: number, product: string, patch: { number?: number | null; active?: boolean; signature?: string | null }): void {
+    const t = this.now();
+    const exists = this.db.prepare("SELECT 1 FROM run_products WHERE run_id = ? AND product = ?").get(runId, product);
+    if (!exists) {
+      this.db
+        .prepare("INSERT INTO run_products (run_id, product, number, active, signature, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)")
+        .run(runId, product, patch.number ?? null, patch.active ? 1 : 0, patch.signature ?? null, t, t);
+      return;
+    }
+    const sets: string[] = [];
+    const vals: Bind[] = [];
+    if (patch.number !== undefined) {
+      sets.push("number = ?");
+      vals.push(patch.number);
+    }
+    if (patch.active !== undefined) {
+      sets.push("active = ?");
+      vals.push(patch.active ? 1 : 0);
+    }
+    if (patch.signature !== undefined) {
+      sets.push("signature = ?");
+      vals.push(patch.signature);
+    }
+    if (sets.length === 0) return;
+    sets.push("updated_at = ?");
+    vals.push(t);
+    this.db.prepare(`UPDATE run_products SET ${sets.join(", ")} WHERE run_id = ? AND product = ?`).run(...vals, runId, product);
   }
 
   endRun(id: number, outcome: Outcome): void {

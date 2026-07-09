@@ -23,14 +23,21 @@ optional unique `name` (default = the type) + its backend block.
 `priority`, and an optional programmatic `match` predicate (a `.ts` default export
 `(ctx) => boolean`, sync or async, with `ctx = { item, source: { name, type } }`; no `match` ⇒
 accept all) — at claim time belts are walked in priority order and the first that accepts an
-item claims it (**first match wins**). Two `belt_type`s ship:
+item claims it (**first match wins**). A belt is one ordered `steps[]` list; each step references a
+registered **step primitive** by `type`, and the belt's lifecycle is **derived** from what its steps
+declare — there is no `belt_type`:
 
-- **`work_to_pull_request`** — the engine-owned `fix → evidence → review → pr` flow (evidence is
-  opt-in — see [§7](#7-the-reconciler--multi-agent-pipeline)) + the PR-watch/merge lifecycle
-  (`reviewing` phase, resolver).
-- **`custom`** — user-defined ordered `steps[]`, each with its own `prompt_file` as the whole
-  step body, fully agent-driven: the run ends when the **last** step signals `step-done`
-  (no PR, no `reviewing`).
+- Five primitives ship (`src/steps/registry.ts`) — **`work`** (implement + commit), **`evidence`**
+  (opt-in visual proof; can bounce), **`review`** (read-only gate; can bounce), **`pr`** (open the PR
+  + ride CI), and the generic **`custom`** (a user step whose `prompt_file` is the whole body).
+- The canonical **`work_to_pull_request`** belt is `steps: [work, evidence, review, pr]`: because its
+  `pr` step *produces* a pull request, the belt gets the PR-watch/merge lifecycle (`reviewing` phase,
+  resolver) + the `in_review` write-back (see [§7](#7-the-reconciler--multi-agent-pipeline)). A belt
+  with no PR-producing step (e.g. all `custom` steps) just runs its steps and ends when the **last**
+  signals `step-done` — no PR, no `reviewing`.
+- Composition is validated at load: each primitive declares typed `consumes`/`produces`, and a belt
+  whose step needs an input nothing upstream (source or an earlier step) produces is rejected — so a
+  hand-built belt is as reliable as the shipped one.
 
 A run records its `belt` + active `step`; phases are `claiming | running | waiting_for_human |
 reviewing | tearing_down | done | attention` (`waiting_for_human` is the ask-human park,
@@ -186,8 +193,10 @@ herdr-factory/
     runtime/effect.ts        the shared Effect ManagedRuntime (also hosts the OTel layer)
     telemetry/…              OpenTelemetry spans/metrics (no-op unless HERDR_FACTORY_TELEMETRY)
     tui/…                    the opentui TUI (Dashboard · Config editor · Doctor)
-    prompts/{fix,evidence,review,pr}.md            shared step prompts (fix.md is source-neutral)
-    prompts/jira/fix.md + prompts/github_issues/{fix,pr}.md   per-source-type overrides
+    prompts/{work,evidence,review,pr}.md           shared step-primitive prompts (work.md is source-neutral)
+    prompts/jira/work.md + prompts/github_issues/{work,pr}.md   per-source-type overrides
+    steps/registry.ts + steps/<name>/descriptor.ts   the STEP_DESCRIPTORS registry (work/evidence/review/pr/custom)
+    products/registry.ts · signals/registry.ts       PRODUCT_CAPABILITIES + SIGNAL_DESCRIPTORS registries
   examples/example-repo/{config.yml, guidelines-prompt.md, match-bugs.ts, prompts/…}
   test/                   vitest
 ```
@@ -220,7 +229,7 @@ out to `herdr …` and parses its JSON; it contains zero terminal/worktree logic
 **The step layout** (a tab/pane per pipeline agent) is applied by the external
 **workspace-manager herdr plugin** on `worktree.created`. herdr-factory does **not** apply
 layouts — it relies on the plugin and simply *targets* the resulting panes: one per step, from a
-belt's `agents.{fix,evidence,review,pr}.tab`/`.pane` (w2pr) or a custom step's `tab`/`pane`.
+each belt step's own `tab`/`pane` (from its `steps[]` entry).
 herdr-factory **waits** for a targeted pane to come up (escalating to `attention` after
 `layout_wait_seconds`) and only spawns a pane itself for steps that have **no** tab/pane
 configured — except `evidence`, which never spawns its own: with no tab/pane that step is
@@ -459,7 +468,7 @@ CREATE INDEX idx_runs_active ON runs(repo) WHERE ended_at IS NULL;
 
 CREATE TABLE run_steps(                  -- one row per pipeline agent (migration v4)
   id INTEGER PRIMARY KEY AUTOINCREMENT, run_id INTEGER NOT NULL,
-  step TEXT NOT NULL,                    -- belt step name (fix/evidence/review/pr for w2pr)
+  step TEXT NOT NULL,                    -- belt step name (work/evidence/review/pr/custom)
   pane_id TEXT, session_id TEXT,         -- on-demand cross-agent query handles
   progress_sig TEXT, progress_at INTEGER,   -- per-step commit heartbeat
   done INTEGER NOT NULL DEFAULT 0, started_at INTEGER, done_at INTEGER,
@@ -619,20 +628,21 @@ herdr agent in its own tab/pane, dispatched and gated by the reconciler. The run
 
 | Step | Does | Hands off |
 |---|---|---|
-| **fix** | read the work doc + attachments → implement → lint/type/tests → commit | `handoff-fix.md` + `step-done fix` |
-| **evidence** *(opt-in)* | derive a test plan from acceptance criteria → run the app via the repo's dev-server/credentials skills (right persona) → capture before/after screenshots+video (`capture-attempt` signals each try) → publish to S3 → per-criterion verdict: pass forward or **bounce to fix** | `handoff-evidence.md` + `step-done` / `bounce` |
-| **review** | fresh-eyes **read-only** gate — never edits or commits: pass forward, or **bounce to fix** with findings | `handoff-review.md` + `step-done` / `bounce` |
+| **work** | read the work doc + attachments → implement → lint/type/tests → commit | `handoff-work.md` + `step-done work` |
+| **evidence** *(opt-in)* | derive a test plan from acceptance criteria → run the app via the repo's dev-server/credentials skills (right persona) → capture before/after screenshots+video (`capture-attempt` signals each try) → publish to S3 → per-criterion verdict: pass forward or **bounce to work** | `handoff-evidence.md` + `step-done` / `bounce` |
+| **review** | fresh-eyes **read-only** gate — never edits or commits (enforced: a commit parks the run): pass forward, or **bounce to work** with findings | `handoff-review.md` + `step-done` / `bounce` |
 | **pr** | push + open the PR (evidence URLs embedded) → drive the automated round (CI green + bot comments) | `step-done pr` → human review |
 
-The steps come from the run's **belt**: for w2pr the engine defines the ordered `PR_STEPS`
-(`config.ts` — each step's budget/heartbeat/bounce-targets resolved onto a generic `StepConfig`,
-so `core/step.ts`/`reconcileStep` stay belt-agnostic), and the belt's
-`agents.{fix,evidence,review,pr}` block supplies each station's layout pane + optional
-augmenting `prompt_file`. **`evidence` is opt-in**: it verifies fix's work through an agent your
-layout provides, so it materializes only when its block sets `tab`+`pane` — otherwise the
-pipeline is fix → review → pr; it never spawns its own pane. A **bounce**
-(`bounce <KEY> fix --reason-file …`) rewinds `run.step`, writes the findings to
-`feedback-fix.md` in the worktree, clears the target's *and* the intermediate steps' completion
+The steps come from the run's **belt**: each `steps[]` entry names a primitive `type`, resolved
+against its `StepDescriptor` (`src/steps/registry.ts`) onto a generic `StepConfig` — budget,
+heartbeat, bounce-targets, read-only, and typed consumes/produces — so `core/step.ts`/`reconcileStep`
+stay declaration-driven (they branch on the resolved `StepConfig`, never a step name). The step ref
+supplies each station's layout pane + optional augmenting `prompt_file`. **`evidence` is opt-in**:
+its descriptor is `requiresLayout`, so it materializes only when its step ref sets `tab`+`pane` —
+otherwise the pipeline is work → review → pr; it never spawns its own pane. A **bounce**
+(`bounce <KEY> work --reason-file …`, the target resolved to the earliest earlier step that consumes
+`bounce_feedback`) rewinds `run.step`, writes the findings to `feedback-work.md` in the worktree,
+clears the target's *and* the intermediate steps' completion
 so they re-run, and counts toward `max_bounces` (default 6; per-belt override; `0` disables —
 past the cap the run parks for `attention`). The evidence step separately signals each capture try
 via `capture-attempt`; past `max_capture_attempts` (default 5, reset per fresh pass into the step)
@@ -650,15 +660,15 @@ over user-defined steps with no PR watch — its last `step-done` tears the run 
 flowchart TD
     subgraph PIPE["Pipeline — one agent per step, each in its own herdr pane"]
       direction TB
-      fix["fix agent<br/>implement → verify → commit"]
+      work["work agent<br/>implement → verify → commit"]
       evidence["evidence agent (opt-in)<br/>capture app → publish → judge"]
       review["review agent<br/>fresh-eyes READ-ONLY gate"]
       pr["pr agent<br/>open + push PR → CI / bot round"]
-      fix -->|"agent → herdr-factory step-done KEY fix<br/>(+ writes handoff-fix.md)"| evidence
+      work -->|"agent → herdr-factory step-done KEY work<br/>(+ writes handoff-work.md)"| evidence
       evidence -->|"agent → step-done KEY evidence"| review
       review -->|"agent → step-done KEY review"| pr
-      evidence -.->|"agent → herdr-factory bounce KEY fix<br/>(+ writes feedback-fix.md)"| fix
-      review -.->|"agent → herdr-factory bounce KEY fix"| fix
+      evidence -.->|"agent → herdr-factory bounce KEY work<br/>(+ writes feedback-work.md)"| work
+      review -.->|"agent → herdr-factory bounce KEY work"| work
     end
 
     subgraph DISP["Dispatcher — core/reconcile"]
@@ -668,7 +678,7 @@ flowchart TD
     end
 
     todo["Jira: To Do (labelled)"] -->|"disp → herdr worktree create<br/>Jira REST → In Development"| wt["herdr worktree + workspace"]
-    wt -->|"disp → herdr agent send (spawn fix)"| fix
+    wt -->|"disp → herdr agent send (spawn work)"| work
     pr -->|"agent → herdr-factory step-done KEY pr<br/>disp → Jira REST → In Review"| human["reviewing<br/>human review (dispatcher-watched)"]
     human -->|"disp → herdr worktree remove<br/>· git branch -D"| done["done (merged / closed)"]
 
@@ -676,7 +686,7 @@ flowchart TD
     tick -.->|"disp → gh pr checks · review threads"| human
     tick -.->|"disp → herdr notification show + source note<br/>(re-notifies hourly; `resume` un-parks)"| attention["attention<br/>(no claim slot)"]
 
-    review -.->|"on-demand → herdr agent read fix-pane"| fix
+    review -.->|"on-demand → herdr agent read work-pane"| work
     pr -.->|"on-demand → herdr agent read / send prior-pane"| review
 ```
 
@@ -737,10 +747,10 @@ by what they actually need:
   querying) in `run_steps`, not a single `pane_id`. `run.pane_id` is kept pointed at the
   *latest* step's pane (the `reviewing` resolver reuses it). Teardown (herdr `worktree
   remove`) reaps all of a run's panes at once.
-- **Liveness:** the commit-HEAD heartbeat applies to `fix` / `pr` (they commit) but not
-  `evidence` / `review` (`StepConfig.heartbeat`; custom steps default it off); each step also has
-  its own budget (`develop_/evidence_/review_/pr_budget_seconds`; a custom step's
-  `budget_seconds`, else `step_budget_seconds`).
+- **Liveness:** the commit-HEAD heartbeat applies to `work` / `pr` (they commit) but not
+  `evidence` / `review` (derived from the primitive's guards; a `custom` step opts in); each step
+  also has its own budget (the step ref's `budget_seconds`, else the primitive's default — `work`
+  5400 / `evidence` 2400 / `review` 1800 / `pr` 3600 — else `step_budget_seconds`).
 - **Coordination:** on-demand `agent read` / `agent send` is agent-to-agent traffic
   *outside* the tick, so the dispatcher is no longer the sole coordinator and the DB
   timeline no longer captures every inter-agent interaction.
@@ -760,7 +770,7 @@ by what they actually need:
 
 - **Lossy handoffs + feedback loops.** CI failures and review comments loop *back* to
   code-fixing, so a clean linear relay fights the work's real, iterative shape. The
-  evidence/review → fix **bounce** now models the biggest loop explicitly, and on-demand query
+  evidence/review → work **bounce** now models the biggest loop explicitly, and on-demand query
   softens the lossy handoffs; the CI/comment loops remain in `pr` and `reviewing`.
 - **Cost & accountability.** ~3–4 panes / sessions per ticket vs. 1; no single agent
   owns the outcome end-to-end (diffusion of responsibility).
@@ -777,8 +787,8 @@ Each step is an agent (`core/step.ts`) dispatched **by the reconciler, never by
 another agent**, through the shared `dispatchToLayout(tab, pane, prompt, …)` helper. Per
 step (`spawnStep`):
 
-1. **Dispatch** — two modes, by whether the step has a configured `tab`/`pane` (from the belt's
-   `agents.<step>` block or the custom step, resolved onto its `StepConfig`):
+1. **Dispatch** — two modes, by whether the step has a configured `tab`/`pane` (from the step's
+   `steps[]` entry, resolved onto its `StepConfig`):
    - **Configured** (the user's layout owns the pane): find that pane and require an agent
      that is present **and idle** (agent-agnostic — claude *or* opencode), then `agent send`
      the prompt + Enter. If the pane isn't up yet or its agent is still busy starting up,
@@ -793,15 +803,16 @@ step (`spawnStep`):
    `run.pane_id`, the latest active pane) and reset `started_at` (now the per-step budget
    clock); set `run.focus_pending` so the worktree view can follow the active step (§7,
    *Focus follows the active step* — applied later, never stealing focus from another worktree).
-2. **Prompt** — the step body is resolved by belt type: a **w2pr** step uses the engine-shipped
-   prompt, optionally **augmented** by its agent block's `prompt_file`; a **custom** step's body
-   *is* its (required) `prompt_file`. Each `prompt_file` carries a `prompt_file_source` —
+2. **Prompt** — the step body is resolved by the step's descriptor: a step with a `basePrompt`
+   (`work`/`evidence`/`review`/`pr`) uses that engine-shipped prompt, optionally **augmented** by the
+   step ref's `prompt_file`; a `custom` step (no `basePrompt`) body *is* its (required) `prompt_file`.
+   Each `prompt_file` carries a `prompt_file_source` —
    `config` (the repo's config folder, read + existence-checked at load) or `repo` (the target
    repo checkout, read from the run's **worktree at render time**, so prompts can live
    version-controlled next to the code). The built-in is resolved **per source type**:
    `src/prompts/<type>/<step>.md` if present, else the shared `src/prompts/<step>.md`. The
-   shared `fix.md` is source-NEUTRAL (`@@WORK_DOC@@`-based, with the rework + ask-human
-   guidance); `jira` and `github_issues` override `fix` with source-flavored versions, and
+   shared `work.md` is source-NEUTRAL (`@@WORK_DOC@@`-based, with the rework + ask-human
+   guidance); `jira` and `github_issues` override `work` with source-flavored versions, and
    `github_issues` also overrides `pr` (it mandates copying the work doc's
    `Closing reference:` line into the PR body verbatim — the issue-linkage/auto-close hook);
    evidence/review/pr otherwise share the defaults. `renderStepPrompt` then substitutes tokens
@@ -811,7 +822,7 @@ step (`spawnStep`):
    `@@STEP_DONE_CMD@@`/`@@BOUNCE_CMD@@`/`@@EVIDENCE_UPLOAD_CMD@@` — each carrying `--source` so
    the signal resolves unambiguously, …), appends `guidelines-prompt.md`, and appends the
    **handover scaffold**: where you are in the belt, the prior step's handoff + session pointer,
-   the ask-human protocol, the bounce protocol (when the step declares `canBounceTo`), and the
+   the ask-human protocol, the bounce protocol (when the step declares a bounce), and the
    finish protocol — write your handoff note, then signal `step-done`. The rendered prompt is
    written to `.memory/herdr-factory/prompt-<step>.md`; the agent is told to read it.
 3. **Handoff out** — before signalling, the agent writes
@@ -840,9 +851,9 @@ so live Q&A is available — at the cost of up to 3 panes/sessions per run.
 ### Per-step liveness
 
 The tick's watchdog (`reconcileStep`) gates each step on `step-done`, with safety nets:
-the commit-HEAD **stall** heartbeat (`fix` / `pr` only — `evidence`/`review` don't commit) and a
-per-step **budget** (`develop_/evidence_/review_/pr_budget_seconds`; custom steps
-`budget_seconds` else `step_budget_seconds`). Past the budget while the
+the commit-HEAD **stall** heartbeat (`work` / `pr` only — `evidence`/`review` don't commit) and a
+per-step **budget** (the ref's `budget_seconds`, else the primitive's default, else
+`step_budget_seconds`). Past the budget while the
 agent isn't actively `working`, or stalled past `stall_seconds`, the run → `attention`.
 
 **Liveness never acts on uncertainty.** herdr being unreachable (`HerdrUnreachableError`) defers
@@ -860,7 +871,7 @@ records the event, fires a notification, **relabels the run's active pane** to `
 externally, so the label is the persistent cue), and **posts the reason to the work source**
 (`postNote` — a Jira comment / local note, including the ready-made resume command). While
 parked, the run **re-notifies every `attention_renotify_seconds`** (default 1h) and — for a
-w2pr belt with a PR — keeps polling for a merge (which still tears it down). The operator
+belt with a PR — keeps polling for a merge (which still tears it down). The operator
 un-parks it with **`herdr-factory --repo <name> resume <KEY>`**: back to its active step (budget/
 heartbeat/absence clocks reset — the stale clocks are usually why it parked), to the PR watch
 (fresh deadline, cleared thread signature), or to `claiming`, and it reconciles on the same pass.
@@ -920,10 +931,11 @@ from being claimed again).
       (`resolver_active`); parked `attention`/`waiting_for_human` runs and idle PR-watches hold no
       slot, so neither human-blocked runs nor long-lived PRs-in-review starve the belt. The PR watch
       has no time limit — there is no `watch_hours`.)
-      / `attention_renotify_seconds` / `develop_budget_seconds` (fix) / `evidence_budget_seconds`
-      / `review_budget_seconds` / `pr_budget_seconds` / `stall_seconds` / `max_bounces`
+      / `attention_renotify_seconds` / `stall_seconds` / `max_bounces`
       / `max_capture_attempts` (evidence capture attempts per pass before `attention`)
-      / `step_budget_seconds` (custom-step default) / `tick_interval_seconds`
+      / `step_budget_seconds` (fallback per-step budget — used when a step sets no `budget_seconds`
+      and its primitive declares no default; the primitive defaults are `work` 5400 / `evidence` 2400
+      / `review` 1800 / `pr` 3600) / `tick_interval_seconds`
       / `reconcile_concurrency` (Phase-A parallelism, default 8) / `max_claims_per_tick`
       (claim admission, default 10) / `layout_wait_seconds`.
     - `work_sources` — **required, ≥1** (`zod` discriminated union on `type`, assembled from the
@@ -945,8 +957,8 @@ from being claimed again).
         **pickup label is per-belt** (`belt.label`), not a source field — one source can feed
         several belts, each claiming a different label. `descriptor.pickupLabel` marks the
         label-driven types (jira, github_issues) so config validation can require/forbid it.
-    - `belt` — **required, ≥1** (`zod` discriminated union on `belt_type`, `.strict()` members —
-      `agents` on a `custom` belt is a parse error, not silently ignored). Common fields:
+    - `belt` — **required, ≥1** (`.strict()` members — unknown keys, including the removed
+      `belt_type` / `agents`, are parse errors). Common fields:
       - `name` (unique) · `source` (must reference a `work_sources` name) · `priority` (optional,
         default `100`; **lower = matched first**; ties keep config order — stable sort).
       - `label` — the belt's pickup label, threaded into `listEligible`/`transition`/`health`.
@@ -966,16 +978,21 @@ from being claimed again).
         merged ticket — gets a distinct branch (the pr step's `prForBranch` then can't match a
         stale merged PR on a reused branch name).
       - `max_bounces` — optional per-belt override of `limits.max_bounces`.
-      - **`belt_type: work_to_pull_request`** adds `agents`: one block each for `fix`/`review`/
-        `pr` (required; `{}` is fine — the factory spawns the pane) and `evidence` (**opt-in**:
-        the step runs only when its block sets `tab`+`pane`, else it's skipped and the pipeline
-        is fix → review → pr). Each block: `tab`/`pane` (optional, both-or-neither) + an optional
-        `prompt_file` (+ required `prompt_file_source`: `config` | `repo`) that **augments** the
-        engine's per-type built-in (`src/prompts/<type>/<step>.md`, else `src/prompts/<step>.md`).
-      - **`belt_type: custom`** adds `steps[]` (≥1): each `{ name` (lowercase slug, unique within
-        the belt)`, prompt_file + prompt_file_source` (required — the whole step body)`,
-        tab?/pane?, budget_seconds?` (default `limits.step_budget_seconds`)`, heartbeat?`
-        (default false) `}`. Custom steps don't (yet) declare evidence/bounce.
+      - `steps` — **required, ≥1**, the ordered pipeline. Each entry references a registered step
+        primitive by `type` (`work`/`evidence`/`review`/`pr`/`custom` — the enum is generated from
+        `STEP_DESCRIPTORS`), with optional `name` (defaults to `type`, unique within the belt),
+        `tab`/`pane` (both-or-neither), `budget_seconds`, `heartbeat`, and `prompt_file`
+        (+ required `prompt_file_source`: `config` | `repo`). For a primitive with a built-in prompt
+        (`work`/`evidence`/`review`/`pr`) the `prompt_file` **augments** the per-type built-in
+        (`src/prompts/<type>/<slug>.md`, else `src/prompts/<slug>.md`); a `custom` step ships no
+        built-in, so its `prompt_file` is **required** and is the whole body. `evidence` is
+        **opt-in** (its descriptor is `requiresLayout` — skipped when it has no `tab`+`pane`, so the
+        pipeline is work → review → pr). The belt's lifecycle is DERIVED from its steps' declared
+        `produces` (a `pull_request` producer ⇒ the `reviewing` watch + `in_review` write-back) and
+        `controls` (a bounce ⇒ the `max_bounces` cap); `evidence`/`review` are `read_only` (enforced:
+        a commit parks the run). Composition is validated at load — each primitive declares typed
+        `consumes`/`produces`, and a belt whose step needs an input no earlier step or the source
+        produces is rejected.
     - `evidence` — optional repo-wide block: where the evidence step publishes captures.
       `bucket` + `region` + `cloudfront_domain` (required together), optional `key_prefix` /
       `profile` / `github_username` (default: the `gh` login at upload time). Non-secret

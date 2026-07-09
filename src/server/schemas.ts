@@ -148,7 +148,7 @@ export const BounceBody = z
   .openapi("BounceBody");
 // No step field: the attempt always applies to the run's current running step (the engine validates
 // it is a gathersEvidence step), so the agent can't misattribute it.
-export const CaptureAttemptBody = z.object({ key: z.string(), source: z.string().optional() }).openapi("CaptureAttemptBody");
+export const CaptureAttemptBody = z.object({ key: z.string(), step: z.string(), source: z.string().optional() }).openapi("CaptureAttemptBody");
 export const ClaimBody = z.object({ key: z.string(), belt: z.string().optional() }).openapi("ClaimBody");
 export const TeardownBody = z.object({ key: z.string(), source: z.string().optional() }).openapi("TeardownBody");
 export const ResumeBody = z.object({ key: z.string(), source: z.string().optional() }).openapi("ResumeBody");
