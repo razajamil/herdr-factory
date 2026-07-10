@@ -14,6 +14,11 @@ const attentionEvents = Metric.counter("herdr_factory.attention_events", { incre
 const tickLocksSkipped = Metric.counter("herdr_factory.tick.lock_skipped", { incremental: true });
 const ticks = Metric.counter("herdr_factory.ticks", { incremental: true });
 
+const sourceAuthEvents = Metric.counter("herdr_factory.source_auth_events", {
+  incremental: true,
+  description: "Work-source auth-gate transitions (labelled work.source + auth.state unauthenticated|recovered)",
+});
+
 const rateLimitRemaining = Metric.gauge("herdr_factory.rate_limit.remaining", { description: "Backend-reported rate-limit remaining (per backend label)" });
 const rateLimitWaitMs = Metric.histogram(
   "herdr_factory.rate_limit.wait_ms",
@@ -79,6 +84,10 @@ export function recordTickLockSkippedEffect(attrs: TelemetryAttributes = {}): Ef
 
 export function recordRateLimitRemainingEffect(remaining: number, attrs: TelemetryAttributes = {}): Effect.Effect<void> {
   return Metric.update(Metric.taggedWithLabels(rateLimitRemaining, metricLabels(attrs)), remaining);
+}
+
+export function recordSourceAuthEventEffect(attrs: TelemetryAttributes = {}): Effect.Effect<void> {
+  return Metric.increment(Metric.taggedWithLabels(sourceAuthEvents, metricLabels(attrs)));
 }
 
 export function recordRateLimitWaitEffect(ms: number, attrs: TelemetryAttributes = {}): Effect.Effect<void> {

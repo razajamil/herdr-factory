@@ -186,7 +186,7 @@ export function createApp(renderer: CliRenderer): { currentTab: () => number; at
     const tail = "   ·   Tab: switch view · Esc: top level · q: quit";
     if (idx === 1) return " 1 repos · 2 fields   ·   ↑↓: move · ↵: open/edit · [ ]: reorder" + tail;
     if (idx === 2) return " ↑↓: scroll · r: re-run · d: deep (gh auth, herdr daemon)" + tail;
-    return " ↑↓: move · ↵: timeline · t: tick · c: claim · x: teardown · r: refresh" + tail;
+    return " ↑↓: move · ↵: timeline · t: tick · c: claim · x: teardown · l: login · r: refresh" + tail;
   }
 
   /** Top of the hierarchy: focus the tab bar. From here numbers enter a section, ←→/Tab switch. */

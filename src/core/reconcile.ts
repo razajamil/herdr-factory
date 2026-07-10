@@ -11,7 +11,7 @@ import { branchName } from "./branch.ts";
 import { firstStep, indexOfStep, materializeWork, MEMORY_DIR, nextStep, spawnStep, stepByName } from "./step.ts";
 import { STEP_DESCRIPTORS } from "../steps/registry.ts";
 import { wakeResolver } from "./watch.ts";
-import { recordTick, recordTickDuration, recordTickLockSkipped, telemetryEvent, telemetrySpan } from "../telemetry/index.ts";
+import { recordSourceAuthEvent, recordTick, recordTickDuration, recordTickLockSkipped, telemetryEvent, telemetrySpan } from "../telemetry/index.ts";
 import { isSourceUnauthenticated, type SourceUnauthenticatedError } from "../auth/errors.ts";
 import { getAuthFailure, markAuthNotified, recordAuthFailure, recordAuthOk } from "../auth/gate.ts";
 
@@ -37,6 +37,7 @@ async function noteSourceAuthFailure(deps: Deps, source: string, e: SourceUnauth
   if (!wasDown) {
     deps.log("warn", `${source}: work source not authenticated (${e.reason}) — pausing its claims + status write-backs until re-authenticated`);
     telemetryEvent("source.auth.unauthenticated", { "work.source": source, "auth.reason": e.reason });
+    recordSourceAuthEvent({ "work.source": source, "auth.state": "unauthenticated", "auth.reason": e.reason });
   }
   const f = getAuthFailure(repo, source)!;
   const notifyDue = f.notifiedAt == null || deps.now() - f.notifiedAt >= deps.config.limits.attentionRenotifySeconds;
@@ -58,6 +59,7 @@ function noteSourceAuthRecovered(deps: Deps, source: string): void {
   const requeued = deps.store.retryTransitionsForSource(repo, source);
   deps.log("info", `${source}: re-authenticated — resuming work${requeued ? ` (${requeued} held write-back(s) re-queued)` : ""}`);
   telemetryEvent("source.auth.recovered", { "work.source": source, "transition.requeued": requeued });
+  recordSourceAuthEvent({ "work.source": source, "auth.state": "recovered" });
   void deps.herdr.notify(`herdr-factory: ${source} re-authenticated`, `Work source "${source}" is authenticated again — paused work is resuming.`).catch(() => {});
 }
 

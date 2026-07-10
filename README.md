@@ -88,6 +88,10 @@ JIRA_EMAIL=you@org.com
 JIRA_API_TOKEN=...          # id.atlassian.com → Security → API tokens
 ```
 
+(Prefer not to manage a token? Set `auth: { method: oauth }` on the source and run
+`herdr-factory --repo my-app auth login` to sign in through the browser instead — see
+[`work_sources`](#work_sources--1).)
+
 (Jira is the walkthrough; a [GitHub Issues source](#github-issues--label-an-issue-get-a-pr)
 needs no credentials at all beyond your already-authenticated `gh` CLI — add a `GITHUB_TOKEN`
 line to the same file only if you want it to use a dedicated token instead.)
@@ -434,7 +438,22 @@ reference it), and a type block:
   ticket for pickup is set per **belt** (`label` — see [`belt`](#belt--1)), not here. The status of
   record lives in Jira; the factory deliberately never writes a terminal status (merged/closed is
   owned by Jira's GitHub integration). Ticket description, comments, and image/video attachments are
-  materialized into the worktree for the agents.
+  materialized into the worktree for the agents. Authentication is chosen per source with an optional
+  `auth` block:
+  - `auth: { method: api_token }` (**the default** — omit `auth` entirely for it): `JIRA_EMAIL` +
+    `JIRA_API_TOKEN` in the repo's `env`.
+  - `auth: { method: oauth }`: browser login instead of a token. Run
+    `herdr-factory --repo <name> auth login`, approve in the browser, and the factory stores the
+    tokens **locally** and refreshes them automatically — nothing to rotate by hand. It uses a
+    registered Atlassian OAuth app: the one shipped with herdr-factory, or — if that isn't set up in
+    your build, or you'd rather use your own — set `client_id` here and `JIRA_OAUTH_CLIENT_SECRET` in
+    `env`. Optional `scopes` overrides the defaults (`read:jira-work write:jira-work offline_access`).
+
+  Either way, a source that **isn't authenticated yet** (no token, or an expired OAuth session that
+  can't refresh) is *paused*, not broken: its claims and status write-backs hold, you get one
+  notification, and it resumes automatically the moment it authenticates again — so an unauthenticated
+  source never wedges the factory. `herdr-factory --repo <name> auth status` shows where each source
+  stands.
 - **`local_markdown`** — `folder`: a directory where each top-level `*.md` file _or_ top-level
   subdirectory containing at least one top-level `*.md` is one work item (key = filename stem /
   dir name; names starting `__` are skipped as still-being-drafted). Title/type come from YAML
@@ -594,6 +613,7 @@ herdr-factory --repo <name> status | eligible | runs [--all] | timeline <KEY> | 
 herdr-factory --repo <name> claim <KEY> [--belt <name>]
 herdr-factory --repo <name> teardown <KEY> [--source <name>]
 herdr-factory --repo <name> resume <KEY> [--source <name>]          # un-park an `attention` run
+herdr-factory --repo <name> auth login|status|logout [--source <name>] [--paste]   # work-source auth (OAuth)
 
 # agent → dispatcher signals (rendered into every step prompt; you rarely type these)
 herdr-factory --repo <name> step-done <KEY> <step> [--source <name>]
@@ -615,6 +635,12 @@ back to executing directly against the DB when it isn't; reads (`status`, `eligi
 `timeline`, `logs`) always go straight to the DB. `--source` disambiguates a key active in more
 than one source; `claim --belt` is required only when the repo has more than one belt.
 
+`auth login` runs the browser OAuth flow for a source configured with `auth.method: oauth` (only
+needed for those — an `api_token` source authenticates from `env`, and `github_issues` from your
+`gh` login). It opens a browser to Atlassian and catches the redirect on a local loopback port; on
+a headless/remote host pass `--paste` to approve in any browser and paste the redirected URL back.
+`auth status` reports each source's method + state; `auth logout` clears a source's stored tokens.
+
 `serve` binds `127.0.0.1:8765` (override with `HERDR_FACTORY_PORT`) with the OpenAPI spec at
 `/doc` and Swagger UI at `/ui`. `update` pulls the latest code (hard reset to the branch's
 upstream) and restarts onto it — the supervisor does the same automatically every ~60s.
@@ -628,12 +654,16 @@ keys jump to a numbered section, arrows move within it, `Esc` pops back out, `q`
 - **Dashboard** — live runs from the server's API: `↑↓` navigate, `↵` opens a run's event
   timeline, `t` tick, `c` claim an eligible item, `x` teardown, `r` refresh (each action behind a
   confirmation). A per-repo evidence-upload **SSO light** goes red when AWS creds have expired (the
-  fix: `aws sso login`), and is hidden for repos with no evidence configured.
+  fix: `aws sso login`), and is hidden for repos with no evidence configured. A per-source **auth
+  light** does the same for each work source — red when it can't authenticate (its work is paused,
+  auto-resuming on re-auth); highlight a red one and press `l` to run the browser OAuth login.
 - **Config** — a repo list and a full `config.yml` editor: edits the YAML surgically (comments
   and the schema modeline preserved), validates against the engine schema, `^S` saves, `[`/`]`
   reorder list entries. Credentials appear as masked, replace-only `secrets (env)` fields —
-  declared per source type (`JIRA_EMAIL`/`JIRA_API_TOKEN` for jira, `GITHUB_TOKEN` for
-  github_issues) — written separately to the `env` file (`chmod 600`).
+  declared per source type (`JIRA_EMAIL`/`JIRA_API_TOKEN` — or `JIRA_OAUTH_CLIENT_SECRET` for a
+  bring-your-own OAuth app — for jira, `GITHUB_TOKEN` for github_issues) — written separately to the
+  `env` file (`chmod 600`). OAuth sign-in itself is the Dashboard's `l` action / `auth login`, not an
+  env field.
 - **Doctor** — the same checks as the CLI: `r` re-runs, `d` toggles deep mode (live herdr/gh/S3
   probes). The `herdr`/`gh`/`claude`/`git` presence checks resolve against the **service's** PATH
   (the environment the resident server runs its tools in), not the TUI's own — so they read the
