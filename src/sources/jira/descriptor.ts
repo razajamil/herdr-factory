@@ -109,6 +109,10 @@ export const jiraDescriptor: SourceDescriptor<JiraSourceCfg> = {
       { label: "status.todo", path: ["jira", "status", "todo"], placeholder: "To Do" },
       { label: "status.in_development", path: ["jira", "status", "in_development"], placeholder: "In Progress" },
       { label: "status.review", path: ["jira", "status", "review"], placeholder: "In Review" },
+      // api_token = JIRA_EMAIL + JIRA_API_TOKEN from env; oauth = browser login (`auth login`), no
+      // secret. Choosing oauth writes `auth: { method: oauth }`, which uses the built-in public app;
+      // a per-source client_id override is a rare case left to the YAML (no field for it here).
+      { label: "auth.method", path: ["jira", "auth", "method"], choices: ["api_token", "oauth"], enumDefault: "api_token" },
     ],
   },
 };

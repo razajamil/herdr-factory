@@ -118,7 +118,16 @@ export function buildDescriptors(draft: Document, rebuild: () => void, confirm: 
     // YAML — falls back to no fields; the schema validation on save reports it properly).
     const descriptor = SOURCE_DESCRIPTORS.find((x) => x.type === type);
     for (const f of descriptor?.tui.fields ?? []) {
-      d.push({ kind: "text", label: f.label, path: ["work_sources", i, ...f.path], placeholder: f.placeholder, numeric: f.numeric, indent: 2 });
+      const full: Path = ["work_sources", i, ...f.path];
+      if (f.choices) {
+        // A pick-list field (e.g. auth.method): read the current value, default to enumDefault when
+        // unset, and setIn on change (creates intermediate maps like auth:{} as needed).
+        const cur = draft.getIn(full);
+        const value = cur == null ? (f.enumDefault ?? f.choices[0]!) : String(cur);
+        d.push({ kind: "enum", label: f.label, value, choices: [...f.choices], indent: 2, apply: (next) => { if (next !== value) { draft.setIn(full, next); rebuild(); } } });
+      } else {
+        d.push({ kind: "text", label: f.label, path: full, placeholder: f.placeholder, numeric: f.numeric, indent: 2 });
+      }
     }
     d.push({ kind: "action", label: "‹ remove source ›", indent: 2, run: () => { void confirm(`Remove work source "${sourceNames[i]}"?`).then((ok) => { if (ok) { draft.deleteIn(["work_sources", i]); rebuild(); } }); } });
   });

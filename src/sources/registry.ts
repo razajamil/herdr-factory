@@ -37,6 +37,10 @@ export interface TuiFieldSpec {
   path: string[];
   placeholder?: string;
   numeric?: boolean;
+  /** When set, the field renders as a pick-list (enum), not a text input — e.g. auth.method. */
+  choices?: readonly string[];
+  /** Enum only: the value shown when the path is unset (mirror the schema default). */
+  enumDefault?: string;
 }
 
 /** Everything a descriptor's create() gets to build a live client. */
