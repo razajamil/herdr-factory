@@ -753,6 +753,18 @@ export class Store {
     this.db.prepare("UPDATE transition_outbox SET stale_handled_at = ?, updated_at = ? WHERE id = ?").run(t, t, id);
   }
 
+  /** On auth RECOVERY for a source: make all its undelivered write-backs due now, so a restored
+   *  session flushes them on the next tick's Phase 0 instead of waiting out the exponential backoff
+   *  they accrued while the source was unauthenticated. Harmless if some were merely network-flaky
+   *  (they just retry a little sooner). Returns how many were re-queued. */
+  retryTransitionsForSource(repo: string, source: string): number {
+    const t = this.now();
+    const info = this.db
+      .prepare("UPDATE transition_outbox SET next_attempt_at = ?, updated_at = ? WHERE repo = ? AND work_source = ? AND delivered_at IS NULL")
+      .run(t, t, repo, source);
+    return Number(info.changes);
+  }
+
   /** Does this work item have any undelivered status write-back? While it does, the item's
    *  source status is known-stale — Phase B must not trust an "eligible" listing for it. */
   pendingTransitionForKey(repo: string, source: string, key: string): boolean {

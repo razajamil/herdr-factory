@@ -139,6 +139,16 @@ export async function repoGroup(repo: string, deep = false): Promise<DoctorGroup
       } else {
         checks.push({ name: `source ${src.name} (${src.type})`, ok: true, detail: "configured (--deep to health-check)" });
       }
+      // Auth readiness — the source's own cheap, no-network view (INV-12). Covers what the secrets
+      // manifest can't (github's `gh auth token` fallback), and reads back the actionable hint. A
+      // present-but-rejected credential still shows ✓ here; deep's health() is what exercises it.
+      checks.push(
+        await attempt(`auth ${src.name} (${src.type})`, async () => {
+          const st = await src.client.authStatus();
+          if (st.state === "unauthenticated") throw new Error(st.detail ?? "not authenticated");
+          return st.state === "not_applicable" ? "no auth required" : "credentials present";
+        }),
+      );
       // Required secrets present is a cheap local check (driven by the type's descriptor
       // manifest) — keep in both modes; deep's health() proves they actually work.
       const required = descriptorFor(src.type).secrets.filter((s) => s.required);

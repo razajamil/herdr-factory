@@ -12,6 +12,7 @@ import { annotateCurrentSpan, recordHttpServerDurationEffect, withHttpServerSpan
 import { runEffect } from "../runtime/effect.ts";
 import { bounceStep, claimTicket, reconcileRepo, reconcileRun, recordCaptureAttempt, requestHumanInput, resumeRun, teardownTicket, withRunLock, withRunLockWaiting, withTickLock } from "../core/reconcile.ts";
 import { probeEvidenceCreds } from "../clients/evidence.ts";
+import { getAuthFailure } from "../auth/gate.ts";
 import { stepByName } from "../core/step.ts";
 import { resolveActiveRun, resolveBeltName } from "../resolve.ts";
 import type { Deps } from "../core/deps.ts";
@@ -89,6 +90,33 @@ async function evidenceSsoStatus(rt: RepoRuntime): Promise<{ state: "ok" | "down
   return cached.auth ? { state: "down", detail: cached.reason } : { state: "ok" };
 }
 
+/** Cached per-source authStatus() probe (the dashboard polls /status ~every 3s; a github source's
+ *  probe shells out to `gh auth token`, which mustn't run per poll). Mirrors ssoProbeCache. */
+const AUTH_PROBE_TTL_SECONDS = 90;
+const authProbeCache = new Map<string, { at: number; state: "ok" | "unauthenticated" | "not_applicable"; detail?: string }>();
+
+/** Per-source auth light for the dashboard, mirroring evidenceSso's vocabulary: "down" when the
+ *  reconcile gate has recorded a live failure (reactive — catches a present-but-rejected credential)
+ *  OR the source's own cheap authStatus() probe reports missing credentials (proactive); "na" for a
+ *  source with no auth; else "ok". */
+async function sourceAuthStatus(rt: RepoRuntime, sourceName: string): Promise<{ state: "ok" | "down" | "na"; detail?: string }> {
+  const repo = rt.deps.config.repoName;
+  const failure = getAuthFailure(repo, sourceName);
+  if (failure) return { state: "down", detail: failure.detail };
+  const src = rt.deps.resolveSource(sourceName);
+  if (!src) return { state: "na" };
+  const now = rt.deps.now();
+  const cacheKey = `${repo} ${sourceName}`;
+  let cached = authProbeCache.get(cacheKey);
+  if (!cached || now - cached.at >= AUTH_PROBE_TTL_SECONDS) {
+    const probe = await src.client.authStatus().catch((): { state: "ok" | "unauthenticated" | "not_applicable"; detail?: string } => ({ state: "ok" }));
+    cached = { at: now, state: probe.state, detail: probe.detail };
+    authProbeCache.set(cacheKey, cached);
+  }
+  if (cached.state === "unauthenticated") return { state: "down", detail: cached.detail };
+  return { state: cached.state === "not_applicable" ? "na" : "ok" };
+}
+
 /** The structured status payload — same data the CLI `status` renders, exposed for the web UI.
  *  Hits herdr for live pane state, so it's async. */
 async function statusPayload(rt: RepoRuntime) {
@@ -111,7 +139,7 @@ async function statusPayload(rt: RepoRuntime) {
   return {
     repo: cfg.repoName,
     limits: { maxActiveWorkspaces: cfg.limits.maxActiveWorkspaces },
-    sources: cfg.sources.map((s) => ({ name: s.name, type: s.type as string })),
+    sources: await Promise.all(cfg.sources.map(async (s) => ({ name: s.name, type: s.type as string, auth: await sourceAuthStatus(rt, s.name) }))),
     belts: cfg.belts.map((b) => ({ name: b.name, beltType: b.beltType as string, source: b.source, priority: b.priority })),
     active: await Promise.all(active.map(runView)),
     finished: finished.map((r) => ({

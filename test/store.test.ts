@@ -298,4 +298,29 @@ describe("Store", () => {
       expect(store.undeliveredEvidenceUploadsForRun(run.id)).toHaveLength(0);
     });
   });
+
+  describe("transition outbox — auth recovery", () => {
+    it("retryTransitionsForSource makes a source's undelivered write-backs due now (only that source, only undelivered)", () => {
+      const { store } = makeStore();
+      const run = store.createRun({ repo: "r", workSource: "jira", belt: "ship", ticketKey: "K-1", branch: "b" });
+      const other = store.createRun({ repo: "r", workSource: "gh", belt: "ship2", ticketKey: "G-1", branch: "b2" });
+      const held = store.enqueueTransition({ runId: run.id, repo: "r", workSource: "jira", ticketKey: "K-1", toState: "in_review" });
+      const otherSrc = store.enqueueTransition({ runId: other.id, repo: "r", workSource: "gh", ticketKey: "G-1", toState: "in_review" });
+      // Back the jira intent off (as an auth failure would), so it's no longer due.
+      store.recordTransitionAttempt(held.id, "401 not authenticated");
+      expect(store.getTransitionIntent(held.id)!.nextAttemptAt).toBe(1060);
+      expect(store.dueTransitions("r").map((i) => i.id)).not.toContain(held.id);
+
+      const requeued = store.retryTransitionsForSource("r", "jira");
+      expect(requeued).toBe(1); // only the jira intent, and it was undelivered
+      expect(store.getTransitionIntent(held.id)!.nextAttemptAt).toBe(1000); // due now
+      expect(store.dueTransitions("r").map((i) => i.id)).toContain(held.id);
+      // A different source's intent is untouched by a jira recovery.
+      expect(store.getTransitionIntent(otherSrc.id)!.nextAttemptAt).toBe(1000);
+
+      // A delivered intent is never resurrected.
+      store.markTransitionDelivered(held.id);
+      expect(store.retryTransitionsForSource("r", "jira")).toBe(0);
+    });
+  });
 });

@@ -6,6 +6,8 @@ import { openDb } from "../src/db/index.ts";
 import { Store } from "../src/db/store.ts";
 import { applyPendingFocus, bounceStep, claimTicket, flushTransitionOutbox, reconcileRepo, reconcileRun, recordCaptureAttempt, requestHumanInput, resumeRun, withRunLock, withRunLockWaiting, withTickLock } from "../src/core/reconcile.ts";
 import { HerdrUnreachableError, type BeltRuntime, type Deps, type GitApi, type GitHubApi, type HerdrApi, type SourceRuntime, type WorkSource } from "../src/core/deps.ts";
+import { SourceUnauthenticatedError } from "../src/auth/errors.ts";
+import { getAuthFailure, resetAuthGate } from "../src/auth/gate.ts";
 import type { Config, StepConfig } from "../src/config.ts";
 import type { FocusedPane, HumanAskInput, HumanPollInput, HumanReply, JiraMatchItem, LocalMarkdownMatchItem, Phase, PrInfo, PrSnapshot, ReviewSig, Ticket, WorkState } from "../src/types.ts";
 import { StaleItemError } from "../src/types.ts";
@@ -14,6 +16,7 @@ const tmps: string[] = [];
 afterEach(() => {
   for (const t of tmps) rmSync(t, { recursive: true, force: true });
   tmps.length = 0;
+  resetAuthGate(); // the gate Map is process-global (keyed by repo "demo") — don't leak across tests
 });
 
 interface FakeState {
@@ -36,6 +39,7 @@ interface FakeState {
   humanPollError: Error | null; // pollHumanReply throws this instead of returning
   humanAskError: Error | null; // askHuman throws this instead of posting
   failEligible: boolean; // the jira source's listEligible throws (backend outage)
+  authFail: boolean; // the jira source's calls throw SourceUnauthenticatedError (not authenticated)
   itemLabels: Record<string, string[]>; // labels the jira fake attaches per key (default [])
 }
 
@@ -78,7 +82,7 @@ function build(opts: { multi?: boolean } = {}) {
   let now = 1000;
   let uidN = 0; // deterministic per-claim branch suffix (u1, u2, …) so re-claims get distinct branches
   const store = new Store(openDb(":memory:"), () => now);
-  const state: FakeState = { eligible: [], eligible2: [], pr: null, sig: { unresolved: 0, failing: 0, sig: "s0" }, paneState: "idle", deadPanes: new Set(), headSha: "sha0", sessionId: "sess-1", workspaceExists: false, focusedPane: { paneId: "w1:p1", workspaceId: "w1", tabId: "w1:t1", label: "agent" }, humanReply: null, herdrUnreachable: false, failTransitions: false, failTransitionStates: new Set(), staleTransitionStates: new Set(), humanPollError: null, humanAskError: null, failEligible: false, itemLabels: {} };
+  const state: FakeState = { eligible: [], eligible2: [], pr: null, sig: { unresolved: 0, failing: 0, sig: "s0" }, paneState: "idle", deadPanes: new Set(), headSha: "sha0", sessionId: "sess-1", workspaceExists: false, focusedPane: { paneId: "w1:p1", workspaceId: "w1", tabId: "w1:t1", label: "agent" }, humanReply: null, herdrUnreachable: false, failTransitions: false, failTransitionStates: new Set(), staleTransitionStates: new Set(), humanPollError: null, humanAskError: null, failEligible: false, authFail: false, itemLabels: {} };
   const calls = {
     transitions: [] as [string, WorkState][],
     agentSend: [] as [string, string][],
@@ -102,12 +106,15 @@ function build(opts: { multi?: boolean } = {}) {
   // lives inside the real JiraSource/LocalMarkdownSource, which these fakes stand in for).
   const jiraClient: WorkSource = {
     spec: { statusOfRecord: "external", mappedStates: ["todo", "in_development", "in_review"], replyChannel: "comments" },
+    authStatus: async () => (state.authFail ? { state: "unauthenticated", detail: "fake: JIRA_API_TOKEN missing" } : { state: "ok" }),
     listEligible: async () => {
+      if (state.authFail) throw new SourceUnauthenticatedError({ reason: "rejected", hint: "fake: not authenticated" });
       if (state.failEligible) throw new Error("jira is down (fake)");
       return state.eligible.map(wrapJira);
     },
     describe: async (key) => ({ key, summary: "Fix the thing", type: "Bug" }),
     transition: async (key, to) => {
+      if (state.authFail) throw new SourceUnauthenticatedError({ reason: "rejected", hint: "fake: not authenticated" });
       if (state.failTransitions || state.failTransitionStates.has(to)) throw new Error(`transition to ${to} failed (fake)`);
       if (state.staleTransitionStates.has(to)) return { kind: "stale", detail: "issue deleted (fake)" };
       calls.transitions.push([key, to]);
@@ -137,6 +144,7 @@ function build(opts: { multi?: boolean } = {}) {
   if (opts.multi) {
     const lmClient: WorkSource = {
       spec: { statusOfRecord: "internal", mappedStates: ["todo", "in_development", "in_review", "merged", "aborted", "done"], replyChannel: "file" },
+      authStatus: async () => ({ state: "not_applicable" }),
       listEligible: async () => state.eligible2.map(wrapLm),
       describe: async (key) => ({ key, summary: "md work", type: "task" }),
       transition: async (key, to) => { calls.transitions.push([key, to]); return { kind: "applied" }; },
@@ -1612,5 +1620,45 @@ describe("rate limiting — batched PR polling, claim admission, poll backoff", 
     expect(store.recordHumanPollMiss(q.id).nextPollAt).toBe(1000 + 240);
     expect(store.recordHumanPollMiss(q.id).nextPollAt).toBe(1000 + 300); // capped
     expect(store.recordHumanPollMiss(q.id).nextPollAt).toBe(1000 + 300);
+  });
+});
+
+describe("work-source auth gate (unauthenticated → pause + auto-resume, never haywire)", () => {
+  it("claiming: an unauthenticated source is paused (no claim) + notified once, OTHER sources keep claiming, and it auto-resumes on recovery", async () => {
+    const { deps, store, state, calls } = build({ multi: true });
+    state.authFail = true; // jira can't authenticate
+    state.eligible = [ticket("A-1")]; // a jira item is waiting
+    state.eligible2 = [ticket("M-1")]; // and a local_markdown item
+
+    await reconcileRepo(deps);
+    // jira is gated: its item is NOT claimed. The label-less local_markdown belt is unaffected.
+    expect(store.activeRunForTicket("demo", "jira", "A-1")).toBeUndefined();
+    expect(store.activeRunForTicket("demo", "lm", "M-1")).toBeDefined();
+    expect(getAuthFailure("demo", "jira")).toBeDefined();
+    expect(getAuthFailure("demo", "lm")).toBeUndefined(); // no-auth source never gates
+    expect(calls.notify).toBe(1); // the operator is told exactly once (throttled)
+
+    // A second gated tick must NOT re-notify (throttle) and must NOT claim.
+    await reconcileRepo(deps);
+    expect(calls.notify).toBe(1);
+    expect(store.activeRunForTicket("demo", "jira", "A-1")).toBeUndefined();
+
+    // Re-authenticated: the gate clears and the held jira item is claimed on the next tick.
+    state.authFail = false;
+    await reconcileRepo(deps);
+    expect(getAuthFailure("demo", "jira")).toBeUndefined();
+    expect(store.activeRunForTicket("demo", "jira", "A-1")).toBeDefined();
+  });
+
+  it("write-back: an auth failure DEFERS the transition + notifies (intent stays queued, never lost or escalated)", async () => {
+    const { deps, store, state, calls } = build();
+    const run = store.createRun({ repo: "demo", workSource: "jira", belt: "ship", ticketKey: "K-1", branch: "b" });
+    const intent = store.enqueueTransition({ runId: run.id, repo: "demo", workSource: "jira", ticketKey: "K-1", toState: "in_review" });
+    state.authFail = true;
+    await flushTransitionOutbox(deps);
+    expect(calls.transitions).not.toContainEqual(["K-1", "in_review"]); // never delivered
+    expect(store.getTransitionIntent(intent.id)?.deliveredAt).toBeNull(); // still queued for retry
+    expect(getAuthFailure("demo", "jira")).toBeDefined();
+    expect(calls.notify).toBe(1);
   });
 });

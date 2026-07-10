@@ -204,6 +204,15 @@ describe.each(HARNESSES)("WorkSource contract: $name", ({ make }) => {
     expect(await src.listEligible()).toEqual([]);
   });
 
+  it("INV-12: authStatus reports a valid state with ZERO backend calls (local/cheap)", async () => {
+    const ctx = make();
+    const before = ctx.backendCalls();
+    const st = await ctx.src.authStatus();
+    expect(["ok", "unauthenticated", "not_applicable"]).toContain(st.state);
+    if (st.state === "unauthenticated") expect((st.detail ?? "").trim()).not.toBe(""); // actionable
+    expect(ctx.backendCalls()).toBe(before); // no network — it's a credential-presence check
+  });
+
   it("eligible items carry non-empty key/summary/type, a safe key, and the uniform labels/fields base", async () => {
     const ctx = make();
     const key = ctx.seedEligible();

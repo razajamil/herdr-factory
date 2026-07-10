@@ -15,7 +15,8 @@
 // are "the item is no longer ours", where retrying cannot help.
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { bearsHerdrMarker, HERDR_MARKER, type Logger, type WorkSource, type WorkSourceSpec } from "../core/deps.ts";
+import { bearsHerdrMarker, HERDR_MARKER, type Logger, type SourceAuthStatus, type WorkSource, type WorkSourceSpec } from "../core/deps.ts";
+import { isSourceUnauthenticated } from "../auth/errors.ts";
 import {
   StaleItemError,
   type GithubIssuesMatchItem,
@@ -115,6 +116,19 @@ export class GithubIssuesSource implements WorkSource {
     replyChannel: "comments",
     terminalAutomation: "PR closing keywords (Fixes #n) auto-close on default-branch merges; the close here is the idempotent backstop",
   };
+
+  /** Local (no-network) auth readiness: can a token be resolved (env GITHUB_TOKEN, else the gh
+   *  CLI)? A present-but-rejected token still reads "ok" here; a live 401 surfaces it as rejected
+   *  (INV-12). */
+  async authStatus(): Promise<SourceAuthStatus> {
+    try {
+      await this.gh.probeAuth();
+      return { state: "ok" };
+    } catch (e) {
+      if (isSourceUnauthenticated(e)) return { state: "unauthenticated", detail: e.hint ?? e.message };
+      return { state: "ok" }; // a transient probe glitch must not mark the source down
+    }
+  }
 
   private stateLabelFor(to: WorkState): string | undefined {
     switch (to) {

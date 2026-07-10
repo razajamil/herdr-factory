@@ -83,6 +83,16 @@ export interface WorkSourceSpec {
   terminalAutomation?: string;
 }
 
+/** A source's LOCAL credential readiness — the proactive, no-network view answered by
+ *  `WorkSource.authStatus()`. "not_applicable" is a source with no auth at all (local_markdown).
+ *  It does NOT prove the credentials WORK against the backend; a present-but-rejected credential is
+ *  reported reactively as a SourceUnauthenticatedError from the first real call that 401/403s. */
+export interface SourceAuthStatus {
+  state: "ok" | "unauthenticated" | "not_applicable";
+  /** Actionable remediation when unauthenticated (which env key to set / which command to run). */
+  detail?: string;
+}
+
 /** Every artifact a source writes to its reply channel carries this visible prefix, and reply
  *  polling skips artifacts bearing it (INV-6). Shared so all sources mark and filter uniformly. */
 export const HERDR_MARKER = "[herdr-factory";
@@ -152,6 +162,14 @@ export function bearsHerdrMarker(body: string): boolean {
 export interface WorkSource {
   /** Declarative capabilities/ownership. Cheap, constant, side-effect free. */
   readonly spec: WorkSourceSpec;
+  /** INV-12  AUTH IS OBSERVABLE: report LOCAL credential readiness cheaply and with ZERO network
+   *  (creds present / bootstrappable), so the engine can pause + surface an unauthenticated source
+   *  BEFORE a call fails. A present-but-rejected credential need not be caught here — it surfaces
+   *  when a real call throws SourceUnauthenticatedError (which every network method MUST throw for a
+   *  missing credential or a 401/403, never a generic Error). A source with no auth returns
+   *  not_applicable. The reconciler pauses claims + write-backs for an unauthenticated source and
+   *  auto-resumes them once a call succeeds again — so this must be truthful and stable. */
+  authStatus(): Promise<SourceAuthStatus>;
   /** A BOUNDED batch of eligible (todo) items in claim order — need not be exhaustive (claims are
    *  admission-capped per tick anyway); [] when there's none. MAY throw on hard backend failure:
    *  every caller try/catches per source and degrades to [], so one source's outage never starves

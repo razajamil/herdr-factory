@@ -1,7 +1,22 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { JiraIssue } from "../types.ts";
-import { httpOk, httpOkBytes, TokenBucket } from "./http.ts";
+import { SourceUnauthenticatedError } from "../auth/errors.ts";
+import { HttpStatusError, httpOk, httpOkBytes, TokenBucket, type HttpPolicy, type HttpRequest, type HttpResponse } from "./http.ts";
+
+/** Map a Jira 401/403 to the typed auth error (else pass the error through unchanged). Jira uses
+ *  Basic auth, so a 401/403 is unambiguously bad/expired credentials — not a scope/permission
+ *  nuance like GitHub's 403. */
+function asJiraAuthError(e: unknown): unknown {
+  if (e instanceof HttpStatusError && (e.status === 401 || e.status === 403)) {
+    return new SourceUnauthenticatedError({
+      reason: "rejected",
+      hint: "Jira rejected the credentials (HTTP " + e.status + ") — check JIRA_EMAIL + JIRA_API_TOKEN in the repo env",
+      cause: e,
+    });
+  }
+  return e;
+}
 
 /** Time budget for a JSON API round-trip; media downloads get a larger one. Both are HARD
  *  bounds — a black-holed Jira connection must never wedge a reconcile tick. */
@@ -61,9 +76,22 @@ export class JiraClient {
 
   requireAuth(): void {
     if (!this.email || !this.token) {
-      throw new Error(
-        "Jira auth missing — set JIRA_EMAIL + JIRA_API_TOKEN in the repo's env (~/.config/herdr-factory/repos/<name>/env) or the shared ~/.config/herdr-factory/env",
-      );
+      throw new SourceUnauthenticatedError({
+        reason: "missing",
+        hint: "Jira auth missing — set JIRA_EMAIL + JIRA_API_TOKEN in the repo's env (~/.config/herdr-factory/repos/<name>/env)",
+      });
+    }
+  }
+
+  /** httpOk with Jira's 401/403 mapped to the typed auth error. All JSON round-trips go through
+   *  here so a rejected credential surfaces as SourceUnauthenticatedError everywhere, not a raw
+   *  HttpStatusError. (Attachment downloads stay on raw httpOkBytes — they're best-effort and
+   *  swallow their own errors, so an auth failure there is a skipped attachment, not a poison.) */
+  private async okOrAuth(req: HttpRequest, policy: HttpPolicy): Promise<HttpResponse> {
+    try {
+      return await httpOk(req, policy);
+    } catch (e) {
+      throw asJiraAuthError(e);
     }
   }
 
@@ -75,7 +103,7 @@ export class JiraClient {
   }
 
   private async getJson<T>(path: string): Promise<T> {
-    const res = await httpOk({ url: this.baseUrl + path, headers: this.headers(), timeoutMs: JIRA_TIMEOUT_MS }, { bucket: this.bucket });
+    const res = await this.okOrAuth({ url: this.baseUrl + path, headers: this.headers(), timeoutMs: JIRA_TIMEOUT_MS }, { bucket: this.bucket });
     return JSON.parse(res.text) as T;
   }
 
@@ -83,7 +111,7 @@ export class JiraClient {
   // or 5xx write may have landed — a rare duplicate comment is acceptable noise, a retry storm
   // of writes is not.
   private async postJson<T>(path: string, body: unknown): Promise<T> {
-    const res = await httpOk(
+    const res = await this.okOrAuth(
       {
         url: this.baseUrl + path,
         method: "POST",
@@ -154,8 +182,8 @@ export class JiraClient {
     );
     const match = (tr.transitions ?? []).find((t) => t.to?.name?.toLowerCase() === targetName.toLowerCase());
     if (!match) throw new Error(`${key}: no transition from "${current}" to "${targetName}"`);
-    // The transition POST returns 204 with an empty body — httpOk (not postJson, which parses).
-    await httpOk(
+    // The transition POST returns 204 with an empty body — okOrAuth (not postJson, which parses).
+    await this.okOrAuth(
       {
         url: `${this.baseUrl}/rest/api/3/issue/${key}/transitions`,
         method: "POST",

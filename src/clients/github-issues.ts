@@ -6,6 +6,7 @@
 // The gh CLI remains the transport for the PR watcher and for agents inside prompts; only its
 // auth is borrowed here (`gh auth token`) when no GITHUB_TOKEN is configured.
 import type { Logger } from "../core/deps.ts";
+import { SourceUnauthenticatedError } from "../auth/errors.ts";
 import { recordRateLimitRemaining, telemetryEvent } from "../telemetry/index.ts";
 import { run } from "./exec.ts";
 import { GITHUB_MUTATION_BUCKETS, githubReadBucket } from "./github-budget.ts";
@@ -42,6 +43,16 @@ export function classifyGone(e: unknown): string | null {
   if (e.status === 410) return "deleted";
   if (e.status === 404) return "not found (deleted, or the token lost access)";
   return null;
+}
+
+/** Map a GitHub 401 to the typed auth error (bad/expired token). NOT 403 — GitHub's 403 is
+ *  ambiguous (secondary rate limit, or a valid token that lacks a scope/permission), so it stays a
+ *  generic HttpStatusError rather than being mis-reported as an auth failure. */
+function asGithubAuthError(e: unknown): unknown {
+  if (e instanceof HttpStatusError && e.status === 401) {
+    return new SourceUnauthenticatedError({ reason: "rejected", hint: "GitHub rejected the token (401) — refresh GITHUB_TOKEN, or run `gh auth login`", cause: e });
+  }
+  return e;
 }
 
 // REST payload shapes (the fields we read; everything else rides along in `fields`).
@@ -112,9 +123,19 @@ export class GithubIssuesClient {
     // only fires when a request was actually sent.
     if (this.token === undefined) this.token = (await this.tokenCmd()) ?? undefined;
     if (!this.token) {
-      throw new Error("GitHub auth missing — set GITHUB_TOKEN in the repo env, or authenticate the gh CLI (`gh auth login`)");
+      throw new SourceUnauthenticatedError({
+        reason: "missing",
+        hint: "GitHub auth missing — set GITHUB_TOKEN in the repo env, or authenticate the gh CLI (`gh auth login`)",
+      });
     }
     return this.token;
+  }
+
+  /** Cheap, no-network auth probe for the source's authStatus(): resolves a token (env or the gh
+   *  CLI) or throws SourceUnauthenticatedError. Reuses authToken so the memoization/rotation rules
+   *  are identical to a real call's. */
+  async probeAuth(): Promise<void> {
+    await this.authToken();
   }
 
   /** One API round-trip: auth → manual-redirect fetch through the budget buckets → JSON. A 401
@@ -159,9 +180,13 @@ export class GithubIssuesClient {
         this.log("warn", `github: 401 with a memoized gh-CLI token — refreshing it once (${method} ${path})`);
         telemetryEvent("github.token_refreshed", { "http.request.method": method });
         this.token = undefined; // gh CLI token rotated — refetch once
-        return attempt();
+        try {
+          return await attempt();
+        } catch (e2) {
+          throw asGithubAuthError(e2); // still 401 after a rotation ⇒ the credential itself is bad
+        }
       }
-      throw e;
+      throw asGithubAuthError(e);
     }
   }
 

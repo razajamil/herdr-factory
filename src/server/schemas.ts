@@ -87,7 +87,9 @@ const StatusResponse = z
   .object({
     repo: z.string(),
     limits: z.object({ maxActiveWorkspaces: z.number() }),
-    sources: z.array(z.object({ name: z.string(), type: z.string() })),
+    // `auth` is the per-source authentication light (same vocab as evidenceSso). "down" = the source
+    // can't authenticate (its claims + write-backs are paused, auto-resuming on re-auth); "na" = no auth.
+    sources: z.array(z.object({ name: z.string(), type: z.string(), auth: z.object({ state: z.enum(["ok", "down", "na"]), detail: z.string().optional() }) })),
     belts: z.array(z.object({ name: z.string(), beltType: z.string(), source: z.string(), priority: z.number() })),
     active: z.array(
       z.object({

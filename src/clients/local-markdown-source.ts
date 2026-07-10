@@ -2,7 +2,7 @@ import { appendFileSync, cpSync, existsSync, mkdirSync, readFileSync, readdirSyn
 import { join } from "node:path";
 import { parse as parseYaml } from "yaml";
 import type { Store } from "../db/store.ts";
-import type { Logger, WorkSource, WorkSourceSpec } from "../core/deps.ts";
+import type { Logger, SourceAuthStatus, WorkSource, WorkSourceSpec } from "../core/deps.ts";
 import type {
   HumanAskInput,
   HumanAskResult,
@@ -113,6 +113,11 @@ export class LocalMarkdownSource implements WorkSource {
     mappedStates: ["todo", "in_development", "in_review", "merged", "aborted", "done"],
     replyChannel: "file",
   };
+
+  /** No auth: a folder of files on the local disk (folder reachability is a health() concern). */
+  async authStatus(): Promise<SourceAuthStatus> {
+    return { state: "not_applicable" };
+  }
 
   /** Top-level `*.md` in a work directory whose contents seed the ticket: `README.md`
    *  (case-insensitive) if present, else the first `*.md` alphabetically. Null when the directory

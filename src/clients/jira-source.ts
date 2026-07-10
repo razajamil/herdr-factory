@@ -1,6 +1,6 @@
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { bearsHerdrMarker, HERDR_MARKER, type Logger, type WorkSource, type WorkSourceSpec } from "../core/deps.ts";
+import { bearsHerdrMarker, HERDR_MARKER, type Logger, type SourceAuthStatus, type WorkSource, type WorkSourceSpec } from "../core/deps.ts";
 import type {
   HumanAskInput,
   HumanAskResult,
@@ -72,8 +72,10 @@ function humanQuestionComment(input: HumanAskInput): string {
 export class JiraSource implements WorkSource {
   private readonly jira: JiraClient;
   private readonly cfg: JiraSourceCfg;
+  private readonly hasCreds: boolean;
   constructor(cfg: JiraSourceCfg, email: string, token: string) {
     this.cfg = cfg;
+    this.hasCreds = !!(email && token);
     this.jira = new JiraClient(cfg.baseUrl, email, token);
   }
 
@@ -83,6 +85,12 @@ export class JiraSource implements WorkSource {
     replyChannel: "comments",
     terminalAutomation: "Jira's GitHub integration owns terminal closure (merged/aborted/done are unmapped)",
   };
+
+  /** Local (no-network) credential presence — the api_token method needs both env values. A
+   *  present-but-wrong token still reads "ok" here; a live 401 surfaces it as rejected (INV-12). */
+  async authStatus(): Promise<SourceAuthStatus> {
+    return this.hasCreds ? { state: "ok" } : { state: "unauthenticated", detail: "set JIRA_EMAIL + JIRA_API_TOKEN in the repo env" };
+  }
 
   async listEligible(pickupLabel?: string): Promise<MatchItem[]> {
     const items = await this.jira.listEligible(this.cfg.board, pickupLabel, this.cfg.statusTodo);

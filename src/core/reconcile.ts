@@ -12,9 +12,53 @@ import { firstStep, indexOfStep, materializeWork, MEMORY_DIR, nextStep, spawnSte
 import { STEP_DESCRIPTORS } from "../steps/registry.ts";
 import { wakeResolver } from "./watch.ts";
 import { recordTick, recordTickDuration, recordTickLockSkipped, telemetryEvent, telemetrySpan } from "../telemetry/index.ts";
+import { isSourceUnauthenticated, type SourceUnauthenticatedError } from "../auth/errors.ts";
+import { getAuthFailure, markAuthNotified, recordAuthFailure, recordAuthOk } from "../auth/gate.ts";
 
 function err(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
+}
+
+// --- work-source auth gate (resilience: pause + auto-resume, never haywire) -------------------
+// A work source that can't authenticate (missing creds, or a live 401/403 → SourceUnauthenticatedError)
+// must not silently vanish (the poll path used to degrade to []) or retry forever (the outbox). These
+// two helpers record the gate state (src/auth/gate.ts — surfaced on the dashboard + doctor), notify the
+// operator ONCE per source (throttled by attentionRenotifySeconds, mirroring the AWS-SSO evidence path),
+// and — on recovery — re-queue the source's held write-backs so a restored session catches up promptly.
+// Claiming/outbox/human-poll all call these; auto-resume falls out of the normal tick the moment a call
+// to the source succeeds again.
+
+/** Record + (throttled) notify that a work source is unauthenticated. Idempotent per source. */
+async function noteSourceAuthFailure(deps: Deps, source: string, e: SourceUnauthenticatedError): Promise<void> {
+  const repo = deps.config.repoName;
+  const detail = e.hint ?? e.message;
+  const wasDown = getAuthFailure(repo, source) !== undefined;
+  recordAuthFailure(repo, source, { reason: e.reason, detail, now: deps.now() });
+  if (!wasDown) {
+    deps.log("warn", `${source}: work source not authenticated (${e.reason}) — pausing its claims + status write-backs until re-authenticated`);
+    telemetryEvent("source.auth.unauthenticated", { "work.source": source, "auth.reason": e.reason });
+  }
+  const f = getAuthFailure(repo, source)!;
+  const notifyDue = f.notifiedAt == null || deps.now() - f.notifiedAt >= deps.config.limits.attentionRenotifySeconds;
+  if (notifyDue) {
+    await deps.herdr
+      .notify(
+        `herdr-factory: ${source} not authenticated`,
+        `Work source "${source}" can't authenticate: ${detail}. Its claims + status write-backs are paused; they resume automatically once it's authenticated again.`,
+      )
+      .catch(() => {});
+    markAuthNotified(repo, source, deps.now());
+  }
+}
+
+/** A source call SUCCEEDED — clear any auth failure. On recovery, re-queue held write-backs + notify. */
+function noteSourceAuthRecovered(deps: Deps, source: string): void {
+  const repo = deps.config.repoName;
+  if (!recordAuthOk(repo, source)) return; // wasn't down — the common, hot path
+  const requeued = deps.store.retryTransitionsForSource(repo, source);
+  deps.log("info", `${source}: re-authenticated — resuming work${requeued ? ` (${requeued} held write-back(s) re-queued)` : ""}`);
+  telemetryEvent("source.auth.recovered", { "work.source": source, "transition.requeued": requeued });
+  void deps.herdr.notify(`herdr-factory: ${source} re-authenticated`, `Work source "${source}" is authenticated again — paused work is resuming.`).catch(() => {});
 }
 
 /** How long a step's pane must stay CONFIRMED absent before the reconciler respawns it. Two
@@ -43,6 +87,7 @@ async function deliverTransition(deps: Deps, src: SourceRuntime, intent: Transit
     // to clear". Terminal transitions don't use it (they strip state labels + close).
     const pickupLabel = deps.resolveBelt(deps.store.getRun(intent.runId)?.belt ?? null)?.label;
     const result = await src.client.transition(intent.ticketKey, intent.toState, pickupLabel);
+    noteSourceAuthRecovered(deps, src.name); // delivery succeeded ⇒ auth is fine (clears any gate)
     switch (result.kind) {
       case "applied":
         deps.store.markTransitionDelivered(intent.id);
@@ -81,6 +126,10 @@ async function deliverTransition(deps: Deps, src: SourceRuntime, intent: Transit
     }
     return true;
   } catch (e) {
+    // An auth failure here is a PAUSE, not a lost write-back: record + notify (once) so the operator
+    // knows why the status isn't moving. The intent stays queued and re-queues promptly on recovery
+    // (retryTransitionsForSource), rather than burning its exponential backoff out to an hour blindly.
+    if (isSourceUnauthenticated(e)) await noteSourceAuthFailure(deps, src.name, e);
     const after = deps.store.recordTransitionAttempt(intent.id, err(e));
     deps.log(
       "warn",
@@ -400,9 +449,13 @@ async function reconcileRepoImpl(deps: Deps): Promise<void> {
     let items: MatchItem[];
     try {
       items = await src.client.listEligible(label);
+      noteSourceAuthRecovered(deps, src.name); // a successful poll ⇒ auth is fine (clears any gate)
     } catch (e) {
-      // One source's backend hiccup must not starve the others — log and move on.
-      deps.log("warn", `${src.name}: eligible query failed: ${err(e)}`);
+      // A source that can't authenticate is PAUSED, not broken: record + notify (once) and skip its
+      // claims this tick — it auto-resumes when a later poll succeeds. Any other backend hiccup must
+      // still not starve the other sources, so it also degrades to [] (just logged, not gated).
+      if (isSourceUnauthenticated(e)) await noteSourceAuthFailure(deps, src.name, e);
+      else deps.log("warn", `${src.name}: eligible query failed: ${err(e)}`);
       items = [];
     }
     eligibleCache.set(cacheKey, items);
@@ -1100,6 +1153,15 @@ async function reconcileWaitingForHuman(deps: Deps, run: Run, belt: BeltRuntime,
     // tick) but count it separately — a slow HUMAN is normal, a persistently-throwing source is
     // not, and a parked run doesn't occupy capacity so it would otherwise wedge invisibly.
     if (e instanceof StaleItemError) return humanLoopStale(deps, run, q, err(e));
+    if (isSourceUnauthenticated(e)) {
+      // Auth-held, NOT a poll failure: record + notify (once), back off like a normal miss, and
+      // NEVER count toward the poll-error escalation. A human is still expected to answer — the
+      // source just needs re-auth — so parking the run for attention would be wrong.
+      await noteSourceAuthFailure(deps, src.name, e);
+      const held = deps.store.recordHumanPollMiss(q.id);
+      deps.log("warn", `${run.ticketKey}: reply poll for #${q.id} held — ${src.name} not authenticated (next poll in ${held.nextPollAt - deps.now()}s)`);
+      return;
+    }
     const errored = deps.store.recordHumanPollError(q.id);
     deps.log("warn", `${run.ticketKey}: reply poll for question #${q.id} failed (${errored.pollErrors} consecutive): ${err(e)}`);
     if (errored.pollErrors >= HUMAN_POLL_ERROR_ESCALATE) {
@@ -1112,6 +1174,7 @@ async function reconcileWaitingForHuman(deps: Deps, run: Run, belt: BeltRuntime,
     }
     return;
   }
+  noteSourceAuthRecovered(deps, src.name); // the poll call itself succeeded ⇒ auth is fine
   if (!reply) {
     const missed = deps.store.recordHumanPollMiss(q.id);
     deps.log("info", `${run.ticketKey}: waiting for human reply to question #${q.id} (next poll in ${missed.nextPollAt - deps.now()}s)`);
