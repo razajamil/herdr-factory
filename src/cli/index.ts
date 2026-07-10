@@ -4,7 +4,7 @@ import { createInterface } from "node:readline/promises";
 import { Command } from "commander";
 import { configJsonSchema, configSchemaPath, evidenceKeyPrefix, globalDbPath, isManagedNode, loadConfig, managedNodePath, nodePathFile, writeConfigSchema, type WorkSourceConfig } from "../config.ts";
 import type { JiraSourceCfg } from "../clients/jira-source.ts";
-import { jiraOAuthLogin } from "../auth/jira-login.ts";
+import { codeFromPaste, jiraOAuthLogin, openBrowser, pollServerForCode } from "../auth/jira-login.ts";
 import { resolveJiraOAuthApp } from "../auth/jira-oauth.ts";
 import { classifyS3Error, enumerateEvidenceFiles, evidenceUrls, resolveGithubUsername, uploadEvidence } from "../clients/evidence.ts";
 import { baseGroups, repoGroup, type DoctorGroup } from "../doctor.ts";
@@ -21,7 +21,7 @@ import { serve } from "../server/serve.ts";
 import { ensureUp, stopServer, type Log } from "../watchers/supervisor.ts";
 import { selfUpdate } from "../watchers/updater.ts";
 import { pinnedNodeVersion, provisionNode } from "../watchers/provision.ts";
-import { NoServerError, pingHealth, readServerInfo, serverFetch, viaServerOrLocal } from "../server/client.ts";
+import { NoServerError, pingHealth, readHealth, readServerInfo, serverFetch, viaServerOrLocal } from "../server/client.ts";
 import { VERSION } from "../version.ts";
 import { initTelemetry, recordCliDuration, shutdownTelemetry, telemetryEnabled, telemetryEvent, telemetrySpan } from "../telemetry/index.ts";
 import { disposeEffectRuntime } from "../runtime/effect.ts";
@@ -408,7 +408,7 @@ program
   .command("auth <action>")
   .description("work-source authentication: `login` (browser OAuth), `status`, or `logout`")
   .option("--source <name>", "target a specific work source (default: the sole OAuth source)")
-  .option("--paste", "headless login — print the URL and paste the redirect back (no local browser)")
+  .option("--paste", "login: skip the server auto-capture — paste the redirected URL yourself (headless)")
   .action(cliAction("auth", async (action: string, opts: { source?: string; paste?: boolean }) => {
     try {
       const repo = requireRepo();
@@ -431,18 +431,25 @@ program
         }
         const auth = cfg.auth as Extract<JiraSourceCfg["auth"], { method: "oauth" }>;
         const app = resolveJiraOAuthApp({ clientId: auth.clientId });
-        const result = await jiraOAuthLogin({
-          store,
-          repo,
-          source: src.name,
-          siteBaseUrl: cfg.baseUrl,
-          app,
-          scopes: auth.scopes,
-          paste: !!opts.paste,
-          now: systemClock,
-          log: (m) => console.log(m),
-          readPastedRedirect: () => promptLine("Paste the redirected URL (or the code): "),
-        });
+        // Prefer the resident server's https callback listener (auto-capture); fall back to paste when
+        // there's no server, its callback listener is down (no openssl), or --paste was passed.
+        const info = readServerInfo();
+        const health = info ? await readHealth(info.port) : null;
+        const useServer = !opts.paste && info && health?.oauthCallback === true;
+        const getCode = useServer
+          ? async ({ authUrl, state }: { authUrl: string; state: string }) => {
+              console.log("Opening your browser to authorize herdr-factory.");
+              console.log('Your browser will warn that localhost isn\'t private (a self-signed cert) — click through it (Advanced → proceed to localhost).\nWaiting for the callback…');
+              if (!(await openBrowser(authUrl))) console.log(`\nCouldn't open a browser — open this URL yourself:\n\n  ${authUrl}\n`);
+              return pollServerForCode(info.port, state);
+            }
+          : async ({ authUrl, state }: { authUrl: string; state: string }) => {
+              if (await openBrowser(authUrl)) console.log(`Opening your browser to authorize herdr-factory…\n\n  ${authUrl}\n`);
+              else console.log(`Open this URL in a browser and approve access:\n\n  ${authUrl}\n`);
+              console.log('After approving, your browser shows a "can\'t reach localhost" page — that\'s expected. Copy the full address-bar URL and paste it here.');
+              return codeFromPaste(await promptLine("Paste the redirected URL (or the code): "), state);
+            };
+        const result = await jiraOAuthLogin({ store, repo, source: src.name, siteBaseUrl: cfg.baseUrl, app, scopes: auth.scopes, now: systemClock, getCode });
         console.log(`\n✓ ${src.name}: authenticated to ${result.cloudName} (${result.cloudUrl})`);
         console.log(`  scopes: ${result.scopes}`);
         console.log(`  access token expires ${new Date(result.expiresAt * 1000).toISOString()} — refreshed automatically`);

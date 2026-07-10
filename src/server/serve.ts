@@ -1,11 +1,16 @@
 // The resident `serve` daemon's lifecycle: discover repos, run a per-repo tick loop, bind the Hono
 // app (server/app.ts) on @hono/node-server, advertise via server.json, and shut down gracefully.
 // All HTTP routing/validation lives in app.ts; this module owns the state + process lifecycle.
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createServer as createHttpsServer } from "node:https";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { serve as nodeServe } from "@hono/node-server";
 import * as Effect from "effect/Effect";
 import { listConfiguredRepos, serverInfoPath, serverLogsDir, serverPort } from "../config.ts";
 import { buildDeps } from "../build-deps.ts";
+import { run } from "../clients/exec.ts";
+import { OAUTH_CALLBACK_PORT } from "../auth/jira-login.ts";
 import { isTickStale, pingHealth, readServerInfo } from "./client.ts";
 import { createApp, type HealthInfo, type RepoRuntime, type ServerContext } from "./app.ts";
 import { reconcileRepo, withTickLock } from "../core/reconcile.ts";
@@ -27,8 +32,53 @@ function slog(level: "info" | "warn" | "error", m: string): void {
 
 const repos = new Map<string, RepoRuntime>();
 let httpServer: ReturnType<typeof nodeServe> | undefined;
+let oauthHttpsServer: ReturnType<typeof nodeServe> | undefined;
+let oauthCallbackUp = false;
 let startedAt = 0;
 let shuttingDown = false;
+
+/** Mint an ephemeral self-signed cert (localhost) via openssl for the OAuth callback listener. The
+ *  browser shows a one-time "not private" warning the operator clicks through — that's the trade for
+ *  Atlassian requiring an https callback. Returns null (→ paste fallback) if openssl isn't available. */
+async function selfSignedCert(): Promise<{ key: Buffer; cert: Buffer } | null> {
+  const dir = mkdtempSync(join(tmpdir(), "hf-oauth-cert-"));
+  try {
+    const keyPath = join(dir, "key.pem");
+    const certPath = join(dir, "cert.pem");
+    const r = await run("openssl", ["req", "-x509", "-newkey", "rsa:2048", "-keyout", keyPath, "-out", certPath, "-days", "3650", "-nodes", "-subj", "/CN=localhost"], {
+      allowFail: true,
+      timeoutMs: 20_000,
+    });
+    if (r.code !== 0) return null;
+    return { key: readFileSync(keyPath), cert: readFileSync(certPath) };
+  } catch {
+    return null;
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+/** Bring up the resident server's https OAuth-callback listener (same Hono app, a second listener) so
+ *  `auth login` can auto-capture the redirect. Best-effort: on any failure it logs + leaves
+ *  oauthCallbackUp false (the CLI/TUI then fall back to the paste capture). */
+async function startOAuthCallbackListener(app: ReturnType<typeof createApp>): Promise<void> {
+  const cert = await selfSignedCert();
+  if (!cert) {
+    slog("warn", "openssl unavailable — OAuth callback listener disabled; `auth login` will use paste capture");
+    return;
+  }
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const srv = nodeServe({ fetch: app.fetch, port: OAUTH_CALLBACK_PORT, hostname: "127.0.0.1", createServer: createHttpsServer, serverOptions: cert }, () => resolve());
+      srv.once("error", reject);
+      oauthHttpsServer = srv;
+    });
+    oauthCallbackUp = true;
+    slog("info", `OAuth callback listener on https://127.0.0.1:${OAUTH_CALLBACK_PORT}`);
+  } catch (e) {
+    slog("warn", `OAuth callback listener failed to bind :${OAUTH_CALLBACK_PORT} (${msg(e)}) — falling back to paste capture`);
+  }
+}
 
 /** (Re)build the per-repo runtimes from config. Clears any existing tick timers first. Returns
  *  the repos that FAILED to load (schema-valid config whose source construction threw, etc.) —
@@ -125,6 +175,7 @@ function health(): HealthInfo {
         tickStale: isTickStale(lastTickAt, startedAt, rt.deps.config.limits.tickIntervalSeconds, now),
       };
     }),
+    oauthCallback: oauthCallbackUp,
   };
 }
 
@@ -134,6 +185,7 @@ async function shutdown(why: string): Promise<void> {
   slog("info", `shutting down (${why})`);
   for (const rt of repos.values()) if (rt.timer) clearInterval(rt.timer);
   httpServer?.close();
+  oauthHttpsServer?.close();
   // Let any in-flight tick finish (state is idempotent + on disk, so a hard kill is safe too;
   // this just avoids a torn mid-pass log).
   const deadline = Date.now() + 15_000;
@@ -200,6 +252,10 @@ async function serveImpl(): Promise<void> {
   mkdirSync(serverLogsDir(), { recursive: true });
   writeFileSync(serverInfoPath(), JSON.stringify({ pid: process.pid, port, version: VERSION, startedAt }));
   slog("info", `serving on 127.0.0.1:${port} — repos: ${[...repos.keys()].join(", ") || "(none)"}`);
+
+  // The OAuth callback listener rides the SAME app on a second (https) listener — best-effort, so a
+  // failure here never blocks the main server coming up.
+  await startOAuthCallbackListener(app);
 
   process.on("SIGTERM", () => void shutdown("SIGTERM"));
   process.on("SIGINT", () => void shutdown("SIGINT"));

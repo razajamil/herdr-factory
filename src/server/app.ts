@@ -13,6 +13,7 @@ import { runEffect } from "../runtime/effect.ts";
 import { bounceStep, claimTicket, reconcileRepo, reconcileRun, recordCaptureAttempt, requestHumanInput, resumeRun, teardownTicket, withRunLock, withRunLockWaiting, withTickLock } from "../core/reconcile.ts";
 import { probeEvidenceCreds } from "../clients/evidence.ts";
 import { getAuthFailure } from "../auth/gate.ts";
+import { getCallback, recordCallback } from "./oauth-callback.ts";
 import { stepByName } from "../core/step.ts";
 import { resolveActiveRun, resolveBeltName } from "../resolve.ts";
 import type { Deps } from "../core/deps.ts";
@@ -51,6 +52,9 @@ export interface HealthInfo {
   startedAt: number;
   uptimeSec: number;
   repos: { name: string; active: number; lastTickAt: number | null; tickStale: boolean }[];
+  /** Whether the https OAuth-callback listener came up (serve.ts). When false, `auth login` falls
+   *  back to the paste capture instead of the auto-capture callback. */
+  oauthCallback: boolean;
 }
 
 /** Everything the HTTP layer needs from the resident lifecycle (implemented in serve.ts). */
@@ -395,6 +399,37 @@ export function createApp(ctx: ServerContext): OpenAPIHono {
     const rt = ctx.getRepo(repo);
     if (!rt) return c.json({ error: notConfigured(repo) }, 404);
     return c.json({ timeline: rt.deps.store.timeline(repo, key) }, 200);
+  });
+
+  // --- OAuth callback relay (served on BOTH listeners; the browser hits the https one) -----------
+  // The browser redirects here after the user approves; stash the code by `state`. Plain routes (not
+  // OpenAPI): this is browser-facing + polled by the CLI/TUI, not part of the typed API surface.
+  app.get("/oauth/callback", (c) => {
+    const state = c.req.query("state");
+    const code = c.req.query("code");
+    const error = c.req.query("error");
+    const page = (msg: string) =>
+      c.html(`<!doctype html><meta charset=utf-8><title>herdr-factory</title><body style="font:16px system-ui;margin:3rem;color:#222"><h2>herdr-factory</h2><p>${msg}</p></body>`);
+    if (!state) return page("Missing state — please retry the login.");
+    if (error) {
+      recordCallback(state, { error });
+      return page(`Authorization failed: ${error}. You can close this tab.`);
+    }
+    if (!code) {
+      recordCallback(state, { error: "no authorization code returned" });
+      return page("No authorization code returned. You can close this tab.");
+    }
+    recordCallback(state, { code });
+    return page("herdr-factory is authenticated. You can close this tab.");
+  });
+  // The login initiator polls this (on the http listener) for the code its browser just delivered.
+  app.get("/oauth/callback-result", (c) => {
+    const state = c.req.query("state");
+    if (!state) return c.json({ status: "error", error: "no state" }, 400);
+    const r = getCallback(state);
+    if (!r) return c.json({ status: "pending" }, 200);
+    if (r.error) return c.json({ status: "error", error: r.error }, 200);
+    return c.json({ status: "done", code: r.code }, 200);
   });
 
   // --- OpenAPI document + Swagger UI --------------------------------------

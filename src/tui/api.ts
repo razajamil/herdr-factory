@@ -57,6 +57,13 @@ export interface Health {
   pid: number;
   uptimeSec: number;
   repos: { name: string; active: number }[];
+  /** Whether the server's https OAuth-callback listener is up (drives auto-capture vs paste login). */
+  oauthCallback?: boolean;
+}
+
+/** The resident server's advertised port, or null when no server is running. */
+export function serverPort(): number | null {
+  return readInfo()?.port ?? null;
 }
 
 async function getJson<T>(path: string): Promise<T | null> {

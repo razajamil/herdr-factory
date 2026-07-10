@@ -639,11 +639,14 @@ than one source; `claim --belt` is required only when the repo has more than one
 
 `auth login` runs the browser OAuth flow for a source configured with `auth.method: oauth` (only
 needed for those — an `api_token` source authenticates from `env`, and `github_issues` from your
-`gh` login). It opens a browser to Atlassian; after you approve, the browser lands on a "can't reach
-localhost" page — that's expected (Atlassian requires an https callback and nothing is listening on
-it) — so you copy that address-bar URL and paste it back into the prompt. `--paste` just skips the
-auto-open (headless/remote). `auth status` reports each source's method + state; `auth logout` clears
-a source's stored tokens.
+`gh` login). It opens a browser to Atlassian; approve, and the **resident server's** OAuth callback
+listener (an https loopback the `serve` process runs) captures the code automatically — no copying.
+Because Atlassian mandates an https callback, that listener uses a self-signed cert, so your browser
+shows a one-time "your connection is not private" warning for `localhost` that you click through
+(Advanced → proceed). If the server isn't running (or has no `openssl` to mint the cert), login falls
+back to a **paste** flow: the browser lands on a "can't reach localhost" page and you paste that URL
+back. `--paste` forces the paste flow. `auth status` reports each source's method + state; `auth
+logout` clears a source's stored tokens.
 
 `serve` binds `127.0.0.1:8765` (override with `HERDR_FACTORY_PORT`) with the OpenAPI spec at
 `/doc` and Swagger UI at `/ui`. `update` pulls the latest code (hard reset to the branch's
@@ -661,7 +664,9 @@ keys jump to a numbered section, arrows move within it, `Esc` pops back out, `q`
   fix: `aws sso login`), and is hidden for repos with no evidence configured. A per-source **auth
   light** does the same for each work source — red when it can't authenticate (its work is paused,
   auto-resuming on re-auth); highlight a red OAuth source and press `l` to log in — it opens your
-  browser, and you paste the redirected URL into a prompt (the light turns green when it's stored).
+  browser and the resident server auto-captures the callback (click through the one-time localhost
+  cert warning); the light turns green when the token's stored. (Falls back to a paste prompt if the
+  server's callback listener isn't up.)
 - **Config** — a repo list and a full `config.yml` editor: edits the YAML surgically (comments
   and the schema modeline preserved), validates against the engine schema, `^S` saves, `[`/`]`
   reorder list entries. Credentials appear as masked, replace-only `secrets (env)` fields —

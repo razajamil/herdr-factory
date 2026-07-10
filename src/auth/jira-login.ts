@@ -1,25 +1,28 @@
-// The interactive Jira OAuth login flow, driven by the `auth login` CLI command. Authorization-code
-// + PKCE (public client — no secret).
+// The Jira OAuth login flow (authorization-code + PKCE, public client — no secret). The redirect
+// lands on the RESIDENT server's https callback listener (server/serve.ts starts it on
+// OAUTH_CALLBACK_PORT; server/app.ts serves /oauth/callback), which stashes the code by `state`; the
+// caller polls /oauth/callback-result for it (`pollServerForCode`) — no throwaway per-login server.
 //
-// Atlassian Cloud 3LO forces an HTTPS callback and matches redirect_uri EXACTLY (no RFC 8252 dynamic
-// loopback ports — JRACLOUD-92180). Serving HTTPS on localhost would need a self-signed cert (a scary
-// browser warning), so rather than auto-catch the redirect we use the copy-the-URL flow: nothing
-// listens on the callback, the browser lands on a "can't reach localhost" page (EXPECTED), and the
-// operator pastes that address-bar URL back — it carries ?code=…&state=…. Works identically local and
-// headless/remote. On success it discovers the cloudId (accessible-resources) and persists tokens via
-// the store, so the running server picks them up on its next authorize() (WAL + fresh reads) — no restart.
+// Atlassian Cloud 3LO forces an https callback and an exact redirect_uri (no RFC 8252 dynamic ports),
+// so the listener uses a self-signed cert → the browser shows a one-time "not private" warning the
+// operator clicks through. When the server's callback listener isn't available (e.g. no openssl), the
+// caller falls back to a paste capture (`codeFromPaste`) instead. This module only assembles the URL,
+// exchanges the code, and persists tokens; HOW the code is captured is injected as `getCode`.
 import { randomBytes } from "node:crypto";
 import type { Store } from "../db/store.ts";
 import { run } from "../clients/exec.ts";
 import { accessibleResources, buildAuthorizeUrl, exchangeCode, newPkcePair, pickResource, type OAuthApp } from "./jira-oauth.ts";
 
-/** The single callback URL the OAuth app must register — https (console requirement) and an exact
- *  match to the redirect_uri we send. Nothing listens here; the browser's failed navigation still
- *  shows the ?code= in its address bar, which the operator pastes back. */
-export const OAUTH_REDIRECT_URI = "https://localhost:8976/oauth/callback";
+/** The fixed port the OAuth app's single https callback is registered on, and the redirect_uri we
+ *  send (must match the registered callback exactly). The resident server listens here for the
+ *  callback; `https` + `localhost` because the console requires https and Jira 3LO matches exactly. */
+export const OAUTH_CALLBACK_PORT = 8976;
+export const OAUTH_REDIRECT_URI = `https://localhost:${OAUTH_CALLBACK_PORT}/oauth/callback`;
+
+const CAPTURE_TIMEOUT_MS = 5 * 60 * 1000;
 
 /** Open a URL in the OS browser. Best-effort — returns false if we couldn't launch one. */
-async function openUrl(url: string): Promise<boolean> {
+export async function openBrowser(url: string): Promise<boolean> {
   const [cmd, args] = process.platform === "darwin" ? ["open", [url]] : process.platform === "win32" ? ["cmd", ["/c", "start", "", url]] : ["xdg-open", [url]];
   try {
     await run(cmd, args as string[], { allowFail: true, timeoutMs: 10_000 });
@@ -29,8 +32,25 @@ async function openUrl(url: string): Promise<boolean> {
   }
 }
 
-/** Extract the authorization code from a pasted redirect URL (validating state) or a bare code. */
-function codeFromPaste(input: string, expectedState: string): string {
+/** Poll the resident server's /oauth/callback-result for the code its https listener captured for
+ *  `state`. Resolves with the code, rejects on an authorization error or timeout. */
+export async function pollServerForCode(serverPort: number, state: string, opts: { timeoutMs?: number } = {}): Promise<string> {
+  const deadline = Date.now() + (opts.timeoutMs ?? CAPTURE_TIMEOUT_MS);
+  while (Date.now() < deadline) {
+    const res = await fetch(`http://127.0.0.1:${serverPort}/oauth/callback-result?state=${encodeURIComponent(state)}`, { signal: AbortSignal.timeout(5_000) }).catch(() => null);
+    if (res?.ok) {
+      const j = (await res.json().catch(() => null)) as { status?: string; code?: string; error?: string } | null;
+      if (j?.status === "done" && j.code) return j.code;
+      if (j?.status === "error") throw new Error(j.error || "authorization failed");
+    }
+    await new Promise((r) => setTimeout(r, 1_500));
+  }
+  throw new Error("timed out waiting for the browser callback (5 min)");
+}
+
+/** Extract the authorization code from a pasted redirect URL (validating state) or a bare code —
+ *  the fallback capture when the server's callback listener isn't available. */
+export function codeFromPaste(input: string, expectedState: string): string {
   const t = input.trim();
   if (/^https?:\/\//i.test(t)) {
     const u = new URL(t);
@@ -54,8 +74,9 @@ export interface JiraLoginResult {
   expiresAt: number;
 }
 
-/** Run the OAuth login and persist tokens. Auto-opens a browser unless `paste` (headless), then reads
- *  the redirected URL back via `readPastedRedirect`. */
+/** Assemble the authorize URL, capture the code via the injected `getCode`, exchange it (PKCE, no
+ *  secret) and persist tokens. `getCode` receives the authorize URL + `state` and returns the code
+ *  (server-poll or paste). */
 export async function jiraOAuthLogin(opts: {
   store: Store;
   repo: string;
@@ -63,26 +84,14 @@ export async function jiraOAuthLogin(opts: {
   siteBaseUrl: string;
   app: OAuthApp;
   scopes: string[];
-  paste: boolean;
   now: () => number;
-  log: (msg: string) => void;
-  readPastedRedirect: () => Promise<string>;
+  getCode: (ctx: { authUrl: string; state: string }) => Promise<string>;
 }): Promise<JiraLoginResult> {
   const state = randomBytes(16).toString("hex");
   const { verifier, challenge } = newPkcePair(); // PKCE — no client_secret; the verifier is the proof
   const authUrl = buildAuthorizeUrl({ app: opts.app, redirectUri: OAUTH_REDIRECT_URI, scopes: opts.scopes, state, codeChallenge: challenge });
 
-  if (!opts.paste && (await openUrl(authUrl))) {
-    opts.log("A browser is opening to authorize herdr-factory — approve access.");
-  } else {
-    opts.log(`Open this URL in a browser and approve access:\n\n  ${authUrl}\n`);
-  }
-  opts.log(
-    `Your browser will then show a "can't reach localhost" page — that is EXPECTED (nothing is meant\n` +
-      `to be listening). Copy the FULL address-bar URL (it starts with ${OAUTH_REDIRECT_URI}?code=…)\n` +
-      `and paste it here.`,
-  );
-  const code = codeFromPaste(await opts.readPastedRedirect(), state);
+  const code = await opts.getCode({ authUrl, state });
 
   const tokens = await exchangeCode({ app: opts.app, code, redirectUri: OAUTH_REDIRECT_URI, codeVerifier: verifier });
   const resource = pickResource(await accessibleResources(tokens.accessToken), opts.siteBaseUrl);
@@ -98,8 +107,5 @@ export async function jiraOAuthLogin(opts: {
     cloudUrl: resource.url,
     scopes: tokens.scope,
   });
-  if (!tokens.refreshToken) {
-    opts.log("Warning: no refresh token was returned — add `offline_access` to the source's `auth.scopes` so the session can renew without re-login.");
-  }
   return { cloudUrl: resource.url, cloudName: resource.name, cloudId: resource.id, scopes: tokens.scope, expiresAt };
 }

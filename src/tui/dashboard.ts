@@ -16,9 +16,9 @@ import { openDb } from "../db/index.ts";
 import { Store } from "../db/store.ts";
 import { systemClock } from "../types.ts";
 import type { JiraSourceCfg } from "../clients/jira-source.ts";
-import { jiraOAuthLogin, OAUTH_REDIRECT_URI } from "../auth/jira-login.ts";
+import { codeFromPaste, jiraOAuthLogin, OAUTH_REDIRECT_URI, openBrowser, pollServerForCode } from "../auth/jira-login.ts";
 import { resolveJiraOAuthApp } from "../auth/jira-oauth.ts";
-import { fetchEligible, fetchHealth, fetchStatus, fetchTimeline, postClaim, postTeardown, postTick, type ActiveRun, type EligibleItem, type RepoStatus } from "./api.ts";
+import { fetchEligible, fetchHealth, fetchStatus, fetchTimeline, postClaim, postTeardown, postTick, serverPort, type ActiveRun, type EligibleItem, type RepoStatus } from "./api.ts";
 import { BORDER, theme } from "./theme.ts";
 import type { ChooseFn, ConfirmFn, PromptFn, ShowInfoFn, TabView } from "./types.ts";
 
@@ -307,23 +307,25 @@ export function createDashboard(renderer: CliRenderer, actions: { confirm: Confi
     }
     const db = openDb(dbPath);
     try {
+      // Auto-capture via the resident server's https callback listener when it's up; else paste via
+      // the shell's prompt modal (openssl-less server, etc.).
+      const health = await fetchHealth();
+      const port = serverPort();
+      const getCode =
+        port && health?.oauthCallback
+          ? async ({ authUrl, state }: { authUrl: string; state: string }) => {
+              await openBrowser(authUrl);
+              setAction(`approve in your browser (click through the localhost warning) — waiting…`, theme.text.secondary);
+              return pollServerForCode(port, state);
+            }
+          : async ({ authUrl, state }: { authUrl: string; state: string }) => {
+              await openBrowser(authUrl);
+              const v = await prompt("Approve in your browser, then paste the redirected URL here", `${OAUTH_REDIRECT_URI}?code=…`);
+              if (v == null) throw new Error("login cancelled");
+              return codeFromPaste(v, state);
+            };
       setAction(`opening a browser to authenticate "${t.source}"…`, theme.text.secondary);
-      const result = await jiraOAuthLogin({
-        store: new Store(db, systemClock),
-        repo: t.repo,
-        source: t.source,
-        siteBaseUrl: cfg.baseUrl,
-        app,
-        scopes: auth.scopes,
-        paste: false,
-        now: systemClock,
-        log: () => {}, // the prompt modal carries the instruction; keep the action line quiet
-        readPastedRedirect: async () => {
-          const v = await prompt("Approve in your browser, then paste the redirected URL here", `${OAUTH_REDIRECT_URI}?code=…`);
-          if (v == null) throw new Error("login cancelled");
-          return v;
-        },
-      });
+      const result = await jiraOAuthLogin({ store: new Store(db, systemClock), repo: t.repo, source: t.source, siteBaseUrl: cfg.baseUrl, app, scopes: auth.scopes, now: systemClock, getCode });
       setAction(`✓ ${t.source}: authenticated to ${result.cloudUrl}`, theme.status.good);
       void refresh();
     } catch (e) {
