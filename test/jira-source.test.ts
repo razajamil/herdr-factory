@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { JiraSource, type JiraSourceCfg } from "../src/clients/jira-source.ts";
+import { JiraApiTokenAuth } from "../src/auth/jira-provider.ts";
 
 const CFG: JiraSourceCfg = {
   baseUrl: "https://x.atlassian.net",
@@ -11,6 +12,7 @@ const CFG: JiraSourceCfg = {
   statusTodo: "To Do",
   statusInDev: "In development",
   statusReview: "Ready for Code Review",
+  auth: { method: "api_token" },
 };
 // The belt's pickup label — a per-belt arg to listEligible now, not source config.
 const LABEL = "agent";
@@ -36,7 +38,7 @@ afterEach(() => {
 });
 
 describe("JiraSource", () => {
-  const src = () => new JiraSource(CFG, "me@x.com", "tok");
+  const src = () => new JiraSource(CFG, new JiraApiTokenAuth(CFG.baseUrl, "me@x.com", "tok"));
 
   // The single most load-bearing parity guarantee: unmapped canonical states (merged/aborted) —
   // which teardown writes for every run — must NOT touch the network, so teardown stays

@@ -213,6 +213,24 @@ export interface EvidenceUpload {
   deliveredAt: number | null;
 }
 
+/** Stored OAuth credentials for a work source configured with auth.method: oauth (migration v19).
+ *  Persisted locally per (repo, source). `expiresAt` is the access token's expiry (epoch seconds);
+ *  `refreshToken` ROTATES on every refresh; `cloudId` keys the Atlassian API base
+ *  (https://api.atlassian.com/ex/jira/<cloudId>). The api_token method never uses this. */
+export interface SourceAuthToken {
+  repo: string;
+  source: string;
+  method: string;
+  accessToken: string | null;
+  refreshToken: string | null;
+  expiresAt: number | null;
+  cloudId: string | null;
+  cloudUrl: string | null;
+  scopes: string | null;
+  createdAt: number;
+  updatedAt: number;
+}
+
 export type HumanQuestionStatus = "pending" | "answered";
 
 /** A source-agnostic human-in-the-loop question parked by an agent and resumed by the reconciler. */

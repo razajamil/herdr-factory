@@ -10,6 +10,7 @@ import type {
   RunPatch,
   RunStep,
   RunStepPatch,
+  SourceAuthToken,
   StepName,
   TransitionIntent,
   WorkItem,
@@ -179,6 +180,20 @@ interface EvidenceUploadRow {
   created_at: number;
   updated_at: number;
   delivered_at: number | null;
+}
+
+interface SourceAuthRow {
+  repo: string;
+  source: string;
+  method: string;
+  access_token: string | null;
+  refresh_token: string | null;
+  expires_at: number | null;
+  cloud_id: string | null;
+  cloud_url: string | null;
+  scopes: string | null;
+  created_at: number;
+  updated_at: number;
 }
 
 /** Enqueue lease for an evidence upload: the CLI's inline attempt runs UNLOCKED in the agent process,
@@ -772,6 +787,64 @@ export class Store {
       .prepare("SELECT 1 AS x FROM transition_outbox WHERE repo = ? AND work_source = ? AND ticket_key = ? AND delivered_at IS NULL LIMIT 1")
       .get(repo, source, key) as { x: number } | undefined;
     return row !== undefined;
+  }
+
+  // --- source OAuth tokens (auth.method: oauth) -----------------------------
+  // Per-(repo, source) stored credentials. api_token sources never touch this table. `auth login`
+  // writes here (possibly from a different process than the running server — WAL + busy_timeout make
+  // that safe); the JiraOAuthAuth provider reads FRESH on each authorize() so a login lands without a
+  // restart, and overwrites the rotated refresh_token on each refresh.
+
+  private toSourceAuth(r: SourceAuthRow): SourceAuthToken {
+    return {
+      repo: r.repo,
+      source: r.source,
+      method: r.method,
+      accessToken: r.access_token,
+      refreshToken: r.refresh_token,
+      expiresAt: r.expires_at,
+      cloudId: r.cloud_id,
+      cloudUrl: r.cloud_url,
+      scopes: r.scopes,
+      createdAt: r.created_at,
+      updatedAt: r.updated_at,
+    };
+  }
+
+  getSourceAuth(repo: string, source: string): SourceAuthToken | undefined {
+    const row = this.db.prepare("SELECT * FROM source_auth WHERE repo = ? AND source = ?").get(repo, source) as SourceAuthRow | undefined;
+    return row ? this.toSourceAuth(row) : undefined;
+  }
+
+  /** Upsert a source's stored credentials (a fresh login, or a rotated refresh). created_at is kept
+   *  on update so it reads as "first authenticated at". */
+  saveSourceAuth(input: {
+    repo: string;
+    source: string;
+    method: string;
+    accessToken: string | null;
+    refreshToken: string | null;
+    expiresAt: number | null;
+    cloudId: string | null;
+    cloudUrl: string | null;
+    scopes: string | null;
+  }): void {
+    const t = this.now();
+    this.db
+      .prepare(
+        `INSERT INTO source_auth (repo, source, method, access_token, refresh_token, expires_at, cloud_id, cloud_url, scopes, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(repo, source) DO UPDATE SET method = excluded.method, access_token = excluded.access_token,
+           refresh_token = excluded.refresh_token, expires_at = excluded.expires_at, cloud_id = excluded.cloud_id,
+           cloud_url = excluded.cloud_url, scopes = excluded.scopes, updated_at = excluded.updated_at`,
+      )
+      .run(input.repo, input.source, input.method, input.accessToken, input.refreshToken, input.expiresAt, input.cloudId, input.cloudUrl, input.scopes, t, t);
+    telemetryEvent("store.source_auth.saved", { repo: input.repo, "work.source": input.source, "auth.method": input.method });
+  }
+
+  clearSourceAuth(repo: string, source: string): boolean {
+    const info = this.db.prepare("DELETE FROM source_auth WHERE repo = ? AND source = ?").run(repo, source);
+    return Number(info.changes) > 0;
   }
 
   // --- evidence-upload outbox -----------------------------------------------

@@ -10,6 +10,7 @@ import { join } from "node:path";
 import { openDb } from "../src/db/index.ts";
 import { Store } from "../src/db/store.ts";
 import { JiraSource } from "../src/clients/jira-source.ts";
+import { JiraApiTokenAuth } from "../src/auth/jira-provider.ts";
 import { LocalMarkdownSource } from "../src/clients/local-markdown-source.ts";
 import { bearsHerdrMarker, HERDR_MARKER, type WorkSource } from "../src/core/deps.ts";
 import { instrumentObject } from "../src/telemetry/index.ts";
@@ -105,11 +106,8 @@ function jiraHarness(): ContractCtx {
     return json({ key: m[1], fields: { summary: `Summary of ${m[1]}`, status: { name: issue.status }, issuetype: { name: "Bug" }, labels: ["agent"], attachment: [] } });
   }) as typeof fetch;
 
-  const src = new JiraSource(
-    { baseUrl: "https://x.atlassian.net", project: "RWR", board: "254", statusTodo: "To Do", statusInDev: "In development", statusReview: "Ready for Code Review" },
-    "me@x.com",
-    "tok",
-  );
+  const cfg = { baseUrl: "https://x.atlassian.net", project: "RWR", board: "254", statusTodo: "To Do", statusInDev: "In development", statusReview: "Ready for Code Review", auth: { method: "api_token" as const } };
+  const src = new JiraSource(cfg, new JiraApiTokenAuth(cfg.baseUrl, "me@x.com", "tok"));
   return {
     src,
     seedEligible: () => {

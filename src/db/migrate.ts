@@ -343,6 +343,32 @@ const MIGRATIONS: { version: number; sql: string }[] = [
       ALTER TABLE runs DROP COLUMN last_thread_sig;
     `,
   },
+  {
+    version: 19,
+    // source_auth: per-(repo, source) OAuth tokens for a work source configured with auth.method:
+    // oauth (Phase 2). The api_token method keeps its credentials in the per-repo env file and never
+    // touches this table. Tokens live in the LOCAL db (WAL, chmod'd) — no secret leaves the machine,
+    // consistent with the "local only" guarantee. cloud_id/cloud_url come from Atlassian's
+    // accessible-resources (the OAuth API base is https://api.atlassian.com/ex/jira/<cloud_id>).
+    // refresh_token ROTATES on every refresh, so it's overwritten in place. PK (repo, source) — one
+    // authenticated identity per configured source (INV-9's durable source name is the FK).
+    sql: `
+      CREATE TABLE source_auth (
+        repo TEXT NOT NULL,
+        source TEXT NOT NULL,
+        method TEXT NOT NULL,
+        access_token TEXT,
+        refresh_token TEXT,
+        expires_at INTEGER,
+        cloud_id TEXT,
+        cloud_url TEXT,
+        scopes TEXT,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY (repo, source)
+      );
+    `,
+  },
 ];
 
 /** Apply pending migrations in a transaction. Idempotent. */

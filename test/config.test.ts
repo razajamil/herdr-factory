@@ -85,6 +85,7 @@ describe("loadConfig — work sources + belts", () => {
     expect(jira.board).toBe("254"); // coerced number → string
     expect((jira as unknown as Record<string, unknown>).label).toBeUndefined(); // label is per-belt now, not on the source
     expect(jira.statusInDev).toBe("In development");
+    expect(jira.auth).toEqual({ method: "api_token" }); // no `auth` block ⇒ api_token (back-compat)
     expect(config.limits.stallSeconds).toBe(2700); // default
     expect(config.limits.maxActiveWorkspaces).toBe(3); // default
     expect(config.limits.stepBudgetSeconds).toBe(3600); // default
@@ -99,6 +100,38 @@ describe("loadConfig — work sources + belts", () => {
     expect(belt.label).toBe("agent"); // per-belt pickup label (no default — set in SHIP_BELT)
     expect(belt.priority).toBe(100); // default
     expect(belt.watchPr).toBe(true); // derived: a step produces pull_request
+  });
+
+  it("resolves auth.method: oauth — default scopes, and an explicit client_id + scopes override", () => {
+    setup(
+      cfg(
+        `  - type: jira
+    jira:
+      base_url: https://x.atlassian.net
+      project: RWR
+      board: 254
+      auth: { method: oauth }
+`,
+        SHIP_BELT,
+      ),
+    );
+    const dflt = loadConfig("demo").config.sources[0]!.cfg as JiraSourceCfg;
+    expect(dflt.auth).toEqual({ method: "oauth", clientId: undefined, scopes: ["read:jira-work", "write:jira-work", "offline_access"] });
+
+    setup(
+      cfg(
+        `  - type: jira
+    jira:
+      base_url: https://x.atlassian.net
+      project: RWR
+      board: 254
+      auth: { method: oauth, client_id: myapp, scopes: [read:jira-work, offline_access] }
+`,
+        SHIP_BELT,
+      ),
+    );
+    const custom = loadConfig("demo").config.sources[0]!.cfg as JiraSourceCfg;
+    expect(custom.auth).toEqual({ method: "oauth", clientId: "myapp", scopes: ["read:jira-work", "offline_access"] });
   });
 
   it("maps a github_issues source with defaults (labels, close_on, type map) and camelCase resolution", () => {

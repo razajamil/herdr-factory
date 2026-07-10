@@ -132,6 +132,51 @@
                         "type": "string"
                       }
                     }
+                  },
+                  "auth": {
+                    "default": {
+                      "method": "api_token"
+                    },
+                    "oneOf": [
+                      {
+                        "type": "object",
+                        "properties": {
+                          "method": {
+                            "type": "string",
+                            "const": "api_token"
+                          }
+                        },
+                        "required": [
+                          "method"
+                        ],
+                        "additionalProperties": false
+                      },
+                      {
+                        "type": "object",
+                        "properties": {
+                          "method": {
+                            "type": "string",
+                            "const": "oauth"
+                          },
+                          "client_id": {
+                            "type": "string",
+                            "minLength": 1
+                          },
+                          "scopes": {
+                            "minItems": 1,
+                            "type": "array",
+                            "items": {
+                              "type": "string",
+                              "minLength": 1
+                            }
+                          }
+                        },
+                        "required": [
+                          "method"
+                        ],
+                        "additionalProperties": false
+                      }
+                    ]
                   }
                 },
                 "required": [

@@ -1,7 +1,11 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { createInterface } from "node:readline/promises";
 import { Command } from "commander";
-import { configJsonSchema, configSchemaPath, evidenceKeyPrefix, globalDbPath, isManagedNode, managedNodePath, nodePathFile, writeConfigSchema } from "../config.ts";
+import { configJsonSchema, configSchemaPath, evidenceKeyPrefix, globalDbPath, isManagedNode, loadConfig, managedNodePath, nodePathFile, writeConfigSchema, type WorkSourceConfig } from "../config.ts";
+import type { JiraSourceCfg } from "../clients/jira-source.ts";
+import { jiraOAuthLogin } from "../auth/jira-login.ts";
+import { resolveJiraOAuthApp } from "../auth/jira-oauth.ts";
 import { classifyS3Error, enumerateEvidenceFiles, evidenceUrls, resolveGithubUsername, uploadEvidence } from "../clients/evidence.ts";
 import { baseGroups, repoGroup, type DoctorGroup } from "../doctor.ts";
 import { openDb } from "../db/index.ts";
@@ -102,6 +106,57 @@ function bounceReasonText(opts: { reason?: string; reasonFile?: string }): strin
   const text = opts.reasonFile ? readFileSync(opts.reasonFile, "utf8") : opts.reason;
   if (!text?.trim()) fail("bounce: provide a non-empty --reason or --reason-file (the findings the earlier step must address)");
   return text.trim();
+}
+
+/** Prompt for one line on stdin (paste-mode OAuth login). */
+async function promptLine(q: string): Promise<string> {
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    return (await rl.question(q)).trim();
+  } finally {
+    rl.close();
+  }
+}
+
+/** Choose the work source `auth login`/`logout` targets: an explicit --source, else the sole
+ *  OAuth-configured jira source. Fails with an actionable message otherwise. */
+function pickAuthSource(config: ReturnType<typeof loadConfig>["config"], sourceName: string | undefined): WorkSourceConfig {
+  if (sourceName) {
+    const s = config.sources.find((x) => x.name === sourceName);
+    if (!s) fail(`no work source named "${sourceName}" (configured: ${config.sources.map((x) => x.name).join(", ") || "none"})`);
+    return s;
+  }
+  const oauth = config.sources.filter((s) => s.type === "jira" && (s.cfg as JiraSourceCfg).auth.method === "oauth");
+  if (oauth.length === 1) return oauth[0]!;
+  if (oauth.length === 0) fail(`no OAuth work source in repo "${config.repoName}" — set \`auth: { method: oauth }\` on a jira source (api_token sources need no login)`);
+  fail(`multiple OAuth sources (${oauth.map((s) => s.name).join(", ")}) — pass --source <name>`);
+}
+
+/** Print each source's auth method + state (no network — reads env presence + stored tokens). */
+function authStatusReport(config: ReturnType<typeof loadConfig>["config"], env: Record<string, string>, store: Store): void {
+  console.log(`auth status — repo ${config.repoName}:`);
+  for (const s of config.sources) {
+    if (s.type === "jira") {
+      const cfg = s.cfg as JiraSourceCfg;
+      if (cfg.auth.method === "oauth") {
+        const tok = store.getSourceAuth(config.repoName, s.name);
+        if (!tok?.accessToken) {
+          console.log(`  ${s.name} (jira, oauth): ✗ not logged in — run \`herdr-factory --repo ${config.repoName} auth login --source ${s.name}\``);
+        } else {
+          const exp = tok.expiresAt ? new Date(tok.expiresAt * 1000).toISOString() : "unknown";
+          const refresh = tok.refreshToken ? "auto-refreshed" : "NO refresh token — re-login needed when it expires";
+          console.log(`  ${s.name} (jira, oauth): ✓ ${tok.cloudUrl ?? "?"} — access token expires ${exp} (${refresh})`);
+        }
+      } else {
+        const ok = !!(env.JIRA_EMAIL && env.JIRA_API_TOKEN);
+        console.log(`  ${s.name} (jira, api_token): ${ok ? "✓ JIRA_EMAIL + JIRA_API_TOKEN present" : "✗ set JIRA_EMAIL + JIRA_API_TOKEN in the repo env"}`);
+      }
+    } else if (s.type === "github_issues") {
+      console.log(`  ${s.name} (github_issues): ${env.GITHUB_TOKEN ? "✓ GITHUB_TOKEN present" : "using the gh CLI login (`gh auth status`)"}`);
+    } else {
+      console.log(`  ${s.name} (${s.type}): no authentication required`);
+    }
+  }
 }
 
 function cliAction<Args extends unknown[]>(name: string, fn: (...args: Args) => Promise<void> | void): (...args: Args) => Promise<void> {
@@ -344,6 +399,56 @@ program
         return;
       }
       console.log(`${key}: resumed -> ${d.phase}`);
+    } catch (e) {
+      fail(e);
+    }
+  }));
+
+program
+  .command("auth <action>")
+  .description("work-source authentication: `login` (browser OAuth), `status`, or `logout`")
+  .option("--source <name>", "target a specific work source (default: the sole OAuth source)")
+  .option("--paste", "headless login — print the URL and paste the redirect back (no local browser)")
+  .action(cliAction("auth", async (action: string, opts: { source?: string; paste?: boolean }) => {
+    try {
+      const repo = requireRepo();
+      const { config, env } = loadConfig(repo);
+      const store = new Store(openDb(config.paths.dbPath), systemClock);
+      if (action === "status") {
+        authStatusReport(config, env, store);
+        return;
+      }
+      if (action === "logout") {
+        const src = pickAuthSource(config, opts.source);
+        console.log(`${src.name}: ${store.clearSourceAuth(repo, src.name) ? "logged out (stored tokens cleared)" : "no stored tokens to clear"}`);
+        return;
+      }
+      if (action === "login") {
+        const src = pickAuthSource(config, opts.source);
+        const cfg = src.cfg as JiraSourceCfg;
+        if (src.type !== "jira" || cfg.auth.method !== "oauth") {
+          fail(`source "${src.name}" isn't configured for OAuth login (set \`auth: { method: oauth }\` on a jira source)`);
+        }
+        const auth = cfg.auth as Extract<JiraSourceCfg["auth"], { method: "oauth" }>;
+        const app = resolveJiraOAuthApp({ clientId: auth.clientId, clientSecret: env.JIRA_OAUTH_CLIENT_SECRET });
+        const result = await jiraOAuthLogin({
+          store,
+          repo,
+          source: src.name,
+          siteBaseUrl: cfg.baseUrl,
+          app,
+          scopes: auth.scopes,
+          paste: !!opts.paste,
+          now: systemClock,
+          log: (m) => console.log(m),
+          readPastedRedirect: () => promptLine("Paste the redirected URL (or the code): "),
+        });
+        console.log(`\n✓ ${src.name}: authenticated to ${result.cloudName} (${result.cloudUrl})`);
+        console.log(`  scopes: ${result.scopes}`);
+        console.log(`  access token expires ${new Date(result.expiresAt * 1000).toISOString()} — refreshed automatically`);
+        return;
+      }
+      fail(`unknown auth action "${action}" — use: login | status | logout`);
     } catch (e) {
       fail(e);
     }

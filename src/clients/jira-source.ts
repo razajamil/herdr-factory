@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { bearsHerdrMarker, HERDR_MARKER, type Logger, type SourceAuthStatus, type WorkSource, type WorkSourceSpec } from "../core/deps.ts";
+import type { JiraAuth } from "../auth/jira-provider.ts";
 import type {
   HumanAskInput,
   HumanAskResult,
@@ -24,8 +25,15 @@ const isMedia = (mime: string): boolean => mime.startsWith("image/") || mime.sta
 
 const QUESTION_MARKER = `${HERDR_MARKER} question:`;
 
+/** How a Jira source authenticates (resolved from the `auth` config block). api_token reads
+ *  JIRA_EMAIL + JIRA_API_TOKEN from env; oauth uses factory-managed tokens (Phase 2), optionally
+ *  against a per-source OAuth app override (clientId in config, secret in env). */
+export type JiraAuthCfg = { method: "api_token" } | { method: "oauth"; clientId?: string; scopes: string[] };
+
 /** Resolved Jira-source config (the client owns its config shape; the descriptor maps YAML onto it).
- *  The pickup label is NOT here — it's per-belt and arrives as an argument to listEligible/health. */
+ *  The pickup label is NOT here — it's per-belt and arrives as an argument to listEligible/health.
+ *  `auth` is consumed by the descriptor's create() to build the JiraAuth provider (not by the
+ *  source itself, which just holds the built provider). */
 export interface JiraSourceCfg {
   baseUrl: string;
   project: string;
@@ -33,6 +41,7 @@ export interface JiraSourceCfg {
   statusTodo: string;
   statusInDev: string;
   statusReview: string;
+  auth: JiraAuthCfg;
 }
 
 function bodyText(node: unknown): string {
@@ -72,11 +81,9 @@ function humanQuestionComment(input: HumanAskInput): string {
 export class JiraSource implements WorkSource {
   private readonly jira: JiraClient;
   private readonly cfg: JiraSourceCfg;
-  private readonly hasCreds: boolean;
-  constructor(cfg: JiraSourceCfg, email: string, token: string) {
+  constructor(cfg: JiraSourceCfg, auth: JiraAuth) {
     this.cfg = cfg;
-    this.hasCreds = !!(email && token);
-    this.jira = new JiraClient(cfg.baseUrl, email, token);
+    this.jira = new JiraClient(auth);
   }
 
   readonly spec: WorkSourceSpec = {
@@ -86,10 +93,11 @@ export class JiraSource implements WorkSource {
     terminalAutomation: "Jira's GitHub integration owns terminal closure (merged/aborted/done are unmapped)",
   };
 
-  /** Local (no-network) credential presence — the api_token method needs both env values. A
-   *  present-but-wrong token still reads "ok" here; a live 401 surfaces it as rejected (INV-12). */
+  /** Local (no-network) credential readiness from the auth provider — api_token checks env-value
+   *  presence, OAuth checks a stored token. A present-but-wrong credential still reads "ok" here; a
+   *  live 401 surfaces it as rejected (INV-12). */
   async authStatus(): Promise<SourceAuthStatus> {
-    return this.hasCreds ? { state: "ok" } : { state: "unauthenticated", detail: "set JIRA_EMAIL + JIRA_API_TOKEN in the repo env" };
+    return this.jira.authStatus();
   }
 
   async listEligible(pickupLabel?: string): Promise<MatchItem[]> {

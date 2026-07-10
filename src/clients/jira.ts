@@ -1,8 +1,10 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { JiraIssue } from "../types.ts";
+import type { SourceAuthStatus } from "../core/deps.ts";
 import { SourceUnauthenticatedError } from "../auth/errors.ts";
-import { HttpStatusError, httpOk, httpOkBytes, TokenBucket, type HttpPolicy, type HttpRequest, type HttpResponse } from "./http.ts";
+import type { JiraAuth } from "../auth/jira-provider.ts";
+import { HttpStatusError, httpOk, httpOkBytes, TokenBucket, type HttpPolicy, type HttpResponse } from "./http.ts";
 
 /** Map a Jira 401/403 to the typed auth error (else pass the error through unchanged). Jira uses
  *  Basic auth, so a 401/403 is unambiguously bad/expired credentials — not a scope/permission
@@ -61,49 +63,55 @@ function adfDoc(text: string): unknown {
   };
 }
 
-/** Jira Cloud REST via fetch + API-token basic auth. All calls share one token bucket and a
- *  Retry-After-honoring retry policy (see clients/http.ts). */
+/** Jira Cloud REST via fetch. Auth (api_token Basic, or OAuth Bearer + the api.atlassian.com base)
+ *  is owned by the injected JiraAuth — the client just asks it for the per-request base + headers,
+ *  and on a 401/403 gives it one chance to recover (OAuth token refresh) before surfacing a typed
+ *  auth error. All calls share one token bucket and a Retry-After-honoring retry policy (http.ts). */
 export class JiraClient {
-  private readonly baseUrl: string;
-  private readonly email: string;
-  private readonly token: string;
+  private readonly auth: JiraAuth;
   private readonly bucket = new TokenBucket(JIRA_RATE_PER_SEC, JIRA_BURST);
-  constructor(baseUrl: string, email: string, token: string) {
-    this.baseUrl = baseUrl;
-    this.email = email;
-    this.token = token;
+  constructor(auth: JiraAuth) {
+    this.auth = auth;
   }
 
-  requireAuth(): void {
-    if (!this.email || !this.token) {
-      throw new SourceUnauthenticatedError({
-        reason: "missing",
-        hint: "Jira auth missing — set JIRA_EMAIL + JIRA_API_TOKEN in the repo's env (~/.config/herdr-factory/repos/<name>/env)",
-      });
-    }
+  /** The provider's cheap, no-network auth readiness (drives the source's authStatus / INV-12). */
+  authStatus(): SourceAuthStatus {
+    return this.auth.status();
   }
 
-  /** httpOk with Jira's 401/403 mapped to the typed auth error. All JSON round-trips go through
-   *  here so a rejected credential surfaces as SourceUnauthenticatedError everywhere, not a raw
-   *  HttpStatusError. (Attachment downloads stay on raw httpOkBytes — they're best-effort and
-   *  swallow their own errors, so an auth failure there is a skipped attachment, not a poison.) */
-  private async okOrAuth(req: HttpRequest, policy: HttpPolicy): Promise<HttpResponse> {
+  /** One authorized request: resolve base + headers, send, and on a 401/403 let the provider try to
+   *  recover once (OAuth refresh) before mapping to a typed SourceUnauthenticatedError. `path` is
+   *  joined onto the provider's base (which differs between api_token and OAuth). */
+  private async send(path: string, init: { method?: string; body?: unknown }, policy: HttpPolicy): Promise<HttpResponse> {
+    const attempt = async (): Promise<HttpResponse> => {
+      const { baseUrl, headers } = await this.auth.authorize();
+      return httpOk(
+        {
+          url: baseUrl + path,
+          method: init.method,
+          headers: { ...headers, Accept: "application/json", ...(init.body !== undefined ? { "Content-Type": "application/json" } : {}) },
+          body: init.body !== undefined ? JSON.stringify(init.body) : undefined,
+          timeoutMs: JIRA_TIMEOUT_MS,
+        },
+        policy,
+      );
+    };
     try {
-      return await httpOk(req, policy);
+      return await attempt();
     } catch (e) {
+      if (e instanceof HttpStatusError && (e.status === 401 || e.status === 403) && (await this.auth.reauthorize())) {
+        try {
+          return await attempt();
+        } catch (e2) {
+          throw asJiraAuthError(e2);
+        }
+      }
       throw asJiraAuthError(e);
     }
   }
 
-  private headers(): Record<string, string> {
-    return {
-      Authorization: "Basic " + Buffer.from(`${this.email}:${this.token}`).toString("base64"),
-      Accept: "application/json",
-    };
-  }
-
   private async getJson<T>(path: string): Promise<T> {
-    const res = await this.okOrAuth({ url: this.baseUrl + path, headers: this.headers(), timeoutMs: JIRA_TIMEOUT_MS }, { bucket: this.bucket });
+    const res = await this.send(path, {}, { bucket: this.bucket });
     return JSON.parse(res.text) as T;
   }
 
@@ -111,16 +119,7 @@ export class JiraClient {
   // or 5xx write may have landed — a rare duplicate comment is acceptable noise, a retry storm
   // of writes is not.
   private async postJson<T>(path: string, body: unknown): Promise<T> {
-    const res = await this.okOrAuth(
-      {
-        url: this.baseUrl + path,
-        method: "POST",
-        headers: { ...this.headers(), "Content-Type": "application/json" },
-        body: JSON.stringify(body),
-        timeoutMs: JIRA_TIMEOUT_MS,
-      },
-      { bucket: this.bucket, retries: 1 },
-    );
+    const res = await this.send(path, { method: "POST", body }, { bucket: this.bucket, retries: 1 });
     return JSON.parse(res.text) as T;
   }
 
@@ -129,7 +128,6 @@ export class JiraClient {
    *  fields object) so a belt's match predicate can route at claim time. `label` is omitted only by
    *  the doctor's connectivity probe; the real belt flow always passes one. */
   async listEligible(board: string, label: string | undefined, todoStatus: string): Promise<JiraEligible[]> {
-    this.requireAuth();
     const labelClause = label ? ` AND labels = "${label}"` : "";
     const jql = `status = "${todoStatus}"${labelClause} ORDER BY created ASC`;
     const data = await this.getJson<{
@@ -149,7 +147,6 @@ export class JiraClient {
   }
 
   async getIssue(key: string): Promise<JiraIssue> {
-    this.requireAuth();
     return this.getJson<JiraIssue>(
       `/rest/api/3/issue/${key}?fields=summary,description,issuetype,status,labels,attachment,comment`,
     );
@@ -160,12 +157,10 @@ export class JiraClient {
   }
 
   async addComment(key: string, text: string): Promise<JiraComment> {
-    this.requireAuth();
     return this.postJson<JiraComment>(`/rest/api/3/issue/${key}/comment`, { body: adfDoc(text) });
   }
 
   async listComments(key: string): Promise<JiraComment[]> {
-    this.requireAuth();
     const data = await this.getJson<{ comments?: JiraComment[] }>(
       `/rest/api/3/issue/${key}/comment?orderBy=created&maxResults=100`,
     );
@@ -174,7 +169,6 @@ export class JiraClient {
 
   /** Idempotent, case-insensitive transition. Returns false if already in target. */
   async transition(key: string, targetName: string): Promise<boolean> {
-    this.requireAuth();
     const current = await this.currentStatus(key);
     if (current.toLowerCase() === targetName.toLowerCase()) return false;
     const tr = await this.getJson<{ transitions?: { id: string; to?: { name?: string } }[] }>(
@@ -182,17 +176,8 @@ export class JiraClient {
     );
     const match = (tr.transitions ?? []).find((t) => t.to?.name?.toLowerCase() === targetName.toLowerCase());
     if (!match) throw new Error(`${key}: no transition from "${current}" to "${targetName}"`);
-    // The transition POST returns 204 with an empty body — okOrAuth (not postJson, which parses).
-    await this.okOrAuth(
-      {
-        url: `${this.baseUrl}/rest/api/3/issue/${key}/transitions`,
-        method: "POST",
-        headers: { ...this.headers(), "Content-Type": "application/json" },
-        body: JSON.stringify({ transition: { id: match.id } }),
-        timeoutMs: JIRA_TIMEOUT_MS,
-      },
-      { bucket: this.bucket, retries: 1 },
-    );
+    // The transition POST returns 204 with an empty body — send() (not postJson, which parses).
+    await this.send(`/rest/api/3/issue/${key}/transitions`, { method: "POST", body: { transition: { id: match.id } } }, { bucket: this.bucket, retries: 1 });
     return true;
   }
 
@@ -209,6 +194,9 @@ export class JiraClient {
   ): Promise<string[]> {
     const issue = await this.getIssue(key);
     mkdirSync(outDir, { recursive: true });
+    // Attachment `content` URLs are absolute, so they're fetched directly (not via send()'s base
+    // join) — but they still need the source's auth headers, resolved once here.
+    const { headers } = await this.auth.authorize();
     const media = (issue.fields.attachment ?? [])
       .filter((a) => {
         const mime = a.mimeType ?? "";
@@ -225,7 +213,7 @@ export class JiraClient {
       try {
         buf = (
           await httpOkBytes(
-            { url: a.content, headers: this.headers(), timeoutMs: JIRA_MEDIA_TIMEOUT_MS },
+            { url: a.content, headers: { ...headers, Accept: "application/json" }, timeoutMs: JIRA_MEDIA_TIMEOUT_MS },
             { bucket: this.bucket, retries: 1 },
           )
         ).bytes;

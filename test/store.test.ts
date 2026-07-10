@@ -299,6 +299,30 @@ describe("Store", () => {
     });
   });
 
+  describe("source OAuth tokens (source_auth)", () => {
+    it("save / get / clear round-trips; upsert rotates tokens but keeps created_at; scoped by (repo, source)", () => {
+      const { store, setNow } = makeStore(1000);
+      expect(store.getSourceAuth("r", "jira")).toBeUndefined();
+      store.saveSourceAuth({ repo: "r", source: "jira", method: "oauth", accessToken: "a1", refreshToken: "r1", expiresAt: 5000, cloudId: "c1", cloudUrl: "https://x.atlassian.net", scopes: "read:jira-work offline_access" });
+      const t1 = store.getSourceAuth("r", "jira")!;
+      expect([t1.accessToken, t1.refreshToken, t1.cloudId, t1.method]).toEqual(["a1", "r1", "c1", "oauth"]);
+      expect(t1.createdAt).toBe(1000);
+
+      setNow(2000);
+      store.saveSourceAuth({ repo: "r", source: "jira", method: "oauth", accessToken: "a2", refreshToken: "r2", expiresAt: 9000, cloudId: "c1", cloudUrl: "https://x.atlassian.net", scopes: "read:jira-work offline_access" });
+      const t2 = store.getSourceAuth("r", "jira")!;
+      expect([t2.accessToken, t2.refreshToken, t2.expiresAt]).toEqual(["a2", "r2", 9000]);
+      expect(t2.createdAt).toBe(1000); // preserved
+      expect(t2.updatedAt).toBe(2000);
+
+      expect(store.getSourceAuth("r", "other")).toBeUndefined(); // scoped by source
+      expect(store.getSourceAuth("other-repo", "jira")).toBeUndefined(); // and by repo
+      expect(store.clearSourceAuth("r", "jira")).toBe(true);
+      expect(store.getSourceAuth("r", "jira")).toBeUndefined();
+      expect(store.clearSourceAuth("r", "jira")).toBe(false); // already gone
+    });
+  });
+
   describe("transition outbox — auth recovery", () => {
     it("retryTransitionsForSource makes a source's undelivered write-backs due now (only that source, only undelivered)", () => {
       const { store } = makeStore();
