@@ -11,10 +11,16 @@
 // that actually changed.
 import { BoxRenderable, ScrollBoxRenderable, TextRenderable, type CliRenderer } from "@opentui/core";
 import type { KeyEvent } from "@opentui/core";
-import { listConfiguredRepos } from "../config.ts";
+import { listConfiguredRepos, loadConfig } from "../config.ts";
+import { openDb } from "../db/index.ts";
+import { Store } from "../db/store.ts";
+import { systemClock } from "../types.ts";
+import type { JiraSourceCfg } from "../clients/jira-source.ts";
+import { jiraOAuthLogin, OAUTH_REDIRECT_URI } from "../auth/jira-login.ts";
+import { resolveJiraOAuthApp } from "../auth/jira-oauth.ts";
 import { fetchEligible, fetchHealth, fetchStatus, fetchTimeline, postClaim, postTeardown, postTick, type ActiveRun, type EligibleItem, type RepoStatus } from "./api.ts";
 import { BORDER, theme } from "./theme.ts";
-import type { ChooseFn, ConfirmFn, ShowInfoFn, TabView } from "./types.ts";
+import type { ChooseFn, ConfirmFn, PromptFn, ShowInfoFn, TabView } from "./types.ts";
 
 function fmtTime(ts: number): string {
   const ms = ts < 1e12 ? ts * 1000 : ts; // tolerate seconds or milliseconds
@@ -66,8 +72,8 @@ interface LineNode {
   baseFg: string;
 }
 
-export function createDashboard(renderer: CliRenderer, actions: { confirm: ConfirmFn; choose: ChooseFn; showInfo: ShowInfoFn }): TabView {
-  const { confirm, choose, showInfo } = actions;
+export function createDashboard(renderer: CliRenderer, actions: { confirm: ConfirmFn; choose: ChooseFn; showInfo: ShowInfoFn; prompt: PromptFn }): TabView {
+  const { confirm, choose, showInfo, prompt } = actions;
 
   const root = new BoxRenderable(renderer, { flexDirection: "column", width: "100%", height: "100%", backgroundColor: theme.bg, paddingLeft: 1, paddingRight: 1 });
   const banner = new TextRenderable(renderer, { content: "loading…", fg: theme.text.secondary, height: 1, wrapMode: "none" });
@@ -267,20 +273,64 @@ export function createDashboard(renderer: CliRenderer, actions: { confirm: Confi
     void refresh();
   }
 
-  /** Show how to log in a red (unauthenticated) source. OAuth login is INTERACTIVE — it opens a
-   *  browser and you paste back the redirected URL — which can't be driven from inside the TUI, so we
-   *  surface the exact terminal command rather than pretend to run it. The auth light flips green on
-   *  refresh once you've done it. (An api_token source is fixed by setting its env creds, not login.) */
-  function doLogin(t: Target): void {
+  /** Run the OAuth login for a red (unauthenticated) source, IN-PROCESS: open the browser, then
+   *  capture the redirected URL through the shell's prompt modal (the https callback means we read
+   *  the code back rather than auto-catch it). Tokens are saved to the local db; the auth light flips
+   *  green on the next refresh. Only a jira `auth.method: oauth` source can log in this way — anything
+   *  else (api_token / github_issues) is explained instead. */
+  async function doLogin(t: Target): Promise<void> {
     if (!t.source) return;
-    showInfo(`Log in to "${t.source}"`, [
-      "OAuth login opens a browser and asks you to paste back the redirected URL, so run it in a",
-      "terminal (this dashboard's auth light turns green when you're done):",
-      "",
-      `  herdr-factory --repo ${t.repo} auth login --source ${t.source}`,
-      "",
-      "If this source uses api_token instead, there's nothing to log in — set its env credentials.",
-    ]);
+    let cfg: JiraSourceCfg;
+    let dbPath: string;
+    try {
+      const { config } = loadConfig(t.repo);
+      const src = config.sources.find((s) => s.name === t.source);
+      if (!src) return setAction(`✗ source "${t.source}" not in config`, theme.status.bad);
+      if (src.type !== "jira" || (src.cfg as JiraSourceCfg).auth.method !== "oauth") {
+        showInfo(`"${t.source}" doesn't use OAuth`, [
+          "Only a jira source with `auth: { method: oauth }` signs in via the browser.",
+          "An api_token source is fixed by setting its env credentials; github_issues uses the gh CLI.",
+        ]);
+        return;
+      }
+      cfg = src.cfg as JiraSourceCfg;
+      dbPath = config.paths.dbPath;
+    } catch (e) {
+      return setAction(`✗ ${e instanceof Error ? e.message : String(e)}`, theme.status.bad);
+    }
+    const auth = cfg.auth as Extract<JiraSourceCfg["auth"], { method: "oauth" }>;
+    let app: { clientId: string };
+    try {
+      app = resolveJiraOAuthApp({ clientId: auth.clientId });
+    } catch (e) {
+      return setAction(`✗ ${e instanceof Error ? e.message : String(e)}`, theme.status.bad);
+    }
+    const db = openDb(dbPath);
+    try {
+      setAction(`opening a browser to authenticate "${t.source}"…`, theme.text.secondary);
+      const result = await jiraOAuthLogin({
+        store: new Store(db, systemClock),
+        repo: t.repo,
+        source: t.source,
+        siteBaseUrl: cfg.baseUrl,
+        app,
+        scopes: auth.scopes,
+        paste: false,
+        now: systemClock,
+        log: () => {}, // the prompt modal carries the instruction; keep the action line quiet
+        readPastedRedirect: async () => {
+          const v = await prompt("Approve in your browser, then paste the redirected URL here", `${OAUTH_REDIRECT_URI}?code=…`);
+          if (v == null) throw new Error("login cancelled");
+          return v;
+        },
+      });
+      setAction(`✓ ${t.source}: authenticated to ${result.cloudUrl}`, theme.status.good);
+      void refresh();
+    } catch (e) {
+      setAction(`✗ login failed: ${e instanceof Error ? e.message : String(e)}`, theme.status.bad);
+    } finally {
+      db.close();
+    }
   }
 
   async function openTimeline(t: Target): Promise<void> {
@@ -323,7 +373,7 @@ export function createDashboard(renderer: CliRenderer, actions: { confirm: Confi
         key.preventDefault();
         break;
       case "l":
-        if (t?.kind === "source") doLogin(t);
+        if (t?.kind === "source") void doLogin(t);
         key.preventDefault();
         break;
       case "r":

@@ -4,6 +4,8 @@ import type { Renderable } from "@opentui/core";
 export type ConfirmFn = (message: string) => Promise<boolean>;
 export type ChooseFn = (title: string, options: { label: string; value: string }[]) => Promise<string | null>;
 export type ShowInfoFn = (title: string, lines: string[]) => void;
+/** A single-line text prompt (e.g. paste an OAuth redirect URL). Resolves null when cancelled (Esc). */
+export type PromptFn = (title: string, placeholder?: string) => Promise<string | null>;
 
 /** A top-level tab (lazygit-style navigation). The shell (index.ts) shows one view at a time and
  *  owns a three-level focus hierarchy: top level (the tab bar) → a numbered section → editing a

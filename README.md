@@ -660,8 +660,8 @@ keys jump to a numbered section, arrows move within it, `Esc` pops back out, `q`
   confirmation). A per-repo evidence-upload **SSO light** goes red when AWS creds have expired (the
   fix: `aws sso login`), and is hidden for repos with no evidence configured. A per-source **auth
   light** does the same for each work source — red when it can't authenticate (its work is paused,
-  auto-resuming on re-auth); highlight a red one and press `l` for the exact `auth login` command to
-  run (OAuth login is an interactive browser + paste flow, so it runs in a terminal, not in the TUI).
+  auto-resuming on re-auth); highlight a red OAuth source and press `l` to log in — it opens your
+  browser, and you paste the redirected URL into a prompt (the light turns green when it's stored).
 - **Config** — a repo list and a full `config.yml` editor: edits the YAML surgically (comments
   and the schema modeline preserved), validates against the engine schema, `^S` saves, `[`/`]`
   reorder list entries. Credentials appear as masked, replace-only `secrets (env)` fields —

@@ -3,7 +3,7 @@
 // section within the active tab; arrows navigate inside the focused section; Esc pops to the top
 // level (the tab bar). Runs on Node >= 26 with --experimental-ffi (see bin/herdr-factory-tui).
 // Imperative opentui core API — no JSX.
-import { BoxRenderable, InputRenderable, ScrollBoxRenderable, TabSelectRenderable, TextRenderable, createCliRenderer, type CliRenderer } from "@opentui/core";
+import { BoxRenderable, InputRenderable, ScrollBoxRenderable, TabSelectRenderable, TextRenderable, createCliRenderer, type CliRenderer, type Renderable } from "@opentui/core";
 import type { KeyEvent } from "@opentui/core";
 import { BORDER, theme } from "./theme.ts";
 import type { TabView } from "./types.ts";
@@ -110,10 +110,13 @@ export function createApp(renderer: CliRenderer): { currentTab: () => number; at
   type ModalState =
     | { kind: "confirm"; resolve: (v: boolean) => void }
     | { kind: "choose"; options: { label: string; value: string }[]; index: number; resolve: (v: string | null) => void }
+    | { kind: "prompt"; input: InputRenderable; prev: Renderable | null; resolve: (v: string | null) => void }
     | { kind: "info" };
   let modal: ModalState | null = null;
 
   function renderModalBody(): void {
+    // A prompt owns its own body (a live InputRenderable) — don't tear it down on re-render.
+    if (modal?.kind === "prompt") return;
     for (const c of [...modalBody.getChildren()]) {
       modalBody.remove(c.id);
       c.destroy();
@@ -169,13 +172,44 @@ export function createApp(renderer: CliRenderer): { currentTab: () => number; at
     infoCard.visible = true;
     overlay.visible = true;
   }
+  /** A single-line text prompt (paste an OAuth redirect URL, …). Focuses a live input; typed keys
+   *  fall through to it (the keypress handler only intercepts Enter/Esc for a prompt modal). */
+  function prompt(title: string, placeholder = ""): Promise<string | null> {
+    return new Promise((resolve) => {
+      for (const c of [...modalBody.getChildren()]) {
+        modalBody.remove(c.id);
+        c.destroy();
+      }
+      modalTitle.content = title;
+      const input = new InputRenderable(renderer, {
+        value: "",
+        placeholder,
+        width: 72,
+        backgroundColor: theme.input.bg,
+        focusedBackgroundColor: theme.input.focusBg,
+        textColor: theme.input.fg,
+        focusedTextColor: theme.input.focusFg,
+        placeholderColor: theme.input.placeholder,
+      });
+      modalBody.add(input);
+      modalBody.add(new TextRenderable(renderer, { content: "↵ submit · Esc cancel", fg: theme.text.tertiary, height: 1, wrapMode: "none" }));
+      const prev = renderer.currentFocusedRenderable ?? null;
+      modal = { kind: "prompt", input, prev, resolve };
+      card.visible = true;
+      infoCard.visible = false;
+      overlay.visible = true;
+      input.focus();
+    });
+  }
   function closeModal(): void {
+    // A prompt focused a live input; restore focus to wherever it was so shell navigation keeps working.
+    if (modal?.kind === "prompt") modal.prev?.focus?.();
     overlay.visible = false;
     modal = null;
   }
 
   // ── views ─────────────────────────────────────────────────────────────────────────────────
-  const views: TabView[] = [createDashboard(renderer, { confirm, choose, showInfo }), createConfigEditor(renderer, confirm), createDoctor(renderer)];
+  const views: TabView[] = [createDashboard(renderer, { confirm, choose, showInfo, prompt }), createConfigEditor(renderer, confirm), createDoctor(renderer)];
   let current = -1;
   // Per-tab focus memory (session): whether each tab was last left at the top level (tab bar). The
   // within-tab section + field is remembered by each view (restoreFocus). Together these restore
@@ -244,6 +278,10 @@ export function createApp(renderer: CliRenderer): { currentTab: () => number; at
         else if (key.name === "down") { modal.index = (modal.index + 1) % n; renderModalBody(); }
         else if (key.name === "return" || key.name === "enter") { const m = modal; const v = m.options[m.index]?.value ?? null; closeModal(); m.resolve(v); }
         else if (key.name === "escape") { const m = modal; closeModal(); m.resolve(null); }
+      } else if (modal.kind === "prompt") {
+        if (key.name === "return" || key.name === "enter") { const m = modal; const v = m.input.value.trim(); closeModal(); m.resolve(v || null); }
+        else if (key.name === "escape") { const m = modal; closeModal(); m.resolve(null); }
+        else return; // typing → don't preventDefault, so the focused input captures the key
       } else {
         // info (scrollable, read-only)
         if (key.name === "up") infoScroll.scrollTop = Math.max(0, infoScroll.scrollTop - 1);
