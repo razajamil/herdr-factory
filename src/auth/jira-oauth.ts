@@ -33,12 +33,11 @@ export const DEFAULT_JIRA_SCOPES = ["read:jira-work", "write:jira-work", "offlin
 // repo; there is no secret to leak. An operator can point at their own app with auth.client_id.
 //
 // MAINTAINER: register ONE OAuth 2.0 (3LO) app at developer.atlassian.com — Callback URL EXACTLY
-// http://localhost:8976/oauth/callback (Jira 3LO matches redirect_uri exactly, port included — it
-// does NOT honor RFC 8252 dynamic loopback ports; the port is OAUTH_LOOPBACK_PORT in jira-login.ts),
-// the Jira API enabled with DEFAULT_JIRA_SCOPES, configured to allow PKCE / a public client — and
-// paste ONLY its client_id below (the secret the console shows is never used). Until then the
-// built-in id is empty and `auth login` requires auth.client_id in config.
-const BUILT_IN_CLIENT_ID = ""; // TODO(maintainer): the registered app's PUBLIC client id (no secret)
+// https://localhost:8976/oauth/callback (the console requires https; Jira 3LO matches redirect_uri
+// exactly, port included, and does NOT honor RFC 8252 dynamic loopback ports — this is
+// OAUTH_REDIRECT_URI in jira-login.ts), the Jira API enabled with DEFAULT_JIRA_SCOPES, configured to
+// allow PKCE / a public client. Only the PUBLIC client_id is used (never a secret — PKCE).
+const BUILT_IN_CLIENT_ID = "R6XRGNmiNVCxA5gqTADoB0zq7ZXbqLut"; // public client id (safe to commit)
 
 export interface OAuthApp {
   clientId: string;

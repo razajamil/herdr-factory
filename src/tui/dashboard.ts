@@ -9,8 +9,6 @@
 // in place — reusing the existing text renderables and only rewriting their content, adding/removing
 // rows at the tail. Unchanged lines are never destroyed, so the terminal just updates the glyphs
 // that actually changed.
-import { spawn } from "node:child_process";
-import { fileURLToPath } from "node:url";
 import { BoxRenderable, ScrollBoxRenderable, TextRenderable, type CliRenderer } from "@opentui/core";
 import type { KeyEvent } from "@opentui/core";
 import { listConfiguredRepos } from "../config.ts";
@@ -54,9 +52,6 @@ interface Target {
   source?: string | null;
 }
 
-/** The CLI entry we re-invoke for `auth login` — resolved relative to this module so it works in a
- *  dev checkout and a vendored install alike (Node runs the .ts directly via type-stripping). */
-const CLI_ENTRY = fileURLToPath(new URL("../cli/index.ts", import.meta.url));
 /** Desired state of one line (built in memory, then reconciled onto the rendered nodes). */
 interface LineSpec {
   content: string;
@@ -272,26 +267,20 @@ export function createDashboard(renderer: CliRenderer, actions: { confirm: Confi
     void refresh();
   }
 
-  /** Kick off OAuth `auth login` for a source. The login flow is interactive (a browser + a local
-   *  loopback listener), so we spawn it DETACHED with no stdio — it never touches the TUI's terminal,
-   *  the browser it opens does the talking, and the running server picks up the saved tokens on its
-   *  next tick (the auth light flips to green on refresh). Only OAuth sources can log in this way; an
-   *  api_token source's fix is in its env (the red row's detail says so), so nothing happens then —
-   *  the confirm makes that explicit. */
-  async function doLogin(t: Target): Promise<void> {
+  /** Show how to log in a red (unauthenticated) source. OAuth login is INTERACTIVE — it opens a
+   *  browser and you paste back the redirected URL — which can't be driven from inside the TUI, so we
+   *  surface the exact terminal command rather than pretend to run it. The auth light flips green on
+   *  refresh once you've done it. (An api_token source is fixed by setting its env creds, not login.) */
+  function doLogin(t: Target): void {
     if (!t.source) return;
-    if (!(await confirm(`Open a browser to log in to "${t.source}" (${t.repo})?\n(OAuth sources only — an api_token source is fixed by setting its env credentials.)`))) return;
-    try {
-      const child = spawn(process.execPath, [CLI_ENTRY, "--repo", t.repo, "auth", "login", "--source", t.source], { detached: true, stdio: "ignore" });
-      child.on("error", () => {}); // never let a spawn error crash the UI event loop
-      child.unref();
-      setAction(`opening a browser to authenticate "${t.source}"… the auth light turns green when you're done`, theme.text.secondary);
-      // Nudge a couple of refreshes so the light updates without waiting for the 3s auto-poll.
-      setTimeout(() => void refresh(), 4000);
-      setTimeout(() => void refresh(), 12000);
-    } catch (e) {
-      setAction(`✗ couldn't start login — run \`herdr-factory --repo ${t.repo} auth login --source ${t.source}\` (${e instanceof Error ? e.message : String(e)})`, theme.status.bad);
-    }
+    showInfo(`Log in to "${t.source}"`, [
+      "OAuth login opens a browser and asks you to paste back the redirected URL, so run it in a",
+      "terminal (this dashboard's auth light turns green when you're done):",
+      "",
+      `  herdr-factory --repo ${t.repo} auth login --source ${t.source}`,
+      "",
+      "If this source uses api_token instead, there's nothing to log in — set its env credentials.",
+    ]);
   }
 
   async function openTimeline(t: Target): Promise<void> {
@@ -334,7 +323,7 @@ export function createDashboard(renderer: CliRenderer, actions: { confirm: Confi
         key.preventDefault();
         break;
       case "l":
-        if (t?.kind === "source") void doLogin(t);
+        if (t?.kind === "source") doLogin(t);
         key.preventDefault();
         break;
       case "r":

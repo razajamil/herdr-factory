@@ -44,9 +44,9 @@ describe("jira-oauth PKCE + public client", () => {
     expect(tokens.refreshToken).toBe("RT");
   });
 
-  it("resolveJiraOAuthApp needs only a client_id (no secret); throws when none is set", () => {
-    expect(resolveJiraOAuthApp({ clientId: "my-public-id" })).toEqual({ clientId: "my-public-id" });
-    expect(() => resolveJiraOAuthApp({})).toThrow(/client_id/);
+  it("resolveJiraOAuthApp returns just a client_id (no secret); an explicit id overrides the baked built-in", () => {
+    expect(resolveJiraOAuthApp({ clientId: "my-public-id" })).toEqual({ clientId: "my-public-id" }); // override wins, no secret field
+    expect(resolveJiraOAuthApp({}).clientId.length).toBeGreaterThan(0); // falls back to the shipped built-in public id
   });
 
   it("pickResource matches the configured site URL, else falls back to a lone resource, else throws", () => {

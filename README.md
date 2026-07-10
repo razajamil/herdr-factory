@@ -639,9 +639,11 @@ than one source; `claim --belt` is required only when the repo has more than one
 
 `auth login` runs the browser OAuth flow for a source configured with `auth.method: oauth` (only
 needed for those — an `api_token` source authenticates from `env`, and `github_issues` from your
-`gh` login). It opens a browser to Atlassian and catches the redirect on a local loopback port; on
-a headless/remote host pass `--paste` to approve in any browser and paste the redirected URL back.
-`auth status` reports each source's method + state; `auth logout` clears a source's stored tokens.
+`gh` login). It opens a browser to Atlassian; after you approve, the browser lands on a "can't reach
+localhost" page — that's expected (Atlassian requires an https callback and nothing is listening on
+it) — so you copy that address-bar URL and paste it back into the prompt. `--paste` just skips the
+auto-open (headless/remote). `auth status` reports each source's method + state; `auth logout` clears
+a source's stored tokens.
 
 `serve` binds `127.0.0.1:8765` (override with `HERDR_FACTORY_PORT`) with the OpenAPI spec at
 `/doc` and Swagger UI at `/ui`. `update` pulls the latest code (hard reset to the branch's
@@ -658,13 +660,14 @@ keys jump to a numbered section, arrows move within it, `Esc` pops back out, `q`
   confirmation). A per-repo evidence-upload **SSO light** goes red when AWS creds have expired (the
   fix: `aws sso login`), and is hidden for repos with no evidence configured. A per-source **auth
   light** does the same for each work source — red when it can't authenticate (its work is paused,
-  auto-resuming on re-auth); highlight a red one and press `l` to run the browser OAuth login.
+  auto-resuming on re-auth); highlight a red one and press `l` for the exact `auth login` command to
+  run (OAuth login is an interactive browser + paste flow, so it runs in a terminal, not in the TUI).
 - **Config** — a repo list and a full `config.yml` editor: edits the YAML surgically (comments
   and the schema modeline preserved), validates against the engine schema, `^S` saves, `[`/`]`
   reorder list entries. Credentials appear as masked, replace-only `secrets (env)` fields —
   declared per source type (`JIRA_EMAIL`/`JIRA_API_TOKEN` for jira, `GITHUB_TOKEN` for
   github_issues) — written separately to the `env` file (`chmod 600`). OAuth needs no env secret at
-  all — sign-in is the Dashboard's `l` action / `auth login` (a PKCE browser flow).
+  all — sign-in is the `auth login` command (a PKCE browser flow; the Dashboard's `l` surfaces it).
 - **Doctor** — the same checks as the CLI: `r` re-runs, `d` toggles deep mode (live herdr/gh/S3
   probes). The `herdr`/`gh`/`claude`/`git` presence checks resolve against the **service's** PATH
   (the environment the resident server runs its tools in), not the TUI's own — so they read the
