@@ -1,20 +1,25 @@
-// The interactive Jira OAuth login flow, driven by the `auth login` CLI command. Two capture modes,
-// both authorization-code (Atlassian has no device flow / public PKCE):
-//   - loopback (default): spin a one-shot 127.0.0.1 listener, open the browser, catch the redirect.
+// The interactive Jira OAuth login flow, driven by the `auth login` CLI command. Authorization-code
+// + PKCE (public client, no secret). Two capture modes:
+//   - loopback (default): spin a one-shot 127.0.0.1 listener on a FIXED port, open the browser, catch
+//     the redirect.
 //   - paste (--paste): print the URL, the operator approves in ANY browser and pastes the redirected
 //     URL back — for a headless/remote factory where the browser isn't on this machine.
+// Both use the SAME redirect_uri (OAUTH_REDIRECT_URI). Jira Cloud 3LO matches redirect_uri EXACTLY
+// against the app's single registered callback and does NOT honor RFC 8252 dynamic loopback ports
+// (JRACLOUD-92180) — hence a pinned port, and the registered callback MUST equal OAUTH_REDIRECT_URI.
 // On success it discovers the cloudId (accessible-resources) and persists tokens via the store, so
 // the running server picks them up on its next authorize() (WAL + fresh reads) — no restart.
 import { createServer } from "node:http";
 import { randomBytes } from "node:crypto";
-import type { AddressInfo } from "node:net";
 import type { Store } from "../db/store.ts";
 import { run } from "../clients/exec.ts";
 import { accessibleResources, buildAuthorizeUrl, exchangeCode, newPkcePair, pickResource, type OAuthApp } from "./jira-oauth.ts";
 
-/** Paste-mode redirect: the browser lands here (nothing listening — the operator copies the URL bar).
- *  Must be a registered/allowed loopback callback on the OAuth app; port 80 default keeps it simple. */
-const PASTE_REDIRECT = "http://localhost/oauth/callback";
+/** The fixed loopback port and the SINGLE callback URL the OAuth app must register. `localhost` (not
+ *  127.0.0.1) so the registered string matches what the browser sends; the listener binds 127.0.0.1,
+ *  which localhost resolves to. Change both together — and re-register the callback — if 8976 clashes. */
+export const OAUTH_LOOPBACK_PORT = 8976;
+export const OAUTH_REDIRECT_URI = `http://localhost:${OAUTH_LOOPBACK_PORT}/oauth/callback`;
 const CALLBACK_TIMEOUT_MS = 5 * 60 * 1000;
 
 const page = (msg: string): string =>
@@ -33,14 +38,13 @@ async function openUrl(url: string): Promise<boolean> {
 }
 
 interface Loopback {
-  redirectUri: string;
   /** Resolves with the authorization code once the browser hits the callback (rejects on
    *  error/state-mismatch/timeout). Closing is automatic when it settles. */
   code: Promise<string>;
 }
 
-/** Start a one-shot loopback listener on an ephemeral 127.0.0.1 port and hand back the redirect URI
- *  (with that port) plus a promise for the captured code. */
+/** Start a one-shot loopback listener on the FIXED port (matching OAUTH_REDIRECT_URI) and hand back a
+ *  promise for the captured code. Rejects with an actionable message if the port is already in use. */
 function startLoopback(expectedState: string): Promise<Loopback> {
   return new Promise<Loopback>((resolveStart, rejectStart) => {
     let resolveCode!: (c: string) => void;
@@ -77,11 +81,14 @@ function startLoopback(expectedState: string): Promise<Loopback> {
       clearTimeout(timer);
       server.close();
     });
-    server.once("error", rejectStart);
-    server.listen(0, "127.0.0.1", () => {
-      const port = (server.address() as AddressInfo).port;
-      resolveStart({ redirectUri: `http://127.0.0.1:${port}/oauth/callback`, code: codeP });
-    });
+    server.once("error", (e: NodeJS.ErrnoException) =>
+      rejectStart(
+        e.code === "EADDRINUSE"
+          ? new Error(`loopback port ${OAUTH_LOOPBACK_PORT} is already in use — free it and retry, or use --paste`)
+          : e,
+      ),
+    );
+    server.listen(OAUTH_LOOPBACK_PORT, "127.0.0.1", () => resolveStart({ code: codeP }));
   });
 }
 
@@ -125,18 +132,15 @@ export async function jiraOAuthLogin(opts: {
 }): Promise<JiraLoginResult> {
   const state = randomBytes(16).toString("hex");
   const { verifier, challenge } = newPkcePair(); // PKCE — no client_secret; the verifier is the proof
+  const redirectUri = OAUTH_REDIRECT_URI; // one registered callback, used by both modes
+  const authUrl = buildAuthorizeUrl({ app: opts.app, redirectUri, scopes: opts.scopes, state, codeChallenge: challenge });
   let code: string;
-  let redirectUri: string;
 
   if (opts.paste) {
-    redirectUri = PASTE_REDIRECT;
-    const authUrl = buildAuthorizeUrl({ app: opts.app, redirectUri, scopes: opts.scopes, state, codeChallenge: challenge });
     opts.log(`Open this URL in a browser, approve access, then paste the URL you land on:\n\n  ${authUrl}\n`);
     code = codeFromPaste(await opts.readPastedRedirect(), state);
   } else {
     const lb = await startLoopback(state);
-    redirectUri = lb.redirectUri;
-    const authUrl = buildAuthorizeUrl({ app: opts.app, redirectUri, scopes: opts.scopes, state, codeChallenge: challenge });
     opts.log(`Opening your browser to authorize herdr-factory…\n\n  ${authUrl}\n\n(waiting for the redirect; Ctrl-C to cancel — or re-run with --paste on a headless host)`);
     if (!(await openUrl(authUrl))) opts.log("Couldn't open a browser automatically — open the URL above yourself.");
     code = await lb.code;
