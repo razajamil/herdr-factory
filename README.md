@@ -442,12 +442,14 @@ reference it), and a type block:
   `auth` block:
   - `auth: { method: api_token }` (**the default** — omit `auth` entirely for it): `JIRA_EMAIL` +
     `JIRA_API_TOKEN` in the repo's `env`.
-  - `auth: { method: oauth }`: browser login instead of a token. Run
+  - `auth: { method: oauth }`: browser login instead of a token, and **no secret**. Run
     `herdr-factory --repo <name> auth login`, approve in the browser, and the factory stores the
-    tokens **locally** and refreshes them automatically — nothing to rotate by hand. It uses a
-    registered Atlassian OAuth app: the one shipped with herdr-factory, or — if that isn't set up in
-    your build, or you'd rather use your own — set `client_id` here and `JIRA_OAUTH_CLIENT_SECRET` in
-    `env`. Optional `scopes` overrides the defaults (`read:jira-work write:jira-work offline_access`).
+    tokens **locally** and refreshes them automatically — nothing to rotate by hand. It's a PKCE
+    public client, so the only thing it needs is a **public** OAuth `client_id` (which is not a
+    secret — it rides in the browser URL): the one shipped with herdr-factory, or your own via
+    `client_id` here (from a developer.atlassian.com OAuth app — the console shows a secret too, but
+    it is never used). Optional `scopes` overrides the defaults (`read:jira-work write:jira-work
+    offline_access`).
 
   Either way, a source that **isn't authenticated yet** (no token, or an expired OAuth session that
   can't refresh) is *paused*, not broken: its claims and status write-backs hold, you get one
@@ -660,10 +662,9 @@ keys jump to a numbered section, arrows move within it, `Esc` pops back out, `q`
 - **Config** — a repo list and a full `config.yml` editor: edits the YAML surgically (comments
   and the schema modeline preserved), validates against the engine schema, `^S` saves, `[`/`]`
   reorder list entries. Credentials appear as masked, replace-only `secrets (env)` fields —
-  declared per source type (`JIRA_EMAIL`/`JIRA_API_TOKEN` — or `JIRA_OAUTH_CLIENT_SECRET` for a
-  bring-your-own OAuth app — for jira, `GITHUB_TOKEN` for github_issues) — written separately to the
-  `env` file (`chmod 600`). OAuth sign-in itself is the Dashboard's `l` action / `auth login`, not an
-  env field.
+  declared per source type (`JIRA_EMAIL`/`JIRA_API_TOKEN` for jira, `GITHUB_TOKEN` for
+  github_issues) — written separately to the `env` file (`chmod 600`). OAuth needs no env secret at
+  all — sign-in is the Dashboard's `l` action / `auth login` (a PKCE browser flow).
 - **Doctor** — the same checks as the CLI: `r` re-runs, `d` toggles deep mode (live herdr/gh/S3
   probes). The `herdr`/`gh`/`claude`/`git` presence checks resolve against the **service's** PATH
   (the environment the resident server runs its tools in), not the TUI's own — so they read the

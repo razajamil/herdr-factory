@@ -5,10 +5,10 @@ import { DEFAULT_JIRA_SCOPES, resolveJiraOAuthApp } from "../../auth/jira-oauth.
 import type { SourceDescriptor } from "../registry.ts";
 
 // How a Jira source authenticates — a discriminated union on `method` (same idiom as source `type`).
-// api_token (DEFAULT, back-compatible): email + token from env. oauth: browser login, factory-managed
-// tokens (Phase 2), against the shipped OAuth app unless overridden per-source with client_id (here)
-// + JIRA_OAUTH_CLIENT_SECRET (env). Omitting `auth` entirely ⇒ api_token, so existing configs are
-// unchanged.
+// api_token (DEFAULT, back-compatible): email + token from env. oauth: browser login (PKCE public
+// client — NO secret), factory-managed tokens, against the shipped public client_id unless
+// overridden per-source with client_id (here). Omitting `auth` entirely ⇒ api_token, so existing
+// configs are unchanged.
 const JiraAuthSchema = z
   .discriminatedUnion("method", [
     z.object({ method: z.literal("api_token") }).strict(),
@@ -73,12 +73,13 @@ export const jiraDescriptor: SourceDescriptor<JiraSourceCfg> = {
     if (cfg.auth.method === "oauth") {
       const { clientId } = cfg.auth;
       // App resolution is LAZY (only a refresh/login needs it) so an oauth source that isn't logged
-      // in yet still starts — it just reports unauthenticated until `auth login`.
+      // in yet still starts — it just reports unauthenticated until `auth login`. Public client
+      // (PKCE): only the public client_id is needed — no secret.
       auth = new JiraOAuthAuth({
         store: ctx.store,
         repo: ctx.repoName,
         source: ctx.sourceName,
-        resolveApp: () => resolveJiraOAuthApp({ clientId, clientSecret: ctx.env.JIRA_OAUTH_CLIENT_SECRET }),
+        resolveApp: () => resolveJiraOAuthApp({ clientId }),
       });
     } else {
       auth = new JiraApiTokenAuth(cfg.baseUrl, ctx.env.JIRA_EMAIL ?? "", ctx.env.JIRA_API_TOKEN ?? "");
@@ -88,11 +89,11 @@ export const jiraDescriptor: SourceDescriptor<JiraSourceCfg> = {
   // Presence is NOT hard-required here anymore — which credentials a source needs depends on its
   // auth.method (api_token vs oauth), which this static manifest can't see. The per-source `auth`
   // doctor line (authStatus / INV-12) gives the accurate, method-aware verdict; these entries just
-  // drive the TUI credential rows + doctor's hints.
+  // drive the TUI credential rows + doctor's hints. OAuth (auth.method: oauth) has NO env secret —
+  // it's a public PKCE client (browser login via `auth login`), so nothing to list here for it.
   secrets: [
     { envKey: "JIRA_EMAIL", required: false, placeholder: "you@org.com", hint: "the Atlassian account email (auth.method: api_token)" },
     { envKey: "JIRA_API_TOKEN", required: false, masked: true, hint: "an Atlassian API token (auth.method: api_token; id.atlassian.com → Security → API tokens)" },
-    { envKey: "JIRA_OAUTH_CLIENT_SECRET", required: false, masked: true, hint: "only when overriding the built-in OAuth app (auth.method: oauth) with your own registered app" },
   ],
   tui: {
     defaultBlock: () => ({

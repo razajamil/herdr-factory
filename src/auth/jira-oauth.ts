@@ -1,11 +1,18 @@
 // The Atlassian OAuth 2.0 (3LO) protocol for Jira Cloud — authorize URL, code↔token exchange,
-// refresh, and cloud-resource discovery. Authorization-code grant with a client_secret (Atlassian
-// exposes NO public PKCE — verified 2026-07), so a confidential client is required. Rides the shared
-// Effect http pipeline (clients/http.ts) for timeouts + retry, same as every other backend call.
+// refresh, and cloud-resource discovery. PUBLIC CLIENT + PKCE (S256): NO client_secret. This is
+// what auth.atlassian.com's live metadata advertises (token_endpoint_auth_methods_supported
+// includes "none", code_challenge_methods_supported: ["S256"]) — verified 2026-07 against
+// /.well-known/oauth-authorization-server. The PKCE code_verifier proves the token request comes
+// from the same client that started the flow, so no shared secret is needed or stored. Rides the
+// shared Effect http pipeline (clients/http.ts) for timeouts + retry.
 //
 // Endpoints: authorize/token on auth.atlassian.com; the Jira REST API for an OAuth client is
-// https://api.atlassian.com/ex/jira/<cloudId>/... (NOT the site host — that's the big difference
-// from api_token). cloudId is discovered from accessible-resources after the first token.
+// https://api.atlassian.com/ex/jira/<cloudId>/... (NOT the site host — the big difference from
+// api_token). cloudId is discovered from accessible-resources after the first token. There is NO
+// dynamic client registration at auth.atlassian.com (registration_endpoint absent) and NO device
+// grant, so a pre-registered client_id is the one irreducible input — but a client_id is a PUBLIC
+// identifier (it rides in the browser URL), not a secret.
+import { createHash, randomBytes } from "node:crypto";
 import { httpOk } from "../clients/http.ts";
 
 const AUTHORIZE_URL = "https://auth.atlassian.com/authorize";
@@ -19,37 +26,41 @@ export const jiraApiBase = (cloudId: string): string => `https://api.atlassian.c
  *  offline_access (REQUIRED to receive a refresh_token). Overridable per-source via auth.scopes. */
 export const DEFAULT_JIRA_SCOPES = ["read:jira-work", "write:jira-work", "offline_access"];
 
-// ── The built-in herdr-factory Atlassian OAuth app ────────────────────────────────────────────
-// SHIPPED so `auth login` is zero-setup (the operator registers nothing) — the gh-CLI experience.
-// Atlassian 3LO has no public PKCE, so a client_secret is required and would ship here; it is
-// therefore NOT truly secret in an open repo (documented tradeoff — the blast radius is
-// consent-screen impersonation, not data access, since a token still needs the user's explicit
-// Allow + a fresh authorization code). Any operator who prefers not to trust the shipped secret
-// overrides it per-source with auth.client_id (config) + JIRA_OAUTH_CLIENT_SECRET (env).
+// ── The built-in herdr-factory Atlassian OAuth app (a PUBLIC client — client_id only) ──────────
+// SHIPPED so `auth login` is zero-setup (the operator registers nothing). Because the flow is PKCE
+// public-client, only a client_id is baked here — and a client_id is NOT a secret (it appears in
+// the browser's address bar during consent and grants nothing on its own). So it's safe in an open
+// repo; there is no secret to leak. An operator can point at their own app with auth.client_id.
 //
 // MAINTAINER: register ONE OAuth 2.0 (3LO) app at developer.atlassian.com — callback
 // http://localhost/oauth/callback (loopback; Atlassian honors RFC 8252 any-port at request time),
-// the Jira API enabled with DEFAULT_JIRA_SCOPES — and paste its credentials below. Until then the
-// built-in app is empty and `auth login` requires the per-source override above.
-const BUILT_IN_CLIENT_ID = ""; // TODO(maintainer): the registered app's client id
-const BUILT_IN_CLIENT_SECRET = ""; // TODO(maintainer): the registered app's client secret
+// the Jira API enabled with DEFAULT_JIRA_SCOPES, configured to allow PKCE / a public client — and
+// paste ONLY its client_id below (the secret the console shows is never used). Until then the
+// built-in id is empty and `auth login` requires auth.client_id in config.
+const BUILT_IN_CLIENT_ID = ""; // TODO(maintainer): the registered app's PUBLIC client id (no secret)
 
 export interface OAuthApp {
   clientId: string;
-  clientSecret: string;
 }
 
-/** Resolve the OAuth app: a per-source override (config client_id + env secret) wins over the
- *  shipped built-in app. Throws with an actionable message when neither is available. */
-export function resolveJiraOAuthApp(opts: { clientId?: string; clientSecret?: string }): OAuthApp {
+/** Resolve the OAuth app's public client_id: a per-source override (auth.client_id) wins over the
+ *  shipped built-in id. Throws with an actionable message when neither is set. No secret involved. */
+export function resolveJiraOAuthApp(opts: { clientId?: string }): OAuthApp {
   const clientId = opts.clientId?.trim() || BUILT_IN_CLIENT_ID;
-  const clientSecret = opts.clientSecret?.trim() || BUILT_IN_CLIENT_SECRET;
-  if (!clientId || !clientSecret) {
+  if (!clientId) {
     throw new Error(
-      "no Jira OAuth app available — the built-in app isn't configured in this build. Set `auth.client_id` in config + JIRA_OAUTH_CLIENT_SECRET in the repo env to use your own registered Atlassian app.",
+      "no Jira OAuth client_id available — the built-in app isn't configured in this build. Set `auth.client_id` in the source config (a public client id from a developer.atlassian.com OAuth app; no secret needed).",
     );
   }
-  return { clientId, clientSecret };
+  return { clientId };
+}
+
+/** A fresh PKCE pair: a high-entropy verifier (kept by the client) and its S256 challenge (sent on
+ *  /authorize). RFC 7636 — the verifier proves possession at the token exchange in place of a secret. */
+export function newPkcePair(): { verifier: string; challenge: string } {
+  const verifier = randomBytes(32).toString("base64url"); // 43 chars, within the 43–128 spec range
+  const challenge = createHash("sha256").update(verifier).digest("base64url");
+  return { verifier, challenge };
 }
 
 export interface TokenSet {
@@ -59,7 +70,7 @@ export interface TokenSet {
   scope: string;
 }
 
-export function buildAuthorizeUrl(opts: { app: OAuthApp; redirectUri: string; scopes: string[]; state: string }): string {
+export function buildAuthorizeUrl(opts: { app: OAuthApp; redirectUri: string; scopes: string[]; state: string; codeChallenge: string }): string {
   const p = new URLSearchParams({
     audience: "api.atlassian.com",
     client_id: opts.app.clientId,
@@ -67,6 +78,8 @@ export function buildAuthorizeUrl(opts: { app: OAuthApp; redirectUri: string; sc
     redirect_uri: opts.redirectUri,
     state: opts.state,
     response_type: "code",
+    code_challenge: opts.codeChallenge,
+    code_challenge_method: "S256",
     prompt: "consent",
   });
   return `${AUTHORIZE_URL}?${p.toString()}`;
@@ -81,23 +94,24 @@ async function postToken(body: Record<string, string>): Promise<TokenSet> {
   return { accessToken: j.access_token, refreshToken: j.refresh_token ?? null, expiresInSec: j.expires_in, scope: j.scope };
 }
 
-/** Exchange an authorization code (from the loopback/paste redirect) for the first token set. */
-export function exchangeCode(opts: { app: OAuthApp; code: string; redirectUri: string }): Promise<TokenSet> {
+/** Exchange an authorization code (from the loopback/paste redirect) for the first token set. The
+ *  PKCE `code_verifier` authenticates the public client — no client_secret. */
+export function exchangeCode(opts: { app: OAuthApp; code: string; redirectUri: string; codeVerifier: string }): Promise<TokenSet> {
   return postToken({
     grant_type: "authorization_code",
     client_id: opts.app.clientId,
-    client_secret: opts.app.clientSecret,
     code: opts.code,
     redirect_uri: opts.redirectUri,
+    code_verifier: opts.codeVerifier,
   });
 }
 
-/** Exchange a (rotating) refresh token for a fresh access token. */
+/** Exchange a (rotating) refresh token for a fresh access token. Public client: client_id only,
+ *  no secret (the refresh_token itself is the credential). */
 export function refreshAccessToken(opts: { app: OAuthApp; refreshToken: string }): Promise<TokenSet> {
   return postToken({
     grant_type: "refresh_token",
     client_id: opts.app.clientId,
-    client_secret: opts.app.clientSecret,
     refresh_token: opts.refreshToken,
   });
 }

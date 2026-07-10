@@ -10,7 +10,7 @@ import { randomBytes } from "node:crypto";
 import type { AddressInfo } from "node:net";
 import type { Store } from "../db/store.ts";
 import { run } from "../clients/exec.ts";
-import { accessibleResources, buildAuthorizeUrl, exchangeCode, pickResource, type OAuthApp } from "./jira-oauth.ts";
+import { accessibleResources, buildAuthorizeUrl, exchangeCode, newPkcePair, pickResource, type OAuthApp } from "./jira-oauth.ts";
 
 /** Paste-mode redirect: the browser lands here (nothing listening — the operator copies the URL bar).
  *  Must be a registered/allowed loopback callback on the OAuth app; port 80 default keeps it simple. */
@@ -124,24 +124,25 @@ export async function jiraOAuthLogin(opts: {
   readPastedRedirect: () => Promise<string>;
 }): Promise<JiraLoginResult> {
   const state = randomBytes(16).toString("hex");
+  const { verifier, challenge } = newPkcePair(); // PKCE — no client_secret; the verifier is the proof
   let code: string;
   let redirectUri: string;
 
   if (opts.paste) {
     redirectUri = PASTE_REDIRECT;
-    const authUrl = buildAuthorizeUrl({ app: opts.app, redirectUri, scopes: opts.scopes, state });
+    const authUrl = buildAuthorizeUrl({ app: opts.app, redirectUri, scopes: opts.scopes, state, codeChallenge: challenge });
     opts.log(`Open this URL in a browser, approve access, then paste the URL you land on:\n\n  ${authUrl}\n`);
     code = codeFromPaste(await opts.readPastedRedirect(), state);
   } else {
     const lb = await startLoopback(state);
     redirectUri = lb.redirectUri;
-    const authUrl = buildAuthorizeUrl({ app: opts.app, redirectUri, scopes: opts.scopes, state });
+    const authUrl = buildAuthorizeUrl({ app: opts.app, redirectUri, scopes: opts.scopes, state, codeChallenge: challenge });
     opts.log(`Opening your browser to authorize herdr-factory…\n\n  ${authUrl}\n\n(waiting for the redirect; Ctrl-C to cancel — or re-run with --paste on a headless host)`);
     if (!(await openUrl(authUrl))) opts.log("Couldn't open a browser automatically — open the URL above yourself.");
     code = await lb.code;
   }
 
-  const tokens = await exchangeCode({ app: opts.app, code, redirectUri });
+  const tokens = await exchangeCode({ app: opts.app, code, redirectUri, codeVerifier: verifier });
   const resource = pickResource(await accessibleResources(tokens.accessToken), opts.siteBaseUrl);
   const expiresAt = opts.now() + tokens.expiresInSec;
   opts.store.saveSourceAuth({
