@@ -282,8 +282,9 @@ export function createDashboard(renderer: CliRenderer, actions: { confirm: Confi
     if (!t.source) return;
     let cfg: JiraSourceCfg;
     let dbPath: string;
+    let clientSecret: string | undefined;
     try {
-      const { config } = loadConfig(t.repo);
+      const { config, env } = loadConfig(t.repo);
       const src = config.sources.find((s) => s.name === t.source);
       if (!src) return setAction(`✗ source "${t.source}" not in config`, theme.status.bad);
       if (src.type !== "jira" || (src.cfg as JiraSourceCfg).auth.method !== "oauth") {
@@ -295,13 +296,14 @@ export function createDashboard(renderer: CliRenderer, actions: { confirm: Confi
       }
       cfg = src.cfg as JiraSourceCfg;
       dbPath = config.paths.dbPath;
+      clientSecret = env.JIRA_OAUTH_CLIENT_SECRET;
     } catch (e) {
       return setAction(`✗ ${e instanceof Error ? e.message : String(e)}`, theme.status.bad);
     }
     const auth = cfg.auth as Extract<JiraSourceCfg["auth"], { method: "oauth" }>;
-    let app: { clientId: string };
+    let app: ReturnType<typeof resolveJiraOAuthApp>;
     try {
-      app = resolveJiraOAuthApp({ clientId: auth.clientId });
+      app = resolveJiraOAuthApp({ clientId: auth.clientId, clientSecret });
     } catch (e) {
       return setAction(`✗ ${e instanceof Error ? e.message : String(e)}`, theme.status.bad);
     }

@@ -73,27 +73,27 @@ export const jiraDescriptor: SourceDescriptor<JiraSourceCfg> = {
     if (cfg.auth.method === "oauth") {
       const { clientId } = cfg.auth;
       // App resolution is LAZY (only a refresh/login needs it) so an oauth source that isn't logged
-      // in yet still starts — it just reports unauthenticated until `auth login`. Public client
-      // (PKCE): only the public client_id is needed — no secret.
+      // in yet still starts — it just reports unauthenticated until `auth login`. Atlassian 3LO needs
+      // the client_secret (JIRA_OAUTH_CLIENT_SECRET in the repo env) for the token exchange + refresh.
       auth = new JiraOAuthAuth({
         store: ctx.store,
         repo: ctx.repoName,
         source: ctx.sourceName,
-        resolveApp: () => resolveJiraOAuthApp({ clientId }),
+        resolveApp: () => resolveJiraOAuthApp({ clientId, clientSecret: ctx.env.JIRA_OAUTH_CLIENT_SECRET }),
       });
     } else {
       auth = new JiraApiTokenAuth(cfg.baseUrl, ctx.env.JIRA_EMAIL ?? "", ctx.env.JIRA_API_TOKEN ?? "");
     }
     return new JiraSource(cfg, auth);
   },
-  // Presence is NOT hard-required here anymore — which credentials a source needs depends on its
-  // auth.method (api_token vs oauth), which this static manifest can't see. The per-source `auth`
-  // doctor line (authStatus / INV-12) gives the accurate, method-aware verdict; these entries just
-  // drive the TUI credential rows + doctor's hints. OAuth (auth.method: oauth) has NO env secret —
-  // it's a public PKCE client (browser login via `auth login`), so nothing to list here for it.
+  // Presence is NOT hard-required here — which credentials a source needs depends on its auth.method
+  // (api_token vs oauth), which this static manifest can't see. The per-source `auth` doctor line
+  // (authStatus / INV-12) gives the accurate, method-aware verdict; these entries drive the TUI
+  // credential rows + doctor's hints.
   secrets: [
     { envKey: "JIRA_EMAIL", required: false, placeholder: "you@org.com", hint: "the Atlassian account email (auth.method: api_token)" },
     { envKey: "JIRA_API_TOKEN", required: false, masked: true, hint: "an Atlassian API token (auth.method: api_token; id.atlassian.com → Security → API tokens)" },
+    { envKey: "JIRA_OAUTH_CLIENT_SECRET", required: false, masked: true, hint: "the OAuth app's client secret (auth.method: oauth; developer.atlassian.com → your app → Settings)" },
   ],
   tui: {
     defaultBlock: () => ({

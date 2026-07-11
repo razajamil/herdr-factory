@@ -1,17 +1,16 @@
 // The Atlassian OAuth 2.0 (3LO) protocol for Jira Cloud — authorize URL, code↔token exchange,
-// refresh, and cloud-resource discovery. PUBLIC CLIENT + PKCE (S256): NO client_secret. This is
-// what auth.atlassian.com's live metadata advertises (token_endpoint_auth_methods_supported
-// includes "none", code_challenge_methods_supported: ["S256"]) — verified 2026-07 against
-// /.well-known/oauth-authorization-server. The PKCE code_verifier proves the token request comes
-// from the same client that started the flow, so no shared secret is needed or stored. Rides the
-// shared Effect http pipeline (clients/http.ts) for timeouts + retry.
+// refresh, and cloud-resource discovery. CONFIDENTIAL CLIENT + PKCE (S256): the token exchange sends
+// BOTH a client_secret AND the PKCE code_verifier. Atlassian 3LO has NO usable public-client mode:
+// despite /.well-known advertising token_endpoint_auth_methods_supported: ["none", …], the live
+// token endpoint 401s a secretless exchange ({"error":"access_denied"}) — verified 2026-07, and a
+// known Atlassian issue ("Jira blocks the PKCE request expecting a client secret"). So a secret is
+// required; PKCE is kept on top for defence-in-depth. Rides the shared Effect http pipeline.
 //
 // Endpoints: authorize/token on auth.atlassian.com; the Jira REST API for an OAuth client is
 // https://api.atlassian.com/ex/jira/<cloudId>/... (NOT the site host — the big difference from
 // api_token). cloudId is discovered from accessible-resources after the first token. There is NO
 // dynamic client registration at auth.atlassian.com (registration_endpoint absent) and NO device
-// grant, so a pre-registered client_id is the one irreducible input — but a client_id is a PUBLIC
-// identifier (it rides in the browser URL), not a secret.
+// grant, so a pre-registered client_id + secret are the irreducible inputs.
 import { createHash, randomBytes } from "node:crypto";
 import { httpOk } from "../clients/http.ts";
 
@@ -26,33 +25,41 @@ export const jiraApiBase = (cloudId: string): string => `https://api.atlassian.c
  *  offline_access (REQUIRED to receive a refresh_token). Overridable per-source via auth.scopes. */
 export const DEFAULT_JIRA_SCOPES = ["read:jira-work", "write:jira-work", "offline_access"];
 
-// ── The built-in herdr-factory Atlassian OAuth app (a PUBLIC client — client_id only) ──────────
-// SHIPPED so `auth login` is zero-setup (the operator registers nothing). Because the flow is PKCE
-// public-client, only a client_id is baked here — and a client_id is NOT a secret (it appears in
-// the browser's address bar during consent and grants nothing on its own). So it's safe in an open
-// repo; there is no secret to leak. An operator can point at their own app with auth.client_id.
+// ── The built-in herdr-factory Atlassian OAuth app ─────────────────────────────────────────────
+// The client_id is baked (it's public — it rides in the browser URL, grants nothing alone). The
+// client_secret is NOT baked by default: Atlassian 3LO requires it, so it's a real secret — leave it
+// empty here and supply it per-repo via JIRA_OAUTH_CLIENT_SECRET (env), OR bake it (accepting that a
+// committed secret in an OSS repo is effectively public; its blast radius is consent-screen
+// impersonation, not data access, since a token still needs the user's Allow + a fresh code).
 //
 // MAINTAINER: register ONE OAuth 2.0 (3LO) app at developer.atlassian.com — Callback URL EXACTLY
 // https://localhost:8976/oauth/callback (the console requires https; Jira 3LO matches redirect_uri
-// exactly, port included, and does NOT honor RFC 8252 dynamic loopback ports — this is
-// OAUTH_REDIRECT_URI in jira-login.ts), the Jira API enabled with DEFAULT_JIRA_SCOPES, configured to
-// allow PKCE / a public client. Only the PUBLIC client_id is used (never a secret — PKCE).
+// exactly, port included; no RFC 8252 dynamic ports — this is OAUTH_REDIRECT_URI in jira-login.ts),
+// the Jira API enabled with DEFAULT_JIRA_SCOPES, made "Distributed" (Distribution → enable sharing)
+// so non-owner accounts can consent. client_id below; client_secret via env (or baked below).
 const BUILT_IN_CLIENT_ID = "R6XRGNmiNVCxA5gqTADoB0zq7ZXbqLut"; // public client id (safe to commit)
+const BUILT_IN_CLIENT_SECRET = ""; // leave empty → supply via JIRA_OAUTH_CLIENT_SECRET; bake only if you accept the leak
 
 export interface OAuthApp {
   clientId: string;
+  clientSecret: string;
 }
 
-/** Resolve the OAuth app's public client_id: a per-source override (auth.client_id) wins over the
- *  shipped built-in id. Throws with an actionable message when neither is set. No secret involved. */
-export function resolveJiraOAuthApp(opts: { clientId?: string }): OAuthApp {
+/** Resolve the OAuth app credentials: per-source/env overrides win over the baked built-ins.
+ *  Atlassian 3LO requires the secret (no public/PKCE-only mode), so both are required — the errors
+ *  say exactly what to set. */
+export function resolveJiraOAuthApp(opts: { clientId?: string; clientSecret?: string }): OAuthApp {
   const clientId = opts.clientId?.trim() || BUILT_IN_CLIENT_ID;
+  const clientSecret = opts.clientSecret?.trim() || BUILT_IN_CLIENT_SECRET;
   if (!clientId) {
+    throw new Error("no Jira OAuth client_id — set `auth.client_id` in the source config (a public client id from a developer.atlassian.com OAuth app).");
+  }
+  if (!clientSecret) {
     throw new Error(
-      "no Jira OAuth client_id available — the built-in app isn't configured in this build. Set `auth.client_id` in the source config (a public client id from a developer.atlassian.com OAuth app; no secret needed).",
+      "no Jira OAuth client secret — Atlassian 3LO requires one (there is no public/PKCE-only mode). Copy it from your app's Settings in the developer console and set JIRA_OAUTH_CLIENT_SECRET in the repo env (~/.config/herdr-factory/repos/<name>/env).",
     );
   }
-  return { clientId };
+  return { clientId, clientSecret };
 }
 
 /** A fresh PKCE pair: a high-entropy verifier (kept by the client) and its S256 challenge (sent on
@@ -94,24 +101,25 @@ async function postToken(body: Record<string, string>): Promise<TokenSet> {
   return { accessToken: j.access_token, refreshToken: j.refresh_token ?? null, expiresInSec: j.expires_in, scope: j.scope };
 }
 
-/** Exchange an authorization code (from the loopback/paste redirect) for the first token set. The
- *  PKCE `code_verifier` authenticates the public client — no client_secret. */
+/** Exchange an authorization code (from the callback/paste redirect) for the first token set —
+ *  confidential client (client_secret) + PKCE (code_verifier). */
 export function exchangeCode(opts: { app: OAuthApp; code: string; redirectUri: string; codeVerifier: string }): Promise<TokenSet> {
   return postToken({
     grant_type: "authorization_code",
     client_id: opts.app.clientId,
+    client_secret: opts.app.clientSecret,
     code: opts.code,
     redirect_uri: opts.redirectUri,
     code_verifier: opts.codeVerifier,
   });
 }
 
-/** Exchange a (rotating) refresh token for a fresh access token. Public client: client_id only,
- *  no secret (the refresh_token itself is the credential). */
+/** Exchange a (rotating) refresh token for a fresh access token — client_id + client_secret. */
 export function refreshAccessToken(opts: { app: OAuthApp; refreshToken: string }): Promise<TokenSet> {
   return postToken({
     grant_type: "refresh_token",
     client_id: opts.app.clientId,
+    client_secret: opts.app.clientSecret,
     refresh_token: opts.refreshToken,
   });
 }

@@ -430,7 +430,7 @@ program
           fail(`source "${src.name}" isn't configured for OAuth login (set \`auth: { method: oauth }\` on a jira source)`);
         }
         const auth = cfg.auth as Extract<JiraSourceCfg["auth"], { method: "oauth" }>;
-        const app = resolveJiraOAuthApp({ clientId: auth.clientId });
+        const app = resolveJiraOAuthApp({ clientId: auth.clientId, clientSecret: env.JIRA_OAUTH_CLIENT_SECRET });
         // Prefer the resident server's https callback listener (auto-capture); fall back to paste when
         // there's no server, its callback listener is down (no openssl), or --paste was passed.
         const info = readServerInfo();

@@ -12,7 +12,7 @@ afterEach(() => {
   globalThis.fetch = realFetch;
 });
 
-const APP = { clientId: "cid" }; // public client — no secret
+const APP = { clientId: "cid", clientSecret: "sec" }; // confidential client (Atlassian 3LO requires the secret) + PKCE
 const makeStore = (now = 1000) => new Store(openDb(":memory:"), () => now);
 const seed = (store: Store, over: Partial<{ accessToken: string; refreshToken: string | null; expiresAt: number }> = {}) =>
   store.saveSourceAuth({ repo: "r", source: "jira", method: "oauth", accessToken: "OLD", refreshToken: "RT1", expiresAt: 999_999, cloudId: "CID", cloudUrl: "https://x.atlassian.net", scopes: "s", ...over });
@@ -70,8 +70,7 @@ describe("JiraOAuthAuth", () => {
     const a = new JiraOAuthAuth({ store, repo: "r", source: "jira", resolveApp: () => APP, now: () => 1000 });
     const ctx = await a.authorize();
     expect(ctx.headers.Authorization).toBe("Bearer NEW");
-    expect(bodies[0]).toMatchObject({ grant_type: "refresh_token", refresh_token: "RT1", client_id: "cid" });
-    expect(bodies[0]!.client_secret).toBeUndefined(); // public client — never sends a secret
+    expect(bodies[0]).toMatchObject({ grant_type: "refresh_token", refresh_token: "RT1", client_id: "cid", client_secret: "sec" });
     const saved = store.getSourceAuth("r", "jira")!;
     expect([saved.accessToken, saved.refreshToken, saved.expiresAt]).toEqual(["NEW", "RT2", 1000 + 3600]);
   });
