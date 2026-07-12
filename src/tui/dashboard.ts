@@ -205,8 +205,10 @@ export function createDashboard(renderer: CliRenderer, actions: { confirm: Confi
           for (const src of st?.sources ?? []) {
             if (!src.auth || src.auth.state === "na") continue;
             const down = src.auth.state === "down";
+            // The signed-in account (whoami, persisted at login) — shows WHO the source is authed as.
+            const acct = src.auth.account ? ` (${src.auth.account})` : "";
             specs.push({
-              content: `  auth ● ${src.name}${down ? `  down — ${src.auth.detail ?? "not authenticated"}` : "  ok"}`,
+              content: `  auth ● ${src.name}${acct}${down ? `  down — ${src.auth.detail ?? "not authenticated"}` : "  ok"}`,
               fg: down ? theme.status.bad : theme.status.good,
               target: down ? { repo: name, kind: "source", source: src.name } : undefined,
             });

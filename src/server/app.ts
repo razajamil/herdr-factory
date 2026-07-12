@@ -103,10 +103,13 @@ const authProbeCache = new Map<string, { at: number; state: "ok" | "unauthentica
  *  reconcile gate has recorded a live failure (reactive — catches a present-but-rejected credential)
  *  OR the source's own cheap authStatus() probe reports missing credentials (proactive); "na" for a
  *  source with no auth; else "ok". */
-async function sourceAuthStatus(rt: RepoRuntime, sourceName: string): Promise<{ state: "ok" | "down" | "na"; detail?: string }> {
+async function sourceAuthStatus(rt: RepoRuntime, sourceName: string): Promise<{ state: "ok" | "down" | "na"; detail?: string; account?: string }> {
   const repo = rt.deps.config.repoName;
+  // The account we authenticated as (whoami, persisted at login) — shown regardless of ok/down so a
+  // rejected-but-present session still reads "signed in as X". No network call (reads the local db).
+  const account = rt.deps.store.getSourceAuth(repo, sourceName)?.accountLabel ?? undefined;
   const failure = getAuthFailure(repo, sourceName);
-  if (failure) return { state: "down", detail: failure.detail };
+  if (failure) return { state: "down", detail: failure.detail, account };
   const src = rt.deps.resolveSource(sourceName);
   if (!src) return { state: "na" };
   const now = rt.deps.now();
@@ -117,8 +120,8 @@ async function sourceAuthStatus(rt: RepoRuntime, sourceName: string): Promise<{ 
     cached = { at: now, state: probe.state, detail: probe.detail };
     authProbeCache.set(cacheKey, cached);
   }
-  if (cached.state === "unauthenticated") return { state: "down", detail: cached.detail };
-  return { state: cached.state === "not_applicable" ? "na" : "ok" };
+  if (cached.state === "unauthenticated") return { state: "down", detail: cached.detail, account };
+  return { state: cached.state === "not_applicable" ? "na" : "ok", account };
 }
 
 /** The structured status payload — same data the CLI `status` renders, exposed for the web UI.

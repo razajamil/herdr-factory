@@ -369,6 +369,14 @@ const MIGRATIONS: { version: number; sql: string }[] = [
       );
     `,
   },
+  {
+    version: 20,
+    // account_label: the authenticated Jira account (whoami /rest/api/3/myself — displayName + email),
+    // captured best-effort at login so the dashboard/CLI can show WHICH identity a source is signed in
+    // as with no network call. Nullable — set only when the read:jira-user whoami succeeded; a token
+    // refresh preserves it (the column isn't part of saveSourceAuth's upsert).
+    sql: `ALTER TABLE source_auth ADD COLUMN account_label TEXT;`,
+  },
 ];
 
 /** Apply pending migrations in a transaction. Idempotent. */

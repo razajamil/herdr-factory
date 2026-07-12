@@ -13,6 +13,7 @@
 // site host); cloudId comes from accessible-resources after the first token.
 import { createHash, randomBytes } from "node:crypto";
 import { httpOk } from "../clients/http.ts";
+import { recordOAuthEvent, telemetrySpan } from "../telemetry/index.ts";
 
 const AUTHORIZE_URL = "https://auth.atlassian.com/authorize";
 /** Atlassian's real token endpoint — used by the BROKER (src/broker), not the client. */
@@ -100,10 +101,28 @@ async function postToken(brokerUrl: string, body: Record<string, string>): Promi
   return { accessToken: j.access_token, refreshToken: j.refresh_token ?? null, expiresInSec: j.expires_in, scope: j.scope };
 }
 
+/** A broker token grant wrapped in a semantic OAuth span + an ok/error `oauth_events` counter — the
+ *  inner broker HTTP call is separately spanned by httpOk (http.client.backend), so this nests under
+ *  `jira.oauth.<phase>` for a clean trace. `phase` distinguishes the first exchange from a refresh. */
+function tokenGrant(phase: "token_exchange" | "token_refresh", brokerUrl: string, body: Record<string, string>): Promise<TokenSet> {
+  return telemetrySpan("jira.oauth." + phase, { "oauth.phase": phase, "oauth.grant_type": body.grant_type! }, async (span) => {
+    try {
+      const tokens = await postToken(brokerUrl, body);
+      span.setAttribute("oauth.scope", tokens.scope).setAttribute("oauth.refresh_rotated", tokens.refreshToken !== null);
+      recordOAuthEvent({ "oauth.phase": phase, "oauth.outcome": "ok", "oauth.grant_type": body.grant_type });
+      return tokens;
+    } catch (e) {
+      span.recordException(e);
+      recordOAuthEvent({ "oauth.phase": phase, "oauth.outcome": "error", "oauth.grant_type": body.grant_type });
+      throw e;
+    }
+  });
+}
+
 /** Exchange an authorization code (from the callback/paste redirect) for the first token set, via the
  *  broker. PKCE code_verifier is sent; the broker adds the client credentials. */
 export function exchangeCode(opts: { app: OAuthApp; code: string; redirectUri: string; codeVerifier: string }): Promise<TokenSet> {
-  return postToken(opts.app.brokerUrl, {
+  return tokenGrant("token_exchange", opts.app.brokerUrl, {
     grant_type: "authorization_code",
     code: opts.code,
     redirect_uri: opts.redirectUri,
@@ -113,7 +132,7 @@ export function exchangeCode(opts: { app: OAuthApp; code: string; redirectUri: s
 
 /** Exchange a (rotating) refresh token for a fresh access token, via the broker. */
 export function refreshAccessToken(opts: { app: OAuthApp; refreshToken: string }): Promise<TokenSet> {
-  return postToken(opts.app.brokerUrl, {
+  return tokenGrant("token_refresh", opts.app.brokerUrl, {
     grant_type: "refresh_token",
     refresh_token: opts.refreshToken,
   });

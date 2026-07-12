@@ -146,7 +146,8 @@ function authStatusReport(config: ReturnType<typeof loadConfig>["config"], env: 
         } else {
           const exp = tok.expiresAt ? new Date(tok.expiresAt * 1000).toISOString() : "unknown";
           const refresh = tok.refreshToken ? "auto-refreshed" : "NO refresh token — re-login needed when it expires";
-          console.log(`  ${s.name} (jira, oauth): ✓ ${tok.cloudUrl ?? "?"} — access token expires ${exp} (${refresh})`);
+          const who = tok.accountLabel ? ` as ${tok.accountLabel}` : "";
+          console.log(`  ${s.name} (jira, oauth): ✓ ${tok.cloudUrl ?? "?"}${who} — access token expires ${exp} (${refresh})`);
         }
       } else {
         const ok = !!(env.JIRA_EMAIL && env.JIRA_API_TOKEN);

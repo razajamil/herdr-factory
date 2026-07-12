@@ -43,7 +43,7 @@ export interface RepoStatus {
   limits: { maxActiveWorkspaces: number };
   /** Per-source auth light (same vocab as evidenceSso): "down" = the source can't authenticate (its
    *  claims + write-backs are paused, auto-resuming on re-auth); "na" = the source needs no auth. */
-  sources: { name: string; type: string; auth?: { state: "ok" | "down" | "na"; detail?: string } }[];
+  sources: { name: string; type: string; auth?: { state: "ok" | "down" | "na"; detail?: string; account?: string } }[];
   belts: { name: string; beltType: string; source: string; priority: number }[];
   active: ActiveRun[];
   finished: { id: number; ticketKey: string; phase: string; outcome: string | null; prNumber: number | null }[];

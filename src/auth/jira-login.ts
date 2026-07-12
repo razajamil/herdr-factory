@@ -14,6 +14,7 @@ import { run } from "../clients/exec.ts";
 import { accessibleResources, buildAuthorizeUrl, exchangeCode, newPkcePair, pickResource, type OAuthApp } from "./jira-oauth.ts";
 import { JiraOAuthAuth } from "./jira-provider.ts";
 import { JiraClient } from "../clients/jira.ts";
+import { recordOAuthEvent, telemetrySpan } from "../telemetry/index.ts";
 
 /** The fixed port the OAuth app's single https callback is registered on, and the redirect_uri we
  *  send (must match the registered callback exactly). The resident server listens here for the
@@ -92,35 +93,49 @@ export async function jiraOAuthLogin(opts: {
   now: () => number;
   getCode: (ctx: { authUrl: string; state: string }) => Promise<string>;
 }): Promise<JiraLoginResult> {
-  const state = randomBytes(16).toString("hex");
-  const { verifier, challenge } = newPkcePair(); // PKCE — no client_secret; the verifier is the proof
-  const authUrl = buildAuthorizeUrl({ app: opts.app, redirectUri: OAUTH_REDIRECT_URI, scopes: opts.scopes, state, codeChallenge: challenge });
+  return telemetrySpan("jira.oauth.login", { "work.repo": opts.repo, "work.source": opts.source }, async (span) => {
+    try {
+      const state = randomBytes(16).toString("hex");
+      const { verifier, challenge } = newPkcePair(); // PKCE — no client_secret; the verifier is the proof
+      const authUrl = buildAuthorizeUrl({ app: opts.app, redirectUri: OAUTH_REDIRECT_URI, scopes: opts.scopes, state, codeChallenge: challenge });
 
-  const code = await opts.getCode({ authUrl, state });
+      const code = await opts.getCode({ authUrl, state });
 
-  const tokens = await exchangeCode({ app: opts.app, code, redirectUri: OAUTH_REDIRECT_URI, codeVerifier: verifier });
-  const resource = pickResource(await accessibleResources(tokens.accessToken), opts.siteBaseUrl);
-  const expiresAt = opts.now() + tokens.expiresInSec;
-  opts.store.saveSourceAuth({
-    repo: opts.repo,
-    source: opts.source,
-    method: "oauth",
-    accessToken: tokens.accessToken,
-    refreshToken: tokens.refreshToken,
-    expiresAt,
-    cloudId: resource.id,
-    cloudUrl: resource.url,
-    scopes: tokens.scope,
+      const tokens = await exchangeCode({ app: opts.app, code, redirectUri: OAUTH_REDIRECT_URI, codeVerifier: verifier });
+      const resource = pickResource(await accessibleResources(tokens.accessToken), opts.siteBaseUrl);
+      const expiresAt = opts.now() + tokens.expiresInSec;
+      opts.store.saveSourceAuth({
+        repo: opts.repo,
+        source: opts.source,
+        method: "oauth",
+        accessToken: tokens.accessToken,
+        refreshToken: tokens.refreshToken,
+        expiresAt,
+        cloudId: resource.id,
+        cloudUrl: resource.url,
+        scopes: tokens.scope,
+      });
+      span.setAttribute("oauth.cloud_id", resource.id).setAttribute("oauth.scope", tokens.scope);
+      // Confirm the session via a real authorized whoami through the SAME provider/client the factory
+      // uses (reads the token we just saved). Best-effort: a missing read:jira-user scope must not fail
+      // an otherwise-successful login — the tokens are already persisted.
+      let account: JiraLoginResult["account"];
+      try {
+        const client = new JiraClient(new JiraOAuthAuth({ store: opts.store, repo: opts.repo, source: opts.source, resolveApp: () => opts.app, now: opts.now }));
+        account = await client.whoami();
+        span.setAttribute("oauth.account_id", account.accountId);
+        // Persist WHO we authenticated as so the dashboard/CLI can show it with no network call.
+        opts.store.setSourceAuthAccount(opts.repo, opts.source, account.email ? `${account.displayName} <${account.email}>` : account.displayName);
+        recordOAuthEvent({ "oauth.phase": "whoami", "oauth.outcome": "ok", "work.source": opts.source });
+      } catch {
+        account = undefined;
+        recordOAuthEvent({ "oauth.phase": "whoami", "oauth.outcome": "error", "work.source": opts.source });
+      }
+      recordOAuthEvent({ "oauth.phase": "login", "oauth.outcome": "ok", "work.source": opts.source });
+      return { cloudUrl: resource.url, cloudName: resource.name, cloudId: resource.id, scopes: tokens.scope, expiresAt, account };
+    } catch (e) {
+      recordOAuthEvent({ "oauth.phase": "login", "oauth.outcome": "error", "work.source": opts.source });
+      throw e;
+    }
   });
-  // Confirm the session via a real authorized whoami through the SAME provider/client the factory
-  // uses (reads the token we just saved). Best-effort: a missing read:jira-user scope must not fail
-  // an otherwise-successful login — the tokens are already persisted.
-  let account: JiraLoginResult["account"];
-  try {
-    const client = new JiraClient(new JiraOAuthAuth({ store: opts.store, repo: opts.repo, source: opts.source, resolveApp: () => opts.app, now: opts.now }));
-    account = await client.whoami();
-  } catch {
-    account = undefined;
-  }
-  return { cloudUrl: resource.url, cloudName: resource.name, cloudId: resource.id, scopes: tokens.scope, expiresAt, account };
 }

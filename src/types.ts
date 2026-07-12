@@ -227,6 +227,9 @@ export interface SourceAuthToken {
   cloudId: string | null;
   cloudUrl: string | null;
   scopes: string | null;
+  /** The authenticated account (whoami displayName + email), captured best-effort at login; null when
+   *  the read:jira-user whoami didn't run/succeed. Shown in the dashboard/CLI to identify the session. */
+  accountLabel: string | null;
   createdAt: number;
   updatedAt: number;
 }

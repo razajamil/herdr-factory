@@ -12,6 +12,13 @@
 import { serve } from "@hono/node-server";
 import { Hono } from "hono";
 import { ATLASSIAN_TOKEN_URL, BUILT_IN_CLIENT_ID, DEFAULT_BROKER_PORT } from "../auth/jira-oauth.ts";
+import { recordOAuthEvent, telemetrySpan } from "../telemetry/index.ts";
+
+/** Count a broker outcome on the `oauth_events` counter (phase=broker_forward). Errors carry an
+ *  `oauth.error` reason so bad-grant / no-secret / upstream failures are distinguishable in metrics. */
+function brokerEvent(outcome: "ok" | "error", attrs: Record<string, string | number> = {}): void {
+  recordOAuthEvent({ "oauth.phase": "broker_forward", "oauth.outcome": outcome, ...attrs });
+}
 
 /** The client credentials the broker injects. Secret is required; id defaults to the baked public id. */
 function brokerCreds(): { clientId: string; clientSecret: string } {
@@ -32,32 +39,44 @@ export function createBrokerApp(): Hono {
     try {
       body = (await c.req.json()) as Record<string, unknown>;
     } catch {
+      brokerEvent("error", { "oauth.error": "invalid_request" });
       return c.json({ error: "invalid_request", error_description: "expected a JSON body" }, 400);
     }
-    if (body.grant_type !== "authorization_code" && body.grant_type !== "refresh_token") {
+    const grantType = String(body.grant_type ?? "");
+    if (grantType !== "authorization_code" && grantType !== "refresh_token") {
+      brokerEvent("error", { "oauth.error": "unsupported_grant_type", "oauth.grant_type": grantType });
       return c.json({ error: "unsupported_grant_type", error_description: "only authorization_code and refresh_token are brokered" }, 400);
     }
     let creds: { clientId: string; clientSecret: string };
     try {
       creds = brokerCreds();
     } catch (e) {
+      brokerEvent("error", { "oauth.error": "no_client_secret", "oauth.grant_type": grantType });
       return c.json({ error: "server_error", error_description: e instanceof Error ? e.message : String(e) }, 500);
     }
     const forward: Record<string, string> = { client_id: creds.clientId, client_secret: creds.clientSecret };
     for (const k of FORWARDED_FIELDS) if (typeof body[k] === "string") forward[k] = body[k] as string;
 
-    const upstream = await fetch(ATLASSIAN_TOKEN_URL, {
-      method: "POST",
-      headers: { "content-type": "application/json", accept: "application/json" },
-      body: JSON.stringify(forward),
-      signal: AbortSignal.timeout(30_000),
-    }).catch((e) => (e instanceof Error ? e : new Error(String(e))));
-    if (upstream instanceof Error) {
-      return c.json({ error: "temporarily_unavailable", error_description: `broker could not reach Atlassian: ${upstream.message}` }, 502);
-    }
-    // Forward Atlassian's response verbatim (status + body) so token errors surface unchanged.
-    const text = await upstream.text();
-    return new Response(text, { status: upstream.status, headers: { "content-type": upstream.headers.get("content-type") ?? "application/json" } });
+    // Span the upstream forward (raw fetch — not httpOk, so not otherwise instrumented) + record the
+    // outcome. The span nests any parent trace context propagated from the caller.
+    return telemetrySpan("oauth.broker.token", { "oauth.phase": "broker_forward", "oauth.grant_type": grantType }, async (span) => {
+      const upstream = await fetch(ATLASSIAN_TOKEN_URL, {
+        method: "POST",
+        headers: { "content-type": "application/json", accept: "application/json" },
+        body: JSON.stringify(forward),
+        signal: AbortSignal.timeout(30_000),
+      }).catch((e) => (e instanceof Error ? e : new Error(String(e))));
+      if (upstream instanceof Error) {
+        span.recordException(upstream);
+        brokerEvent("error", { "oauth.error": "upstream_unreachable", "oauth.grant_type": grantType });
+        return c.json({ error: "temporarily_unavailable", error_description: `broker could not reach Atlassian: ${upstream.message}` }, 502);
+      }
+      span.setAttribute("oauth.upstream_status", upstream.status);
+      brokerEvent(upstream.ok ? "ok" : "error", { "oauth.grant_type": grantType, "oauth.upstream_status": upstream.status });
+      // Forward Atlassian's response verbatim (status + body) so token errors surface unchanged.
+      const text = await upstream.text();
+      return new Response(text, { status: upstream.status, headers: { "content-type": upstream.headers.get("content-type") ?? "application/json" } });
+    });
   });
   return app;
 }

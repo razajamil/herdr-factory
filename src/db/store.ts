@@ -192,6 +192,7 @@ interface SourceAuthRow {
   cloud_id: string | null;
   cloud_url: string | null;
   scopes: string | null;
+  account_label: string | null;
   created_at: number;
   updated_at: number;
 }
@@ -806,6 +807,7 @@ export class Store {
       cloudId: r.cloud_id,
       cloudUrl: r.cloud_url,
       scopes: r.scopes,
+      accountLabel: r.account_label,
       createdAt: r.created_at,
       updatedAt: r.updated_at,
     };
@@ -840,6 +842,13 @@ export class Store {
       )
       .run(input.repo, input.source, input.method, input.accessToken, input.refreshToken, input.expiresAt, input.cloudId, input.cloudUrl, input.scopes, t, t);
     telemetryEvent("store.source_auth.saved", { repo: input.repo, "work.source": input.source, "auth.method": input.method });
+  }
+
+  /** Record the authenticated account label (whoami displayName/email) for a source — set post-login,
+   *  and preserved across token refreshes (it isn't part of saveSourceAuth's upsert). No-op if the
+   *  source has no stored row yet. */
+  setSourceAuthAccount(repo: string, source: string, accountLabel: string): void {
+    this.db.prepare("UPDATE source_auth SET account_label = ?, updated_at = ? WHERE repo = ? AND source = ?").run(accountLabel, this.now(), repo, source);
   }
 
   clearSourceAuth(repo: string, source: string): boolean {

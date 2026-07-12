@@ -321,6 +321,21 @@ describe("Store", () => {
       expect(store.getSourceAuth("r", "jira")).toBeUndefined();
       expect(store.clearSourceAuth("r", "jira")).toBe(false); // already gone
     });
+
+    it("setSourceAuthAccount records the whoami label + it survives a token refresh (upsert)", () => {
+      const { store, setNow } = makeStore(1000);
+      store.saveSourceAuth({ repo: "r", source: "jira", method: "oauth", accessToken: "a1", refreshToken: "r1", expiresAt: 5000, cloudId: "c1", cloudUrl: "https://x.atlassian.net", scopes: "s" });
+      expect(store.getSourceAuth("r", "jira")!.accountLabel).toBeNull(); // not set at first save
+
+      store.setSourceAuthAccount("r", "jira", "Raza Jamil <raza@x.com>");
+      expect(store.getSourceAuth("r", "jira")!.accountLabel).toBe("Raza Jamil <raza@x.com>");
+
+      // A later token refresh (saveSourceAuth upsert) rotates the token but must NOT wipe the account.
+      setNow(2000);
+      store.saveSourceAuth({ repo: "r", source: "jira", method: "oauth", accessToken: "a2", refreshToken: "r2", expiresAt: 9000, cloudId: "c1", cloudUrl: "https://x.atlassian.net", scopes: "s" });
+      const t = store.getSourceAuth("r", "jira")!;
+      expect([t.accessToken, t.accountLabel]).toEqual(["a2", "Raza Jamil <raza@x.com>"]);
+    });
   });
 
   describe("transition outbox — auth recovery", () => {
