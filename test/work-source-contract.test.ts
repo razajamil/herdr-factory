@@ -74,8 +74,8 @@ function jiraHarness(): ContractCtx {
     calls += 1;
     const u = String(url);
     const method = init?.method ?? "GET";
-    const board = u.match(/\/board\/254\/issue/);
-    if (board) {
+    const search = u.match(/\/rest\/api\/3\/search\/jql/);
+    if (search) {
       const list = [...issues.entries()]
         .filter(([, i]) => i.status === "To Do")
         .map(([key]) => ({ key, fields: { summary: `Summary of ${key}`, issuetype: { name: "Bug" }, status: { name: "To Do" }, labels: ["agent"] } }));
@@ -106,7 +106,7 @@ function jiraHarness(): ContractCtx {
     return json({ key: m[1], fields: { summary: `Summary of ${m[1]}`, status: { name: issue.status }, issuetype: { name: "Bug" }, labels: ["agent"], attachment: [] } });
   }) as typeof fetch;
 
-  const cfg = { baseUrl: "https://x.atlassian.net", project: "RWR", board: "254", statusTodo: "To Do", statusInDev: "In development", statusReview: "Ready for Code Review", auth: { method: "api_token" as const } };
+  const cfg = { baseUrl: "https://x.atlassian.net", project: "RWR", statusTodo: "To Do", statusInDev: "In development", statusReview: "Ready for Code Review", auth: { method: "api_token" as const } };
   const src = new JiraSource(cfg, new JiraApiTokenAuth(cfg.baseUrl, "me@x.com", "tok"));
   return {
     src,

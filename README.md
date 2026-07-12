@@ -96,7 +96,7 @@ JIRA_API_TOKEN=...          # id.atlassian.com → Security → API tokens
 needs no credentials at all beyond your already-authenticated `gh` CLI — add a `GITHUB_TOKEN`
 line to the same file only if you want it to use a dedicated token instead.)
 
-### 2. Point it at a repo and a board
+### 2. Point it at a repo and a project
 
 `~/.config/herdr-factory/repos/my-app/config.yml`:
 
@@ -110,7 +110,6 @@ work_sources:
     jira:
       base_url: https://your-org.atlassian.net
       project: APP
-      board: "42"
       # status:         (defaults) — todo: To Do · in_development: In Progress · review: In Review
 
 belt:
@@ -314,7 +313,7 @@ folder, entirely independently.
 
 When more than one belt draws from the **same** label-driven source, each belt uses a **distinct
 `label`** to carve out its own slice of the queue — the factory rejects two belts sharing the same
-source _and_ label (they'd contend for the same items). So one Jira board can feed a `bugs` belt
+source _and_ label (they'd contend for the same items). So one Jira project can feed a `bugs` belt
 (`label: agent-bug`) and a `chores` belt (`label: agent-chore`) that never overlap.
 
 Within a single label, `match` gives finer-grained routing: belts are walked in `priority` order
@@ -433,9 +432,12 @@ is pure data (`herdr-factory reload` picks it up without a restart).
 Each entry: a `type`, an optional `name` (default = the type; must be unique per repo — belts
 reference it), and a type block:
 
-- **`jira`** — `base_url`, `project`, `board`, and a `status` map: `todo` (default `To Do`),
-  `in_development` (default `In Progress`), `review` (default `In Review`). The label that flags a
-  ticket for pickup is set per **belt** (`label` — see [`belt`](#belt--1)), not here. The status of
+- **`jira`** — `base_url`, `project`, and a `status` map: `todo` (default `To Do`),
+  `in_development` (default `In Progress`), `review` (default `In Review`). Pickup is by JQL over the
+  project (`/rest/api/3/search/jql`) — status + the belt's label; there's no `board` (an OAuth token
+  isn't scoped for the Agile API, and the project + status + label query is the full pickup criteria).
+  The label that flags a ticket for pickup is set per **belt** (`label` — see [`belt`](#belt--1)), not
+  here. The status of
   record lives in Jira; the factory deliberately never writes a terminal status (merged/closed is
   owned by Jira's GitHub integration). Ticket description, comments, and image/video attachments are
   materialized into the worktree for the agents. Authentication is chosen per source with an optional
@@ -445,12 +447,13 @@ reference it), and a type block:
   - `auth: { method: oauth }`: browser login instead of an API token. Run
     `herdr-factory --repo <name> auth login`, approve in the browser, and the factory stores the
     tokens **locally** and refreshes them automatically — nothing to rotate by hand. It uses a
-    registered Atlassian OAuth app: a **public** `client_id` (shipped, or your own via `client_id`
-    here) **and** a **`client_secret`** — Atlassian 3LO requires the secret (there is no public /
-    PKCE-only mode), so put it in the repo `env` as `JIRA_OAUTH_CLIENT_SECRET` (from the app's
-    Settings in the developer console). Optional `scopes` overrides the defaults (`read:jira-work
-    write:jira-work offline_access`). The app must also be made **Distributed** (Distribution → enable
-    sharing) so accounts other than the app owner can consent.
+    registered Atlassian OAuth app via a public `client_id` (shipped, or your own via `client_id`
+    here). Atlassian 3LO also requires a `client_secret` (there's no public/PKCE-only mode), but the
+    factory **never holds it** — the token exchange is delegated to an
+    [OAuth broker](#the-oauth-broker) that keeps the secret. Point the factory at the broker with
+    `JIRA_OAUTH_BROKER_URL` in the repo `env` (default: the local broker at `http://127.0.0.1:9099`).
+    Optional `scopes` overrides the defaults (`read:jira-work write:jira-work offline_access`). The
+    app must be made **Distributed** (Distribution → enable sharing) so non-owner accounts can consent.
 
   Either way, a source that **isn't authenticated yet** (no token, or an expired OAuth session that
   can't refresh) is *paused*, not broken: its claims and status write-backs hold, you get one
@@ -627,6 +630,7 @@ herdr-factory capture-lock acquire|release [owner]                  # machine-gl
 
 # the machine-wide server + supervisor (no --repo)
 herdr-factory serve | ensure-up [--restart] | restart | reload | update | provision-node
+herdr-factory oauth-broker                                         # OAuth token broker (holds the Jira secret)
 herdr-factory install | uninstall | start | stop
 herdr-factory schema [--stdout]
 herdr-factory doctor [--deep] [--repo <name>]
@@ -652,6 +656,27 @@ logout` clears a source's stored tokens.
 `serve` binds `127.0.0.1:8765` (override with `HERDR_FACTORY_PORT`) with the OpenAPI spec at
 `/doc` and Swagger UI at `/ui`. `update` pulls the latest code (hard reset to the branch's
 upstream) and restarts onto it — the supervisor does the same automatically every ~60s.
+
+### The OAuth broker
+
+Atlassian 3LO requires a `client_secret` for the token exchange, and shipping that secret to every
+install is a non-starter. `herdr-factory oauth-broker` is a small standalone server that **holds the
+secret** and does the exchange on the factory's behalf: `auth login` (and the resident server's token
+refresh) POST the auth `code` + PKCE `code_verifier` (or a `refresh_token`) to the broker, which
+injects `client_id` + `client_secret` and forwards to Atlassian, relaying the response. **The secret
+never leaves the broker** — it isn't in the repo, the CLI, or any user's machine.
+
+Run it (its own env holds the secret):
+
+```sh
+JIRA_OAUTH_CLIENT_SECRET=… herdr-factory oauth-broker      # + optional JIRA_OAUTH_CLIENT_ID, HERDR_FACTORY_BROKER_PORT
+```
+
+The broker is a thin, stateless proxy — it stores nothing and never touches Jira data, only adds
+client authentication to the token call. It binds `127.0.0.1:9099` and does **no caller
+authentication**, so today it's safe **only on loopback** (run it on the same machine as the factory).
+Point the factory at a non-local broker with `JIRA_OAUTH_BROKER_URL`; hosting it remotely later means
+adding access control (auth, rate limits) to the broker itself.
 
 ## The TUI
 

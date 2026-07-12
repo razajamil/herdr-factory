@@ -12,16 +12,17 @@ afterEach(() => {
   globalThis.fetch = realFetch;
 });
 
-const APP = { clientId: "cid", clientSecret: "sec" }; // confidential client (Atlassian 3LO requires the secret) + PKCE
+const BROKER = "http://127.0.0.1:9099";
+const APP = { clientId: "cid", brokerUrl: BROKER }; // client holds no secret — the broker does
 const makeStore = (now = 1000) => new Store(openDb(":memory:"), () => now);
 const seed = (store: Store, over: Partial<{ accessToken: string; refreshToken: string | null; expiresAt: number }> = {}) =>
   store.saveSourceAuth({ repo: "r", source: "jira", method: "oauth", accessToken: "OLD", refreshToken: "RT1", expiresAt: 999_999, cloudId: "CID", cloudUrl: "https://x.atlassian.net", scopes: "s", ...over });
 
-/** Stub the Atlassian token endpoint; returns the parsed request bodies + a call counter. */
+/** Stub the BROKER's token endpoint (the client posts here, never to Atlassian directly). */
 function stubToken(response: Record<string, unknown>, opts: { status?: number; delayMs?: number } = {}) {
   const bodies: Record<string, string>[] = [];
   globalThis.fetch = (async (url: string | URL, init?: RequestInit) => {
-    if (String(url) !== "https://auth.atlassian.com/oauth/token") throw new Error(`unexpected fetch: ${url}`);
+    if (String(url) !== `${BROKER}/oauth/token`) throw new Error(`unexpected fetch: ${url}`);
     bodies.push(JSON.parse(String(init?.body)));
     if (opts.delayMs) await new Promise((r) => setTimeout(r, opts.delayMs));
     const status = opts.status ?? 200;
@@ -70,7 +71,8 @@ describe("JiraOAuthAuth", () => {
     const a = new JiraOAuthAuth({ store, repo: "r", source: "jira", resolveApp: () => APP, now: () => 1000 });
     const ctx = await a.authorize();
     expect(ctx.headers.Authorization).toBe("Bearer NEW");
-    expect(bodies[0]).toMatchObject({ grant_type: "refresh_token", refresh_token: "RT1", client_id: "cid", client_secret: "sec" });
+    expect(bodies[0]).toMatchObject({ grant_type: "refresh_token", refresh_token: "RT1" });
+    expect(bodies[0]!.client_secret).toBeUndefined(); // the client never sends the secret — the broker adds it
     const saved = store.getSourceAuth("r", "jira")!;
     expect([saved.accessToken, saved.refreshToken, saved.expiresAt]).toEqual(["NEW", "RT2", 1000 + 3600]);
   });

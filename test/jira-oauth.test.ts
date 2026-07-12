@@ -20,7 +20,7 @@ describe("jira-oauth PKCE + public client", () => {
   });
 
   it("buildAuthorizeUrl carries the S256 challenge + client_id; the secret is never in the authorize URL", () => {
-    const url = new URL(buildAuthorizeUrl({ app: { clientId: "cid", clientSecret: "sec" }, redirectUri: "http://127.0.0.1:9/callback", scopes: ["read:jira-work", "offline_access"], state: "st", codeChallenge: "chal" }));
+    const url = new URL(buildAuthorizeUrl({ app: { clientId: "cid", brokerUrl: "http://127.0.0.1:9099" }, redirectUri: "http://127.0.0.1:9/callback", scopes: ["read:jira-work", "offline_access"], state: "st", codeChallenge: "chal" }));
     expect(url.origin + url.pathname).toBe("https://auth.atlassian.com/authorize");
     expect(url.searchParams.get("client_id")).toBe("cid");
     expect(url.searchParams.get("code_challenge")).toBe("chal");
@@ -30,22 +30,26 @@ describe("jira-oauth PKCE + public client", () => {
     expect(url.searchParams.has("client_secret")).toBe(false);
   });
 
-  it("exchangeCode sends BOTH the client_secret and the code_verifier (confidential client + PKCE)", async () => {
+  it("exchangeCode posts to the BROKER with the code + code_verifier and NO client credentials", async () => {
+    let url = "";
     let body: Record<string, string> = {};
     globalThis.fetch = (async (u: string | URL, init?: RequestInit) => {
-      expect(String(u)).toBe("https://auth.atlassian.com/oauth/token");
+      url = String(u);
       body = JSON.parse(String(init?.body));
       return { ok: true, status: 200, text: async () => JSON.stringify({ access_token: "AT", refresh_token: "RT", expires_in: 3600, scope: "s" }), headers: new Headers() } as Response;
     }) as typeof fetch;
-    const tokens = await exchangeCode({ app: { clientId: "cid", clientSecret: "sec" }, code: "CODE", redirectUri: "http://127.0.0.1:9/callback", codeVerifier: "VER" });
-    expect(body).toMatchObject({ grant_type: "authorization_code", client_id: "cid", client_secret: "sec", code: "CODE", code_verifier: "VER" });
+    const tokens = await exchangeCode({ app: { clientId: "cid", brokerUrl: "http://127.0.0.1:9099" }, code: "CODE", redirectUri: "http://127.0.0.1:8976/oauth/callback", codeVerifier: "VER" });
+    expect(url).toBe("http://127.0.0.1:9099/oauth/token"); // the broker, not Atlassian directly
+    expect(body).toMatchObject({ grant_type: "authorization_code", code: "CODE", code_verifier: "VER", redirect_uri: "http://127.0.0.1:8976/oauth/callback" });
+    expect(body.client_secret).toBeUndefined();
+    expect(body.client_id).toBeUndefined(); // the broker injects both client credentials
     expect(tokens.accessToken).toBe("AT");
-    expect(tokens.refreshToken).toBe("RT");
   });
 
-  it("resolveJiraOAuthApp requires client_id AND client_secret (Atlassian 3LO has no public mode)", () => {
-    expect(resolveJiraOAuthApp({ clientId: "id", clientSecret: "sec" })).toEqual({ clientId: "id", clientSecret: "sec" });
-    expect(() => resolveJiraOAuthApp({ clientId: "id" })).toThrow(/secret/i); // built-in secret is empty → required
+  it("resolveJiraOAuthApp returns client_id + broker URL (no secret); broker URL overridable, else local default", () => {
+    expect(resolveJiraOAuthApp({ clientId: "id", brokerUrl: "https://broker.example/" })).toEqual({ clientId: "id", brokerUrl: "https://broker.example" }); // trailing slash trimmed
+    const dflt = resolveJiraOAuthApp({ clientId: "id" });
+    expect(dflt.brokerUrl).toBe("http://127.0.0.1:9099"); // DEFAULT_BROKER_URL
   });
 
   it("pickResource matches the configured site URL, else falls back to a lone resource, else throws", () => {

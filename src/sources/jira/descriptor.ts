@@ -28,7 +28,6 @@ const JiraAuthSchema = z
 const JiraBlockSchema = z.object({
   base_url: z.url().transform((s) => s.replace(/\/+$/, "")),
   project: z.string(),
-  board: z.coerce.string(),
   status: z
     .object({
       todo: z.string().default("To Do"),
@@ -60,7 +59,6 @@ export const jiraDescriptor: SourceDescriptor<JiraSourceCfg> = {
     return {
       baseUrl: s.jira.base_url,
       project: s.jira.project,
-      board: s.jira.board,
       statusTodo: s.jira.status.todo,
       statusInDev: s.jira.status.in_development,
       statusReview: s.jira.status.review,
@@ -73,13 +71,13 @@ export const jiraDescriptor: SourceDescriptor<JiraSourceCfg> = {
     if (cfg.auth.method === "oauth") {
       const { clientId } = cfg.auth;
       // App resolution is LAZY (only a refresh/login needs it) so an oauth source that isn't logged
-      // in yet still starts — it just reports unauthenticated until `auth login`. Atlassian 3LO needs
-      // the client_secret (JIRA_OAUTH_CLIENT_SECRET in the repo env) for the token exchange + refresh.
+      // in yet still starts — it just reports unauthenticated until `auth login`. The token refresh
+      // goes through the broker (JIRA_OAUTH_BROKER_URL, default local) — no secret in the factory.
       auth = new JiraOAuthAuth({
         store: ctx.store,
         repo: ctx.repoName,
         source: ctx.sourceName,
-        resolveApp: () => resolveJiraOAuthApp({ clientId, clientSecret: ctx.env.JIRA_OAUTH_CLIENT_SECRET }),
+        resolveApp: () => resolveJiraOAuthApp({ clientId, brokerUrl: ctx.env.JIRA_OAUTH_BROKER_URL }),
       });
     } else {
       auth = new JiraApiTokenAuth(cfg.baseUrl, ctx.env.JIRA_EMAIL ?? "", ctx.env.JIRA_API_TOKEN ?? "");
@@ -93,19 +91,18 @@ export const jiraDescriptor: SourceDescriptor<JiraSourceCfg> = {
   secrets: [
     { envKey: "JIRA_EMAIL", required: false, placeholder: "you@org.com", hint: "the Atlassian account email (auth.method: api_token)" },
     { envKey: "JIRA_API_TOKEN", required: false, masked: true, hint: "an Atlassian API token (auth.method: api_token; id.atlassian.com → Security → API tokens)" },
-    { envKey: "JIRA_OAUTH_CLIENT_SECRET", required: false, masked: true, hint: "the OAuth app's client secret (auth.method: oauth; developer.atlassian.com → your app → Settings)" },
+    // No JIRA_OAUTH_CLIENT_SECRET here: the oauth flow keeps the secret in the broker (src/broker), not
+    // the factory. The factory optionally sets JIRA_OAUTH_BROKER_URL (not a secret) to point at it.
   ],
   tui: {
     defaultBlock: () => ({
       base_url: "",
       project: "",
-      board: "",
       status: { todo: "To Do", in_development: "In Progress", review: "In Review" },
     }),
     fields: [
       { label: "jira.base_url", path: ["jira", "base_url"], placeholder: "https://org.atlassian.net" },
       { label: "jira.project", path: ["jira", "project"], placeholder: "PROJ" },
-      { label: "jira.board", path: ["jira", "board"], placeholder: "123" },
       { label: "status.todo", path: ["jira", "status", "todo"], placeholder: "To Do" },
       { label: "status.in_development", path: ["jira", "status", "in_development"], placeholder: "In Progress" },
       { label: "status.review", path: ["jira", "status", "review"], placeholder: "In Review" },

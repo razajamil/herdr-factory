@@ -112,9 +112,6 @@
                   "project": {
                     "type": "string"
                   },
-                  "board": {
-                    "type": "string"
-                  },
                   "status": {
                     "default": {},
                     "type": "object",
@@ -181,8 +178,7 @@
                 },
                 "required": [
                   "base_url",
-                  "project",
-                  "board"
+                  "project"
                 ]
               }
             },

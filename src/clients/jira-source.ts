@@ -37,7 +37,6 @@ export type JiraAuthCfg = { method: "api_token" } | { method: "oauth"; clientId?
 export interface JiraSourceCfg {
   baseUrl: string;
   project: string;
-  board: string;
   statusTodo: string;
   statusInDev: string;
   statusReview: string;
@@ -101,7 +100,7 @@ export class JiraSource implements WorkSource {
   }
 
   async listEligible(pickupLabel?: string): Promise<MatchItem[]> {
-    const items = await this.jira.listEligible(this.cfg.board, pickupLabel, this.cfg.statusTodo);
+    const items = await this.jira.listEligible(this.cfg.project, pickupLabel, this.cfg.statusTodo);
     return items.map(
       (i): JiraMatchItem => ({
         sourceType: "jira",
@@ -225,10 +224,10 @@ export class JiraSource implements WorkSource {
   }
 
   async health(pickupLabels: string[] = []): Promise<void> {
-    // Probe the board query for each belt's label (auth + board + JQL reachability); with none, a
+    // Probe the pickup query for each belt's label (auth + project + JQL reachability); with none, a
     // label-less probe still exercises the connection. Jira belts always carry a label in practice.
     for (const label of pickupLabels.length ? pickupLabels : [undefined]) {
-      await this.jira.listEligible(this.cfg.board, label, this.cfg.statusTodo);
+      await this.jira.listEligible(this.cfg.project, label, this.cfg.statusTodo);
     }
   }
 }

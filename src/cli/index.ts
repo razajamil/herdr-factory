@@ -18,6 +18,7 @@ import * as service from "../watchers/service.ts";
 import { buildDeps, today } from "../build-deps.ts";
 import { resolveActiveRun, resolveBeltName } from "../resolve.ts";
 import { serve } from "../server/serve.ts";
+import { serveBroker } from "../broker/broker.ts";
 import { ensureUp, stopServer, type Log } from "../watchers/supervisor.ts";
 import { selfUpdate } from "../watchers/updater.ts";
 import { pinnedNodeVersion, provisionNode } from "../watchers/provision.ts";
@@ -430,7 +431,7 @@ program
           fail(`source "${src.name}" isn't configured for OAuth login (set \`auth: { method: oauth }\` on a jira source)`);
         }
         const auth = cfg.auth as Extract<JiraSourceCfg["auth"], { method: "oauth" }>;
-        const app = resolveJiraOAuthApp({ clientId: auth.clientId, clientSecret: env.JIRA_OAUTH_CLIENT_SECRET });
+        const app = resolveJiraOAuthApp({ clientId: auth.clientId, brokerUrl: env.JIRA_OAUTH_BROKER_URL });
         // Prefer the resident server's https callback listener (auto-capture); fall back to paste when
         // there's no server, its callback listener is down (no openssl), or --paste was passed.
         const info = readServerInfo();
@@ -451,6 +452,8 @@ program
             };
         const result = await jiraOAuthLogin({ store, repo, source: src.name, siteBaseUrl: cfg.baseUrl, app, scopes: auth.scopes, now: systemClock, getCode });
         console.log(`\n✓ ${src.name}: authenticated to ${result.cloudName} (${result.cloudUrl})`);
+        if (result.account) console.log(`  session: ${result.account.displayName}${result.account.email ? ` <${result.account.email}>` : ""}`);
+        else console.log("  session: couldn't verify the account (the token may lack the read:jira-user scope)");
         console.log(`  scopes: ${result.scopes}`);
         console.log(`  access token expires ${new Date(result.expiresAt * 1000).toISOString()} — refreshed automatically`);
         return;
@@ -762,6 +765,18 @@ program
     residentCommand = true;
     try {
       await serve();
+    } catch (e) {
+      fail(e);
+    }
+  }));
+
+program
+  .command("oauth-broker")
+  .description("run the OAuth token broker (holds the Jira client secret; the factory calls it so the secret never ships to clients). Set JIRA_OAUTH_CLIENT_SECRET in its env")
+  .action(cliAction("oauth-broker", async () => {
+    residentCommand = true;
+    try {
+      await serveBroker();
     } catch (e) {
       fail(e);
     }

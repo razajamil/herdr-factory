@@ -82,7 +82,7 @@ describe("loadConfig — work sources + belts", () => {
     const jira = s.cfg as JiraSourceCfg; // resolved by the jira descriptor
     expect(jira.baseUrl).toBe("https://x.atlassian.net"); // trailing slash stripped
     expect(jira.project).toBe("RWR");
-    expect(jira.board).toBe("254"); // coerced number → string
+    expect((jira as unknown as Record<string, unknown>).board).toBeUndefined(); // board removed — pickup queries by project via /search/jql
     expect((jira as unknown as Record<string, unknown>).label).toBeUndefined(); // label is per-belt now, not on the source
     expect(jira.statusInDev).toBe("In development");
     expect(jira.auth).toEqual({ method: "api_token" }); // no `auth` block ⇒ api_token (back-compat)
@@ -116,7 +116,7 @@ describe("loadConfig — work sources + belts", () => {
       ),
     );
     const dflt = loadConfig("demo").config.sources[0]!.cfg as JiraSourceCfg;
-    expect(dflt.auth).toEqual({ method: "oauth", clientId: undefined, scopes: ["read:jira-work", "write:jira-work", "offline_access"] });
+    expect(dflt.auth).toEqual({ method: "oauth", clientId: undefined, scopes: ["read:jira-work", "write:jira-work", "read:jira-user", "offline_access"] });
 
     setup(
       cfg(

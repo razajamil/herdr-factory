@@ -12,6 +12,8 @@ import { randomBytes } from "node:crypto";
 import type { Store } from "../db/store.ts";
 import { run } from "../clients/exec.ts";
 import { accessibleResources, buildAuthorizeUrl, exchangeCode, newPkcePair, pickResource, type OAuthApp } from "./jira-oauth.ts";
+import { JiraOAuthAuth } from "./jira-provider.ts";
+import { JiraClient } from "../clients/jira.ts";
 
 /** The fixed port the OAuth app's single https callback is registered on, and the redirect_uri we
  *  send (must match the registered callback exactly). The resident server listens here for the
@@ -72,6 +74,9 @@ export interface JiraLoginResult {
   cloudId: string;
   scopes: string;
   expiresAt: number;
+  /** The authenticated Jira account (whoami) — undefined if the session check couldn't run (e.g. the
+   *  token lacks read:jira-user). Confirms WHICH Jira session the new token belongs to. */
+  account?: { accountId: string; displayName: string; email?: string };
 }
 
 /** Assemble the authorize URL, capture the code via the injected `getCode`, exchange it (PKCE, no
@@ -107,5 +112,15 @@ export async function jiraOAuthLogin(opts: {
     cloudUrl: resource.url,
     scopes: tokens.scope,
   });
-  return { cloudUrl: resource.url, cloudName: resource.name, cloudId: resource.id, scopes: tokens.scope, expiresAt };
+  // Confirm the session via a real authorized whoami through the SAME provider/client the factory
+  // uses (reads the token we just saved). Best-effort: a missing read:jira-user scope must not fail
+  // an otherwise-successful login — the tokens are already persisted.
+  let account: JiraLoginResult["account"];
+  try {
+    const client = new JiraClient(new JiraOAuthAuth({ store: opts.store, repo: opts.repo, source: opts.source, resolveApp: () => opts.app, now: opts.now }));
+    account = await client.whoami();
+  } catch {
+    account = undefined;
+  }
+  return { cloudUrl: resource.url, cloudName: resource.name, cloudId: resource.id, scopes: tokens.scope, expiresAt, account };
 }
