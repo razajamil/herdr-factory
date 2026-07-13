@@ -111,6 +111,7 @@ work_sources:
       base_url: https://your-org.atlassian.net
       project: APP
       # status:         (defaults) — todo: To Do · in_development: In Progress · review: In Review
+      #                  add `done: <status>` to move the ticket there when the PR merges (opt-in)
 
 belt:
   - name: tickets-to-prs
@@ -433,13 +434,16 @@ Each entry: a `type`, an optional `name` (default = the type; must be unique per
 reference it), and a type block:
 
 - **`jira`** — `base_url`, `project`, and a `status` map: `todo` (default `To Do`),
-  `in_development` (default `In Progress`), `review` (default `In Review`). Pickup is by JQL over the
+  `in_development` (default `In Progress`), `review` (default `In Review`), and an optional `done`
+  (no default). Pickup is by JQL over the
   project (`/rest/api/3/search/jql`) — status + the belt's label; there's no `board` (an OAuth token
   isn't scoped for the Agile API, and the project + status + label query is the full pickup criteria).
   The label that flags a ticket for pickup is set per **belt** (`label` — see [`belt`](#belt--1)), not
   here. The status of
-  record lives in Jira; the factory deliberately never writes a terminal status (merged/closed is
-  owned by Jira's GitHub integration). Ticket description, comments, and image/video attachments are
+  record lives in Jira. By default the factory never writes a terminal status — merged/closed is left
+  to Jira's GitHub integration. Set `status.done` to opt in: a merged PR then moves the ticket to that
+  status at teardown (after the merge, before the worktree is recycled); a closed/abandoned run still
+  leaves the ticket untouched. Ticket description, comments, and image/video attachments are
   materialized into the worktree for the agents. Authentication is chosen per source with an optional
   `auth` block:
   - `auth: { method: api_token }` (**the default** — omit `auth` entirely for it): `JIRA_EMAIL` +

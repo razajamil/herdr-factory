@@ -36,6 +36,9 @@ work_sources:
         todo: To Do
         in_development: In Progress
         review: In Review
+        # done: Done   # OPT-IN: uncomment to move the ticket here when the PR merges (after the merge,
+        #              # before the worktree is recycled). Omit to leave terminal closure to Jira's
+        #              # GitHub integration; a closed/abandoned run never touches the ticket either way.
 
   - type: local_markdown
     name: ideas

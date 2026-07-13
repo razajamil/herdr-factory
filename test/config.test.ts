@@ -85,6 +85,7 @@ describe("loadConfig — work sources + belts", () => {
     expect((jira as unknown as Record<string, unknown>).board).toBeUndefined(); // board removed — pickup queries by project via /search/jql
     expect((jira as unknown as Record<string, unknown>).label).toBeUndefined(); // label is per-belt now, not on the source
     expect(jira.statusInDev).toBe("In development");
+    expect(jira.statusDone).toBeUndefined(); // opt-in: no `status.done` ⇒ terminal stays unmapped
     expect(jira.auth).toEqual({ method: "api_token" }); // no `auth` block ⇒ api_token (back-compat)
     expect(config.limits.stallSeconds).toBe(2700); // default
     expect(config.limits.maxActiveWorkspaces).toBe(3); // default
@@ -100,6 +101,23 @@ describe("loadConfig — work sources + belts", () => {
     expect(belt.label).toBe("agent"); // per-belt pickup label (no default — set in SHIP_BELT)
     expect(belt.priority).toBe(100); // default
     expect(belt.watchPr).toBe(true); // derived: a step produces pull_request
+  });
+
+  it("resolves an opt-in status.done to statusDone (trimmed)", () => {
+    setup(
+      cfg(
+        `  - type: jira
+    jira:
+      base_url: https://x.atlassian.net
+      project: RWR
+      status:
+        done: "  Done  "
+`,
+        SHIP_BELT,
+      ),
+    );
+    const jira = loadConfig("demo").config.sources[0]!.cfg as JiraSourceCfg;
+    expect(jira.statusDone).toBe("Done"); // .trim().min(1)
   });
 
   it("resolves auth.method: oauth — default scopes, and an explicit client_id + scopes override", () => {

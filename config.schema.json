@@ -127,6 +127,10 @@
                       "review": {
                         "default": "In Review",
                         "type": "string"
+                      },
+                      "done": {
+                        "type": "string",
+                        "minLength": 1
                       }
                     }
                   },

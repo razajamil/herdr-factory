@@ -25,10 +25,11 @@ export type Outcome = "merged" | "closed" | "abandoned" | "timeout" | "completed
 
 /**
  * The canonical work lifecycle, source-agnostic. Each work source maps these onto its own
- * backend: Jira maps todo/in_development/in_review onto configured Jira statuses (merged/aborted/
- * done are deliberately UNMAPPED — Jira's terminal state is owned by its GitHub integration, so a
- * transition to them is a no-op with no network call); local_markdown maps all of them onto rows
- * in the `work_items` table. `done` is the terminal state for a custom (non-PR) belt's success.
+ * backend: Jira maps todo/in_development/in_review onto configured Jira statuses and maps the
+ * success terminals (merged/done) onto an OPTIONAL configured `done` status — unset ⇒ they stay
+ * UNMAPPED (a no-op with no network call, leaving terminal closure to Jira's GitHub integration);
+ * `aborted` is always unmapped for Jira. local_markdown maps all of them onto rows in the
+ * `work_items` table. `done` is the terminal state for a custom (non-PR) belt's success.
  */
 export type WorkState = "todo" | "in_development" | "in_review" | "merged" | "aborted" | "done";
 

@@ -373,9 +373,10 @@ reverse-engineered during the bash prototype.
   transition POST) retry at most once: a 429 was definitively not processed; a lost 5xx write may
   have landed, and a rare duplicate comment beats a retry storm of writes. **`jira-source.ts`**
   adapts it to `WorkSource`: it holds the configured status map and maps canonical→Jira status —
-  `merged`/`aborted` are **unmapped** (Jira's terminal state is owned by its GitHub integration),
-  so `transition` answers `noop` **before any network call** and teardown stays
-  Jira-silent. `materialize` writes `ticket.json` + attachments. `postNote` is marker-tagged and
+  `aborted` is always **unmapped**, and `merged`/`done` are unmapped **unless** the source sets the
+  optional `status.done` (opt-in: a merged PR then moves the ticket there at teardown). While a
+  terminal is unmapped, `transition` answers `noop` **before any network call** and teardown stays
+  Jira-silent (its GitHub integration owns closure). `materialize` writes `ticket.json` + attachments. `postNote` is marker-tagged and
   `pollHumanReply` drops **every** marker-bearing comment (questions AND notes — an unmarked
   attention note posted while a question was pending used to poison the reply loop), per INV-6.
 - **`local-markdown-source.ts`** — a folder of work items (top-level only; dot-prefixed and
@@ -947,9 +948,10 @@ from being claimed again).
         (validated on the *resolved* names, so two unnamed `jira` sources collide). Stored on each
         run's `work_source`. **The pre-existing Jira source must keep the default name `jira`** so
         v6-backfilled in-flight runs resolve.
-      - type block: `jira` (`base_url` / `project` / `board` / 3 `status` names, defaulted
-        `To Do`/`In Progress`/`In Review` — `merged`/`aborted` are intentionally absent, so teardown
-        never transitions Jira) **or** `local_markdown` (`folder`) **or** `github_issues` (`repo` —
+      - type block: `jira` (`base_url` / `project` / `board` / 3 defaulted `status` names
+        `To Do`/`In Progress`/`In Review` + an optional `done` — without `done`, `merged`/`aborted`
+        stay unmapped and teardown never transitions Jira; with it, a merged PR moves the ticket to
+        `done`) **or** `local_markdown` (`folder`) **or** `github_issues` (`repo` —
         optional, default = the PR repo, throws at startup when neither resolves /
         `state_labels.{in_development,in_review,aborted}`, defaulted `herdr:*` /
         `close_on.{merged,done,aborted}`, defaults `true`/`true`/`false` / `type_labels` map +
@@ -1220,8 +1222,9 @@ Hard-won from the bash prototype — encode as types/tests/asserts:
 - **Work-source parity:** `WorkSource.transition` returns a `TransitionResult` — `noop` for an
   unmapped/already-there state **with no side effect**, and unmapped states
   (`spec.mappedStates`) decided **before any network call** (the contract suite asserts zero
-  backend calls). For Jira, `merged`/`aborted` are unmapped, so teardown stays Jira-silent
-  exactly as before multi-source. `local_markdown.transition` is
+  backend calls). For Jira, `aborted` is always unmapped and `merged`/`done` are unmapped unless the
+  source opts in with `status.done` — so teardown stays Jira-silent by default, and `spec.mappedStates`
+  reflects the opt-in (it gains `merged`/`done` when `statusDone` is set). `local_markdown.transition` is
   an idempotent, tolerant any→any upsert that never throws on a "non-adjacent" jump. `stale` is
   reserved for "the item is no longer ours — retrying cannot help" (deleted/transferred); a
   plausibly-transient failure must THROW instead (throw = retry me).

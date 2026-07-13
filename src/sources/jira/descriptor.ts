@@ -33,6 +33,10 @@ const JiraBlockSchema = z.object({
       todo: z.string().default("To Do"),
       in_development: z.string().default("In Progress"),
       review: z.string().default("In Review"),
+      // OPT-IN terminal status: when set, a merged PR (and a custom belt's success) moves the ticket
+      // here at teardown. Left UNSET by default so existing configs stay Jira-silent on merge — the
+      // ticket's terminal closure is owned by Jira's GitHub integration unless you opt in here.
+      done: z.string().trim().min(1).optional(),
     })
     .prefault({}),
   auth: JiraAuthSchema,
@@ -62,6 +66,7 @@ export const jiraDescriptor: SourceDescriptor<JiraSourceCfg> = {
       statusTodo: s.jira.status.todo,
       statusInDev: s.jira.status.in_development,
       statusReview: s.jira.status.review,
+      statusDone: s.jira.status.done, // undefined ⇒ terminal stays unmapped (Jira-silent on merge)
       auth,
     };
   },
@@ -106,6 +111,8 @@ export const jiraDescriptor: SourceDescriptor<JiraSourceCfg> = {
       { label: "status.todo", path: ["jira", "status", "todo"], placeholder: "To Do" },
       { label: "status.in_development", path: ["jira", "status", "in_development"], placeholder: "In Progress" },
       { label: "status.review", path: ["jira", "status", "review"], placeholder: "In Review" },
+      // Optional: leave blank to keep the ticket Jira-silent on merge (GitHub integration owns closure).
+      { label: "status.done", path: ["jira", "status", "done"], placeholder: "Done (optional)" },
       // api_token = JIRA_EMAIL + JIRA_API_TOKEN from env; oauth = browser login (`auth login`), no
       // secret. Choosing oauth writes `auth: { method: oauth }`, which uses the built-in public app;
       // a per-source client_id override is a rare case left to the YAML (no field for it here).

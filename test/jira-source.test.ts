@@ -48,6 +48,45 @@ describe("JiraSource", () => {
     expect(fetchCalls.length).toBe(0);
   });
 
+  it("statusDone unset ⇒ merged/done are NOT in mappedStates (opt-in default)", () => {
+    expect(src().spec.mappedStates).toEqual(["todo", "in_development", "in_review"]);
+  });
+
+  // Opt-in terminal: with `statusDone` configured, a merged PR (and a custom belt's success) moves
+  // the ticket to that status at teardown; aborted stays untouched.
+  describe("with statusDone configured (opt-in)", () => {
+    const CFG_DONE: JiraSourceCfg = { ...CFG, statusDone: "Done" };
+    const doneSrc = () => new JiraSource(CFG_DONE, new JiraApiTokenAuth(CFG_DONE.baseUrl, "me@x.com", "tok"));
+
+    it("adds merged/done to mappedStates and reports the mapping in terminalAutomation", () => {
+      expect(doneSrc().spec.mappedStates).toEqual(["todo", "in_development", "in_review", "merged", "done"]);
+      expect(doneSrc().spec.terminalAutomation).toContain('"Done"');
+    });
+
+    for (const state of ["merged", "done"] as const) {
+      it(`transition(${state}) maps to statusDone and POSTs the transition`, async () => {
+        // Issue currently "In development"; statusDone "Done" → a real move.
+        globalThis.fetch = (async (url: string | URL, init?: { method?: string }) => {
+          const u = String(url);
+          const method = init?.method ?? "GET";
+          fetchCalls.push({ url: u, method });
+          if (u.includes("/transitions") && method === "GET") {
+            return { ok: true, status: 200, text: async () => JSON.stringify(({ transitions: [{ id: "77", to: { name: "Done" } }] })), headers: new Headers() } as Response;
+          }
+          const body = { key: "RWR-1", fields: { summary: "s", status: { name: "In development" }, issuetype: { name: "Bug" }, attachment: [] } };
+          return { ok: true, status: 200, text: async () => JSON.stringify(body), headers: new Headers() } as Response;
+        }) as typeof fetch;
+        expect(await doneSrc().transition("RWR-1", state)).toEqual({ kind: "applied" });
+        expect(fetchCalls.some((c) => c.method === "POST" && c.url.includes("/transitions"))).toBe(true);
+      });
+    }
+
+    it("transition(aborted) is STILL a zero-network noop even with statusDone set", async () => {
+      expect(await doneSrc().transition("RWR-1", "aborted")).toEqual({ kind: "noop" });
+      expect(fetchCalls.length).toBe(0);
+    });
+  });
+
   it("transition(in_development) maps to the configured status and DOES hit the network", async () => {
     const result = await src().transition("RWR-1", "in_development");
     expect(result).toEqual({ kind: "noop" }); // already there (case-insensitive) → no POST, but it queried

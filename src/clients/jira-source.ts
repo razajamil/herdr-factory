@@ -40,6 +40,10 @@ export interface JiraSourceCfg {
   statusTodo: string;
   statusInDev: string;
   statusReview: string;
+  /** OPT-IN terminal status. When set, `merged`/`done` map to it (transition at teardown, after the
+   *  PR is merged and before the worktree is torn down); when undefined, the terminal stays unmapped
+   *  (Jira-silent, no network) exactly as before. `aborted` is never mapped regardless. */
+  statusDone?: string;
   auth: JiraAuthCfg;
 }
 
@@ -73,24 +77,32 @@ function humanQuestionComment(input: HumanAskInput): string {
 
 /**
  * The Jira work source: a thin adapter over JiraClient that maps the canonical WorkState
- * lifecycle onto configured Jira statuses. `merged`/`aborted` are deliberately UNMAPPED —
- * Jira's terminal state is owned by its GitHub integration — and `transition` short-circuits
- * to a no-op with NO network call for them, so teardown stays Jira-silent exactly as before.
+ * lifecycle onto configured Jira statuses. `aborted` is always UNMAPPED — a closed/abandoned run
+ * never touches the ticket. `merged`/`done` are mapped ONLY when the source configures `statusDone`
+ * (opt-in): with it set, a merged PR moves the ticket to that status at teardown; without it, the
+ * terminal short-circuits to a no-op with NO network call, so teardown stays Jira-silent (its
+ * GitHub integration owns closure) exactly as before.
  */
 export class JiraSource implements WorkSource {
   private readonly jira: JiraClient;
   private readonly cfg: JiraSourceCfg;
+  readonly spec: WorkSourceSpec;
   constructor(cfg: JiraSourceCfg, auth: JiraAuth) {
     this.cfg = cfg;
     this.jira = new JiraClient(auth);
+    // mappedStates must mirror statusFor: with statusDone set, merged/done become network-bearing
+    // transitions (and drop out of the contract's zero-network unmapped set); aborted never maps.
+    this.spec = {
+      statusOfRecord: "external",
+      mappedStates: cfg.statusDone
+        ? ["todo", "in_development", "in_review", "merged", "done"]
+        : ["todo", "in_development", "in_review"],
+      replyChannel: "comments",
+      terminalAutomation: cfg.statusDone
+        ? `merged/done → "${cfg.statusDone}" on success; aborted stays unmapped (human/GitHub owns cancellation)`
+        : "Jira's GitHub integration owns terminal closure (merged/aborted/done are unmapped)",
+    };
   }
-
-  readonly spec: WorkSourceSpec = {
-    statusOfRecord: "external",
-    mappedStates: ["todo", "in_development", "in_review"],
-    replyChannel: "comments",
-    terminalAutomation: "Jira's GitHub integration owns terminal closure (merged/aborted/done are unmapped)",
-  };
 
   /** Local (no-network) credential readiness from the auth provider — api_token checks env-value
    *  presence, OAuth checks a stored token. A present-but-wrong credential still reads "ok" here; a
@@ -129,11 +141,13 @@ export class JiraSource implements WorkSource {
       case "in_review":
         return this.cfg.statusReview;
       case "merged":
-      case "aborted":
       case "done":
-        // Terminal states are unmapped for Jira: merged/aborted are owned by Jira's GitHub
-        // integration, and `done` (a custom belt's terminal) has no configured Jira status — so
-        // teardown stays Jira-silent (no network) regardless of which belt produced the run.
+        // Success terminals (a merged PR, or a custom belt's completion). Mapped ONLY when the
+        // source opts in with `statusDone`; unset ⇒ undefined ⇒ no-op with no network (Jira's
+        // GitHub integration owns closure, as before).
+        return this.cfg.statusDone;
+      case "aborted":
+        // A closed/abandoned/timed-out run never moves the ticket — a human decides its fate.
         return undefined;
     }
   }
