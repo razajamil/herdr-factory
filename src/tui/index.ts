@@ -8,8 +8,59 @@ import type { KeyEvent } from "@opentui/core";
 import { BORDER, theme } from "./theme.ts";
 import type { TabView } from "./types.ts";
 import { createDashboard } from "./dashboard.ts";
-import { createConfigEditor } from "./config-editor.ts";
-import { createDoctor } from "./doctor.ts";
+
+function createLazyView(renderer: CliRenderer, sectionCount: number, load: () => Promise<TabView>): TabView {
+  const root = new BoxRenderable(renderer, { width: "100%", height: "100%", backgroundColor: theme.bg });
+  const loading = new TextRenderable(renderer, { content: " loading...", fg: theme.text.secondary, height: 1, wrapMode: "none" });
+  root.add(loading);
+  let view: TabView | null = null;
+  let loadingView: Promise<void> | null = null;
+  let active = false;
+
+  function ensureLoaded(): void {
+    if (view || loadingView) return;
+    loadingView = load().then((loaded) => {
+      view = loaded;
+      root.remove(loading.id);
+      loading.destroy();
+      root.add(loaded.root);
+      if (active) {
+        loaded.activate();
+        loaded.restoreFocus();
+      }
+    }).catch((error) => {
+      loading.content = ` failed to load: ${error instanceof Error ? error.message : String(error)}`;
+      loading.fg = theme.status.bad;
+    });
+  }
+
+  return {
+    root,
+    sectionCount,
+    focusSection(n) {
+      if (view) view.focusSection(n);
+    },
+    restoreFocus() {
+      if (view) view.restoreFocus();
+      else loading.focus();
+    },
+    activate() {
+      active = true;
+      if (view) view.activate();
+      else ensureLoaded();
+    },
+    deactivate() {
+      active = false;
+      view?.deactivate();
+    },
+    save() {
+      view?.save?.();
+    },
+    editMove(dir) {
+      view?.editMove?.(dir);
+    },
+  };
+}
 
 /** Build the tabbed shell on an existing renderer (split out from bootstrap so it can be driven in
  *  tests). Returns a few inspection getters. */
@@ -219,7 +270,17 @@ export function createApp(renderer: CliRenderer): { currentTab: () => number; at
   }
 
   // ── views ─────────────────────────────────────────────────────────────────────────────────
-  const views: TabView[] = [createDashboard(renderer, { confirm, choose, showInfo, prompt }), createConfigEditor(renderer, confirm), createDoctor(renderer)];
+  const views: TabView[] = [
+    createDashboard(renderer, { confirm, choose, showInfo, prompt }),
+    createLazyView(renderer, 2, async () => {
+      const { createConfigEditor } = await import("./config-editor.ts");
+      return createConfigEditor(renderer, confirm);
+    }),
+    createLazyView(renderer, 1, async () => {
+      const { createDoctor } = await import("./doctor.ts");
+      return createDoctor(renderer);
+    }),
+  ];
   let current = -1;
   // Per-tab focus memory (session): whether each tab was last left at the top level (tab bar). The
   // within-tab section + field is remembered by each view (restoreFocus). Together these restore
@@ -371,14 +432,16 @@ export function createApp(renderer: CliRenderer): { currentTab: () => number; at
   };
 }
 
-async function main(): Promise<void> {
+export async function main(mark: (name: string) => void = () => {}): Promise<void> {
   const renderer = await createCliRenderer({
     exitOnCtrlC: true,
     screenMode: "alternate-screen",
     useMouse: true,
     backgroundColor: theme.bg, // light canvas (lighter palette)
   });
+  mark("renderer_ready");
   createApp(renderer);
+  mark("app_ready");
 }
 
 // Only auto-run as the entry point (not when imported by a test harness).

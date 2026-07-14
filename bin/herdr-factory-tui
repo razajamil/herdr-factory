@@ -18,7 +18,7 @@ pkg="$(cd -P "$(dirname "$src")/.." && pwd)"
 
 cd "$pkg"
 
-entry="src/tui/index.ts"
+entry="src/tui/main.ts"
 # --disable-warning keeps Node's experimental-FFI notice off the alternate screen.
 node_flags=(--experimental-ffi --disable-warning=ExperimentalWarning)
 

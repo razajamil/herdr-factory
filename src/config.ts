@@ -1,6 +1,5 @@
-import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
-import { dirname, isAbsolute, join, resolve, sep } from "node:path";
+import { chmodSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { dirname, isAbsolute, join, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parse as parseYaml } from "yaml";
 import { z } from "zod";
@@ -9,6 +8,9 @@ import { expandHome } from "./paths.ts";
 import { SOURCE_DESCRIPTORS, descriptorFor } from "./sources/registry.ts";
 import { HEARTBEAT_GUARD, STEP_DESCRIPTORS, stepDescriptorFor, type StepDescriptor } from "./steps/registry.ts";
 import { productCapabilityFor } from "./products/registry.ts";
+import { configDir, listConfiguredRepos, repoConfigDir, serverInfoPath, stateRoot } from "./config-paths.ts";
+
+export { listConfiguredRepos, repoConfigDir, serverInfoPath } from "./config-paths.ts";
 
 // ── Work sources: where to poll work from (no agents/pipeline here anymore — that's a belt). ──
 // Each type's block schema + resolution lives on its descriptor (src/sources/<type>/descriptor.ts);
@@ -464,20 +466,6 @@ export interface Loaded {
   env: Record<string, string>;
 }
 
-// `?.trim() ||` (not `??`): treat an empty/whitespace override as unset, so a stray
-// `HERDR_FACTORY_STATE_ROOT=` doesn't collapse every state path to a relative "" root (and stays
-// consistent with bin/herdr-factory's `${VAR:-default}`, which also falls back on empty).
-function configDir(): string {
-  return process.env.HERDR_FACTORY_CONFIG_DIR?.trim() || join(homedir(), ".config", "herdr-factory");
-}
-function stateRoot(): string {
-  // resolve() so a relative HERDR_FACTORY_STATE_ROOT override becomes absolute (a no-op for the
-  // absolute default): the vendored-runtime `current` symlink stores its target verbatim, and a
-  // relative target would resolve against the LINK's own dir, not cwd — dangling it. The launchers
-  // + service run from the package dir, so cwd is stable for the relative case anyway.
-  return resolve(process.env.HERDR_FACTORY_STATE_ROOT?.trim() || join(homedir(), ".local", "state", "herdr-factory"));
-}
-
 // expandHome lives in the import-free leaf src/paths.ts (descriptors need it, and anything a
 // descriptor imports must never lead back into this module — see paths.ts's header on the cycle).
 export { expandHome };
@@ -565,32 +553,6 @@ export function resolvedNodePath(fallback: string): string {
     /* no baked path yet */
   }
   return fallback;
-}
-
-/** A repo's config folder (`<configDir>/repos/<name>/`) — where its config.yml + env live.
- *  Exposed for tools (e.g. the TUI config editor) that read/write the raw config.yml directly,
- *  without going through loadConfig's parse+validate (so they can edit an as-yet-invalid file and
- *  preserve YAML comments). */
-export function repoConfigDir(name: string): string {
-  return join(configDir(), "repos", name);
-}
-
-/** Every repo configured under `<configDir>/repos/<name>/config.yml`, sorted. The resident
- *  server discovers all of them on startup; the per-repo launchd model needed none of this. */
-export function listConfiguredRepos(): string[] {
-  const dir = join(configDir(), "repos");
-  if (!existsSync(dir)) return [];
-  return readdirSync(dir, { withFileTypes: true })
-    .filter((d) => d.isDirectory() && existsSync(join(dir, d.name, "config.yml")))
-    .map((d) => d.name)
-    .sort();
-}
-
-/** Where the running `serve` process advertises itself: `{pid, port, version, startedAt}`.
- *  Written on listen, removed on graceful shutdown. CLI clients + the supervisor read it to
- *  find (and health-check) the server. */
-export function serverInfoPath(): string {
-  return join(stateRoot(), "server.json");
 }
 
 /** TCP port the server binds on 127.0.0.1 (override with HERDR_FACTORY_PORT). The bind itself

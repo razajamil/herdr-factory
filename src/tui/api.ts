@@ -4,7 +4,7 @@
 // UI). Every call returns null when the server can't be reached, so the Dashboard degrades to
 // "server not running" instead of throwing.
 import { readFileSync } from "node:fs";
-import { serverInfoPath } from "../config.ts";
+import { serverInfoPath } from "../config-paths.ts";
 
 interface ServerInfo {
   pid: number;
@@ -17,8 +17,13 @@ interface ServerInfo {
 function readInfo(): ServerInfo | null {
   try {
     const o = JSON.parse(readFileSync(serverInfoPath(), "utf8")) as Partial<ServerInfo>;
-    if (typeof o.port === "number") return { pid: o.pid ?? 0, port: o.port, version: o.version ?? "?", startedAt: o.startedAt ?? 0 };
-    return null;
+    if (typeof o.pid !== "number" || typeof o.port !== "number") return null;
+    try {
+      process.kill(o.pid, 0);
+    } catch {
+      return null;
+    }
+    return { pid: o.pid, port: o.port, version: o.version ?? "?", startedAt: o.startedAt ?? 0 };
   } catch {
     return null;
   }
@@ -36,6 +41,7 @@ export interface ActiveRun {
   summary: string | null;
   outcome: string | null;
   worker: string | null;
+  steps: { step: string; done: boolean }[];
 }
 
 export interface RepoStatus {
@@ -74,11 +80,11 @@ export function serverPort(): number | null {
   return readInfo()?.port ?? null;
 }
 
-async function getJson<T>(path: string): Promise<T | null> {
+async function getJson<T>(path: string, timeoutMs = 2500): Promise<T | null> {
   const info = readInfo();
   if (!info) return null;
   try {
-    const res = await fetch(`http://127.0.0.1:${info.port}${path}`, { signal: AbortSignal.timeout(2500) });
+    const res = await fetch(`http://127.0.0.1:${info.port}${path}`, { signal: AbortSignal.timeout(timeoutMs) });
     if (!res.ok) return null;
     return (await res.json()) as T;
   } catch {
@@ -87,11 +93,11 @@ async function getJson<T>(path: string): Promise<T | null> {
 }
 
 export function fetchHealth(): Promise<Health | null> {
-  return getJson<Health>("/health");
+  return getJson<Health>("/health", 500);
 }
 
 export function fetchStatus(repo: string, detail = false): Promise<RepoStatus | null> {
-  return getJson<RepoStatus>(`/repos/${encodeURIComponent(repo)}/status${detail ? "?refresh=1" : "?quick=1"}`);
+  return getJson<RepoStatus>(`/repos/${encodeURIComponent(repo)}/status${detail ? "?refresh=1" : "?quick=1"}`, detail ? 2500 : 500);
 }
 
 export interface EligibleItem {

@@ -10,11 +10,12 @@
 // adding/removing rows at the tail.
 import { BoxRenderable, ScrollBoxRenderable, TextRenderable, type CliRenderer } from "@opentui/core";
 import type { KeyEvent } from "@opentui/core";
-import { listConfiguredRepos, loadConfig } from "../config.ts";
+import { listConfiguredRepos } from "../config-paths.ts";
 import type { JiraSourceCfg } from "../clients/jira-source.ts";
 import { fetchEligible, fetchHealth, fetchStatus, fetchTimeline, postClaim, postTeardown, postTick, serverPort, type ActiveRun, type EligibleItem, type RepoStatus } from "./api.ts";
 import { BORDER, theme } from "./theme.ts";
 import type { ChooseFn, ConfirmFn, PromptFn, ShowInfoFn, TabView } from "./types.ts";
+import { formatWorkTable, type WorkTableRow } from "./work-table.ts";
 
 function fmtTime(ts: number): string {
   const ms = ts < 1e12 ? ts * 1000 : ts; // tolerate seconds or milliseconds
@@ -42,6 +43,15 @@ function runColor(run: ActiveRun): string {
   if (p === "attention" || /attention|stall|wait|human/.test(p) || /fail|error|abandon|block/.test(o) || /fail|error|block/.test(p)) return theme.status.bad;
   if (/review|pr|ci|merg/.test(p)) return theme.accent;
   return theme.text.primary;
+}
+
+function runStepStatuses(run: ActiveRun, steps: string[]): string[] {
+  return steps.map((step) => {
+    const state = run.steps.find((item) => item.step === step);
+    if (state?.done) return "done";
+    if (run.step === step) return run.phase;
+    return "pending";
+  });
 }
 
 type RowKind = "repo" | "run" | "eligible" | "source";
@@ -175,15 +185,22 @@ export function createDashboard(renderer: CliRenderer, actions: { confirm: Confi
         const beltEligible = eligible.filter((i) => i.belt === belt.name);
         if (beltRuns.length === 0 && beltEligible.length === 0) continue;
         specs.push({ content: `  ${belt.name}  [${belt.beltType}]`, fg: theme.text.secondary });
-        for (const run of beltRuns) {
-          const step = run.step ? `/${run.step}` : "";
-          const pr = run.prNumber ? `  PR #${run.prNumber}` : "";
-          const summary = run.summary ? `  ${run.summary}` : "";
-          specs.push({ content: `    ${run.ticketKey}  ${run.phase}${step}${pr}${summary}`, fg: runColor(run), target: { repo: name, kind: "run", key: run.ticketKey, source: run.workSource } });
-        }
-        for (const item of beltEligible) {
-          specs.push({ content: `    ${item.key}  eligible  ${item.summary}  (${item.type})`, fg: theme.text.secondary, target: { repo: name, kind: "eligible", key: item.key, source: item.source, belt: item.belt } });
-        }
+        const tableRows: WorkTableRow[] = [
+          ...beltRuns.map((run) => ({ id: run.ticketKey, description: run.summary, statuses: runStepStatuses(run, belt.steps) })),
+          ...beltEligible.map((item) => ({ id: item.key, description: item.summary, statuses: belt.steps.map((_, index) => index === 0 ? "eligible" : "pending") })),
+        ];
+        const table = formatWorkTable(belt.steps, tableRows);
+        specs.push({ content: `    ${table.header}`, fg: theme.text.tertiary });
+        specs.push({ content: `    ${table.divider}`, fg: theme.text.tertiary });
+        table.rows.forEach((content, index) => {
+          const run = beltRuns[index];
+          if (run) {
+            specs.push({ content: `  ${content}`, fg: runColor(run), target: { repo: name, kind: "run", key: run.ticketKey, source: run.workSource } });
+            return;
+          }
+          const item = beltEligible[index - beltRuns.length]!;
+          specs.push({ content: `  ${content}`, fg: theme.text.secondary, target: { repo: name, kind: "eligible", key: item.key, source: item.source, belt: item.belt } });
+        });
       }
       const unassigned = active.filter((r) => !st.belts.some((b) => b.name === r.belt));
       if (unassigned.length > 0) {
@@ -287,6 +304,7 @@ export function createDashboard(renderer: CliRenderer, actions: { confirm: Confi
     let dbPath: string;
     let brokerUrl: string | undefined;
     try {
+      const { loadConfig } = await import("../config.ts");
       const { config, env } = loadConfig(t.repo);
       const src = config.sources.find((s) => s.name === t.source);
       if (!src) return setAction(`✗ source "${t.source}" not in config`, theme.status.bad);
@@ -350,6 +368,7 @@ export function createDashboard(renderer: CliRenderer, actions: { confirm: Confi
   async function doRepoLogin(t: Target): Promise<void> {
     let sources: string[];
     try {
+      const { loadConfig } = await import("../config.ts");
       sources = loadConfig(t.repo).config.sources
         .filter((s) => s.type === "jira" && (s.cfg as JiraSourceCfg).auth.method === "oauth")
         .map((s) => s.name);
