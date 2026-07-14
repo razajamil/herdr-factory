@@ -111,8 +111,9 @@ export function createApp(renderer: CliRenderer): { currentTab: () => number; at
     | { kind: "confirm"; resolve: (v: boolean) => void }
     | { kind: "choose"; options: { label: string; value: string }[]; index: number; resolve: (v: string | null) => void }
     | { kind: "prompt"; input: InputRenderable; prev: Renderable | null; resolve: (v: string | null) => void }
-    | { kind: "info" };
+    | { kind: "info"; id: number };
   let modal: ModalState | null = null;
+  let nextInfoId = 1;
 
   function renderModalBody(): void {
     // A prompt owns its own body (a live InputRenderable) — don't tear it down on re-render.
@@ -158,7 +159,7 @@ export function createApp(renderer: CliRenderer): { currentTab: () => number; at
       overlay.visible = true;
     });
   }
-  function showInfo(title: string, lines: string[]): void {
+  function renderInfo(title: string, lines: string[]): void {
     infoTitle.content = title;
     for (const c of [...infoScroll.getChildren()]) {
       infoScroll.remove(c.id);
@@ -167,10 +168,19 @@ export function createApp(renderer: CliRenderer): { currentTab: () => number; at
     const rendered = lines.length ? lines : ["(no events)"];
     for (const l of rendered) infoScroll.add(new TextRenderable(renderer, { content: l, fg: theme.text.primary, width: "100%", height: 1, wrapMode: "none" }));
     infoScroll.scrollTop = 0;
-    modal = { kind: "info" };
+  }
+  function showInfo(title: string, lines: string[]) {
+    const id = nextInfoId++;
+    renderInfo(title, lines);
+    modal = { kind: "info", id };
     card.visible = false;
     infoCard.visible = true;
     overlay.visible = true;
+    return {
+      update(nextTitle: string, nextLines: string[]) {
+        if (modal?.kind === "info" && modal.id === id) renderInfo(nextTitle, nextLines);
+      },
+    };
   }
   /** A single-line text prompt (paste an OAuth redirect URL, …). Focuses a live input; typed keys
    *  fall through to it (the keypress handler only intercepts Enter/Esc for a prompt modal). */
@@ -220,7 +230,7 @@ export function createApp(renderer: CliRenderer): { currentTab: () => number; at
     const tail = "   ·   Tab: switch view · Esc: top level · q: quit";
     if (idx === 1) return " 1 repos · 2 fields   ·   ↑↓: move · ↵: open/edit · [ ]: reorder" + tail;
     if (idx === 2) return " ↑↓: scroll · r: re-run · d: deep (gh auth, herdr daemon)" + tail;
-    return " ↑↓: move · ↵: timeline · t: tick · c: claim · x: teardown · l: login · r: refresh" + tail;
+    return " ↑↓: move · ↵: timeline · t: tick · c: claim · x: teardown · d: detail · l: login · r: refresh" + tail;
   }
 
   /** Top of the hierarchy: focus the tab bar. From here numbers enter a section, ←→/Tab switch. */

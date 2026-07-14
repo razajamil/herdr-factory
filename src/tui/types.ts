@@ -3,7 +3,11 @@ import type { Renderable } from "@opentui/core";
 /** Shell-provided modal helpers passed into views. */
 export type ConfirmFn = (message: string) => Promise<boolean>;
 export type ChooseFn = (title: string, options: { label: string; value: string }[]) => Promise<string | null>;
-export type ShowInfoFn = (title: string, lines: string[]) => void;
+export interface InfoModalHandle {
+  /** Replace this modal's contents. No-ops if the user has already closed it. */
+  update(title: string, lines: string[]): void;
+}
+export type ShowInfoFn = (title: string, lines: string[]) => InfoModalHandle;
 /** A single-line text prompt (e.g. paste an OAuth redirect URL). Resolves null when cancelled (Esc). */
 export type PromptFn = (title: string, placeholder?: string) => Promise<string | null>;
 

@@ -68,8 +68,8 @@ export interface ServerContext {
 
 const msg = (e: unknown): string => (e instanceof Error ? e.message : String(e));
 
-/** Cached AWS creds probe per repo (the dashboard polls /status every ~3s; a HeadBucket must not run
- *  per poll). TTL keeps the light responsive without hammering AWS. */
+/** Cached AWS creds probe per repo. General API consumers may poll /status, so a HeadBucket must not
+ *  run per request; the TUI's explicit diagnostics action can force a fresh result. */
 const SSO_PROBE_TTL_SECONDS = 90;
 const ssoProbeCache = new Map<string, { at: number; auth: boolean; reason: string }>();
 
@@ -77,7 +77,7 @@ const ssoProbeCache = new Map<string, { at: number; auth: boolean; reason: strin
  *  HeadBucket probe reports a creds/token failure, OR when the outbox already has an auth-stuck upload
  *  (immediate, even between probes). A transient/timeout probe or a permanent bucket/perms error is NOT
  *  "SSO down" (creds are fine — surfaced by doctor). `na` when the repo has no evidence config. */
-async function evidenceSsoStatus(rt: RepoRuntime): Promise<{ state: "ok" | "down" | "na"; detail?: string }> {
+async function evidenceSsoStatus(rt: RepoRuntime, refresh = false): Promise<{ state: "ok" | "down" | "na"; detail?: string }> {
   const cfg = rt.deps.config;
   const ev = cfg.evidence;
   if (!ev) return { state: "na" };
@@ -86,7 +86,7 @@ async function evidenceSsoStatus(rt: RepoRuntime): Promise<{ state: "ok" | "down
   }
   const now = rt.deps.now();
   let cached = ssoProbeCache.get(cfg.repoName);
-  if (!cached || now - cached.at >= SSO_PROBE_TTL_SECONDS) {
+  if (refresh || !cached || now - cached.at >= SSO_PROBE_TTL_SECONDS) {
     const probe = await probeEvidenceCreds(ev).catch(() => ({ auth: false, reason: "probe failed" }));
     cached = { at: now, auth: probe.auth, reason: probe.reason };
     ssoProbeCache.set(cfg.repoName, cached);
@@ -94,8 +94,8 @@ async function evidenceSsoStatus(rt: RepoRuntime): Promise<{ state: "ok" | "down
   return cached.auth ? { state: "down", detail: cached.reason } : { state: "ok" };
 }
 
-/** Cached per-source authStatus() probe (the dashboard polls /status ~every 3s; a github source's
- *  probe shells out to `gh auth token`, which mustn't run per poll). Mirrors ssoProbeCache. */
+/** Cached per-source authStatus() probe. A github source shells out to `gh auth token`, which mustn't
+ *  run for every general /status poll. Mirrors ssoProbeCache. */
 const AUTH_PROBE_TTL_SECONDS = 90;
 const authProbeCache = new Map<string, { at: number; state: "ok" | "unauthenticated" | "not_applicable"; detail?: string }>();
 
@@ -103,7 +103,7 @@ const authProbeCache = new Map<string, { at: number; state: "ok" | "unauthentica
  *  reconcile gate has recorded a live failure (reactive — catches a present-but-rejected credential)
  *  OR the source's own cheap authStatus() probe reports missing credentials (proactive); "na" for a
  *  source with no auth; else "ok". */
-async function sourceAuthStatus(rt: RepoRuntime, sourceName: string): Promise<{ state: "ok" | "down" | "na"; detail?: string; account?: string }> {
+async function sourceAuthStatus(rt: RepoRuntime, sourceName: string, refresh = false): Promise<{ state: "ok" | "down" | "na"; detail?: string; account?: string }> {
   const repo = rt.deps.config.repoName;
   // The account we authenticated as (whoami, persisted at login) — shown regardless of ok/down so a
   // rejected-but-present session still reads "signed in as X". No network call (reads the local db).
@@ -115,7 +115,7 @@ async function sourceAuthStatus(rt: RepoRuntime, sourceName: string): Promise<{ 
   const now = rt.deps.now();
   const cacheKey = `${repo} ${sourceName}`;
   let cached = authProbeCache.get(cacheKey);
-  if (!cached || now - cached.at >= AUTH_PROBE_TTL_SECONDS) {
+  if (refresh || !cached || now - cached.at >= AUTH_PROBE_TTL_SECONDS) {
     const probe = await src.client.authStatus().catch((): { state: "ok" | "unauthenticated" | "not_applicable"; detail?: string } => ({ state: "ok" }));
     cached = { at: now, state: probe.state, detail: probe.detail };
     authProbeCache.set(cacheKey, cached);
@@ -124,9 +124,9 @@ async function sourceAuthStatus(rt: RepoRuntime, sourceName: string): Promise<{ 
   return { state: cached.state === "not_applicable" ? "na" : "ok", account };
 }
 
-/** The structured status payload — same data the CLI `status` renders, exposed for the web UI.
- *  Hits herdr for live pane state, so it's async. */
-async function statusPayload(rt: RepoRuntime) {
+/** The structured status payload exposed for API clients. Quick mode omits auth/AWS probes and live
+ *  pane inspection for latency-sensitive dashboard refreshes. */
+async function statusPayload(rt: RepoRuntime, quick = false, refreshDiagnostics = false) {
   const cfg = rt.deps.config;
   const active = rt.deps.store.activeRuns(cfg.repoName);
   const finished = rt.deps.store.listRuns(cfg.repoName, true).filter((r) => r.endedAt !== null);
@@ -140,15 +140,39 @@ async function statusPayload(rt: RepoRuntime) {
     prNumber: r.prNumber,
     summary: r.summary,
     outcome: r.outcome as string | null,
-    worker: r.paneId ? await rt.deps.herdr.paneState(r.paneId).catch(() => "unknown") : null,
+    worker: !quick && r.paneId ? await rt.deps.herdr.paneState(r.paneId).catch(() => "unknown") : null,
     steps: rt.deps.store.runStepsFor(r.id).map((s) => ({ step: s.step as string, done: s.done })),
   });
+  const sources = quick
+    ? Promise.resolve(cfg.sources.map((s) => ({ name: s.name, type: s.type as string })))
+    : Promise.all(cfg.sources.map(async (s) => ({ name: s.name, type: s.type as string, auth: await sourceAuthStatus(rt, s.name, refreshDiagnostics) })));
+  const belts = Promise.all(cfg.belts.map(async (belt) => {
+    const base = {
+      name: belt.name,
+      beltType: belt.beltType as string,
+      source: belt.source,
+      priority: belt.priority,
+      label: belt.label,
+      steps: belt.steps.map((step) => step.name),
+    };
+    if (!refreshDiagnostics) return base;
+    const source = rt.deps.resolveSource(belt.source);
+    if (!source) return { ...base, diagnostic: { state: "down" as const, detail: `source "${belt.source}" is unavailable` } };
+    try {
+      await source.client.health(belt.label ? [belt.label] : []);
+      return { ...base, diagnostic: { state: "ok" as const } };
+    } catch (e) {
+      return { ...base, diagnostic: { state: "down" as const, detail: msg(e) } };
+    }
+  }));
+  const activeRuns = Promise.all(active.map(runView));
+  const evidenceSso = quick ? undefined : evidenceSsoStatus(rt, refreshDiagnostics);
   return {
     repo: cfg.repoName,
     limits: { maxActiveWorkspaces: cfg.limits.maxActiveWorkspaces },
-    sources: await Promise.all(cfg.sources.map(async (s) => ({ name: s.name, type: s.type as string, auth: await sourceAuthStatus(rt, s.name) }))),
-    belts: cfg.belts.map((b) => ({ name: b.name, beltType: b.beltType as string, source: b.source, priority: b.priority })),
-    active: await Promise.all(active.map(runView)),
+    sources: await sources,
+    belts: await belts,
+    active: await activeRuns,
     finished: finished.map((r) => ({
       id: r.id,
       ticketKey: r.ticketKey,
@@ -156,12 +180,12 @@ async function statusPayload(rt: RepoRuntime) {
       outcome: r.outcome as string | null,
       prNumber: r.prNumber,
     })),
-    evidenceSso: await evidenceSsoStatus(rt),
+    ...(evidenceSso && { evidenceSso: await evidenceSso }),
   };
 }
 
-async function eligiblePayload(rt: RepoRuntime): Promise<{ source: string; key: string; summary: string; type: string }[]> {
-  const out: { source: string; key: string; summary: string; type: string }[] = [];
+async function eligiblePayload(rt: RepoRuntime): Promise<{ source: string; belt: string; key: string; summary: string; type: string }[]> {
+  const out: { source: string; belt: string; key: string; summary: string; type: string }[] = [];
   // Eligibility is per BELT now — each belt polls its source with its own pickup label. Walk belts
   // (not sources) so a label-driven source's items are surfaced under the belt(s) that claim them;
   // dedup by (source, key) since two belts could name the same source (with distinct labels).
@@ -173,7 +197,7 @@ async function eligiblePayload(rt: RepoRuntime): Promise<{ source: string; key: 
       for (const t of await src.client.listEligible(belt.label)) {
         if (seen.has(`${src.name} ${t.key}`)) continue;
         seen.add(`${src.name} ${t.key}`);
-        out.push({ source: src.name, key: t.key, summary: t.summary, type: t.type });
+        out.push({ source: src.name, belt: belt.name, key: t.key, summary: t.summary, type: t.type });
       }
     } catch (e) {
       rt.deps.log("warn", `${src.name}: eligible query failed: ${msg(e)}`);
@@ -376,9 +400,10 @@ export function createApp(ctx: ServerContext): OpenAPIHono {
 
   app.openapi(statusRoute, async (c) => {
     const { repo } = c.req.valid("param");
+    const { quick, refresh } = c.req.valid("query");
     const rt = ctx.getRepo(repo);
     if (!rt) return c.json({ error: notConfigured(repo) }, 404);
-    return c.json(await statusPayload(rt), 200);
+    return c.json(await statusPayload(rt, quick === "1", refresh === "1"), 200);
   });
 
   app.openapi(runsRoute, async (c) => {

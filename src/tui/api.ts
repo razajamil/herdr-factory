@@ -44,7 +44,15 @@ export interface RepoStatus {
   /** Per-source auth light (same vocab as evidenceSso): "down" = the source can't authenticate (its
    *  claims + write-backs are paused, auto-resuming on re-auth); "na" = the source needs no auth. */
   sources: { name: string; type: string; auth?: { state: "ok" | "down" | "na"; detail?: string; account?: string } }[];
-  belts: { name: string; beltType: string; source: string; priority: number }[];
+  belts: {
+    name: string;
+    beltType: string;
+    source: string;
+    priority: number;
+    label?: string;
+    steps: string[];
+    diagnostic?: { state: "ok" | "down"; detail?: string };
+  }[];
   active: ActiveRun[];
   finished: { id: number; ticketKey: string; phase: string; outcome: string | null; prNumber: number | null }[];
   /** Evidence-upload credential (AWS SSO) health for the dashboard light. "na" = no evidence config. */
@@ -82,12 +90,13 @@ export function fetchHealth(): Promise<Health | null> {
   return getJson<Health>("/health");
 }
 
-export function fetchStatus(repo: string): Promise<RepoStatus | null> {
-  return getJson<RepoStatus>(`/repos/${encodeURIComponent(repo)}/status`);
+export function fetchStatus(repo: string, detail = false): Promise<RepoStatus | null> {
+  return getJson<RepoStatus>(`/repos/${encodeURIComponent(repo)}/status${detail ? "?refresh=1" : "?quick=1"}`);
 }
 
 export interface EligibleItem {
   source: string;
+  belt: string;
   key: string;
   summary: string;
   type: string;

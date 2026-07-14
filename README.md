@@ -688,15 +688,13 @@ Plain `herdr-factory` (no arguments) opens a full-screen terminal UI built on
 [opentui](https://github.com/anomalyco/opentui). `Tab`/`Shift+Tab` switch the three tabs, number
 keys jump to a numbered section, arrows move within it, `Esc` pops back out, `q` quits.
 
-- **Dashboard** — live runs from the server's API: `↑↓` navigate, `↵` opens a run's event
-  timeline, `t` tick, `c` claim an eligible item, `x` teardown, `r` refresh (each action behind a
-  confirmation). A per-repo evidence-upload **SSO light** goes red when AWS creds have expired (the
-  fix: `aws sso login`), and is hidden for repos with no evidence configured. A per-source **auth
-  light** does the same for each work source — red when it can't authenticate (its work is paused,
-  auto-resuming on re-auth); highlight a red OAuth source and press `l` to log in — it opens your
-  browser and the resident server auto-captures the callback (click through the one-time localhost
-  cert warning); the light turns green when the token's stored. (Falls back to a paste prompt if the
-  server's callback listener isn't up.)
+- **Dashboard** — repos contain their belts, and each belt contains its active and eligible work
+  items. `↑↓` navigates, `↵` opens a run's event timeline, `t` ticks, `c` claims an eligible item,
+  `x` tears down, and `r` refreshes (mutating actions require confirmation). Empty belts stay hidden.
+  Select a repo and press `d` to open Detail: general AWS SSO/source-auth diagnostics followed by
+  configuration, work counts, and a live source/pickup health check for every belt. Press `l`
+  on a repo to log in to one of its Jira OAuth sources; it opens your browser and the resident server
+  auto-captures the callback, falling back to a paste prompt when the callback listener is unavailable.
 - **Config** — a repo list and a full `config.yml` editor: edits the YAML surgically (comments
   and the schema modeline preserved), validates against the engine schema, `^S` saves, `[`/`]`
   reorder list entries. Credentials appear as masked, replace-only `secrets (env)` fields —

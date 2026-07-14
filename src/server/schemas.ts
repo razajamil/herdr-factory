@@ -89,8 +89,16 @@ const StatusResponse = z
     limits: z.object({ maxActiveWorkspaces: z.number() }),
     // `auth` is the per-source authentication light (same vocab as evidenceSso). "down" = the source
     // can't authenticate (its claims + write-backs are paused, auto-resuming on re-auth); "na" = no auth.
-    sources: z.array(z.object({ name: z.string(), type: z.string(), auth: z.object({ state: z.enum(["ok", "down", "na"]), detail: z.string().optional(), account: z.string().optional() }) })),
-    belts: z.array(z.object({ name: z.string(), beltType: z.string(), source: z.string(), priority: z.number() })),
+    sources: z.array(z.object({ name: z.string(), type: z.string(), auth: z.object({ state: z.enum(["ok", "down", "na"]), detail: z.string().optional(), account: z.string().optional() }).optional() })),
+    belts: z.array(z.object({
+      name: z.string(),
+      beltType: z.string(),
+      source: z.string(),
+      priority: z.number(),
+      label: z.string().optional(),
+      steps: z.array(z.string()),
+      diagnostic: z.object({ state: z.enum(["ok", "down"]), detail: z.string().optional() }).optional(),
+    })),
     active: z.array(
       z.object({
         id: z.number(),
@@ -115,15 +123,15 @@ const StatusResponse = z
         prNumber: z.number().nullable(),
       }),
     ),
-    // Evidence-upload credential (AWS SSO) health, for the dashboard SSO light. "na" = no evidence config.
-    evidenceSso: z.object({ state: z.enum(["ok", "down", "na"]), detail: z.string().optional() }),
+    // Evidence-upload credential (AWS SSO) health. Omitted in quick mode; "na" = no evidence config.
+    evidenceSso: z.object({ state: z.enum(["ok", "down", "na"]), detail: z.string().optional() }).optional(),
   })
   .openapi("Status");
 
 const EligibleResponse = z
   .object({
     eligible: z.array(
-      z.object({ source: z.string(), key: z.string(), summary: z.string(), type: z.string() }),
+      z.object({ source: z.string(), belt: z.string(), key: z.string(), summary: z.string(), type: z.string() }),
     ),
   })
   .openapi("Eligible");
@@ -285,7 +293,7 @@ export const statusRoute = createRoute({
   path: "/repos/{repo}/status",
   tags: ["repo"],
   summary: "Dashboard status: active + finished runs, sources, limits",
-  request: { params: RepoParam },
+  request: { params: RepoParam, query: z.object({ quick: z.enum(["1"]).optional(), refresh: z.enum(["1"]).optional() }) },
   responses: {
     200: { description: "Status", content: { "application/json": { schema: StatusResponse } } },
     ...repoErrors,
