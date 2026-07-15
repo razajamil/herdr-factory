@@ -599,10 +599,12 @@ substitution. Universal tokens (always injected):
 @@PRIOR_SESSION@@ @@STEP_DONE_CMD@@ @@ASK_HUMAN_CMD@@ @@BOUNCE_CMD@@ @@BOUNCE_TARGET@@
 @@BOUNCE_REASON_FILE@@ @@CLI@@`
 
-Plus **capability-scoped** tokens, injected only when their product is actually part of this belt's
-dataflow: `@@EVIDENCE_DIR@@ @@EVIDENCE_UPLOAD_CMD@@ @@CAPTURE_ATTEMPT_CMD@@` appear only when an
-upstream step *produces* `evidence` — so in a work → review → pr belt (evidence skipped) the
-review/pr prompts carry no evidence tokens at all.
+Plus **capability-scoped** tokens, injected only when the step declares the machinery they belong to:
+`@@EVIDENCE_DIR@@ @@EVIDENCE_UPLOAD_CMD@@ @@CAPTURE_ATTEMPT_CMD@@` appear only when an upstream step
+*produces* `evidence` (so in a work → review → pr belt the review/pr prompts carry no evidence tokens
+at all), and `@@CAPTURE_LOCK_ACQUIRE_CMD@@ @@CAPTURE_LOCK_RELEASE_CMD@@` appear only for a step that
+declares an `exclusive_resource` guard (the evidence capture mutex), the lock name coming from the
+guard.
 
 Prompts also support **product-gated clauses** — `@@WHEN:<product>@@ … @@END@@` — kept only when that
 product is active for the step (produced by it or upstream), otherwise the whole clause (prose **and**
@@ -642,7 +644,7 @@ herdr-factory --repo <name> step-done <KEY> <step> [--source <name>]
 herdr-factory --repo <name> bounce <KEY> <toStep> --reason|--reason-file … [--source <name>]
 herdr-factory --repo <name> ask-human <KEY> <step> --question|--question-file … [--source <name>]
 herdr-factory --repo <name> evidence-upload <KEY> [--source <name>]
-herdr-factory capture-lock acquire|release [owner]                  # machine-global capture mutex
+herdr-factory capture-lock acquire|release <resource> [owner]       # machine-global exclusive_resource lock
 
 # the machine-wide server + supervisor (no --repo)
 herdr-factory serve | ensure-up [--restart] | restart | reload | update | provision-node

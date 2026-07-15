@@ -589,9 +589,9 @@ program
   }));
 
 program
-  .command("capture-lock <action> [owner]")
-  .description("machine-global dev-server/screenshot lock (acquire|release)")
-  .action(cliAction("capture-lock", async (act: string, owner = "worker") => {
+  .command("capture-lock <action> <resource> [owner]")
+  .description("machine-global exclusive-resource lock for a step's exclusive_resource guard (acquire|release)")
+  .action(cliAction("capture-lock", async (act: string, resource: string, owner = "worker") => {
     try {
       const dbPath = globalDbPath();
       mkdirSync(dirname(dbPath), { recursive: true });
@@ -599,18 +599,18 @@ program
       if (act === "acquire") {
         const deadline = Date.now() + 3_600_000;
         for (;;) {
-          if (store.acquireLock("capture", owner, 1200)) {
-            console.log(`capture lock acquired by ${owner}`);
+          if (store.acquireLock(resource, owner, 1200)) {
+            console.log(`${resource} lock acquired by ${owner}`);
             return;
           }
-          if (Date.now() > deadline) fail("timed out waiting for capture lock");
+          if (Date.now() > deadline) fail(`timed out waiting for the ${resource} lock`);
           await new Promise((r) => setTimeout(r, 5000));
         }
       } else if (act === "release") {
-        store.releaseLock("capture", owner);
-        console.log(`capture lock released by ${owner}`);
+        store.releaseLock(resource, owner);
+        console.log(`${resource} lock released by ${owner}`);
       } else {
-        fail("capture-lock: acquire|release <owner>");
+        fail("capture-lock: acquire|release <resource> [owner]");
       }
     } catch (e) {
       fail(e);

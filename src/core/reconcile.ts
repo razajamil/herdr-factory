@@ -994,6 +994,8 @@ export async function bounceStep(
     return { ok: true, escalated: true, message: `bounce limit exceeded — escalated to attention` };
   }
 
+  releaseStepLocks(deps, run, from); // bouncing away from this step → free any exclusive_resource it held
+
   // (1) Clear done + reset heartbeat clocks for the TARGET *and every completed step between it and
   //     the bouncer* — those intermediate steps must actually re-run on the forward pass, not be
   //     skipped on their stale done=true (e.g. a review→fix bounce must force the evidence step to
@@ -1242,6 +1244,17 @@ function prClosedAttention(deps: Deps, run: Run, pr: PrInfo): Promise<void> {
  * isn't actively working. Re-spawns a dead pane idempotently. When the belt's last step finishes:
  * a work_to_pull_request belt hands off to the reviewing PR-watch; any other belt is done.
  */
+/** Release any machine-global exclusive_resource lock a step holds (owner = the run's key), called
+ *  when the run LEAVES the step (forward advance or bounce). The step's agent releases its own lock
+ *  in the normal path, so this is a backstop: a forgotten or crashed release frees the resource
+ *  immediately for the next run instead of waiting out the lock's TTL. Idempotent — a no-op when
+ *  nothing is held (releaseLock is owner-scoped to this run's key). */
+function releaseStepLocks(deps: Deps, run: Run, step: StepConfig): void {
+  for (const g of step.guards) {
+    if (g.kind === "exclusive_resource" && g.resourceName) deps.store.releaseLock(g.resourceName, run.ticketKey);
+  }
+}
+
 async function reconcileStep(deps: Deps, run: Run, belt: BeltRuntime, src: SourceRuntime, step: StepConfig): Promise<void> {
   const rs = deps.store.getRunStep(run.id, step.name);
 
@@ -1280,6 +1293,7 @@ async function reconcileStep(deps: Deps, run: Run, belt: BeltRuntime, src: Sourc
 
   // Advance when the agent signalled step-done (or its PR merged out from under us).
   if (rs.done || livePr?.state === "MERGED") {
+    releaseStepLocks(deps, run, step); // leaving the step → free any exclusive_resource it held
     const next = nextStep(belt, step.name);
     if (next) {
       deps.store.updateRun(run.id, { phase: "running", step: next.name });

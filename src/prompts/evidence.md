@@ -44,10 +44,10 @@ evidence is a **bounce or a recapture — never a pass**.
    what's discoverable but **do not fabricate credentials or guess a persona**; record the gap in
    `@@HANDOFF_OUT@@`, and if it blocks a faithful demonstration, bounce or use the ask-human path.
 3. **Capture the change, not the app.** Acquire the shared capture slot
-   (`@@CLI@@ capture-lock acquire @@KEY@@`) and, at the start of each capture attempt, signal it with
+   (`@@CAPTURE_LOCK_ACQUIRE_CMD@@`) and, at the start of each capture attempt, signal it with
    `@@CAPTURE_ATTEMPT_CMD@@` (the engine caps runaway re-capture loops). With the app running in the
    state above, drive it with `playwright-cli` and capture into `@@EVIDENCE_DIR@@/`. Then stop the
-   server and **always** release the lock (`@@CLI@@ capture-lock release @@KEY@@`), even if capture
+   server and **always** release the lock (`@@CAPTURE_LOCK_RELEASE_CMD@@`), even if capture
    failed. `@@EVIDENCE_DIR@@` is scratch — **never commit it.** Make the capture *prove* the change:
    - Work from your test plan as a **shot list**: each beat is one deliberate action and the criterion
      it proves. Do one legible action at a time, wait for content to settle (no loading-spinner

@@ -315,6 +315,14 @@ async function renderStepPromptImpl(
     sub["@@EVIDENCE_UPLOAD_CMD@@"] = evidenceUploadCmd;
     sub["@@CAPTURE_ATTEMPT_CMD@@"] = captureAttemptCmd;
   }
+  // exclusive_resource guard → the machine-global lock commands, injected only for a step that
+  // declares one (evidence's capture mutex). The resource name comes from the guard, so it lives in
+  // exactly one place (the descriptor) rather than being hardcoded in the CLI and the prompt prose.
+  const lockRes = step.guards.find((g) => g.kind === "exclusive_resource")?.resourceName;
+  if (lockRes) {
+    sub["@@CAPTURE_LOCK_ACQUIRE_CMD@@"] = `${CLI_PATH} capture-lock acquire ${lockRes} ${run.ticketKey}`;
+    sub["@@CAPTURE_LOCK_RELEASE_CMD@@"] = `${CLI_PATH} capture-lock release ${lockRes} ${run.ticketKey}`;
+  }
   // Strip product-gated clauses BEFORE substitution so a dropped block's tokens never dangle.
   let out = stripInactiveProductBlocks(stepBody(deps, run, step), isActive);
   for (const [token, value] of Object.entries(sub)) out = out.replaceAll(token, () => value);

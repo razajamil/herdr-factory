@@ -300,6 +300,38 @@ describe("applySignal — shared run-scoped agent signal effect", () => {
   });
 });
 
+describe("exclusive_resource guard (the capture mutex)", () => {
+  const LOCK_GUARD = { kind: "exclusive_resource" as const, resourceName: "capture", escalationReason: "capture_lock", autoRescueOnDone: false };
+
+  it("injects the capture-lock command tokens (resource + key from the guard) for a declaring step", async () => {
+    const { deps, state, worktree, shipBelt } = build();
+    shipBelt.steps[0]!.guards = [LOCK_GUARD];
+    shipBelt.steps[0]!.enginePrompt = "acquire=@@CAPTURE_LOCK_ACQUIRE_CMD@@ release=@@CAPTURE_LOCK_RELEASE_CMD@@";
+    state.eligible = [ticket("K-CL")];
+    await reconcileRepo(deps);
+    const body = readFileSync(join(worktree, ".memory/herdr-factory/prompt-fix.md"), "utf8");
+    expect(body).toContain("capture-lock acquire capture K-CL");
+    expect(body).toContain("capture-lock release capture K-CL");
+    expect(body).not.toMatch(/@@CAPTURE_LOCK/); // no dangling tokens
+  });
+
+  it("backstop-releases the step's lock when the run bounces away from it", async () => {
+    const { deps, store, worktree } = build();
+    const src = deps.resolveSource("jira")!;
+    const belt: BeltRuntime = {
+      name: "ship", beltType: "work_to_pull_request", source: "jira", priority: 1, watchPr: true,
+      steps: [stepCfg("fix"), stepCfg("evidence", { guards: [LOCK_GUARD] }), stepCfg("review"), stepCfg("pr")],
+    };
+    const run = seed(store, worktree, "K-LOCK", "running", "evidence");
+    store.upsertRunStep(run.id, "fix", { paneId: "w1:pfix", done: true });
+    expect(store.acquireLock("capture", "K-LOCK", 1200)).toBe(true); // the evidence agent holds it
+    expect(store.acquireLock("capture", "other", 1200)).toBe(false); // contended while held
+    const res = await bounceStep(deps, store.getRun(run.id)!, belt, src, "fix", "redo");
+    expect(res.ok).toBe(true);
+    expect(store.acquireLock("capture", "other", 1200)).toBe(true); // freed on bounce (backstop)
+  });
+});
+
 describe("reconcile pipeline (work_to_pull_request belt)", () => {
   it("claims an eligible ticket → running fix (worktree + fix agent + ticket fetch + In-dev transition)", async () => {
     const { deps, store, state, calls, worktree } = build();
