@@ -377,6 +377,26 @@ const MIGRATIONS: { version: number; sql: string }[] = [
     // refresh preserves it (the column isn't part of saveSourceAuth's upsert).
     sql: `ALTER TABLE source_auth ADD COLUMN account_label TEXT;`,
   },
+  {
+    version: 21,
+    // guard_counters: generalize the two single-purpose run_steps counters (bounces / capture_attempts)
+    // into one (run, step, guard) table, so a step can carry ANY number of capped guards without a new
+    // column — two capped guards on one step would otherwise collide on capture_attempts. The bounce
+    // cap now lives here keyed (run, targetStep, 'bounce_cap'); the capture cap keyed (run, step,
+    // 'capture_cap'). The old run_steps.bounces / capture_attempts columns are SUPERSEDED and left in
+    // place (unread), matching the v2–v3 worker_done/review_done precedent — a one-time counter reset on
+    // upgrade is immaterial (they are transient safety backstops, not durable state).
+    sql: `
+      CREATE TABLE guard_counters (
+        run_id INTEGER NOT NULL REFERENCES runs(id),
+        step TEXT NOT NULL,
+        guard TEXT NOT NULL,
+        count INTEGER NOT NULL DEFAULT 0,
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY (run_id, step, guard)
+      );
+    `,
+  },
 ];
 
 /** Apply pending migrations in a transaction. Idempotent. */

@@ -60,6 +60,7 @@ describe("StepDescriptor contract (per registered step primitive)", () => {
           if (g.kind === "capture_cap") {
             expect(g.reset).toBe("forward_entry");
             expect(g.cumulative).toBe(false);
+            expect(g.counterScope).toBe("run+step+guard"); // counter lives in the generalized guard_counters table
           }
           if (g.kind === "heartbeat") expect(g.requiresProduct).toBe("commits");
         }

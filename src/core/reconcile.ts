@@ -983,7 +983,7 @@ export async function bounceStep(
   // Safety backstop only: the loop is meant to end when the later step passes (aligned) or the fix
   // agent asks a human — this cap just catches oscillation. Per-belt override wins over the repo limit.
   const maxBounces = belt.maxBounces ?? deps.config.limits.maxBounces;
-  const bounces = deps.store.bumpBounces(run.id, toStep);
+  const bounces = deps.store.bumpGuardCounter(run.id, toStep, "bounce_cap");
   if (bounces > maxBounces) {
     await escalateAttention(deps, run, {
       reason: "bounce_limit",
@@ -1057,7 +1057,7 @@ export async function recordCaptureAttempt(
 
   const repo = deps.config.repoName;
   const cap = deps.config.limits.maxCaptureAttempts;
-  const attempts = deps.store.bumpCaptureAttempts(run.id, step);
+  const attempts = deps.store.bumpGuardCounter(run.id, step, "capture_cap");
   deps.store.recordEvent({ runId: run.id, repo, ticketKey: run.ticketKey, type: "capture_attempt", detail: { step, attempts, cap } });
   if (attempts > cap) {
     await escalateAttention(deps, run, {
@@ -1300,7 +1300,7 @@ async function reconcileStep(deps: Deps, run: Run, belt: BeltRuntime, src: Sourc
       // Fresh pass into an evidence step ⇒ reset its flaky-capture budget (this is the ONLY reset on
       // the forward path; a crash-recovery respawn below deliberately does NOT reset, so a self-crash
       // can't refill the cap). Cheap + scoped: only a gathersEvidence step ever holds a nonzero count.
-      if (next.gathersEvidence) deps.store.upsertRunStep(run.id, next.name, { captureAttempts: 0 });
+      if (next.gathersEvidence) deps.store.resetGuardCounter(run.id, next.name, "capture_cap");
       deps.log("info", `${run.ticketKey}: ${step.name} done -> ${next.name}`);
       await spawnStep(deps, run, belt, src, next.name);
       return;
@@ -1562,7 +1562,10 @@ export async function resumeRun(deps: Deps, run: Run): Promise<{ ok: boolean; ph
   } else if (run.step && stepByName(belt, run.step)) {
     // Fresh slate on human resume: reset the step budget clocks AND the flaky-capture counter — a
     // human just intervened, so a capture-cap park must not immediately re-park on the next attempt.
-    deps.store.upsertRunStep(run.id, run.step, { startedAt: deps.now(), progressSig: null, progressAt: null, absentAt: null, captureAttempts: 0 });
+    // resetGuardCounter is a no-op for a step with no capture_cap counter, so this no longer touches a
+    // non-evidence step's state (the old unconditional captureAttempts:0 reset did).
+    deps.store.upsertRunStep(run.id, run.step, { startedAt: deps.now(), progressSig: null, progressAt: null, absentAt: null });
+    deps.store.resetGuardCounter(run.id, run.step, "capture_cap");
     phase = "running";
   } else if (belt.watchPr && run.prNumber) {
     // Back to watching the PR: clear the handled-signature so the next actionable review state

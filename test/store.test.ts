@@ -11,6 +11,25 @@ function makeStore(start = 1000) {
   return { store, db, setNow: (n: number) => { now = n; }, tick: (d: number) => { now += d; } };
 }
 
+describe("Store — guard_counters (generalized capped-guard storage)", () => {
+  it("counts (run, step, guard) triples independently — two capped guards on one step never collide", () => {
+    const { store } = makeStore();
+    const run = store.createRun({ repo: "r", workSource: "jira", belt: "ship", ticketKey: "K-GC" });
+    // same run+step, two different guards → independent counters (the collision the old single
+    // capture_attempts column could not represent).
+    expect(store.bumpGuardCounter(run.id, "evidence", "capture_cap")).toBe(1);
+    expect(store.bumpGuardCounter(run.id, "evidence", "capture_cap")).toBe(2);
+    expect(store.bumpGuardCounter(run.id, "evidence", "other_cap")).toBe(1);
+    expect(store.guardCounter(run.id, "evidence", "capture_cap")).toBe(2);
+    expect(store.guardCounter(run.id, "evidence", "other_cap")).toBe(1);
+    // reset is per-triple + a no-op when nothing is counted (the fixed resume leak).
+    store.resetGuardCounter(run.id, "evidence", "capture_cap");
+    expect(store.guardCounter(run.id, "evidence", "capture_cap")).toBe(0);
+    expect(store.guardCounter(run.id, "evidence", "other_cap")).toBe(1); // untouched
+    expect(() => store.resetGuardCounter(run.id, "review", "capture_cap")).not.toThrow(); // no counter → no-op
+  });
+});
+
 describe("Store", () => {
   it("creates a run in claiming and counts it active", () => {
     const { store } = makeStore();

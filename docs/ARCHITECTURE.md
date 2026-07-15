@@ -474,9 +474,14 @@ CREATE TABLE run_steps(                  -- one row per pipeline agent (migratio
   pane_id TEXT, session_id TEXT,         -- on-demand cross-agent query handles
   progress_sig TEXT, progress_at INTEGER,   -- per-step commit heartbeat
   done INTEGER NOT NULL DEFAULT 0, started_at INTEGER, done_at INTEGER,
-  bounces INTEGER NOT NULL DEFAULT 0,    -- times a later step sent work back here (v9)
-  absent_at INTEGER);                    -- pane first CONFIRMED absent; two-strike respawn (v10)
+  bounces INTEGER NOT NULL DEFAULT 0,    -- SUPERSEDED (with capture_attempts) by guard_counters (v21),
+  absent_at INTEGER);                    -- left unread. absent_at: pane first CONFIRMED absent (v10)
 CREATE INDEX idx_run_steps ON run_steps(run_id, step);
+
+CREATE TABLE guard_counters(             -- capped-guard counters keyed (run, step, guard) (v21) —
+  run_id INTEGER NOT NULL REFERENCES runs(id), step TEXT NOT NULL, guard TEXT NOT NULL,
+  count INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL,   -- 'bounce_cap' (on the target step)
+  PRIMARY KEY(run_id, step, guard));     -- + 'capture_cap'; two capped guards on a step don't collide
 
 CREATE TABLE events(                     -- the timeline (web-UI gold)
   id INTEGER PRIMARY KEY AUTOINCREMENT, run_id INTEGER, repo TEXT, ticket_key TEXT,
@@ -543,7 +548,8 @@ Phase-B dedup, **source-scoped** so two sources can carry the same key), `active
 `createRun({…,workSource,belt})`, `updateRun(id,patch)`, `endRun(id,outcome)`, `recordEvent(…)`,
 locks: `acquireLock/extendLock/releaseLock` (extend = the heartbeat; owner-checked),
 `upsertRepo`, `touchTick`/`lastTickAt` (the wedged-tick watchdog signal), the run-step rows
-(`getRunStep`/`upsertRunStep`/`markStepDone`/`bumpBounces`), the transition outbox
+(`getRunStep`/`upsertRunStep`/`markStepDone`, the generalized guard counters
+`bumpGuardCounter`/`guardCounter`/`resetGuardCounter`), the transition outbox
 (`enqueueTransition`, `dueTransitions`, `undeliveredTransitionBefore` — in-order-per-run guard,
 `markTransitionDelivered`, `recordTransitionAttempt` — 60s-doubling backoff capped 1h,
 `pendingTransitionForKey` — the claim guard, and the stale two-phase:
@@ -1059,7 +1065,7 @@ herdr-factory reload                      # hot-reload config + re-discover repo
 herdr-factory provision-node              # (re)download the pinned vendored Node runtime
 herdr-factory schema [--stdout]           # write the config.yml JSON Schema for editors
 herdr-factory install | uninstall | start | stop   # the supervisor service (launchd / systemd)
-herdr-factory capture-lock acquire|release [owner] # machine-global capture lock
+herdr-factory capture-lock acquire|release <resource> [owner] # machine-global exclusive_resource lock
 herdr-factory doctor [--deep] [--repo <name>]      # managed / you-provide / per-repo health (--deep: live probes)
 herdr-factory help
 ```

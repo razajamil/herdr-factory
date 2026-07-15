@@ -95,8 +95,6 @@ interface RunStepRow {
   done: number;
   started_at: number | null;
   done_at: number | null;
-  bounces: number;
-  capture_attempts: number;
   absent_at: number | null;
 }
 
@@ -112,8 +110,6 @@ function toRunStep(r: RunStepRow): RunStep {
     done: r.done !== 0,
     startedAt: r.started_at,
     doneAt: r.done_at,
-    bounces: r.bounces,
-    captureAttempts: r.capture_attempts,
     absentAt: r.absent_at,
   };
 }
@@ -589,7 +585,6 @@ export class Store {
     if (patch.progressSig !== undefined) set("progress_sig", patch.progressSig);
     if (patch.progressAt !== undefined) set("progress_at", patch.progressAt);
     if (patch.startedAt !== undefined) set("started_at", patch.startedAt);
-    if (patch.captureAttempts !== undefined) set("capture_attempts", patch.captureAttempts);
     if (patch.absentAt !== undefined) set("absent_at", patch.absentAt);
     if (patch.done !== undefined) {
       set("done", patch.done ? 1 : 0);
@@ -615,28 +610,36 @@ export class Store {
     telemetryEvent("store.run_step.done", { "run.id": runId, step });
   }
 
-  /** Increment (and return) the bounce count for a step — how many times a LATER step has sent the
-   *  run back to it for rework. Ensures the row exists first (so it's safe to bounce to a step whose
-   *  row somehow isn't materialized yet). The reconciler escalates once this exceeds limits.maxBounces. */
-  bumpBounces(runId: number, step: StepName): number {
-    this.upsertRunStep(runId, step); // ensure the row exists
-    this.db.prepare("UPDATE run_steps SET bounces = bounces + 1 WHERE run_id = ? AND step = ?").run(runId, step);
-    const row = this.getRunStep(runId, step)!;
-    telemetryEvent("store.run_step.bounce", { "run.id": runId, step, "step.bounces": row.bounces });
-    return row.bounces;
+  /** Increment (and return) a capped guard's counter, keyed (run, step, guard) in `guard_counters` so
+   *  any number of capped guards on one step count independently (this generalizes the old
+   *  single-purpose run_steps.bounces / capture_attempts columns). The bounce cap uses guard
+   *  'bounce_cap' keyed on the TARGET step; the evidence capture cap uses 'capture_cap' keyed on the
+   *  step itself. The reconciler escalates once the returned count exceeds the guard's configured limit. */
+  bumpGuardCounter(runId: number, step: StepName, guard: string): number {
+    const now = this.now();
+    this.db
+      .prepare(
+        `INSERT INTO guard_counters (run_id, step, guard, count, updated_at) VALUES (?, ?, ?, 1, ?)
+         ON CONFLICT(run_id, step, guard) DO UPDATE SET count = count + 1, updated_at = excluded.updated_at`,
+      )
+      .run(runId, step, guard, now);
+    const row = this.db.prepare("SELECT count FROM guard_counters WHERE run_id = ? AND step = ? AND guard = ?").get(runId, step, guard) as { count: number };
+    telemetryEvent("store.guard_counter.bump", { "run.id": runId, step, guard, count: row.count });
+    return row.count;
   }
 
-  /** Increment (and return) the capture-attempt count for an evidence step — how many capture
-   *  attempts its agent has signalled THIS pass. Ensures the row exists first. The reconciler parks
-   *  the run for attention once this exceeds limits.maxCaptureAttempts. Unlike `bounces`, it is reset
-   *  to 0 on each fresh entry into the step (see reconcileStep / resumeRun), so a legitimate re-pass
-   *  after a fix rework gets a full budget rather than inheriting the last pass's count. */
-  bumpCaptureAttempts(runId: number, step: StepName): number {
-    this.upsertRunStep(runId, step); // ensure the row exists
-    this.db.prepare("UPDATE run_steps SET capture_attempts = capture_attempts + 1 WHERE run_id = ? AND step = ?").run(runId, step);
-    const row = this.getRunStep(runId, step)!;
-    telemetryEvent("store.run_step.capture_attempt", { "run.id": runId, step, "step.capture_attempts": row.captureAttempts });
-    return row.captureAttempts;
+  /** The current value of a (run, step, guard) counter (0 when none has been recorded). */
+  guardCounter(runId: number, step: StepName, guard: string): number {
+    const row = this.db.prepare("SELECT count FROM guard_counters WHERE run_id = ? AND step = ? AND guard = ?").get(runId, step, guard) as { count: number } | undefined;
+    return row?.count ?? 0;
+  }
+
+  /** Reset a (run, step, guard) counter — the capture cap's forward-entry reset (a fresh pass into the
+   *  step gets a full budget) and the human-resume reset. A no-op when nothing is counted, so it is
+   *  safe to call unconditionally (fixing the old leak where resume reset capture_attempts even for a
+   *  step that never gathers evidence). */
+  resetGuardCounter(runId: number, step: StepName, guard: string): void {
+    this.db.prepare("DELETE FROM guard_counters WHERE run_id = ? AND step = ? AND guard = ?").run(runId, step, guard);
   }
 
   // --- transition outbox (source status write-backs, retried until delivered) --

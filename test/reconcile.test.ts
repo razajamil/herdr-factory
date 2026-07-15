@@ -559,7 +559,7 @@ describe("reconcile pipeline (work_to_pull_request belt)", () => {
     expect(got.step).toBe("fix");
     // MUST be cleared, else reconcileStep re-advances the just-bounced step instantly.
     expect(store.getRunStep(run.id, "fix")!.done).toBe(false);
-    expect(store.getRunStep(run.id, "fix")!.bounces).toBe(1);
+    expect(store.guardCounter(run.id, "fix", "bounce_cap")).toBe(1);
     // targets fix's OWN pane (w1:pfix), NOT run.paneId (the review pane w1:p1).
     expect(got.paneId).toBe("w1:pfix");
     expect(calls.agentSend.some(([p]) => p === "w1:pfix")).toBe(true);

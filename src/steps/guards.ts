@@ -11,7 +11,7 @@ import type { GuardSpec } from "../types.ts";
 export const BUDGET_GUARD: GuardSpec = { kind: "budget", escalationReason: "step_budget", autoRescueOnDone: true };
 export const HEARTBEAT_GUARD: GuardSpec = { kind: "heartbeat", escalationReason: "step_stalled", autoRescueOnDone: true, requiresProduct: "commits" };
 export const LAYOUT_WAIT_GUARD: GuardSpec = { kind: "layout_wait", escalationReason: "layout_wait_timeout", autoRescueOnDone: true, attachWhen: "layoutTarget" };
-export const CAPTURE_CAP_GUARD: GuardSpec = { kind: "capture_cap", escalationReason: "capture_limit", autoRescueOnDone: true, reset: "forward_entry", cumulative: false, requiresProduct: "evidence" };
+export const CAPTURE_CAP_GUARD: GuardSpec = { kind: "capture_cap", escalationReason: "capture_limit", autoRescueOnDone: true, reset: "forward_entry", cumulative: false, requiresProduct: "evidence", counterScope: "run+step+guard" };
 // A machine-global exclusive resource the step's agent holds while driving the app (the capture
 // mutex). NOT a watchdog (never parks/auto-rescues) and not a counter — its @@CAPTURE_LOCK_*_CMD@@
 // tokens are injected only for a step that declares it, and the engine backstop-releases it on step
