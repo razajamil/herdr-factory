@@ -924,6 +924,13 @@ describe("reconcile pipeline (work_to_pull_request belt)", () => {
     state.paneState = "idle";
     await reconcileRun(deps, store.getRun(run.id)!);
     expect(calls.agentSend.length).toBe(1); // re-prompted the live pr-agent pane
+    // The resolver prompt is now a rendered library file (prompts/resolver.md), dispatched via a
+    // one-line "read it" pointer — not a hardcoded inline string.
+    expect(calls.agentSend[0]![1]).toContain(".memory/herdr-factory/prompt-resolver.md");
+    const resolverPrompt = readFileSync(join(worktree, ".memory/herdr-factory/prompt-resolver.md"), "utf8");
+    expect(resolverPrompt).toContain("PR #10"); // @@PR_NUMBER@@ substituted
+    expect(resolverPrompt).toContain("K-10"); // @@KEY@@ substituted
+    expect(resolverPrompt).not.toMatch(/@@[A-Z_]+@@/); // no dangling tokens
     const got = store.getRun(run.id)!;
     expect(got.lastThreadSig).toBe("newsig");
     expect(got.resolverActive).toBe(true); // now actively resolving → holds a slot

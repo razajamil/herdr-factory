@@ -24,6 +24,7 @@ dropping are all live. This table is the delta between the proposal below and th
 **Shipped as designed**
 
 - **§1/§3 — three registries.** `STEP_DESCRIPTORS` (`src/steps/registry.ts`: `work`/`evidence`/`review`/`pr`/`custom`), `PRODUCT_CAPABILITIES` (`src/products/registry.ts`), `SIGNAL_DESCRIPTORS` (`src/signals/registry.ts`). The reconciler branches on declarations (`consumes`/`produces`/`controls`/`guards`/posture), never a step name.
+- **§4 — the resolver prompt is a first-class library entry.** `src/prompts/resolver.md`, rendered by `core/watch.ts` (`wakeResolver`): tokenized (`@@KEY@@`/`@@PR_NUMBER@@`) and source-overridable, with the slug + token set + overridability all read from the `pull_request` watch capability's `WatchResolverSpec.wakePrompt`. It's written into the worktree and dispatched via a one-line read-pointer, exactly like a belt step, reusing the pr step's pane (`reusesPaneOf: pull_request`).
 - **§6 — effects.** `belt_start → in_development` is the engine default at claim; `produce(pull_request) → in_review` rides the `pull_request` capability's `effectOnProduce`; both fire forward-only/monotonic through the transition outbox.
 - **§7 — `read_only` declared *and* enforced.** HEAD movement during a read-only step (`evidence`/`review`) parks the run (`core/reconcile.ts`; baseline HEAD captured at spawn in `core/step.ts`).
 - **§8 — typed dataflow, both halves.** Load-time: a required consume with no upstream producer rejects the belt, and a bounce emitter needs an earlier `bounce_feedback` consumer (`config.ts` `superRefine`). Render-time: an unsatisfied *optional* consume drops its `@@TOKEN@@`s and its `@@WHEN:<product>@@…@@END@@` clause (`productActiveFor` / `stripInactiveProductBlocks` in `core/step.ts`), so a work→review→pr belt never references evidence it didn't capture.
@@ -37,7 +38,6 @@ dropping are all live. This table is the delta between the proposal below and th
 - **§2 — `basePrompt` is optional (`basePrompt?`), not always-present.** `custom` ships no base prompt and the `enginePrompt === undefined` assembly branch in `core/step.ts` was **kept** (the proposal expected the placeholder to erase it).
 - **§2 — no `tui?: StepFieldSpec` on `StepDescriptor`.** TUI step rows are still rendered by `tui/config-fields.ts`, not descriptor-driven.
 - **§11 — a `beltType` value survives as a display-only label** on the resolved belt (`config.ts`; shown in CLI/TUI/server), derived from `watchPr` and never branched on by the reconciler. "Gone" holds for config *input*, not the derived label.
-- **§4 — the resolver prompt was not moved into the prompt library.** `core/watch.ts` still owns a hardcoded single-line `resolverPrompt(key, prNumber)`; there is no `src/prompts/resolver.md`, and the capability's `WatchResolverSpec.wakePrompt` is declared but unwired. It does reuse the `pr` step's pane, matching `reusesPaneOf: pull_request`.
 
 **Deferred (designed, not built)**
 

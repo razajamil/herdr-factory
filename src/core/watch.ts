@@ -1,35 +1,57 @@
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import type { Deps } from "./deps.ts";
-import type { Run } from "../types.ts";
-import { CLAUDE_FLAGS } from "./step.ts";
+import type { Run, SourceType } from "../types.ts";
+import { CLAUDE_FLAGS, MEMORY_DIR } from "./step.ts";
+import { productCapabilityFor } from "../products/registry.ts";
 
-/** Single-line resolver instruction (typed into the pr agent's TUI, so no newlines). */
-export function resolverPrompt(key: string, prNumber: number): string {
-  return (
-    `New review activity on PR #${prNumber} for ${key}. Address ALL unresolved review comments and fix ALL ` +
-    `failing CI checks on this PR: fix each thread, commit per thread, push, resolve the thread. ` +
-    `Review your changes for quality before pushing. Do NOT change the work item's status. When every thread is ` +
-    `resolved and CI is green, or you are blocked, stop and say so.`
-  );
+/** Render the resolver prompt from the library — prompts/<sourceType>/<slug>.md if present, else the
+ *  shared prompts/<slug>.md (source-overridable, mirroring the belt-step base prompts) — substituting
+ *  only the tokens the pull_request watch capability declares. */
+function renderResolverPrompt(slug: string, sourceType: SourceType | undefined, tokens: readonly string[], values: Record<string, string>): string {
+  const typed = sourceType ? fileURLToPath(new URL(`../prompts/${sourceType}/${slug}.md`, import.meta.url)) : "";
+  const shared = fileURLToPath(new URL(`../prompts/${slug}.md`, import.meta.url));
+  let body = readFileSync(typed && existsSync(typed) ? typed : shared, "utf8");
+  for (const t of tokens) body = body.replaceAll(t, () => values[t] ?? "");
+  return body;
 }
 
-/** Reuse the run's latest agent pane (the pr step) if alive; else spawn a fresh resolver.
- *  Returns true if a resolver was actually dispatched, false if the spawn failed (so the
- *  caller can retry rather than mark the review round handled). */
+/**
+ * Wake the PR-review resolver: render its (tokenized, source-overridable) library prompt into the
+ * worktree, then point the agent at it — reusing the run's latest agent pane (the pr step) if alive,
+ * else spawning a fresh one. The slug, its overridability, and the token set all come from the
+ * pull_request watch capability's `WatchResolverSpec` (`src/products/registry.ts`), so the resolver
+ * is a first-class library prompt (`prompts/resolver.md`) rather than a hardcoded string — dispatched
+ * via a one-line "read it" pointer exactly like a belt step. Returns true if a resolver was
+ * dispatched, false if the spawn failed (so the caller retries rather than marking the round handled).
+ */
 export async function wakeResolver(deps: Deps, run: Run, prNumber: number): Promise<boolean> {
-  const prompt = resolverPrompt(run.ticketKey, prNumber);
+  const worktree = run.worktreePath;
+  if (!run.workspaceId || !worktree) throw new Error(`${run.ticketKey}: cannot spawn resolver (no workspace)`);
+
+  const { wakePrompt } = productCapabilityFor("pull_request").watch!.resolver;
+  const sourceType = wakePrompt.perSourceOverride ? deps.resolveSource(run.workSource)?.type : undefined;
+  const body = renderResolverPrompt(wakePrompt.slug, sourceType, wakePrompt.tokens, {
+    "@@KEY@@": run.ticketKey,
+    "@@PR_NUMBER@@": String(prNumber),
+  });
+  const mem = join(worktree, MEMORY_DIR);
+  mkdirSync(mem, { recursive: true });
+  writeFileSync(join(mem, `prompt-${wakePrompt.slug}.md`), body);
+  const instruction = `Read ${MEMORY_DIR}/prompt-${wakePrompt.slug}.md in this worktree and follow it exactly. This is an autonomous task — do not pause to ask for confirmation.`;
 
   if (run.paneId && (await deps.herdr.paneAlive(run.paneId))) {
-    await deps.herdr.agentSend(run.paneId, prompt);
+    await deps.herdr.agentSend(run.paneId, instruction);
     await deps.herdr.paneSendKeys(run.paneId, "Enter");
     deps.log("info", `${run.ticketKey}: re-prompted agent (${run.paneId}) to resolve PR #${prNumber}`);
     return true;
   }
 
-  if (!run.workspaceId || !run.worktreePath) throw new Error(`${run.ticketKey}: cannot spawn resolver (no workspace)`);
   const pane = await deps.herdr.agentStart({
     workspaceId: run.workspaceId,
-    cwd: run.worktreePath,
-    argv: ["claude", ...CLAUDE_FLAGS, prompt],
+    cwd: worktree,
+    argv: ["claude", ...CLAUDE_FLAGS, instruction],
   });
   if (!pane) {
     deps.log("warn", `${run.ticketKey}: resolver agentStart returned no pane for PR #${prNumber}`);

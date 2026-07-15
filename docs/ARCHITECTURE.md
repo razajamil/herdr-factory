@@ -193,7 +193,8 @@ herdr-factory/
     runtime/effect.ts        the shared Effect ManagedRuntime (also hosts the OTel layer)
     telemetry/…              OpenTelemetry spans/metrics (no-op unless HERDR_FACTORY_TELEMETRY)
     tui/…                    the opentui TUI (Dashboard · Config editor · Doctor)
-    prompts/{work,evidence,review,pr}.md           shared step-primitive prompts (work.md is source-neutral)
+    prompts/{work,evidence,review,pr}.md + prompts/resolver.md   step-primitive prompts (work.md
+                          source-neutral) + the PR-watch resolver (tokenized + source-overridable, rendered by core/watch.ts)
     prompts/jira/work.md + prompts/github_issues/{work,pr}.md   per-source-type overrides
     steps/registry.ts + steps/<name>/descriptor.ts   the STEP_DESCRIPTORS registry (work/evidence/review/pr/custom)
     products/registry.ts · signals/registry.ts       PRODUCT_CAPABILITIES + SIGNAL_DESCRIPTORS registries
