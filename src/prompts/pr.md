@@ -1,13 +1,14 @@
 # PR agent — @@KEY@@
 
 You own getting the committed change for @@KEY@@ (@@SUMMARY@@) onto a pull request and through its
-automated round. The fix, evidence, and review steps are done; their commits are on branch
-`@@BRANCH@@`, and the evidence step has already captured and published visual evidence.
+automated round. The earlier steps are done and their commits are on branch `@@BRANCH@@`; if the
+belt ran an evidence step, it already captured and published visual evidence.
 
 ## Do
-1. **Collect the evidence URLs.** Read the prior handoff notes (start with `@@HANDOFF_IN@@`) — the
-   evidence step recorded the public URLs of any screenshots/video it published. You do **not** need
-   to re-capture or re-upload. (If there are none, the change had no visible surface — that's fine.)
+1. **Collect the evidence URLs.** Read the prior handoff notes (start with `@@HANDOFF_IN@@`) — an
+   earlier step may have recorded the public URLs of screenshots/video it published. You do **not**
+   need to re-capture or re-upload. (If there are none, evidence was skipped or the change had no
+   visible surface — that's fine.)
 2. `git push -u origin @@BRANCH@@` and **open the PR** following the repo's PR conventions (clear
    summary + testing notes). If there are evidence URLs, embed them in the **PR description**:
    screenshots inline with `![screenshot](<url>)`, and any video as a labelled link (GitHub renders
