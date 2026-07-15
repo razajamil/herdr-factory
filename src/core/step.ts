@@ -1,9 +1,9 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import type { StepConfig } from "../config.ts";
+import { SOURCE_PRODUCTS, type StepConfig } from "../config.ts";
 import type { BeltRuntime, Deps, SourceRuntime } from "./deps.ts";
-import type { Run, RunStep } from "../types.ts";
+import type { ProductType, Run, RunStep, SourceType } from "../types.ts";
 import { signalCommand } from "../signals/registry.ts";
 import { telemetrySpan } from "../telemetry/index.ts";
 
@@ -32,6 +32,38 @@ export const nextStep = (belt: BeltRuntime, name: string): StepConfig | undefine
   const i = indexOfStep(belt, name);
   return i >= 0 && i < belt.steps.length - 1 ? belt.steps[i + 1] : undefined;
 };
+
+// --- typed-dataflow gating: an optional consume unsatisfied by THIS belt is dropped -------------
+// Mirrors config.ts's load-time dataflow check at RENDER time, so a prompt never references a
+// product the belt didn't actually produce (design §8: "drop the corresponding prompt clause + token").
+
+/** Predicate: is `product` ACTIVE for `step`'s prompt in this belt? True when the step produces it,
+ *  or consumes it AND it's produced upstream (an earlier step or the source's roots). An inactive
+ *  optional consume gets no @@TOKEN@@ injected and its @@WHEN:<product>@@…@@END@@ clauses stripped. */
+export function productActiveFor(
+  steps: readonly Pick<StepConfig, "name" | "produces" | "consumes">[],
+  step: Pick<StepConfig, "name" | "produces" | "consumes">,
+  sourceType: SourceType,
+): (product: ProductType) => boolean {
+  const idx = steps.findIndex((s) => s.name === step.name);
+  const upstream = idx >= 0 ? steps.slice(0, idx) : [];
+  const available = new Set<ProductType>([
+    ...(SOURCE_PRODUCTS[sourceType] ?? []),
+    ...upstream.flatMap((s) => s.produces),
+    ...step.produces,
+  ]);
+  return (product) =>
+    available.has(product) && (step.produces.includes(product) || step.consumes.some((c) => c.type === product));
+}
+
+/** Strip product-gated blocks: `@@WHEN:<product>@@ … @@END@@` is kept (delimiters removed) when the
+ *  product is active, else the whole block — prose AND any @@TOKEN@@s inside — is removed, so an
+ *  unsatisfied optional consume leaves no dangling token and no orphaned clause. Non-nesting. */
+export function stripInactiveProductBlocks(body: string, isActive: (product: ProductType) => boolean): string {
+  return body.replace(/@@WHEN:([a-z_]+)@@([\s\S]*?)@@END@@/g, (_m, product: string, inner: string) =>
+    isActive(product as ProductType) ? inner : "",
+  );
+}
 
 const dispatchPrompt = (step: string): string =>
   `Read ${MEMORY_DIR}/prompt-${step}.md in this worktree and follow it exactly. This is an autonomous task — do not pause to ask for confirmation.`;
@@ -234,7 +266,7 @@ async function renderStepPromptImpl(
   const askHumanCmd = signalCommand(CLI_PATH, repo, "ask-human", { key: run.ticketKey, step: step.name, source: src.name, "question-file": `${MEMORY_DIR}/human-question-${step.name}.md` });
   // evidence-upload publishes @@EVIDENCE_DIR@@ to S3/CloudFront (no-op if `evidence:` is unconfigured);
   // capture-attempt signals the start of a capture so the engine caps flaky-capture loops. Both are
-  // capability-gated below (only injected for a step that produces/consumes evidence).
+  // capability-gated below (injected only when `evidence` is ACTIVE for this step — see isActive).
   const evidenceUploadCmd = signalCommand(CLI_PATH, repo, "evidence-upload", { key: run.ticketKey, source: src.name });
   const captureAttemptCmd = signalCommand(CLI_PATH, repo, "capture-attempt", { key: run.ticketKey, step: step.name, source: src.name });
   // For a step that may bounce (evidence/review), a ready-made command that returns the run to its
@@ -273,16 +305,18 @@ async function renderStepPromptImpl(
     "@@PRIOR_SESSION@@": prior?.sessionId ?? "(none)",
     "@@STEP_DONE_CMD@@": stepDoneCmd,
   };
-  // Capability-scoped tokens: the evidence tokens are injected only for a step that produces or
-  // consumes evidence (the universal tokens above are always injected) — the registry-driven
-  // "universal ∪ capability tokens" map. A step that declares neither never sees @@EVIDENCE_*@@.
-  const usesEvidence = step.produces.includes("evidence") || step.consumes.some((c) => c.type === "evidence");
-  if (usesEvidence) {
+  // Capability-scoped tokens + @@WHEN@@ clauses gate on ACTUAL belt dataflow, not just this step's
+  // declaration: an OPTIONAL consume (evidence for review/pr) is ACTIVE only when an upstream step
+  // (or the source) actually produces it. So a work→review→pr belt injects no @@EVIDENCE_*@@ and
+  // strips the "read the evidence" clause instead of pointing the reviewer at evidence never taken.
+  const isActive = productActiveFor(belt.steps, step, src.type);
+  if (isActive("evidence")) {
     sub["@@EVIDENCE_DIR@@"] = `${MEMORY_DIR}/evidence`;
     sub["@@EVIDENCE_UPLOAD_CMD@@"] = evidenceUploadCmd;
     sub["@@CAPTURE_ATTEMPT_CMD@@"] = captureAttemptCmd;
   }
-  let out = stepBody(deps, run, step);
+  // Strip product-gated clauses BEFORE substitution so a dropped block's tokens never dangle.
+  let out = stripInactiveProductBlocks(stepBody(deps, run, step), isActive);
   for (const [token, value] of Object.entries(sub)) out = out.replaceAll(token, () => value);
   if (deps.config.guidance) out += `\n\n## Repo-specific guidance\n\n${deps.config.guidance}\n`;
   out += scaffold(belt, step, prior, stepDoneCmd, askHumanCmd, bounceCmd, bounceTarget);

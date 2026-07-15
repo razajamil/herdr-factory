@@ -175,7 +175,7 @@ const BeltSchema = z.object({ ...beltBase, steps: z.array(BeltStepSchema).min(1,
 // The products a source materializes at belt_start — the roots of the dataflow graph the loader
 // validates each step's `consumes` against (only work_spec is ever a REQUIRED consume; work_raw /
 // close_reference are optional, so this only needs to be right for required edges).
-const SOURCE_PRODUCTS: Record<SourceType, ProductType[]> = {
+export const SOURCE_PRODUCTS: Record<SourceType, ProductType[]> = {
   jira: ["work_spec", "work_raw", "human_reply"],
   local_markdown: ["work_spec", "human_reply"],
   github_issues: ["work_spec", "work_raw", "human_reply", "close_reference"],
