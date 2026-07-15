@@ -10,11 +10,11 @@ import { VERSION } from "../version.ts";
 import { withExtractedTelemetryContext } from "../telemetry/index.ts";
 import { annotateCurrentSpan, recordHttpServerDurationEffect, withHttpServerSpan } from "../telemetry/effect.ts";
 import { runEffect } from "../runtime/effect.ts";
-import { bounceStep, claimTicket, reconcileRepo, reconcileRun, recordCaptureAttempt, requestHumanInput, resumeRun, teardownTicket, withRunLock, withRunLockWaiting, withTickLock } from "../core/reconcile.ts";
+import { claimTicket, reconcileRepo, reconcileRun, resumeRun, teardownTicket, withRunLockWaiting, withTickLock } from "../core/reconcile.ts";
+import { applySignal } from "../core/signals.ts";
 import { probeEvidenceCreds } from "../clients/evidence.ts";
 import { getAuthFailure } from "../auth/gate.ts";
 import { getCallback, recordCallback } from "./oauth-callback.ts";
-import { stepByName } from "../core/step.ts";
 import { resolveActiveRun, resolveBeltName } from "../resolve.ts";
 import type { Deps } from "../core/deps.ts";
 import {
@@ -284,82 +284,32 @@ export function createApp(ctx: ServerContext): OpenAPIHono {
     return c.json({ ran }, 200);
   });
 
+  // The four run-scoped agent signals are thin HTTP shells over the shared engine effect
+  // (core/signals.ts applySignal) — the SAME implementation the CLI's in-process fallback runs, so
+  // the two can't drift and each signal's lock discipline lives in one place. Adding one is a
+  // SIGNAL_DESCRIPTORS entry + an applySignal case + this mount.
   app.openapi(stepDoneRoute, async (c) => {
-    const { repo } = c.req.valid("param");
-    const { key, step, source } = c.req.valid("json");
-    const rt = ctx.getRepo(repo);
-    if (!rt) return c.json({ error: notConfigured(repo) }, 404);
-    const run = resolveActiveRun(rt.deps, key, source);
-    if (!run) return c.json({ ok: false, message: `${key}: no active run` }, 200);
-    const belt = rt.deps.resolveBelt(run.belt);
-    if (belt && !stepByName(belt, step)) {
-      return c.json({ ok: false, message: `${key}: step "${step}" is not in belt "${belt.name}"` }, 200);
-    }
-    rt.deps.store.markStepDone(run.id, step);
-    rt.deps.store.recordEvent({ runId: run.id, repo, ticketKey: key, type: "step_done", detail: { step } });
-    rt.deps.log("info", `${key}: step-done ${step} recorded`);
-    // Per-RUN lock: the nudge lands immediately even while a long tick is mid-pass — it only
-    // contends with work on this same run (in which case the flag is already down and the next
-    // pass advances it).
-    const advanced = await withRunLock(rt.deps, run.id, () => reconcileRun(rt.deps, rt.deps.store.getRun(run.id)!));
-    return c.json({ ok: true, advanced }, 200);
+    const rt = ctx.getRepo(c.req.valid("param").repo);
+    if (!rt) return c.json({ error: notConfigured(c.req.valid("param").repo) }, 404);
+    return c.json(await applySignal(rt.deps, "step-done", c.req.valid("json")), 200);
   });
 
   app.openapi(askHumanRoute, async (c) => {
-    const { repo } = c.req.valid("param");
-    const { key, step, source, question } = c.req.valid("json");
-    const rt = ctx.getRepo(repo);
-    if (!rt) return c.json({ error: notConfigured(repo) }, 404);
-    const run = resolveActiveRun(rt.deps, key, source);
-    if (!run) return c.json({ ok: false, message: `${key}: no active run` }, 200);
-    const belt = rt.deps.resolveBelt(run.belt);
-    if (belt && !stepByName(belt, step)) {
-      return c.json({ ok: false, message: `${key}: step "${step}" is not in belt "${belt.name}"` }, 200);
-    }
-    // Ask-human is a NON-monotonic phase flip (running → waiting_for_human), so it must hold the
-    // run lock: a concurrent reconcile on a stale `running` snapshot could advance the step and
-    // overwrite the flip, orphaning the question forever.
-    const { ran, result } = await withRunLockWaiting(rt.deps, run.id, async () => {
-      const res = await requestHumanInput(rt.deps, rt.deps.store.getRun(run.id)!, step, question);
-      await reconcileRun(rt.deps, rt.deps.store.getRun(run.id)!);
-      return res;
-    });
-    if (!ran) return c.json({ ok: false, message: `${key}: run busy — retry ask-human in a moment` }, 200);
-    return c.json(result!, 200);
+    const rt = ctx.getRepo(c.req.valid("param").repo);
+    if (!rt) return c.json({ error: notConfigured(c.req.valid("param").repo) }, 404);
+    return c.json(await applySignal(rt.deps, "ask-human", c.req.valid("json")), 200);
   });
 
   app.openapi(bounceRoute, async (c) => {
-    const { repo } = c.req.valid("param");
-    const { key, toStep, source, reason } = c.req.valid("json");
-    const rt = ctx.getRepo(repo);
-    if (!rt) return c.json({ error: notConfigured(repo) }, 404);
-    const run = resolveActiveRun(rt.deps, key, source);
-    if (!run) return c.json({ ok: false, message: `${key}: no active run` }, 200);
-    const belt = rt.deps.resolveBelt(run.belt);
-    if (!belt) return c.json({ ok: false, message: `${key}: run has no configured belt` }, 200);
-    const src = rt.deps.resolveSource(run.workSource);
-    if (!src) return c.json({ ok: false, message: `${key}: run has no configured work source` }, 200);
-    // Serialize the bounce (step rewind + pane re-dispatch) against anything else touching this run.
-    const { ran, result } = await withRunLockWaiting(rt.deps, run.id, () => bounceStep(rt.deps, rt.deps.store.getRun(run.id)!, belt, src, toStep, reason));
-    if (!ran) return c.json({ ok: false, message: `${key}: run busy — retry the bounce` }, 200);
-    return c.json(result!, 200);
+    const rt = ctx.getRepo(c.req.valid("param").repo);
+    if (!rt) return c.json({ error: notConfigured(c.req.valid("param").repo) }, 404);
+    return c.json(await applySignal(rt.deps, "bounce", c.req.valid("json")), 200);
   });
 
   app.openapi(captureAttemptRoute, async (c) => {
-    const { repo } = c.req.valid("param");
-    const { key, step, source } = c.req.valid("json");
-    const rt = ctx.getRepo(repo);
-    if (!rt) return c.json({ error: notConfigured(repo) }, 404);
-    const run = resolveActiveRun(rt.deps, key, source);
-    if (!run) return c.json({ ok: false, message: `${key}: no active run` }, 200);
-    const belt = rt.deps.resolveBelt(run.belt);
-    if (!belt) return c.json({ ok: false, message: `${key}: run has no configured belt` }, 200);
-    // Past the cap this parks the run (running → attention) — a non-monotonic flip, so hold the run
-    // lock like bounce/ask-human: a concurrent reconcile on a stale `running` snapshot must not
-    // overwrite the escalation.
-    const { ran, result } = await withRunLockWaiting(rt.deps, run.id, () => recordCaptureAttempt(rt.deps, rt.deps.store.getRun(run.id)!, belt, step));
-    if (!ran) return c.json({ ok: false, message: `${key}: run busy — retry the capture-attempt` }, 200);
-    return c.json(result!, 200);
+    const rt = ctx.getRepo(c.req.valid("param").repo);
+    if (!rt) return c.json({ error: notConfigured(c.req.valid("param").repo) }, 404);
+    return c.json(await applySignal(rt.deps, "capture-attempt", c.req.valid("json")), 200);
   });
 
   app.openapi(claimRoute, async (c) => {

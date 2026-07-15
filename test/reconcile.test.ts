@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { openDb } from "../src/db/index.ts";
 import { Store } from "../src/db/store.ts";
 import { applyPendingFocus, bounceStep, claimTicket, flushTransitionOutbox, reconcileRepo, reconcileRun, recordCaptureAttempt, requestHumanInput, resumeRun, withRunLock, withRunLockWaiting, withTickLock } from "../src/core/reconcile.ts";
+import { applySignal } from "../src/core/signals.ts";
 import { HerdrUnreachableError, type BeltRuntime, type Deps, type GitApi, type GitHubApi, type HerdrApi, type SourceRuntime, type WorkSource } from "../src/core/deps.ts";
 import { SourceUnauthenticatedError } from "../src/auth/errors.ts";
 import { getAuthFailure, resetAuthGate } from "../src/auth/gate.ts";
@@ -258,6 +259,46 @@ function seed(
   if (step) store.upsertRunStep(run.id, step, { paneId: "w1:p1" });
   return store.getRun(run.id)!;
 }
+
+// The shared run-scoped signal effect (core/signals.ts) that BOTH the HTTP handler and the CLI
+// in-process fallback call. These lock the seam: run resolution, the fire-and-forget vs waiting lock
+// choice, and the result shapes — the engine functions beneath (bounceStep, …) are covered above.
+describe("applySignal — shared run-scoped agent signal effect", () => {
+  it("step-done: marks the step done, records the event, and advances the belt (fire-and-forget lock)", async () => {
+    const { deps, store, worktree } = build();
+    const run = seed(store, worktree, "K-AS1", "running", "review");
+    store.upsertRunStep(run.id, "fix", { done: true });
+    const res = await applySignal(deps, "step-done", { key: "K-AS1", step: "review" });
+    expect(res.ok).toBe(true);
+    expect(store.getRun(run.id)!.step).toBe("pr"); // advanced past review
+    expect(store.getRunStep(run.id, "review")!.done).toBe(true);
+    expect(store.timeline("demo", "K-AS1").some((e) => e.type === "step_done")).toBe(true);
+  });
+
+  it("step-done: rejects a step that isn't in the run's belt (no advance)", async () => {
+    const { deps, store, worktree } = build();
+    const run = seed(store, worktree, "K-AS1b", "running", "review");
+    const res = await applySignal(deps, "step-done", { key: "K-AS1b", step: "not_a_step" });
+    expect(res.ok).toBe(false);
+    expect(res.message).toContain("not in belt");
+    expect(store.getRun(run.id)!.step).toBe("review"); // unchanged
+  });
+
+  it("no active run → ok:false with a bare message (no key prefix — the caller adds it)", async () => {
+    const { deps } = build();
+    expect(await applySignal(deps, "step-done", { key: "GHOST", step: "review" })).toEqual({ ok: false, message: "no active run" });
+  });
+
+  it("bounce: routes through the waiting run-lock, rewinds the step, clears the target's done", async () => {
+    const { deps, store, worktree } = build();
+    const run = seed(store, worktree, "K-AS2", "running", "review");
+    store.upsertRunStep(run.id, "fix", { paneId: "w1:pfix", done: true });
+    const res = await applySignal(deps, "bounce", { key: "K-AS2", toStep: "fix", reason: "the toast still 500s" });
+    expect(res.ok).toBe(true);
+    expect(store.getRun(run.id)!.step).toBe("fix");
+    expect(store.getRunStep(run.id, "fix")!.done).toBe(false);
+  });
+});
 
 describe("reconcile pipeline (work_to_pull_request belt)", () => {
   it("claims an eligible ticket → running fix (worktree + fix agent + ticket fetch + In-dev transition)", async () => {

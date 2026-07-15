@@ -12,8 +12,9 @@ import { openDb } from "../db/index.ts";
 import { Store } from "../db/store.ts";
 import { systemClock, type Run } from "../types.ts";
 import type { Deps } from "../core/deps.ts";
-import { bounceStep, claimTicket, reconcileRepo, reconcileRun, recordCaptureAttempt, requestHumanInput, resumeRun, teardownTicket, withRunLock, withRunLockWaiting, withTickLock } from "../core/reconcile.ts";
-import { MEMORY_DIR, stepByName } from "../core/step.ts";
+import { claimTicket, reconcileRepo, reconcileRun, resumeRun, teardownTicket, withRunLockWaiting, withTickLock } from "../core/reconcile.ts";
+import { applySignal, type SignalBody, type SignalResult } from "../core/signals.ts";
+import { MEMORY_DIR } from "../core/step.ts";
 import * as service from "../watchers/service.ts";
 import { buildDeps, today } from "../build-deps.ts";
 import { resolveActiveRun, resolveBeltName } from "../resolve.ts";
@@ -107,6 +108,18 @@ function bounceReasonText(opts: { reason?: string; reasonFile?: string }): strin
   const text = opts.reasonFile ? readFileSync(opts.reasonFile, "utf8") : opts.reason;
   if (!text?.trim()) fail("bounce: provide a non-empty --reason or --reason-file (the findings the earlier step must address)");
   return text.trim();
+}
+
+/** Send a run-scoped agent signal (step-done · ask-human · bounce · capture-attempt): route it
+ *  through the running server for a warm reconcile, with a direct in-process fallback so it still
+ *  lands while the server restarts (the next tick is the backstop either way). BOTH paths run the
+ *  same engine effect — `applySignal` on the server, or here in-process — so they can't drift. */
+async function dispatchSignal(repo: string, name: string, body: SignalBody): Promise<SignalResult> {
+  const { data } = await viaServerOrLocal(
+    { method: "POST", path: `/repos/${encodeURIComponent(repo)}/${name}`, body },
+    async () => applySignal(await buildDeps(repo), name, body),
+  );
+  return data as SignalResult;
 }
 
 /** Prompt for one line on stdin (paste-mode OAuth login). */
@@ -471,34 +484,7 @@ program
   .option("--source <name>", "the work source the run belongs to (passed by the agent)")
   .action(cliAction("step-done", async (key: string, step: string, opts: { source?: string }) => {
     try {
-      const repo = requireRepo();
-      // Route through the server (warm reconcile in ~ms) with a direct in-process fallback so the
-      // nudge still lands while the server is restarting — the next tick is the backstop either way.
-      const { data } = await viaServerOrLocal(
-        { method: "POST", path: `/repos/${encodeURIComponent(repo)}/step-done`, body: { key, step, source: opts.source } },
-        async () => {
-          const deps = await buildDeps(repo);
-          const run = resolveActiveRun(deps, key, opts.source);
-          if (!run) {
-            deps.log("warn", `${key}: no active run to mark step-done`);
-            return { ok: false, message: "no active run" };
-          }
-          // The valid step set is belt-specific; reject a step that isn't part of the run's belt.
-          const belt = deps.resolveBelt(run.belt);
-          if (belt && !stepByName(belt, step)) {
-            deps.log("warn", `${key}: step "${step}" is not in belt "${belt.name}"`);
-            return { ok: false, message: `step "${step}" is not in belt "${belt.name}"` };
-          }
-          deps.store.markStepDone(run.id, step);
-          deps.store.recordEvent({ runId: run.id, repo: deps.config.repoName, ticketKey: key, type: "step_done", detail: { step } });
-          deps.log("info", `${key}: step-done ${step} recorded`);
-          // Per-run lock: the nudge lands even while a tick is mid-pass on other runs.
-          const advanced = await withRunLock(deps, run.id, () => reconcileRun(deps, deps.store.getRun(run.id)!));
-          if (!advanced) deps.log("info", `${key}: run busy — the next pass will advance the belt`);
-          return { ok: true, advanced };
-        },
-      );
-      const d = data as { ok?: boolean; message?: string };
+      const d = await dispatchSignal(requireRepo(), "step-done", { key, step, source: opts.source });
       if (d.ok === false) console.log(`${key}: ${d.message ?? "no active run"}`);
     } catch (e) {
       fail(e);
@@ -513,33 +499,8 @@ program
   .option("--question-file <path>", "file containing the question text")
   .action(cliAction("ask-human", async (key: string, step: string, opts: { source?: string; question?: string; questionFile?: string }) => {
     try {
-      const repo = requireRepo();
       const question = humanQuestionText(opts);
-      const { data } = await viaServerOrLocal(
-        { method: "POST", path: `/repos/${encodeURIComponent(repo)}/ask-human`, body: { key, step, source: opts.source, question } },
-        async () => {
-          const deps = await buildDeps(repo);
-          const run = resolveActiveRun(deps, key, opts.source);
-          if (!run) {
-            deps.log("warn", `${key}: no active run to ask human`);
-            return { ok: false, message: "no active run" };
-          }
-          const belt = deps.resolveBelt(run.belt);
-          if (belt && !stepByName(belt, step)) {
-            deps.log("warn", `${key}: step "${step}" is not in belt "${belt.name}"`);
-            return { ok: false, message: `step "${step}" is not in belt "${belt.name}"` };
-          }
-          // Non-monotonic phase flip — must hold the run lock (see the server handler).
-          const { ran, result } = await withRunLockWaiting(deps, run.id, async () => {
-            const res = await requestHumanInput(deps, deps.store.getRun(run.id)!, step, question);
-            await reconcileRun(deps, deps.store.getRun(run.id)!);
-            return res;
-          });
-          if (!ran) return { ok: false, message: "run busy — retry ask-human in a moment" };
-          return result!;
-        },
-      );
-      const d = data as { ok?: boolean; questionId?: number; posted?: boolean; message?: string };
+      const d = await dispatchSignal(requireRepo(), "ask-human", { key, step, source: opts.source, question });
       if (d.ok === false) {
         console.log(`${key}: ${d.message ?? "no active run"}`);
         return;
@@ -559,29 +520,8 @@ program
   .option("--reason-file <path>", "file containing the reason/findings")
   .action(cliAction("bounce", async (key: string, toStep: string, opts: { source?: string; reason?: string; reasonFile?: string }) => {
     try {
-      const repo = requireRepo();
       const reason = bounceReasonText(opts);
-      const { data } = await viaServerOrLocal(
-        { method: "POST", path: `/repos/${encodeURIComponent(repo)}/bounce`, body: { key, toStep, source: opts.source, reason } },
-        async () => {
-          const deps = await buildDeps(repo);
-          const run = resolveActiveRun(deps, key, opts.source);
-          if (!run) {
-            deps.log("warn", `${key}: no active run to bounce`);
-            return { ok: false, message: "no active run" };
-          }
-          const belt = deps.resolveBelt(run.belt);
-          if (!belt) return { ok: false, message: `run has no configured belt "${run.belt}"` };
-          const src = deps.resolveSource(run.workSource);
-          if (!src) return { ok: false, message: `run has no configured work source "${run.workSource}"` };
-          // The bounce rewinds the step + re-dispatches a pane, so it must run UNDER this run's
-          // lock (serialized against the tick's pass over this run), not as a fire-and-forget nudge.
-          const { ran, result } = await withRunLockWaiting(deps, run.id, () => bounceStep(deps, deps.store.getRun(run.id)!, belt, src, toStep, reason));
-          if (!ran) return { ok: false, message: "run busy — retry the bounce in a moment" };
-          return result!;
-        },
-      );
-      const d = data as { ok?: boolean; escalated?: boolean; message?: string };
+      const d = await dispatchSignal(requireRepo(), "bounce", { key, toStep, source: opts.source, reason });
       if (d.ok === false) {
         console.log(`${key}: ${d.message ?? "bounce failed"}`);
         return;
@@ -602,26 +542,7 @@ program
   .option("--source <name>", "the work source the run belongs to (passed by the agent)")
   .action(cliAction("capture-attempt", async (key: string, step: string, opts: { source?: string }) => {
     try {
-      const repo = requireRepo();
-      const { data } = await viaServerOrLocal(
-        { method: "POST", path: `/repos/${encodeURIComponent(repo)}/capture-attempt`, body: { key, step, source: opts.source } },
-        async () => {
-          const deps = await buildDeps(repo);
-          const run = resolveActiveRun(deps, key, opts.source);
-          if (!run) {
-            deps.log("warn", `${key}: no active run to record a capture attempt`);
-            return { ok: false, message: "no active run" };
-          }
-          const belt = deps.resolveBelt(run.belt);
-          if (!belt) return { ok: false, message: `run has no configured belt "${run.belt}"` };
-          // Past the cap this parks the run (a non-monotonic phase flip), so run it UNDER the run
-          // lock — serialized against the tick's pass over this run, like bounce.
-          const { ran, result } = await withRunLockWaiting(deps, run.id, () => recordCaptureAttempt(deps, deps.store.getRun(run.id)!, belt, step));
-          if (!ran) return { ok: false, message: "run busy — retry the capture-attempt in a moment" };
-          return result!;
-        },
-      );
-      const d = data as { ok?: boolean; attempts?: number; escalated?: boolean; message?: string };
+      const d = await dispatchSignal(requireRepo(), "capture-attempt", { key, step, source: opts.source });
       if (d.ok === false) {
         console.log(`${key}: ${d.message ?? "capture-attempt failed"}`);
         return;
