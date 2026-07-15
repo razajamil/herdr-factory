@@ -571,8 +571,8 @@ pile of runs waiting on humans must not starve the belt of new claims. History i
 (we set `ended_at`), so the web UI can show attempts, outcomes, and durations.
 
 **event types:** `claimed · transition · worktree_created · step_spawned · step_done · bounced ·
-stale · human_question · human_reply · focus_applied · pr_opened · resolver_woken · merged ·
-closed · torn_down · attention · resumed · error`
+capture_attempt · evidence_uploaded · evidence_upload_failed · stale · human_question · human_reply ·
+focus_applied · pr_opened · resolver_woken · merged · closed · torn_down · attention · resumed · error`
 (plus legacy `worker_*` / `review_*` kept for old-run history).
 
 ---
@@ -826,6 +826,15 @@ step (`spawnStep`):
    the ask-human protocol, the bounce protocol (when the step declares a bounce), and the
    finish protocol — write your handoff note, then signal `step-done`. The rendered prompt is
    written to `.memory/herdr-factory/prompt-<step>.md`; the agent is told to read it.
+   Two dataflow refinements keep a primitive honest in any belt (`productActiveFor` in `step.ts`,
+   mirroring the load-time check): **capability-scoped tokens**
+   (`@@EVIDENCE_DIR@@`/`@@EVIDENCE_UPLOAD_CMD@@`/`@@CAPTURE_ATTEMPT_CMD@@`) are injected only when
+   their product is live upstream — an evidence token reaches `review`/`pr` only if a step *produces*
+   `evidence` — and **product-gated clauses** `@@WHEN:<product>@@ … @@END@@` are stripped (prose +
+   tokens) when their product is inactive. So a work→review→pr belt's prompts carry no evidence
+   references and no dangling tokens. Base prompts name neighbours only through
+   `@@HANDOFF_IN@@`/`@@STEPS@@`, never literally, so a primitive composed into a differently-ordered
+   belt still reads correctly.
 3. **Handoff out** — before signalling, the agent writes
    `.memory/herdr-factory/handoff-<step>.md` (did / why / uncertain / verify-next).
 4. **Signal** — `herdr-factory --repo <name> step-done <KEY> <step>` sets the step's `done`

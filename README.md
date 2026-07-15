@@ -592,12 +592,24 @@ Around the body the engine always adds: a handover scaffold (which belt and step
 full step sequence, the prior step's handoff note and pane/session pointer for on-demand
 questions, the ask-human protocol, the bounce protocol where applicable, and the finish protocol —
 write your handoff, then run step-done), your repo's `guidelines-prompt.md`, and token
-substitution. Available tokens:
+substitution. Universal tokens (always injected):
 
 `@@KEY@@ @@REPO@@ @@BELT@@ @@STEPS@@ @@STEP@@ @@TYPE@@ @@SUMMARY@@ @@BRANCH@@ @@WORKTREE@@
 @@MEMORY_DIR@@ @@WORK_DOC@@ @@WORK_DOC_KIND@@ @@HANDOFF_IN@@ @@HANDOFF_OUT@@ @@PRIOR_PANE@@
-@@PRIOR_SESSION@@ @@STEP_DONE_CMD@@ @@BOUNCE_CMD@@ @@BOUNCE_TARGET@@ @@EVIDENCE_DIR@@
-@@EVIDENCE_UPLOAD_CMD@@ @@CLI@@`
+@@PRIOR_SESSION@@ @@STEP_DONE_CMD@@ @@ASK_HUMAN_CMD@@ @@BOUNCE_CMD@@ @@BOUNCE_TARGET@@
+@@BOUNCE_REASON_FILE@@ @@CLI@@`
+
+Plus **capability-scoped** tokens, injected only when their product is actually part of this belt's
+dataflow: `@@EVIDENCE_DIR@@ @@EVIDENCE_UPLOAD_CMD@@ @@CAPTURE_ATTEMPT_CMD@@` appear only when an
+upstream step *produces* `evidence` — so in a work → review → pr belt (evidence skipped) the
+review/pr prompts carry no evidence tokens at all.
+
+Prompts also support **product-gated clauses** — `@@WHEN:<product>@@ … @@END@@` — kept only when that
+product is active for the step (produced by it or upstream), otherwise the whole clause (prose **and**
+its tokens) is dropped. That's how the shipped `review`/`pr` prompts reference evidence without ever
+pointing at evidence a shorter belt never captured. Base prompts never name neighbour steps by name —
+they reference prior/next work only through `@@HANDOFF_IN@@`/`@@HANDOFF_OUT@@` and the `@@STEPS@@`
+sequence, so a primitive reads correctly in any belt order.
 
 Everything a run reads and writes lives in `.memory/herdr-factory/` inside its worktree: the
 rendered prompts, handoff notes, the work doc (`ticket.json`, or `task.md`/`task/`), attachments,
@@ -607,8 +619,8 @@ bounce feedback, human questions and replies, and captured evidence.
 
 `config.yml`'s first line — `# yaml-language-server: $schema=../../config.schema.json` — points
 the YAML language server at a JSON Schema generated from the engine's own zod schema (so it can't
-drift): autocomplete, required fields, enums, and unknown-key errors (catching the classic
-`agents`-on-a-`custom`-belt mixup). `herdr-factory install` writes it to
+drift): autocomplete, required fields, enums (e.g. a valid step `type`), and unknown-key errors.
+`herdr-factory install` writes it to
 `~/.config/herdr-factory/config.schema.json`; regenerate after an upgrade with
 `herdr-factory schema`. A committed copy at the repo root serves the in-repo example (`npm run
 schema`; a test guards it against drift). Cross-field rules — belt `source` refs, unique names,
