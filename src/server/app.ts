@@ -130,19 +130,31 @@ async function statusPayload(rt: RepoRuntime, quick = false, refreshDiagnostics 
   const cfg = rt.deps.config;
   const active = rt.deps.store.activeRuns(cfg.repoName);
   const finished = rt.deps.store.listRuns(cfg.repoName, true).filter((r) => r.endedAt !== null);
-  const runView = async (r: (typeof active)[number]) => ({
-    id: r.id,
-    ticketKey: r.ticketKey,
-    workSource: r.workSource,
-    belt: r.belt,
-    phase: r.phase as string,
-    step: r.step,
-    prNumber: r.prNumber,
-    summary: r.summary,
-    outcome: r.outcome as string | null,
-    worker: !quick && r.paneId ? await rt.deps.herdr.paneState(r.paneId).catch(() => "unknown") : null,
-    steps: rt.deps.store.runStepsFor(r.id).map((s) => ({ step: s.step as string, done: s.done })),
-  });
+  const runView = async (r: (typeof active)[number]) => {
+    // Surface a stuck async upload hiding behind a "done" evidence step. errorKind != null ⇒ at least
+    // one attempt has failed (a freshly-enqueued, not-yet-attempted row is pending, not a problem).
+    const stuckUploads = rt.deps.store.undeliveredEvidenceUploadsForRun(r.id).filter((u) => u.errorKind != null);
+    const problem = stuckUploads.length === 0
+      ? undefined
+      : {
+          kind: "evidence-upload" as const,
+          detail: stuckUploads.some((u) => u.errorKind === "auth") ? "evidence not uploaded — AWS creds" : "evidence upload retrying",
+        };
+    return {
+      id: r.id,
+      ticketKey: r.ticketKey,
+      workSource: r.workSource,
+      belt: r.belt,
+      phase: r.phase as string,
+      step: r.step,
+      prNumber: r.prNumber,
+      summary: r.summary,
+      outcome: r.outcome as string | null,
+      worker: !quick && r.paneId ? await rt.deps.herdr.paneState(r.paneId).catch(() => "unknown") : null,
+      steps: rt.deps.store.runStepsFor(r.id).map((s) => ({ step: s.step as string, done: s.done })),
+      ...(problem ? { problem } : {}),
+    };
+  };
   const sources = quick
     ? Promise.resolve(cfg.sources.map((s) => ({ name: s.name, type: s.type as string })))
     : Promise.all(cfg.sources.map(async (s) => ({ name: s.name, type: s.type as string, auth: await sourceAuthStatus(rt, s.name, refreshDiagnostics) })));

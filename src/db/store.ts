@@ -1014,6 +1014,24 @@ export class Store {
     return row !== undefined;
   }
 
+  /** On AWS-creds RECOVERY (SSO re-login): make every auth-stuck upload due now, so the next Phase 0
+   *  flush lands it instead of waiting out the (up-to-1h) backoff it accrued while creds were expired.
+   *  Mirrors retryTransitionsForSource. Scoped to error_kind='auth' — transient/permanent rows keep
+   *  their own retry policy (a flaky-S3 backoff or a config error creds recovery can't fix). Returns
+   *  how many rows were re-queued. */
+  retryEvidenceUploadsForRepo(repo: string): number {
+    const t = this.now();
+    const info = this.db
+      .prepare(
+        `UPDATE evidence_uploads SET next_attempt_at = ?, updated_at = ?
+         WHERE repo = ? AND error_kind = 'auth' AND delivered_at IS NULL AND permanent_failed_at IS NULL AND abandoned_at IS NULL`,
+      )
+      .run(t, t, repo);
+    const requeued = Number(info.changes);
+    if (requeued > 0) telemetryEvent("store.evidence_upload.creds_recovered", { repo, "evidence_upload.requeued": requeued });
+    return requeued;
+  }
+
   // --- human-in-the-loop questions ------------------------------------------
 
   getHumanQuestion(id: number): HumanQuestion | undefined {

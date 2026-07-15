@@ -316,6 +316,31 @@ describe("Store", () => {
       expect(store.abandonEvidenceUploadsForRun(run.id, "torn down")).toBe(1);
       expect(store.undeliveredEvidenceUploadsForRun(run.id)).toHaveLength(0);
     });
+
+    it("retryEvidenceUploadsForRepo makes auth-stuck rows due now; leaves transient/terminal rows alone", () => {
+      const { store, setNow } = makeStore(1000);
+      // Distinct runs — one pending upload each (a fresh capture on the same run supersedes the prior).
+      const mkRun = (k: string) => store.createRun({ repo: "r", workSource: "jira", belt: "ship", ticketKey: k, branch: `fix/${k}` });
+      const auth = store.enqueueEvidenceUpload({ runId: mkRun("K-A").id, repo: "r", ticketKey: "K-A", keyPrefix: "p/A", evidenceDir: "/wt/ev" });
+      const transient = store.enqueueEvidenceUpload({ runId: mkRun("K-B").id, repo: "r", ticketKey: "K-B", keyPrefix: "p/B", evidenceDir: "/wt/ev" });
+      const delivered = store.enqueueEvidenceUpload({ runId: mkRun("K-C").id, repo: "r", ticketKey: "K-C", keyPrefix: "p/C", evidenceDir: "/wt/ev" });
+      setNow(1300);
+      store.recordEvidenceAttempt(auth.id, "sso expired", "auth"); // next_attempt_at pushed to 1300+60
+      store.recordEvidenceAttempt(transient.id, "timeout", "transient");
+      store.markEvidenceDelivered(delivered.id);
+      expect(store.getEvidenceUpload(auth.id)!.nextAttemptAt).toBe(1360);
+      expect(store.dueEvidenceUploads("r")).toHaveLength(0); // both pending rows are backing off
+
+      // Creds recovered: only the auth-stuck row is re-queued due-now (1350, still inside its own 1360
+      // backoff — proving the reset, not the backoff, is what makes it due). The transient row keeps
+      // its 1360 (not yet due), so the due list isolates the auth row.
+      setNow(1350);
+      expect(store.retryEvidenceUploadsForRepo("r")).toBe(1);
+      expect(store.getEvidenceUpload(auth.id)!.nextAttemptAt).toBe(1350);
+      expect(store.getEvidenceUpload(transient.id)!.nextAttemptAt).toBe(1360); // untouched (1300 + 60s backoff)
+      expect(store.getEvidenceUpload(delivered.id)!.deliveredAt).not.toBeNull(); // untouched
+      expect(store.dueEvidenceUploads("r").map((u) => u.id)).toEqual([auth.id]);
+    });
   });
 
   describe("source OAuth tokens (source_auth)", () => {

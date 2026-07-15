@@ -41,6 +41,9 @@ function runColor(run: ActiveRun): string {
   // "attention" is the engine's needs-a-human state (stalled / over-budget / asked a human) — color
   // it (and failed/abandoned outcomes) red so it stands out as needing action.
   if (p === "attention" || /attention|stall|wait|human/.test(p) || /fail|error|abandon|block/.test(o) || /fail|error|block/.test(p)) return theme.status.bad;
+  // A background problem (e.g. a stuck evidence upload) — amber, so it stands out without shouting like
+  // the red needs-a-human states. Attention/failure above still win.
+  if (run.problem) return theme.status.warn;
   if (/review|pr|ci|merg/.test(p)) return theme.accent;
   return theme.text.primary;
 }
@@ -195,7 +198,8 @@ export function createDashboard(renderer: CliRenderer, actions: { confirm: Confi
         table.rows.forEach((content, index) => {
           const run = beltRuns[index];
           if (run) {
-            specs.push({ content: `  ${content}`, fg: runColor(run), target: { repo: name, kind: "run", key: run.ticketKey, source: run.workSource } });
+            const marker = run.problem ? `  ⚠ ${run.problem.detail}` : "";
+            specs.push({ content: `  ${content}${marker}`, fg: runColor(run), target: { repo: name, kind: "run", key: run.ticketKey, source: run.workSource } });
             return;
           }
           const item = beltEligible[index - beltRuns.length]!;
@@ -208,7 +212,8 @@ export function createDashboard(renderer: CliRenderer, actions: { confirm: Confi
         for (const run of unassigned) {
           const step = run.step ? `/${run.step}` : "";
           const summary = run.summary ? `  ${run.summary}` : "";
-          specs.push({ content: `    ${run.ticketKey}  ${run.phase}${step}${summary}`, fg: runColor(run), target: { repo: name, kind: "run", key: run.ticketKey, source: run.workSource } });
+          const marker = run.problem ? `  ⚠ ${run.problem.detail}` : "";
+          specs.push({ content: `    ${run.ticketKey}  ${run.phase}${step}${summary}${marker}`, fg: runColor(run), target: { repo: name, kind: "run", key: run.ticketKey, source: run.workSource } });
         }
       }
     }

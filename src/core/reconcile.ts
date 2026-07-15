@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import * as Effect from "effect/Effect";
-import { classifyS3Error, uploadEvidence } from "../clients/evidence.ts";
+import { classifyS3Error, probeEvidenceCreds, uploadEvidence } from "../clients/evidence.ts";
 import { runEffect } from "../runtime/effect.ts";
 import { HerdrUnreachableError, type BeltRuntime, type Deps, type SourceRuntime } from "./deps.ts";
 import type { StepConfig } from "../config.ts";
@@ -194,6 +194,18 @@ export async function flushTransitionOutbox(deps: Deps): Promise<void> {
 export async function flushEvidenceUploads(deps: Deps): Promise<void> {
   const repo = deps.config.repoName;
   const ev = deps.config.evidence;
+  // Auto-resume on AWS-creds recovery: if an upload is stuck on expired creds, cheaply probe once (a
+  // HeadBucket, gated so the happy path never probes). The moment creds are live again, make every
+  // auth-stuck row due now so THIS pass uploads it — no human "retry" gesture, no waiting out the
+  // backoff. Mirrors the source-auth path's retryTransitionsForSource. A probe error is treated as
+  // still-down (conservative: don't reset on an ambiguous probe), so recovery just lands a tick later.
+  if (ev && deps.store.authStuckEvidenceUpload(repo)) {
+    const probe = await probeEvidenceCreds(ev).catch(() => ({ auth: true, reason: "probe failed" }));
+    if (!probe.auth) {
+      const requeued = deps.store.retryEvidenceUploadsForRepo(repo);
+      if (requeued > 0) deps.log("info", `evidence upload: AWS creds recovered — re-queued ${requeued} stuck upload(s) for immediate retry`);
+    }
+  }
   for (const job of deps.store.dueEvidenceUploads(repo)) {
     if (!ev) {
       deps.store.markEvidencePermanentFailed(job.id, "evidence config removed");

@@ -42,6 +42,9 @@ export interface ActiveRun {
   outcome: string | null;
   worker: string | null;
   steps: { step: string; done: boolean }[];
+  /** A background problem the step columns can't show — e.g. the evidence step reads "done" (URLs
+   *  emitted) but its media upload is still stuck retrying. Absent when the run is healthy. */
+  problem?: { kind: "evidence-upload"; detail: string };
 }
 
 export interface RepoStatus {

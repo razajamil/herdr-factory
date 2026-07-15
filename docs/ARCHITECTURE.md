@@ -602,7 +602,11 @@ the note would go to is what's gone). Phase 0 then also flushes the **evidence-u
 retried until it lands, so an AWS SSO session expiring mid-run no longer ships a PR with broken
 evidence links (the `evidence-upload` CLI publishes the deterministic URLs + attempts inline
 up-front, then enqueues the bytes here). A persistent auth failure notifies the human to
-`aws sso login`; a non-retryable error or a vanished capture dir is marked permanently failed —
+`aws sso login`; and when a row is auth-stuck the flush cheaply probes creds once (gated on a stuck
+row — the happy path never probes) and, the moment they're live again, resets every auth-stuck row
+due-now (`retryEvidenceUploadsForRepo`, mirroring the source-auth `retryTransitionsForSource`) so
+the same pass uploads it instead of waiting out the up-to-1h backoff — no manual retry, no waiting.
+A non-retryable error or a vanished capture dir is marked permanently failed —
 there's no source-stale two-phase, as evidence has no "gone at source". **Phase A** advances every active run one idempotent step, **in parallel
 with bounded concurrency** (`limits.reconcile_concurrency`, default 8, via `Effect.forEach` —
 most of a run's reconcile is subprocess/network wait, so pass wall-clock stays roughly flat as
@@ -1071,7 +1075,11 @@ herdr-factory help
 ```
 
 Plain `herdr-factory` (no arguments) opens the **TUI** (Dashboard · Config editor · Doctor) via
-`bin/herdr-factory-tui`.
+`bin/herdr-factory-tui`. The Dashboard's job table paints a run **amber with a `⚠`** when it carries
+a background `problem` — a signal orthogonal to the per-step done/pending cells, so a stuck async
+upload shows even while its `evidence` step reads _done_. It's computed server-side per active run
+(`/status` `active[].problem`, from `undeliveredEvidenceUploadsForRun` where a failure has been
+recorded) so any `/status` reader sees it; the needs-a-human red (attention/failed) still outranks it.
 
 **Server routing.** The mutating + nudge commands (`tick`, `step-done`, `ask-human`, `bounce`,
 `resume`, `claim`, `teardown`) route through the running server (`POST /repos/:repo/…`) when it's

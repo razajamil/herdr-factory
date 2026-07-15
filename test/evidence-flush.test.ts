@@ -8,16 +8,17 @@ import { join } from "node:path";
 // applies to it too.
 vi.mock("../src/clients/evidence.ts", async (orig) => {
   const actual = await orig<typeof import("../src/clients/evidence.ts")>();
-  return { ...actual, uploadEvidence: vi.fn() };
+  return { ...actual, uploadEvidence: vi.fn(), probeEvidenceCreds: vi.fn() };
 });
 
-import { uploadEvidence } from "../src/clients/evidence.ts";
+import { probeEvidenceCreds, uploadEvidence } from "../src/clients/evidence.ts";
 import { flushEvidenceUploads } from "../src/core/reconcile.ts";
 import { openDb } from "../src/db/index.ts";
 import { Store } from "../src/db/store.ts";
 import type { Deps } from "../src/core/deps.ts";
 
 const upload = vi.mocked(uploadEvidence);
+const probe = vi.mocked(probeEvidenceCreds);
 
 const authErr = () => Object.assign(new Error("The SSO session associated with this profile has expired"), { name: "CredentialsProviderError" });
 const permErr = () => Object.assign(new Error("bucket missing"), { name: "NoSuchBucket" });
@@ -42,7 +43,12 @@ function setup() {
 }
 
 describe("flushEvidenceUploads", () => {
-  beforeEach(() => upload.mockReset());
+  beforeEach(() => {
+    upload.mockReset();
+    // Default: creds still down, so the recovery-probe never re-queues unless a test opts in.
+    probe.mockReset();
+    probe.mockResolvedValue({ auth: true, reason: "down" });
+  });
 
   it("uploads a due job → delivered + evidence_uploaded event", async () => {
     const { deps, store, run, enqueue, setNow } = setup();
@@ -74,6 +80,37 @@ describe("flushEvidenceUploads", () => {
     await flushEvidenceUploads(deps);
     expect(store.getEvidenceUpload(job.id)!.deliveredAt).not.toBeNull();
     expect(store.authStuckEvidenceUpload("r")).toBe(false);
+  });
+
+  it("creds-recovery probe re-queues an auth-stuck upload due-now — delivers WITHIN the backoff window", async () => {
+    const { deps, store, run, enqueue, setNow } = setup();
+    const job = enqueue();
+    setNow(2400);
+    upload.mockRejectedValueOnce(authErr());
+    await flushEvidenceUploads(deps); // attempt 1 fails → auth-stuck, next_attempt_at pushed to 2460
+    expect(store.authStuckEvidenceUpload("r")).toBe(true);
+    expect(store.getEvidenceUpload(job.id)!.nextAttemptAt).toBe(2460);
+
+    // Only 5s later — still well inside the 60s backoff, so a plain flush would NOT retry. But creds
+    // are now live: the probe fires (gated on the stuck row), re-queues due-now, and this same pass
+    // uploads. No human action, no waiting out the backoff.
+    setNow(2405);
+    probe.mockResolvedValue({ auth: false, reason: "ok" });
+    upload.mockResolvedValueOnce({ files: ["shot.png"] });
+    await flushEvidenceUploads(deps);
+    expect(probe).toHaveBeenCalledTimes(1);
+    expect(upload).toHaveBeenCalledTimes(2);
+    expect(store.getEvidenceUpload(job.id)!.deliveredAt).not.toBeNull();
+    expect(store.authStuckEvidenceUpload("r")).toBe(false);
+  });
+
+  it("does NOT probe on the happy path (no stuck upload)", async () => {
+    const { deps, enqueue, setNow } = setup();
+    enqueue();
+    setNow(2400);
+    upload.mockResolvedValueOnce({ files: ["shot.png"] });
+    await flushEvidenceUploads(deps);
+    expect(probe).not.toHaveBeenCalled();
   });
 
   it("permanent (config) error → permanent-failed + evidence_upload_failed event + one notify", async () => {

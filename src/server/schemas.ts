@@ -112,6 +112,7 @@ const StatusResponse = z
         outcome: z.string().nullable(),
         worker: z.string().nullable(),
         steps: z.array(z.object({ step: z.string(), done: z.boolean() })),
+        problem: z.object({ kind: z.literal("evidence-upload"), detail: z.string() }).optional(),
       }),
     ),
     finished: z.array(

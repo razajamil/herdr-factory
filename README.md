@@ -349,7 +349,9 @@ brief's front-matter). Route bugs to one belt and stories to another, programmat
   `step-done` lands even mid-restart. Workers live in herdr and survive factory restarts. Source
   status write-backs **and S3 evidence uploads** are persisted intents, retried in the background
   until confirmed — an upload survives an AWS SSO session expiring mid-run instead of shipping a PR
-  with broken evidence links (a persistent auth failure pings you to `aws sso login`).
+  with broken evidence links (a persistent auth failure pings you to `aws sso login`, and the next
+  tick auto-retries the moment credentials come back — it re-queues due-now instead of waiting out
+  the backoff, so there's nothing to press).
 - **Built to scale.** Active runs reconcile in parallel under per-run locks; Jira and GitHub
   traffic flows through token buckets (GitHub's is a process-wide budget) with
   `Retry-After`-honoring retries; all watched PRs share one batched
@@ -359,8 +361,11 @@ brief's front-matter). Route bugs to one belt and stories to another, programmat
   supervisor restarts it if it's down, wedged, or outdated; auto-update ships new code (and new
   Node runtimes) within ~a minute of a push, draining gracefully before restart.
 - **A control room.** Running `herdr-factory` with no arguments opens a full-screen TUI —
-  live dashboard, a schema-validated config editor, and doctor. The server also exposes a local
-  HTTP API (`127.0.0.1:8765`) with an OpenAPI spec at `/doc` and Swagger UI at `/ui`.
+  live dashboard, a schema-validated config editor, and doctor. The dashboard's job table flags a
+  run whose background work is stuck even when its steps read _done_ — e.g. an evidence step that
+  finished but whose media upload is still retrying on expired AWS creds shows an amber `⚠` on that
+  row. The server also exposes a local HTTP API (`127.0.0.1:8765`) with an OpenAPI spec at `/doc`
+  and Swagger UI at `/ui`.
 - **Observable.** Set `HERDR_FACTORY_TELEMETRY=1` for OpenTelemetry traces and metrics; a local
   Grafana stack ships via `docker-compose.telemetry.yml` (see [`docs/TELEMETRY.md`](docs/TELEMETRY.md)).
 
