@@ -1,8 +1,10 @@
 # Design — Step primitives, product capabilities, and composable belts
 
-**Status:** proposal · **Scope:** full redesign in one pass · **Config:** clean break
-(no back-compat alias) · **Anchor:** `work_to_pull_request` must resolve byte-identically to
-today's `PR_STEPS`.
+**Status:** implemented (2026-07) · **Scope:** full redesign in one pass · **Config:** clean break
+(no back-compat alias) · **Anchor:** `work_to_pull_request` resolves byte-identically to the
+historical `PR_STEPS` (asserted in `test/config.test.ts`). The sections below are the original
+proposal (kept for rationale); **Implementation status** immediately after records — verified against
+source — where the shipped code matches, diverged, or deferred.
 
 > Goal: make a `custom` belt **exactly as reliable, powerful, and composable as
 > `work_to_pull_request`**. Today custom steps get the dumb subset — no bounce, no evidence, no
@@ -10,6 +12,38 @@ today's `PR_STEPS`.
 > coherent. This turns every capability w2pr enjoys into a **declared, reusable primitive** the
 > reconciler wires generically, and adds **load-time typed-dataflow validation** so a hand-built
 > belt fails at config-parse time instead of mid-run.
+
+---
+
+## Implementation status (as-built — verified against source)
+
+The redesign shipped. The three registries, the clean-break belt model, load-time dataflow
+validation, `read_only` enforcement, the `run_products` table, and the render-time optional-consume
+dropping are all live. This table is the delta between the proposal below and the shipped code.
+
+**Shipped as designed**
+
+- **§1/§3 — three registries.** `STEP_DESCRIPTORS` (`src/steps/registry.ts`: `work`/`evidence`/`review`/`pr`/`custom`), `PRODUCT_CAPABILITIES` (`src/products/registry.ts`), `SIGNAL_DESCRIPTORS` (`src/signals/registry.ts`). The reconciler branches on declarations (`consumes`/`produces`/`controls`/`guards`/posture), never a step name.
+- **§6 — effects.** `belt_start → in_development` is the engine default at claim; `produce(pull_request) → in_review` rides the `pull_request` capability's `effectOnProduce`; both fire forward-only/monotonic through the transition outbox.
+- **§7 — `read_only` declared *and* enforced.** HEAD movement during a read-only step (`evidence`/`review`) parks the run (`core/reconcile.ts`; baseline HEAD captured at spawn in `core/step.ts`).
+- **§8 — typed dataflow, both halves.** Load-time: a required consume with no upstream producer rejects the belt, and a bounce emitter needs an earlier `bounce_feedback` consumer (`config.ts` `superRefine`). Render-time: an unsatisfied *optional* consume drops its `@@TOKEN@@`s and its `@@WHEN:<product>@@…@@END@@` clause (`productActiveFor` / `stripInactiveProductBlocks` in `core/step.ts`), so a work→review→pr belt never references evidence it didn't capture.
+- **§10 — `run_products` table (migration v18).** PR-watch state (`pr_number`/`resolver_active`/`last_thread_sig`) moved off `runs`; `countOccupying` joins it, so a `reviewing` run occupies a claim slot only while its resolver is active. `StepName` widened to an open `string`.
+- **§11 — clean break.** `belt_type` and the `agents:` map are gone from config input; a belt is one ordered `steps[]`. `config.schema.json` regenerated (drift-tested in `test/config.test.ts`).
+- **§12 — contract suites.** Per-descriptor (`test/step-descriptor-contract.test.ts`) + belt-composition + the w2pr byte-identical anchor (`test/config.test.ts`, "recreates work_to_pull_request byte-identically"). A dedicated render-gating suite: `test/step-prompt-dataflow.test.ts`.
+
+**Diverged from the proposal**
+
+- **§2 — `basePrompt` is optional (`basePrompt?`), not always-present.** `custom` ships no base prompt and the `enginePrompt === undefined` assembly branch in `core/step.ts` was **kept** (the proposal expected the placeholder to erase it).
+- **§2 — no `tui?: StepFieldSpec` on `StepDescriptor`.** TUI step rows are still rendered by `tui/config-fields.ts`, not descriptor-driven.
+- **§11 — a `beltType` value survives as a display-only label** on the resolved belt (`config.ts`; shown in CLI/TUI/server), derived from `watchPr` and never branched on by the reconciler. "Gone" holds for config *input*, not the derived label.
+- **§4 — the resolver prompt was not moved into the prompt library.** `core/watch.ts` still owns a hardcoded single-line `resolverPrompt(key, prNumber)`; there is no `src/prompts/resolver.md`, and the capability's `WatchResolverSpec.wakePrompt` is declared but unwired. It does reuse the `pr` step's pane, matching `reusesPaneOf: pull_request`.
+
+**Deferred (designed, not built)**
+
+- **§5/§10 — guard-counter storage keyed `(run, step, guard)` + `GuardSpec.counterScope`.** Not built; still dedicated `run_steps.bounces` and `run_steps.capture_attempts` columns. Harmless until a *second* capped guard lands on one step (they would collide on `capture_attempts`).
+- **§9 — server/CLI do not iterate `SIGNAL_DESCRIPTORS` to auto-mount** routes/commands/OpenAPI; those are still hand-written. The registry is the single source of truth for the prompt `@@*_CMD@@` tokens only (`signalCommand` in `core/step.ts`). `capture-attempt` did gain its explicit `step` arg; `evidence-upload` is scoped `product-outbox` and routed through the durable `evidence_uploads` outbox.
+- **§9 — `capture-lock` is not a `SignalDescriptor`** and `exclusive_resource` is a declared-but-unused `GuardKind`; the capture mutex is still a standalone `capture-lock acquire|release` CLI command.
+- **§13 — plugin *loading* (discovery/sandboxing)** stays out of scope; the three registries are the seam.
 
 ---
 
