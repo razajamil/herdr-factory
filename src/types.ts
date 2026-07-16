@@ -154,11 +154,16 @@ export interface RunStep {
    *  pass's prompt commands (--pass N) so a stale signal from a prior pass is rejectable. Crash
    *  respawns and human resumes continue the pass — no bump. */
   pass: number;
+  /** When the CURRENT pass's prompt reached an agent; null = this pass still needs its dispatch.
+   *  paneId can't carry this meaning — it is kept across re-entries as the pane-reuse handle — so
+   *  the reconciler's spawn branch keys on this instead, routing an undispatched pass through the
+   *  bounded layout-wait machinery rather than the budget watchdog. */
+  dispatchedAt: number | null;
 }
 
 /** Fields the reconciler may patch on a run step. */
 export type RunStepPatch = Partial<
-  Pick<RunStep, "paneId" | "sessionId" | "progressSig" | "progressAt" | "done" | "startedAt" | "absentAt" | "pass">
+  Pick<RunStep, "paneId" | "sessionId" | "progressSig" | "progressAt" | "done" | "startedAt" | "absentAt" | "pass" | "dispatchedAt">
 >;
 
 /** A durable agent-signal intent (`pending_signals`): bounce / ask-human persisted BEFORE the run

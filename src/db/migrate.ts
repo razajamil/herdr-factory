@@ -445,6 +445,23 @@ const MIGRATIONS: { version: number; sql: string }[] = [
       ALTER TABLE pending_signals ADD COLUMN pass INTEGER;
     `,
   },
+  {
+    version: 24,
+    // run_steps.dispatched_at: when the CURRENT pass's prompt actually reached an agent (null = the
+    // pass still needs its dispatch). pane_id can no longer carry that meaning alone: it is
+    // deliberately KEPT across re-entries as the pane-reuse handle, so after a bounce (or forward
+    // re-advance) whose re-dispatch returned "waiting" — the recorded pane died and the configured
+    // layout pane isn't resolvable — the row still looked dispatched, reconcileStep skipped the
+    // layout-wait branch, and the budget watchdog parked the run on the stale clock with a
+    // misleading "over budget (worker: gone)". Keying the spawn branch on dispatched_at routes every
+    // undispatched pass through the bounded layout-wait machinery instead. Backfill: any row with a
+    // recorded pane is a dispatched pass (started_at is reset at dispatch, so it's the closest
+    // truthful stamp) — without this, every in-flight step would be re-prompted on upgrade.
+    sql: `
+      ALTER TABLE run_steps ADD COLUMN dispatched_at INTEGER;
+      UPDATE run_steps SET dispatched_at = started_at WHERE pane_id IS NOT NULL;
+    `,
+  },
 ];
 
 /** Apply pending migrations in a transaction. Idempotent. */

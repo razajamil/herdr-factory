@@ -491,11 +491,17 @@ CREATE TABLE run_steps(                  -- one row per pipeline agent (migratio
   done INTEGER NOT NULL DEFAULT 0, started_at INTEGER, done_at INTEGER,
   bounces INTEGER NOT NULL DEFAULT 0,    -- SUPERSEDED (with capture_attempts) by guard_counters (v21),
   absent_at INTEGER,                     -- left unread. absent_at: pane first CONFIRMED absent (v10)
-  pass INTEGER NOT NULL DEFAULT 1);      -- which ENTRY into the step this state belongs to (v23):
-CREATE INDEX idx_run_steps ON run_steps(run_id, step);   -- 1 on first entry, +1 per re-entry (bounce
-                                         -- rewind / forward re-advance); crash respawns + human
-                                         -- resumes CONTINUE a pass. Stamped into the pass's prompt
-                                         -- commands (--pass N) so stale signals are rejectable.
+  pass INTEGER NOT NULL DEFAULT 1,       -- which ENTRY into the step this state belongs to (v23):
+                                         -- 1 on first entry, +1 per re-entry (bounce rewind /
+                                         -- forward re-advance); crash respawns + human resumes
+                                         -- CONTINUE a pass. Stamped into the pass's prompt commands
+                                         -- (--pass N) so stale signals are rejectable.
+  dispatched_at INTEGER);                -- when THIS pass's prompt reached an agent; null = the
+CREATE INDEX idx_run_steps ON run_steps(run_id, step);   -- pass still needs its dispatch (v24).
+                                         -- pane_id can't carry this (it's KEPT across re-entries as
+                                         -- the reuse handle), so the spawn branch keys on this —
+                                         -- an undispatched pass retries under the bounded layout
+                                         -- wait instead of tripping the budget watchdog.
 
 CREATE TABLE guard_counters(             -- capped-guard counters keyed (run, step, guard) (v21) —
   run_id INTEGER NOT NULL REFERENCES runs(id), step TEXT NOT NULL, guard TEXT NOT NULL,
@@ -957,6 +963,12 @@ the machine is already struggling). A respawn therefore requires the absence to 
 a fresh (unmemoized) re-read of the agent list, then a **second confirmed absence ≥45s after the
 first** (`run_steps.absent_at`; a pane seen alive again clears the mark) — long enough to ride
 out a herdr daemon restart, short enough that a genuinely dead pane restarts within ~a tick.
+When the confirmed respawn (or a bounce / forward re-entry's re-dispatch) returns **waiting** —
+the recorded pane is dead and the configured layout pane isn't resolvable — the pass is marked
+undispatched (`dispatched_at` null) with a re-based wait clock, handing the retry to the bounded
+layout wait: the run escalates as `layout_wait_timeout` after its windows are spent, instead of
+the budget watchdog reading the prior pass's stale clock and parking it as "over budget
+(worker: gone)".
 
 **Attention is a workflow, not a dead end.** On escalation, `escalateAttention` flips the phase,
 records the event, fires a notification, **relabels the run's active pane** to `⚠ ATTENTION

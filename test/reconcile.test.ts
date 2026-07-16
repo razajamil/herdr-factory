@@ -275,7 +275,13 @@ function seed(
 ) {
   const run = store.createRun({ repo: "demo", workSource, belt, ticketKey: key, summary: "s", issueType: "Bug", branch: `fix/${key}-s` });
   store.updateRun(run.id, { phase, step, workspaceId: "w1", worktreePath: worktree, paneId: "w1:p1", ...extra });
-  if (step) store.upsertRunStep(run.id, step, { paneId: "w1:p1" });
+  // dispatchedAt: a seeded active step is a DISPATCHED pass (its agent has the prompt) — the
+  // reconciler's spawn branch keys on it, and an undispatched row would be re-prompted instead of
+  // watched. Mirrors the row's insert-time started_at, like the migration backfill.
+  if (step) {
+    const row = store.upsertRunStep(run.id, step, { paneId: "w1:p1" });
+    store.upsertRunStep(run.id, step, { dispatchedAt: row.startedAt });
+  }
   return store.getRun(run.id)!;
 }
 
@@ -470,6 +476,48 @@ describe("pass stamping — signals are bound to the step pass that minted them"
     // Advanced out of fix: the addressed note is archived, so a later re-render can't resurrect it.
     expect(existsSync(join(worktree, ".memory/herdr-factory/feedback-fix.md"))).toBe(false);
     expect(existsSync(join(worktree, ".memory/herdr-factory/feedback-fix-addressed-pass2.md"))).toBe(true);
+  });
+
+  it("a bounce to a DEAD pane heals through the bounded layout wait, not a misleading step_budget park", async () => {
+    const { deps, store, state, setNow, worktree } = build();
+    const run = seed(store, worktree, "K-DP1", "running", "review");
+    store.upsertRunStep(run.id, "fix", { paneId: "w1:pfix", done: true });
+    state.deadPanes.add("w1:pfix"); // the target's recorded pane died…
+    state.tabPane = null; // …and its configured layout pane is not resolvable (nothing recreates it)
+    const res = await applySignal(deps, "bounce", { key: "K-DP1", toStep: "fix", reason: "redo", step: "review", pass: 1 });
+    expect(res.ok).toBe(true);
+    const rs = store.getRunStep(run.id, "fix")!;
+    expect(rs.dispatchedAt).toBeNull(); // the rework pass is opened UNDISPATCHED
+    expect(rs.startedAt).toBe(1000); // …with a fresh wait clock (not pass 1's stale one)
+    // Ticks: the spawn branch + layout wait own the retry — no step_budget park on a stale clock.
+    await reconcileRun(deps, store.getRun(run.id)!);
+    expect(store.getRun(run.id)!.phase).toBe("running");
+    // Burn the wait window + its 3 bounded re-arms (each expiry re-bases the clock).
+    for (const t of [1701, 2402, 3103, 3804]) {
+      setNow(t);
+      await reconcileRun(deps, store.getRun(run.id)!);
+    }
+    const fresh = store.getRun(run.id)!;
+    expect(fresh.phase).toBe("attention");
+    const timeline = store.timeline("demo", "K-DP1");
+    expect(timeline.filter((e) => e.type === "layout_wait_retry").length).toBe(3);
+    const parks = timeline.filter((e) => e.type === "attention").map((e) => JSON.parse(e.detail ?? "{}").reason);
+    expect(parks).toEqual(["layout_wait_timeout"]); // never step_budget
+  });
+
+  it("a confirmed-dead pane whose respawn can't land hands the retry to the layout wait", async () => {
+    const { deps, store, state, setNow, worktree } = build();
+    const run = seed(store, worktree, "K-DP2", "running", "fix");
+    state.deadPanes.add("w1:p1"); // the active step's pane dies mid-pass
+    state.tabPane = null; // and its layout pane is not resolvable
+    await reconcileRun(deps, store.getRun(run.id)!); // first confirmed absence — marks absent_at
+    expect(store.getRunStep(run.id, "fix")!.absentAt).toBe(1000);
+    setNow(1050); // past the 45s confirmation window → respawn attempt, which returns waiting
+    await reconcileRun(deps, store.getRun(run.id)!);
+    const rs = store.getRunStep(run.id, "fix")!;
+    expect(rs.dispatchedAt).toBeNull(); // pass marked undispatched…
+    expect(rs.startedAt).toBe(1050); // …with a re-based wait clock
+    expect(store.getRun(run.id)!.phase).toBe("running"); // not parked — the layout wait owns it now
   });
 
   it("a bounce to a dedicated-pane step (no tab/pane) re-prompts its live pane instead of spawning a duplicate", async () => {

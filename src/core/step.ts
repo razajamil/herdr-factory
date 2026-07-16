@@ -456,9 +456,10 @@ async function spawnStepImpl(
   if (result.status === "waiting") return result; // still waiting on the user's layout pane
 
   // Dispatched. Reset started_at so the per-step budget is measured from now (per attempt,
-  // not cumulatively across crash-recovery re-spawns or the preceding layout wait), and clear
-  // any pending absence confirmation — this pane is definitionally alive right now.
-  deps.store.upsertRunStep(run.id, stepName, { paneId: result.paneId, startedAt: deps.now(), absentAt: null });
+  // not cumulatively across crash-recovery re-spawns or the preceding layout wait), stamp
+  // dispatched_at (this pass's prompt has reached an agent — the reconciler's spawn branch keys on
+  // it), and clear any pending absence confirmation — this pane is definitionally alive right now.
+  deps.store.upsertRunStep(run.id, stepName, { paneId: result.paneId, startedAt: deps.now(), absentAt: null, dispatchedAt: deps.now() });
   // The pane came up — refund the layout-wait respawn budget, so a FUTURE wait by this step (a
   // re-entry after a bounce, a crash respawn) starts with its full bounded-retry allowance.
   deps.store.resetGuardCounter(run.id, stepName, "layout_wait");

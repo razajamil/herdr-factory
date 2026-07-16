@@ -98,6 +98,7 @@ interface RunStepRow {
   done_at: number | null;
   absent_at: number | null;
   pass: number;
+  dispatched_at: number | null;
 }
 
 function toRunStep(r: RunStepRow): RunStep {
@@ -114,6 +115,7 @@ function toRunStep(r: RunStepRow): RunStep {
     doneAt: r.done_at,
     absentAt: r.absent_at,
     pass: r.pass,
+    dispatchedAt: r.dispatched_at,
   };
 }
 
@@ -632,6 +634,7 @@ export class Store {
     if (patch.startedAt !== undefined) set("started_at", patch.startedAt);
     if (patch.absentAt !== undefined) set("absent_at", patch.absentAt);
     if (patch.pass !== undefined) set("pass", patch.pass);
+    if (patch.dispatchedAt !== undefined) set("dispatched_at", patch.dispatchedAt);
     if (patch.done !== undefined) {
       set("done", patch.done ? 1 : 0);
       set("done_at", patch.done ? this.now() : null);

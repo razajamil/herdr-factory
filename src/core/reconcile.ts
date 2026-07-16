@@ -1031,7 +1031,16 @@ export async function bounceStep(
   // (2) Open the TARGET's next pass — it re-enters NOW, and its re-rendered prompt stamps the new
   //     pass into its commands so a stale step-done from the pre-bounce pass can't complete the
   //     rework (see applySignal). Intermediates get their bump when the forward advance re-enters.
-  deps.store.upsertRunStep(run.id, toStep, { pass: (deps.store.getRunStep(run.id, toStep)?.pass ?? 0) + 1 });
+  //     The pass starts UNDISPATCHED with a fresh wait clock: if the re-dispatch below returns
+  //     "waiting" (target pane dead + layout pane unresolvable), later ticks route through the
+  //     spawn branch + bounded layout wait instead of the budget watchdog reading the PRIOR pass's
+  //     stale started_at and parking the run as "over budget (worker: gone)".
+  deps.store.upsertRunStep(run.id, toStep, {
+    pass: (deps.store.getRunStep(run.id, toStep)?.pass ?? 0) + 1,
+    dispatchedAt: null,
+    startedAt: deps.now(),
+    absentAt: null,
+  });
   const notePath = writeBounceNote(run, fromStep, toStep, reason);
   // (5) Rewind the active-step pointer.
   deps.store.updateRun(run.id, { phase: "running", step: toStep, attentionReason: null, focusPending: true });
@@ -1369,10 +1378,12 @@ function releaseStepLocks(deps: Deps, run: Run, step: StepConfig): void {
 async function reconcileStep(deps: Deps, run: Run, belt: BeltRuntime, src: SourceRuntime, step: StepConfig): Promise<void> {
   const rs = deps.store.getRunStep(run.id, step.name);
 
-  // (Re)spawn if there's no live pane recorded for this step (first entry / crash gap). If
-  // the step's configured layout pane isn't up yet, wait (bounded → attention) rather than
-  // spawning our own.
-  if (!rs || !rs.paneId) {
+  // (Re)spawn while the current pass is UNDISPATCHED: first entry (no row / no pane), or a
+  // re-entry (bounce rewind, forward re-advance) whose dispatch hasn't landed yet — pane_id alone
+  // can't tell those apart, since it's kept across re-entries as the pane-reuse handle
+  // (dispatched_at is the per-pass truth). If the step's configured layout pane isn't up yet,
+  // wait (bounded → attention) rather than spawning our own.
+  if (!rs || !rs.paneId || rs.dispatchedAt == null) {
     const res = await spawnStep(deps, run, belt, src, step.name);
     if (res.status === "waiting") await handleLayoutWait(deps, run, belt, step);
     return;
@@ -1436,9 +1447,13 @@ async function reconcileStep(deps: Deps, run: Run, belt: BeltRuntime, src: Sourc
       // re-resolving the configured label (which the first dispatch renamed — re-resolution would fail
       // and wedge the run in a layout-wait timeout). A dead pane there falls back to a fresh lookup.
       // `pass` opens the step's next entry: the re-rendered prompt stamps its commands with it, so a
-      // stale step-done/bounce minted by a PRIOR pass is rejectable (see applySignal).
+      // stale step-done/bounce minted by a PRIOR pass is rejectable (see applySignal). The new pass
+      // starts UNDISPATCHED (dispatched_at null) — if the spawn below returns "waiting" (the reused
+      // pane died and the configured label isn't resolvable), the spawn branch + layout-wait
+      // machinery own the retry on later ticks, instead of the kept pane_id masking the pass as
+      // dispatched and the budget watchdog parking it on a misleading "over budget (worker: gone)".
       const prevPass = deps.store.getRunStep(run.id, next.name)?.pass ?? 0;
-      deps.store.upsertRunStep(run.id, next.name, { done: false, startedAt: deps.now(), progressSig: null, progressAt: null, absentAt: null, pass: prevPass + 1 });
+      deps.store.upsertRunStep(run.id, next.name, { done: false, startedAt: deps.now(), progressSig: null, progressAt: null, absentAt: null, pass: prevPass + 1, dispatchedAt: null });
       deps.log("info", `${run.ticketKey}: ${step.name} done -> ${next.name}`);
       const res = await spawnStep(deps, run, belt, src, next.name);
       if (res.status === "waiting") await handleLayoutWait(deps, run, belt, next);
@@ -1531,7 +1546,16 @@ async function reconcileStep(deps: Deps, run: Run, belt: BeltRuntime, src: Sourc
     }
     if (deps.now() - freshRow.absentAt < PANE_ABSENCE_CONFIRM_SECONDS) return; // within the window — wait
     deps.log("info", `${run.ticketKey}: ${step.name} pane gone (confirmed twice) — re-spawning`);
-    await spawnStep(deps, run, belt, src, step.name);
+    const res = await spawnStep(deps, run, belt, src, step.name);
+    if (res.status === "waiting") {
+      // The pane died AND its replacement isn't resolvable right now (a dead layout pane is not
+      // recreated by the engine — the layout hook fires once per worktree). Mark the pass
+      // undispatched with a fresh wait clock so the spawn branch + bounded layout wait own the
+      // retry and the eventual escalation — instead of this branch silently re-trying every tick
+      // until the budget watchdog parks the run with a misleading "over budget (worker: gone)".
+      deps.store.upsertRunStep(run.id, step.name, { dispatchedAt: null, startedAt: deps.now(), absentAt: null });
+      deps.log("warn", `${run.ticketKey}: ${step.name} replacement pane not available — handing the retry to the layout wait`);
+    }
     return;
   }
   if (rs.absentAt != null) deps.store.upsertRunStep(run.id, step.name, { absentAt: null }); // seen alive again
