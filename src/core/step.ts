@@ -87,9 +87,10 @@ export type DispatchResult = { status: "ready"; paneId: string } | { status: "wa
  *    `tab`/`pane` would no longer find it (the run would wedge in a layout-wait timeout — "pane
  *    never became available"). So we resolve in order: a live `knownPaneId` (the durable handle) →
  *    the configured label (FIRST entry, before any rename) → the renamed `paneName` (a re-entry
- *    whose recorded id was lost). A re-entry pane finished its prior pass and is idle-at-prompt, so
- *    we re-prompt it directly, skipping the idle gate — mirroring how `bounceStep` re-enters its
- *    target; only a fresh configured-label pane must clear the idle gate first.
+ *    whose recorded id was lost). A re-entry pane normally finished its prior pass and sits
+ *    idle-at-prompt, so it skips the startup settle — but a pane that is actively `working`
+ *    (mid-answer to an on-demand agent-send question, or human-driven) defers the dispatch to a
+ *    later tick rather than queueing the prompt into a foreign turn.
  *  - **Not configured** (no tab/pane): spawn a dedicated claude pane ourselves. This is the
  *    only path that creates a pane.
  *
@@ -140,7 +141,15 @@ async function dispatchToLayoutImpl(
       }
     }
     if (!target) return { status: "waiting" }; // the layout hasn't created this tab/pane yet
-    if (!reused && (await deps.herdr.paneState(target)) !== "idle") return { status: "waiting" }; // no agent, or still busy
+    const state = await deps.herdr.paneState(target);
+    if (!reused && state !== "idle") return { status: "waiting" }; // no agent, or still busy starting up
+    // A re-entry pane is NORMALLY idle-at-prompt (it finished its prior pass) — but not always: a
+    // later agent may have `agent send`-ed it an on-demand question (§7's handoff+query protocol)
+    // and it's mid-answer, or a human is driving it. Queueing the re-dispatch into a busy turn
+    // interleaves two conversations and starts the step budget while the pane works on something
+    // else — defer instead. The pass stays undispatched, so the caller retries on later ticks
+    // under the bounded layout wait until the pane comes back to idle.
+    if (reused && state === "working") return { status: "waiting" };
     if (!reused) await deps.sleep(2000); // settle a just-started agent so the first keystrokes aren't dropped
     await deps.herdr.agentSend(target, opts.prompt);
     await deps.herdr.paneSendKeys(target, "Enter");
@@ -153,7 +162,10 @@ async function dispatchToLayoutImpl(
   // re-advance after a bounce) re-prompts the step's own live pane — its agent holds the step's
   // context, and starting a second dedicated agent for the same step would pile up a duplicate
   // pane per rework cycle. Only with no live known pane (first entry, or the pane died) does this
-  // path START one — still the only path that creates a pane.
+  // path START one — still the only path that creates a pane. Unlike the configured branch above,
+  // a busy dedicated pane is NOT deferred: dedicated steps carry no layout-wait guard to bound the
+  // deferral, and the factory-owned agent queues the message for after its current turn — the
+  // lesser evil vs. a human park.
   if (opts.knownPaneId != null && (await deps.herdr.paneAlive(opts.knownPaneId))) {
     await deps.herdr.agentSend(opts.knownPaneId, opts.prompt);
     await deps.herdr.paneSendKeys(opts.knownPaneId, "Enter");

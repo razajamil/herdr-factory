@@ -880,7 +880,11 @@ step (`spawnStep`):
      the prompt + Enter. If the pane isn't up yet or its agent is still busy starting up,
      `spawnStep` returns `waiting` — the run stays in its phase and retries on later ticks
      (the wait is bounded by `layout_wait_seconds`, measured from the `run_steps` row's
-     `started_at`). An expired window is **re-armed in place** up to the layout-wait guard's
+     `started_at`). A **re-entry** (bounce rework, forward re-advance) re-prompts the step's own
+     pane via its recorded id (the first dispatch renamed it away from the configured label) — and
+     defers the same way while that pane is actively `working` (mid-answer to an on-demand
+     agent-send question, or human-driven), rather than queueing the prompt into a foreign turn
+     and starting the budget clock under someone else's work. An expired window is **re-armed in place** up to the layout-wait guard's
      `autoRespawnLimit` (3) — a transient herdr/layout race must be retried by the engine, not
      handed to a human — and only once that budget is spent does the reconciler escalate to
      `attention`; a run already parked with `layout_wait_timeout` is likewise auto-un-parked and

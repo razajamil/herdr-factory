@@ -578,6 +578,25 @@ describe("pass stamping — signals are bound to the step pass that minted them"
     expect(store.getRun(run.id)!.phase).toBe("running"); // not parked — the layout wait owns it now
   });
 
+  it("a re-entry into a BUSY pane defers instead of queueing the prompt into a foreign turn", async () => {
+    const { deps, store, state, calls, worktree } = build();
+    const run = seed(store, worktree, "K-BZ1", "running", "review");
+    store.upsertRunStep(run.id, "fix", { paneId: "w1:pfix", done: true });
+    state.paneState = "working"; // e.g. the fix agent is mid-answer to an on-demand agent-send question
+    const res = await applySignal(deps, "bounce", { key: "K-BZ1", toStep: "fix", reason: "redo", step: "review", pass: 1 });
+    expect(res.ok).toBe(true); // the bounce landed (rewind + feedback note)…
+    expect(store.getRun(run.id)!.step).toBe("fix");
+    expect(store.getRunStep(run.id, "fix")!.dispatchedAt).toBeNull(); // …but the dispatch is deferred
+    expect(calls.agentSend.filter(([pane]) => pane === "w1:pfix").length).toBe(0);
+    // The pane finishes its turn → the next pass dispatches the rework prompt.
+    state.paneState = "idle";
+    await reconcileRun(deps, store.getRun(run.id)!);
+    const sent = calls.agentSend.filter(([pane]) => pane === "w1:pfix");
+    expect(sent.length).toBe(1);
+    expect(sent[0]![1]).toContain("prompt-fix.md");
+    expect(store.getRunStep(run.id, "fix")!.dispatchedAt).not.toBeNull();
+  });
+
   it("a bounce to a dedicated-pane step (no tab/pane) re-prompts its live pane instead of spawning a duplicate", async () => {
     const { deps, store, calls, worktree } = build();
     const src = deps.resolveSource("jira")!;
