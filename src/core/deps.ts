@@ -16,6 +16,7 @@ import type {
   Ticket,
   TransitionResult,
   WorkDocInfo,
+  WorkspaceInfo,
   WorkState,
   WorktreeResult,
 } from "../types.ts";
@@ -57,6 +58,21 @@ export interface HerdrApi {
   tabPaneByLabel(workspaceId: string, tabLabel: string, paneLabel: string): Promise<string | null>;
   agentStart(opts: { workspaceId: string; cwd: string; argv: string[]; env?: Record<string, string> }): Promise<string | null>;
   paneRun(paneId: string, command: string): Promise<void>;
+  // Layout building (absorbed from workspace-manager); driven by src/core/layout.ts.
+  tabCreate(workspaceId: string, opts: { label?: string; cwd?: string }): Promise<{ tabId: string; paneId: string }>;
+  tabRename(tabId: string, label: string): Promise<void>;
+  paneSplit(fromPaneId: string, opts: { direction: "right" | "down"; ratio?: number; cwd?: string }): Promise<string>;
+  paneRename(paneId: string, label: string): Promise<void>;
+  /** Pane extent (cells) along the split axis — width for "right", height for "down"; null if unknown. */
+  paneExtent(paneId: string, direction: "right" | "down"): Promise<number | null>;
+  /** Wait for `marker` in a pane's output up to timeoutMs (blocking setup); matched line or null. */
+  waitOutput(paneId: string, marker: string, timeoutMs: number): Promise<string | null>;
+  /** The workspace's first (root) tab id — the tab a fresh worktree comes up with. */
+  firstTabId(workspaceId: string): Promise<string | null>;
+  // Introspection for the layout event hook (src/core/layout-hook.ts).
+  workspaceInfo(workspaceId: string): Promise<WorkspaceInfo | null>;
+  worktreeBranch(workspaceId: string, checkoutPath?: string | null): Promise<string | null>;
+  firstPaneOfTab(workspaceId: string, tabId: string): Promise<string | null>;
   agentSend(paneId: string, text: string): Promise<void>;
   agentFocus(paneId: string): Promise<void>;
   focusedPane(): Promise<FocusedPane | null>;

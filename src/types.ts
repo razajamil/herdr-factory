@@ -51,6 +51,8 @@ export type EventType =
   | "claimed"
   | "transition"
   | "worktree_created"
+  | "layout_applied" // the factory built a belt's herdr layout into a fresh worktree
+  | "layout_apply_failed" // building a belt's layout failed (best-effort; the claim proceeds)
   | "worker_spawned"
   | "pr_opened"
   | "resolver_woken"
@@ -451,6 +453,18 @@ export interface WorktreeResult {
   workspaceId: string;
   worktreePath: string;
   paneId: string | null;
+}
+
+/** A workspace's worktree facts + freshness — the source of truth the layout event hook matches a
+ *  newly-created worktree on (src/core/layout-hook.ts). */
+export interface WorkspaceInfo {
+  checkoutPath: string | null;
+  repoRoot: string | null;
+  repoName: string | null;
+  isLinkedWorktree: boolean;
+  tabCount: number | null;
+  paneCount: number | null;
+  activeTabId: string | null;
 }
 
 /** The single globally-focused pane (what the user is looking at right now). */

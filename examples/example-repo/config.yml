@@ -80,8 +80,9 @@ belt:
   # review to merge, then tear the worktree down). `work` implements + commits; `evidence` captures
   # visual proof (dev server + playwright) and can bounce back to `work` if the fix isn't proven;
   # `review` is a strict read-only gate that passes or bounces back to `work`; `pr` opens the PR
-  # (embedding the evidence URLs) + rides CI. Set a step's `tab`+`pane` together for a layout your
-  # herdr setup provisions; omit both to have herdr-factory spawn a dedicated pane — except
+  # (embedding the evidence URLs) + rides CI. Set a step's `tab`+`pane` together to target a pane a
+  # `layouts` entry builds (see below) — the belt's `default_layout` is built into each worktree on
+  # claim, so those panes come up automatically; omit both to have herdr-factory spawn a dedicated pane — except
   # `evidence`, which runs ONLY when a tab+pane targets an agent your layout provides (drop it — or
   # its tab/pane — and the belt is work → review → pr). A step may OPTIONALLY add a `prompt_file`
   # (+ required `prompt_file_source`: `config` = this folder, `repo` = the target repo checkout, read
@@ -93,6 +94,9 @@ belt:
     priority: 1
     match: match-bugs.ts # optional; omit ⇒ this belt accepts anything from `jira` carrying `label`
     workspace_name: "{{semantic_work_prefix}}/{{work_id}}-{{work_slug}}"
+    default_layout: bug-dev # the layout (see `layouts:` below) the factory builds into every worktree this belt claims
+    # layout_matching:                                  # optional: pick a different layout per branch — first glob that matches the branch wins
+    #   - { worktree_pattern: "hotfix/*", layout: bug-dev }
     steps:
       - { type: work, tab: work, pane: agent }
       - { type: evidence, tab: evidence, pane: agent } # opt-in; drop tab/pane (or the whole entry) to SKIP evidence
@@ -130,6 +134,34 @@ belt:
           prompt_file: prompts/work_generation/create-jira-ticket.md,
           prompt_file_source: config,
         }
+
+# ── Layouts: herdr tab/pane arrangements the factory BUILDS into each worktree on claim (absorbed
+# from the workspace-manager plugin). A belt picks one via `default_layout` (or, per branch,
+# `layout_matching`) above. Building the layout is what brings up the panes a step's `tab`/`pane`
+# targets, so you no longer hand-build a herdr layout per worktree. Each pane's `command` runs once
+# the pane is up (a step's target pane runs an interactive agent — e.g. `command: claude` — that the
+# step then delivers its prompt to). `split` is vertical|right / horizontal|down; a pane's `size` is
+# a "30%" percentage, a 0<n<1 fraction, or an integer count of cells. At most ONE pane may be
+# `setup: true`: the layout-level `setup.command` runs there first, and `blocking: true` makes the
+# builder wait for it to finish before spawning any later tab. OPTIONAL — omit `layouts` (and a
+# belt's default_layout/layout_matching) and the factory builds nothing.
+layouts:
+  - id: bug-dev
+    setup: { command: mise run setup, blocking: true } # runs once in the setup pane before the rest of the layout
+    tabs:
+      - title: work # ← the `work` step targets tab: work / pane: agent
+        panes:
+          - { title: agent, command: claude, setup: true } # the agent the work step delivers its prompt to; also runs setup
+          - { title: server, command: mise run dev, split: right, size: "40%" } # dev server alongside, 40% wide
+      - title: evidence # ← the `evidence` step targets tab: evidence / pane: agent
+        panes:
+          - { title: agent, command: claude }
+      - title: review # ← the `review` step
+        panes:
+          - { title: agent, command: claude }
+      - title: pr # ← the `pr` step
+        panes:
+          - { title: agent, command: claude }
 
 # ── evidence: where the evidence step publishes captured screenshots/video (S3 + CloudFront). ──
 # OPTIONAL — omit it and the evidence step still captures + assesses (and can bounce), it just

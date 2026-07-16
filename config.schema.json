@@ -356,6 +356,35 @@
             "minimum": 0,
             "maximum": 9007199254740991
           },
+          "default_layout": {
+            "type": "string",
+            "minLength": 1
+          },
+          "layout_matching": {
+            "default": [],
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "string"
+                },
+                "worktree_pattern": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "layout": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              },
+              "required": [
+                "worktree_pattern",
+                "layout"
+              ],
+              "additionalProperties": false
+            }
+          },
           "steps": {
             "minItems": 1,
             "type": "array",
@@ -413,6 +442,106 @@
           "name",
           "source",
           "steps"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "layouts": {
+      "default": [],
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "setup": {
+            "type": "object",
+            "properties": {
+              "command": {
+                "type": "string",
+                "minLength": 1
+              },
+              "blocking": {
+                "default": false,
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "command"
+            ],
+            "additionalProperties": false
+          },
+          "tabs": {
+            "minItems": 1,
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "panes": {
+                  "minItems": 1,
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "title": {
+                        "type": "string",
+                        "minLength": 1
+                      },
+                      "command": {
+                        "type": "string",
+                        "minLength": 1
+                      },
+                      "setup": {
+                        "default": false,
+                        "type": "boolean"
+                      },
+                      "split": {
+                        "type": "string",
+                        "enum": [
+                          "vertical",
+                          "horizontal",
+                          "right",
+                          "down"
+                        ]
+                      },
+                      "ratio": {
+                        "type": "number",
+                        "exclusiveMinimum": 0,
+                        "exclusiveMaximum": 1
+                      },
+                      "size": {
+                        "anyOf": [
+                          {
+                            "type": "string",
+                            "pattern": "^\\d+(\\.\\d+)?%$"
+                          },
+                          {
+                            "type": "number",
+                            "exclusiveMinimum": 0
+                          }
+                        ]
+                      }
+                    },
+                    "additionalProperties": false
+                  }
+                }
+              },
+              "required": [
+                "panes"
+              ],
+              "additionalProperties": false
+            }
+          }
+        },
+        "required": [
+          "id",
+          "tabs"
         ],
         "additionalProperties": false
       }

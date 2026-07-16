@@ -1,6 +1,6 @@
 import { run, runJson } from "./exec.ts";
 import { HerdrUnreachableError, type LivenessOpts } from "../core/deps.ts";
-import type { Agent, FocusedPane, WorktreeResult } from "../types.ts";
+import type { Agent, FocusedPane, WorkspaceInfo, WorktreeResult } from "../types.ts";
 
 interface RawAgent {
   pane_id: string;
@@ -28,6 +28,34 @@ interface PaneListResp {
 }
 interface AgentStartResp {
   result?: { agent?: { pane_id?: string } };
+}
+interface TabCreateResp {
+  result?: { tab?: { tab_id?: string }; tab_id?: string; root_pane?: { pane_id?: string }; pane?: { pane_id?: string }; pane_id?: string };
+}
+interface PaneSplitResp {
+  result?: { pane?: { pane_id?: string }; pane_id?: string };
+}
+interface PaneLayoutResp {
+  result?: { layout?: { panes?: { pane_id?: string; rect?: { width?: number; height?: number } }[] } };
+}
+interface WaitOutputResp {
+  result?: { matched_line?: string };
+}
+interface RawWorkspace {
+  workspace_id?: string;
+  active_tab_id?: string;
+  tab_count?: number;
+  pane_count?: number;
+  worktree?: { checkout_path?: string; repo_root?: string; repo_name?: string; is_linked_worktree?: boolean };
+}
+interface WorkspaceGetResp {
+  result?: { workspace?: RawWorkspace };
+}
+interface WorkspaceListResp {
+  result?: { workspaces?: RawWorkspace[] };
+}
+interface WorktreeListResp {
+  result?: { worktrees?: { path?: string; branch?: string; open_workspace_id?: string }[] };
 }
 
 /**
@@ -170,6 +198,122 @@ export class HerdrClient {
 
   async paneRun(paneId: string, command: string): Promise<void> {
     await run(this.bin, ["pane", "run", paneId, command], { allowFail: true });
+  }
+
+  // ── Layout building (absorbed from the workspace-manager plugin). argv mirrors that plugin's
+  //    runner exactly; see src/core/layout.ts for the planner that drives these. ──
+
+  /** Create a new tab in the workspace (opening in `cwd` if given); returns the tab + its root pane. */
+  async tabCreate(workspaceId: string, opts: { label?: string; cwd?: string } = {}): Promise<{ tabId: string; paneId: string }> {
+    const args = ["tab", "create", "--workspace", workspaceId, "--no-focus"];
+    if (opts.label) args.push("--label", opts.label);
+    if (opts.cwd) args.push("--cwd", opts.cwd);
+    const j = await runJson<TabCreateResp>(this.bin, args, { timeoutMs: HerdrClient.WORKTREE_TIMEOUT_MS });
+    const tabId = j.result?.tab?.tab_id ?? j.result?.tab_id;
+    const paneId = j.result?.root_pane?.pane_id ?? j.result?.pane?.pane_id ?? j.result?.pane_id;
+    if (!tabId || !paneId) throw new Error(`herdr tab create missing ids: ${JSON.stringify(j).slice(0, 300)}`);
+    return { tabId, paneId };
+  }
+
+  async tabRename(tabId: string, label: string): Promise<void> {
+    await run(this.bin, ["tab", "rename", tabId, label], { allowFail: true });
+  }
+
+  /** Split `fromPaneId` (direction right|down; `ratio` is the fraction the FROM pane keeps); returns
+   *  the new pane's id. */
+  async paneSplit(fromPaneId: string, opts: { direction: "right" | "down"; ratio?: number; cwd?: string }): Promise<string> {
+    const args = ["pane", "split", fromPaneId, "--direction", opts.direction, "--no-focus"];
+    if (opts.ratio != null) args.push("--ratio", String(Math.round(opts.ratio * 1e4) / 1e4));
+    if (opts.cwd) args.push("--cwd", opts.cwd);
+    const j = await runJson<PaneSplitResp>(this.bin, args, { timeoutMs: HerdrClient.WORKTREE_TIMEOUT_MS });
+    const paneId = j.result?.pane?.pane_id ?? j.result?.pane_id;
+    if (!paneId) throw new Error(`herdr pane split returned no pane id: ${JSON.stringify(j).slice(0, 300)}`);
+    return paneId;
+  }
+
+  async paneRename(paneId: string, label: string): Promise<void> {
+    await run(this.bin, ["pane", "rename", paneId, label], { allowFail: true });
+  }
+
+  /** The pane's current extent in cells along the split axis (width for "right", height for "down"),
+   *  or null when it can't be read. Converts a fixed cell `size` into a split ratio. */
+  async paneExtent(paneId: string, direction: "right" | "down"): Promise<number | null> {
+    const j = await runJson<PaneLayoutResp>(this.bin, ["pane", "layout", "--pane", paneId], { allowFail: true }).catch(
+      () => ({}) as PaneLayoutResp,
+    );
+    const rect = (j.result?.layout?.panes ?? []).find((p) => p.pane_id === paneId)?.rect;
+    const side = direction === "down" ? rect?.height : rect?.width;
+    return typeof side === "number" && Number.isFinite(side) ? side : null;
+  }
+
+  /** Wait for `marker` in the pane's output, up to `timeoutMs` (blocking layout setup). Returns the
+   *  matched line, or null on timeout / no match. The exec budget outlasts herdr's own --timeout. */
+  async waitOutput(paneId: string, marker: string, timeoutMs: number): Promise<string | null> {
+    const j = await runJson<WaitOutputResp>(
+      this.bin,
+      ["wait", "output", paneId, "--match", marker, "--timeout", String(timeoutMs)],
+      { allowFail: true, timeoutMs: timeoutMs + 30_000 },
+    ).catch(() => ({}) as WaitOutputResp);
+    return j.result?.matched_line ?? null;
+  }
+
+  /** The workspace's first (root) tab id — the tab a fresh worktree comes up with. */
+  async firstTabId(workspaceId: string): Promise<string | null> {
+    const j = await runJson<TabListResp>(this.bin, ["tab", "list", "--workspace", workspaceId], { allowFail: true }).catch(
+      () => ({}) as TabListResp,
+    );
+    return j.result?.tabs?.[0]?.tab_id ?? null;
+  }
+
+  // ── Worktree/workspace introspection for the layout event hook (src/core/layout-hook.ts). ──
+
+  private static parseWorkspaceInfo(w: RawWorkspace | undefined): WorkspaceInfo | null {
+    if (!w) return null;
+    const wt = w.worktree ?? {};
+    return {
+      checkoutPath: wt.checkout_path ?? null,
+      repoRoot: wt.repo_root ?? null,
+      repoName: wt.repo_name ?? null,
+      isLinkedWorktree: wt.is_linked_worktree === true,
+      tabCount: typeof w.tab_count === "number" ? w.tab_count : null,
+      paneCount: typeof w.pane_count === "number" ? w.pane_count : null,
+      activeTabId: w.active_tab_id ?? null,
+    };
+  }
+
+  /** A workspace's worktree facts + freshness (tab/pane counts) by id. Tries `workspace get`, then
+   *  falls back to scanning `workspace list`. null when the id isn't a known workspace. */
+  async workspaceInfo(workspaceId: string): Promise<WorkspaceInfo | null> {
+    const got = await runJson<WorkspaceGetResp>(this.bin, ["workspace", "get", workspaceId], { allowFail: true }).catch(
+      () => ({}) as WorkspaceGetResp,
+    );
+    if (got.result?.workspace) return HerdrClient.parseWorkspaceInfo(got.result.workspace);
+    const list = await runJson<WorkspaceListResp>(this.bin, ["workspace", "list"], { allowFail: true }).catch(
+      () => ({}) as WorkspaceListResp,
+    );
+    const found = (list.result?.workspaces ?? []).find((w) => w.workspace_id === workspaceId);
+    return found ? HerdrClient.parseWorkspaceInfo(found) : null;
+  }
+
+  /** The git branch of a workspace's worktree (or null for a detached HEAD / unresolvable). Matches
+   *  on the open workspace id, falling back to the checkout path. */
+  async worktreeBranch(workspaceId: string, checkoutPath?: string | null): Promise<string | null> {
+    const j = await runJson<WorktreeListResp>(this.bin, ["worktree", "list", "--workspace", workspaceId, "--json"], {
+      allowFail: true,
+    }).catch(() => ({}) as WorktreeListResp);
+    const worktrees = j.result?.worktrees ?? [];
+    const byWorkspace = worktrees.find((w) => w.open_workspace_id === workspaceId);
+    const byPath = checkoutPath ? worktrees.find((w) => w.path === checkoutPath) : undefined;
+    const branch = (byWorkspace ?? byPath)?.branch;
+    return branch && branch.length > 0 ? branch : null;
+  }
+
+  /** The first pane in a tab (a fresh worktree's root pane), or null. */
+  async firstPaneOfTab(workspaceId: string, tabId: string): Promise<string | null> {
+    const j = await runJson<PaneListResp>(this.bin, ["pane", "list", "--workspace", workspaceId], { allowFail: true }).catch(
+      () => ({}) as PaneListResp,
+    );
+    return (j.result?.panes ?? []).find((p) => p.tab_id === tabId)?.pane_id ?? null;
   }
 
   async agentSend(paneId: string, text: string): Promise<void> {

@@ -92,6 +92,74 @@ const layoutRefine = {
   path: ["pane"] as string[],
 };
 
+// ── Layouts: a herdr tab/pane arrangement the factory BUILDS into a worktree right after it is
+// created (absorbed from the workspace-manager plugin). A repo-level `layouts:` library of named
+// arrangements; each belt selects one per worktree — the first of its `layout_matching` globs that
+// matches the branch, else its `default_layout`. Building the layout is what brings up the panes a
+// step's `tab`/`pane` (above) then targets, so the factory no longer waits on a hand-built layout. ──
+
+// A layout-level setup command, run once in the single `setup: true` pane before that pane's own
+// command. `blocking: true` makes the builder wait for it to finish before spawning any later tab.
+const LayoutSetupSchema = z.object({ command: z.string().trim().min(1), blocking: z.boolean().default(false) }).strict();
+
+// A pane's extent along the split axis. A "30%" string (or a fraction 0<n<1) is a percentage of the
+// parent; an integer ≥1 is a fixed cell count. Collapsed to {percent}|{cells} at load (normalizeSize).
+const PaneSizeSchema = z.union([
+  z.string().trim().regex(/^\d+(\.\d+)?%$/, 'size must be a percentage like "30%"'),
+  z.number().positive(),
+]);
+
+// Split direction. vertical/right → a new pane to the RIGHT; horizontal/down → BELOW. Normalized to
+// "right"|"down" at load (matches herdr's `pane split --direction`).
+const PaneSplitSchema = z.enum(["vertical", "horizontal", "right", "down"]);
+
+const LayoutPaneSchema = z
+  .object({
+    title: z.string().trim().min(1).optional(), // herdr pane label (what a step's `pane` matches)
+    command: z.string().trim().min(1).optional(), // shell command run in the pane once it's built
+    setup: z.boolean().default(false), // THIS is the pane the layout-level setup command runs in
+    split: PaneSplitSchema.optional(), // how this pane splits off the previous one (ignored on pane 0)
+    ratio: z.number().gt(0).lt(1).optional(), // legacy: the fraction the PREVIOUS pane keeps
+    size: PaneSizeSchema.optional(), // this pane's extent (mutually exclusive with ratio)
+  })
+  .strict()
+  .refine((p) => !(p.ratio != null && p.size != null), { message: "set either ratio or size, not both", path: ["size"] });
+
+const LayoutTabSchema = z
+  .object({
+    title: z.string().trim().min(1).optional(), // herdr tab label (what a step's `tab` matches)
+    panes: z.array(LayoutPaneSchema).min(1, "a tab needs at least one pane"),
+  })
+  .strict();
+
+const LayoutSchema = z
+  .object({
+    id: z.string().trim().min(1),
+    setup: LayoutSetupSchema.optional(),
+    tabs: z.array(LayoutTabSchema).min(1, "a layout needs at least one tab"),
+  })
+  .strict()
+  // At most one setup pane per layout (the setup command runs exactly once), and a layout that
+  // declares a setup block must have a pane to run it in.
+  .refine((l) => l.tabs.flatMap((t) => t.panes).filter((p) => p.setup).length <= 1, {
+    message: "at most one pane in a layout may set `setup: true`",
+    path: ["tabs"],
+  })
+  .refine((l) => !l.setup || l.tabs.some((t) => t.panes.some((p) => p.setup)), {
+    message: "a layout with a `setup` block needs one pane marked `setup: true` to run it in",
+    path: ["setup"],
+  });
+
+// A per-belt branch→layout rule: the first rule whose glob matches the worktree's branch wins (see
+// resolveBeltLayout). `*` matches any run of chars (incl "/"), `?` a single char. `title` is docs.
+const LayoutMatchRuleSchema = z
+  .object({
+    title: z.string().optional(),
+    worktree_pattern: z.string().trim().min(1),
+    layout: z.string().trim().min(1),
+  })
+  .strict();
+
 // Where a `prompt_file` is resolved from: `config` = relative to this repo's config folder
 // (repos/<name>/); `repo` = relative to the target repo checkout, read from the run's WORKTREE at
 // render time (so the prompt can live version-controlled in the codebase).
@@ -165,6 +233,12 @@ const beltBase = {
   // Optional per-belt override of the repo-wide max_bounces safety cap (the loop-safety backstop for
   // the fix↔evidence/review rework loop). Unset ⇒ falls back to limits.max_bounces.
   max_bounces: z.coerce.number().int().nonnegative().optional(),
+  // Layout selection (absorbed from workspace-manager). The layout the factory builds into a fresh
+  // worktree for this belt: the first `layout_matching` rule whose glob matches the branch, else
+  // `default_layout`. Both reference an id in the repo-level `layouts:` library (checked in superRefine).
+  // Unset ⇒ the factory builds nothing; steps spawn their own panes as before.
+  default_layout: z.string().trim().min(1).optional(),
+  layout_matching: z.array(LayoutMatchRuleSchema).default([]),
 };
 
 // A belt is a (source + ordered steps) pairing. `.strict()` rejects typos AND the removed
@@ -267,6 +341,9 @@ export const RepoConfigSchema = z
     // Belts (≥1): each pairs a source with an ordered pipeline. At claim time belts are walked in
     // priority order and the first whose `match` accepts an item claims it (first match wins).
     belt: z.array(BeltSchema).min(1, "belt must list at least one belt"),
+    // Named herdr tab/pane arrangements this repo's belts build into a worktree on claim (referenced
+    // by a belt's default_layout / layout_matching). Empty ⇒ the factory builds nothing.
+    layouts: z.array(LayoutSchema).default([]),
     // Optional: where the evidence step publishes captured media (S3 + CloudFront). Repo-wide.
     evidence: EvidenceBlockSchema.optional(),
   })
@@ -283,6 +360,14 @@ export const RepoConfigSchema = z
       }
       sourceNames.add(name);
       sourceTypeByName.set(name, s.type);
+    });
+    // Layout ids unique — belts reference layouts by id, so a collision would make selection ambiguous.
+    const layoutIds = new Set<string>();
+    cfg.layouts.forEach((l, i) => {
+      if (layoutIds.has(l.id)) {
+        ctx.addIssue({ code: "custom", message: `duplicate layout id "${l.id}" — layout ids must be unique`, path: ["layouts", i, "id"] });
+      }
+      layoutIds.add(l.id);
     });
     // Belt names unique; each belt.source references a configured work source; custom step names
     // unique within their belt; the per-belt pickup `label` matches its source's label semantics
@@ -320,6 +405,15 @@ export const RepoConfigSchema = z
           sourceLabelPairs.set(key, b.name);
         }
       }
+      // Layout references resolve to a defined layout id (default_layout + every layout_matching rule).
+      if (b.default_layout != null && !layoutIds.has(b.default_layout)) {
+        ctx.addIssue({ code: "custom", message: `belt "${b.name}" default_layout "${b.default_layout}" is not a defined layout (defined: ${[...layoutIds].join(", ") || "none"})`, path: ["belt", i, "default_layout"] });
+      }
+      b.layout_matching.forEach((r, j) => {
+        if (!layoutIds.has(r.layout)) {
+          ctx.addIssue({ code: "custom", message: `belt "${b.name}" layout_matching[${j}] references unknown layout "${r.layout}" (defined: ${[...layoutIds].join(", ") || "none"})`, path: ["belt", i, "layout_matching", j, "layout"] });
+        }
+      });
       // Step validation for EVERY belt (previously custom-only). Each step references a registered
       // primitive; resolve its descriptor and run the structural checks the reconciler relies on.
       const kept = b.steps.filter((s) => {
@@ -401,6 +495,40 @@ export interface StepConfig {
   posture: StepPosture; // read_only / requiresLayout flags
 }
 
+/** A pane's normalized extent along its split axis: a percentage of the parent, or a fixed cell
+ *  count. Config accepts "30%" / 0.3 / 40; normalizeSize collapses those to this. */
+export type LayoutSize = { percent: number } | { cells: number };
+
+/** One resolved layout pane. `split` is normalized to right|down; `size` to LayoutSize. */
+export interface LayoutPane {
+  title?: string;
+  command?: string;
+  setup: boolean;
+  split?: "right" | "down";
+  ratio?: number;
+  size?: LayoutSize;
+}
+export interface LayoutTab {
+  title?: string;
+  panes: LayoutPane[];
+}
+export interface LayoutSetup {
+  command: string;
+  blocking: boolean;
+}
+/** A named herdr tab/pane arrangement the factory builds into a worktree on claim (absorbed from the
+ *  workspace-manager plugin). Referenced by a belt's defaultLayout / layoutMatching. */
+export interface LayoutConfig {
+  id: string;
+  setup?: LayoutSetup;
+  tabs: LayoutTab[];
+}
+/** A belt's branch→layout rule: the first rule whose glob matches the branch wins (resolveBeltLayout). */
+export interface LayoutMatchRule {
+  worktreePattern: string;
+  layout: string;
+}
+
 /** One resolved belt: a (source + ordered steps) pairing with its lifecycle. `watchPr` true means
  *  the engine runs the token-free PR-watch (reviewing phase) after the last step. `matchFile` is
  *  the resolved path to the belt's `.ts` predicate (the predicate fn itself is loaded in buildDeps,
@@ -420,6 +548,12 @@ export interface BeltConfig {
   watchPr: boolean;
   /** Per-belt override of the repo-wide bounce safety cap; undefined ⇒ use limits.maxBounces. */
   maxBounces?: number;
+  /** Layout selection (absorbed from workspace-manager). `defaultLayout` is the layout built into a
+   *  fresh worktree for this belt when no `layoutMatching` rule matches the branch; both reference an
+   *  id in Config.layouts. undefined defaultLayout + empty/undefined layoutMatching ⇒ nothing built.
+   *  (loadConfig always sets layoutMatching, defaulting to []; optional for terse test literals.) */
+  defaultLayout?: string;
+  layoutMatching?: LayoutMatchRule[];
 }
 
 export interface Config {
@@ -439,6 +573,8 @@ export interface Config {
   };
   sources: WorkSourceConfig[];
   belts: BeltConfig[]; // sorted by priority asc (ties: config order)
+  /** Named tab/pane arrangements belts build into worktrees (resolved from the `layouts:` block). */
+  layouts: LayoutConfig[];
   /** Where the evidence step publishes captured media (S3 + CloudFront). Undefined ⇒ no upload. */
   evidence?: {
     bucket: string;
@@ -621,6 +757,26 @@ export function writeConfigSchema(): string {
   return path;
 }
 
+/** Normalize a parsed pane `size` (a "30%" string, or a number) into a LayoutSize, or throw a
+ *  readable error. Mirrors the workspace-manager plugin: a "%" string or a fraction 0<n<1 is a
+ *  percentage; an integer ≥1 is a fixed cell count. The Zod schema already guarantees the string
+ *  shape and number>0, so this only enforces the range/whole-number rules. */
+function normalizeSize(raw: string | number, where: string): LayoutSize {
+  if (typeof raw === "string") {
+    const pct = Number(raw.replace(/%$/, "").trim());
+    if (!(pct > 0 && pct < 100)) throw new Error(`${where}: size "${raw}" must be a percentage between 0% and 100%`);
+    return { percent: pct };
+  }
+  if (raw < 1) return { percent: raw * 100 };
+  if (!Number.isInteger(raw)) throw new Error(`${where}: a fixed pane size (${raw}) must be a whole number of cells`);
+  return { cells: raw };
+}
+
+/** vertical/right → a new pane to the right; horizontal/down → below (herdr's split directions). */
+function normalizeSplit(raw: "vertical" | "horizontal" | "right" | "down"): "right" | "down" {
+  return raw === "horizontal" || raw === "down" ? "down" : "right";
+}
+
 export function loadConfig(repoName: string): Loaded {
   const cfgDir = configDir();
   const repoDir = join(cfgDir, "repos", repoName);
@@ -736,10 +892,29 @@ export function loadConfig(repoName: string): Loaded {
       steps,
       watchPr,
       maxBounces: b.max_bounces,
+      defaultLayout: b.default_layout,
+      layoutMatching: b.layout_matching.map((r) => ({ worktreePattern: r.worktree_pattern, layout: r.layout })),
     };
   });
   // Stable sort: equal priorities keep config order (V8 Array.sort is stable on Node >=24).
   belts.sort((a, b) => a.priority - b.priority);
+
+  // Normalize the layout library: collapse each pane's `size`/`split` to their runtime forms.
+  const layouts: LayoutConfig[] = parsed.layouts.map((l) => ({
+    id: l.id,
+    setup: l.setup ? { command: l.setup.command, blocking: l.setup.blocking } : undefined,
+    tabs: l.tabs.map((t) => ({
+      title: t.title,
+      panes: t.panes.map((p) => ({
+        title: p.title,
+        command: p.command,
+        setup: p.setup,
+        split: p.split ? normalizeSplit(p.split) : undefined,
+        ratio: p.ratio,
+        size: p.size != null ? normalizeSize(p.size, `layout "${l.id}"`) : undefined,
+      })),
+    })),
+  }));
 
   const root = stateRoot();
   const stateDir = join(root, repoName);
@@ -761,6 +936,7 @@ export function loadConfig(repoName: string): Loaded {
     },
     sources,
     belts,
+    layouts,
     evidence: parsed.evidence
       ? {
           bucket: parsed.evidence.bucket,

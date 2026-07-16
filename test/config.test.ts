@@ -3,7 +3,8 @@ import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from "nod
 import { tmpdir, homedir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { loadConfig, assertMainCheckout, expandHome, configJsonSchema, evidenceKeyPrefix } from "../src/config.ts";
+import { parse as parseYaml } from "yaml";
+import { loadConfig, assertMainCheckout, expandHome, configJsonSchema, evidenceKeyPrefix, RepoConfigSchema } from "../src/config.ts";
 import type { JiraSourceCfg } from "../src/clients/jira-source.ts";
 import type { GithubIssuesSourceCfg } from "../src/clients/github-issues-source.ts";
 import type { LocalMarkdownSourceCfg } from "../src/sources/local-markdown/descriptor.ts";
@@ -888,6 +889,111 @@ describe("expandHome", () => {
     expect(expandHome("${HOME}/dev/x")).toBe(`${home}/dev/x`);
     expect(expandHome("/already/absolute")).toBe("/already/absolute");
     expect(expandHome("$HOMEWORK/x")).toBe("$HOMEWORK/x"); // not a HOME match
+  });
+});
+
+describe("loadConfig — layouts (workspace-manager port)", () => {
+  const WS = `  - type: jira
+    jira: { base_url: https://x.atlassian.net, project: RWR, board: 254 }
+`;
+  // A belt that selects layouts: hotfix/* → hot, else the web default.
+  const BELT = `  - name: ship
+    source: jira
+    label: agent
+    default_layout: web
+    layout_matching:
+      - { worktree_pattern: "hotfix/*", layout: hot }
+    steps:
+      - { type: work,   tab: main,   pane: agent }
+      - { type: review, tab: review, pane: agent }
+      - { type: pr,     tab: pr,     pane: agent }
+`;
+  // A belt referencing only the `web` layout (for tests whose layout library omits `hot`).
+  const BELT_WEB_ONLY = `  - name: ship
+    source: jira
+    label: agent
+    default_layout: web
+    steps:
+      - { type: work,   tab: main,   pane: agent }
+      - { type: review, tab: review, pane: agent }
+      - { type: pr,     tab: pr,     pane: agent }
+`;
+  const LAYOUTS = `  - id: web
+    setup: { command: pnpm i, blocking: true }
+    tabs:
+      - title: main
+        panes:
+          - { title: agent,  command: claude,  setup: true }
+          - { title: editor, command: nvim, split: vertical, size: "30%" }
+      - title: dev
+        panes:
+          - { title: server, command: pnpm dev, size: 0.5 }
+          - { title: logs, split: horizontal, size: 40 }
+  - id: hot
+    tabs:
+      - panes:
+          - { command: claude }
+`;
+  const full = (belt = BELT, layouts = LAYOUTS) =>
+    `repo:\n  path: __REPO__\nwork_sources:\n${WS}belt:\n${belt}layouts:\n${layouts}`;
+
+  it("parses + normalizes the layout library and per-belt selection", () => {
+    setup(full());
+    const { config } = loadConfig("demo");
+    expect(config.layouts.map((l) => l.id)).toEqual(["web", "hot"]);
+    const web = config.layouts[0]!;
+    expect(web.setup).toEqual({ command: "pnpm i", blocking: true });
+    // vertical → right; "30%" → { percent: 30 }
+    expect(web.tabs[0]!.panes[1]!.split).toBe("right");
+    expect(web.tabs[0]!.panes[1]!.size).toEqual({ percent: 30 });
+    // 0.5 fraction → percent 50; horizontal → down; 40 → cells
+    expect(web.tabs[1]!.panes[0]!.size).toEqual({ percent: 50 });
+    expect(web.tabs[1]!.panes[1]!.split).toBe("down");
+    expect(web.tabs[1]!.panes[1]!.size).toEqual({ cells: 40 });
+    const belt = config.belts[0]!;
+    expect(belt.defaultLayout).toBe("web");
+    expect(belt.layoutMatching).toEqual([{ worktreePattern: "hotfix/*", layout: "hot" }]);
+  });
+
+  it("rejects duplicate layout ids", () => {
+    setup(full(BELT, `${LAYOUTS}  - id: web\n    tabs:\n      - panes:\n          - { command: x }\n`));
+    expect(() => loadConfig("demo")).toThrow(/duplicate layout id "web"/);
+  });
+
+  it("rejects a belt default_layout that isn't a defined layout", () => {
+    setup(full(BELT.replace("default_layout: web", "default_layout: ghost")));
+    expect(() => loadConfig("demo")).toThrow(/default_layout "ghost" is not a defined layout/);
+  });
+
+  it("rejects a layout_matching rule referencing an unknown layout", () => {
+    setup(full(BELT.replace("layout: hot", "layout: ghost")));
+    expect(() => loadConfig("demo")).toThrow(/references unknown layout "ghost"/);
+  });
+
+  it("rejects a pane that sets both ratio and size", () => {
+    const bad = `  - id: web\n    tabs:\n      - panes:\n          - { command: a }\n          - { split: right, ratio: 0.5, size: "30%" }\n`;
+    setup(full(BELT_WEB_ONLY, bad));
+    expect(() => loadConfig("demo")).toThrow(/either ratio or size/);
+  });
+
+  it("rejects more than one setup pane in a layout", () => {
+    const bad = `  - id: web\n    setup: { command: x }\n    tabs:\n      - panes:\n          - { command: a, setup: true }\n          - { command: b, setup: true, split: right }\n`;
+    setup(full(BELT_WEB_ONLY, bad));
+    expect(() => loadConfig("demo")).toThrow(/at most one pane/);
+  });
+
+  it("rejects an out-of-range percentage size", () => {
+    const bad = `  - id: web\n    tabs:\n      - panes:\n          - { command: a }\n          - { split: right, size: "150%" }\n`;
+    setup(full(BELT_WEB_ONLY, bad));
+    expect(() => loadConfig("demo")).toThrow(/between 0% and 100%/);
+  });
+
+  it("the shipped example config parses against the schema (guards example drift)", () => {
+    const repoRoot = fileURLToPath(new URL("../", import.meta.url));
+    const raw = readFileSync(join(repoRoot, "examples/example-repo/config.yml"), "utf8");
+    const r = RepoConfigSchema.safeParse(parseYaml(raw));
+    const detail = r.success ? "" : r.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("; ");
+    expect(r.success, detail).toBe(true);
   });
 });
 

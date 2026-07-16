@@ -303,6 +303,16 @@ export class Store {
     return row ? toRun(row) : undefined;
   }
 
+  /** The active run whose worktree branch matches — how the layout hook tells a factory-created
+   *  worktree (use that run's belt for layout selection) from a hand-made one (walk belts). Branches
+   *  carry a per-claim uid suffix, so this is effectively unique among active runs. */
+  activeRunForBranch(repo: string, branch: string): Run | undefined {
+    const row = this.db
+      .prepare(`${RUN_SELECT} WHERE r.repo = ? AND r.branch = ? AND r.ended_at IS NULL`)
+      .get(repo, branch) as RunRow | undefined;
+    return row ? toRun(row) : undefined;
+  }
+
   /** All active runs for a ticket key, across sources — for the manual CLI (claim/teardown/
    *  step-done) which is given only a key. The caller errors when this returns >1 (ambiguous). */
   activeRunsForKey(repo: string, key: string): Run[] {

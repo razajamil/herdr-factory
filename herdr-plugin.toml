@@ -1,0 +1,31 @@
+id = "herdr-factory"
+name = "herdr-factory layouts"
+version = "0.1.0"
+min_herdr_version = "0.7.0"
+description = "Builds a per-belt herdr tab/pane layout into each newly-created worktree of a herdr-factory-managed repo (absorbed from herdr-plugin-workspace-manager)."
+platforms = ["linux", "macos"]
+
+# All events route through bin/herdr-factory (the CLI launcher), which resolves a Node >= 26 and
+# dispatches the "layout-hook" arg to the LEAN entry (src/cli/layout-hook.ts) — so the hot
+# workspace.focused path doesn't load the whole CLI graph. The hook matches the new worktree's repo
+# root to a herdr-factory repo config, picks the layout (a factory-claimed worktree uses its run's
+# belt; a hand-created one walks the repo's belts), and builds it once into a fresh 1-tab/1-pane
+# linked worktree.
+
+# Fires for every new worktree created via the CLI / `herdr worktree create` (which is what the
+# factory itself uses when it claims work).
+[[events]]
+on = "worktree.created"
+command = ["bash", "bin/herdr-factory", "layout-hook"]
+
+# The herdr UI "new worktree" command creates the worktree in-app and emits NEITHER worktree.created
+# NOR workspace.created to plugins — the only event it dispatches is workspace.focused. So we also
+# listen for workspace.created (CLI path) and workspace.focused (UI path). The hook dedupes (a
+# per-checkout-path claim + a per-workspace "decided" cache), so the extra events are harmless.
+[[events]]
+on = "workspace.created"
+command = ["bash", "bin/herdr-factory", "layout-hook"]
+
+[[events]]
+on = "workspace.focused"
+command = ["bash", "bin/herdr-factory", "layout-hook"]

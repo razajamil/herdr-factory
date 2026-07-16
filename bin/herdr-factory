@@ -19,6 +19,15 @@ if [ "$#" -eq 0 ]; then
   exec "$pkg/bin/herdr-factory-tui"
 fi
 
+# The herdr layout event hook has a lean entry (src/cli/layout-hook.ts) so herdr's constantly-firing
+# workspace.focused event doesn't load the whole CLI graph just to no-op. Route "layout-hook" there;
+# everything else goes through the full CLI (src/cli/index.ts).
+entry="src/cli/index.ts"
+if [ "$1" = "layout-hook" ]; then
+  entry="src/cli/layout-hook.ts"
+  shift
+fi
+
 # herdr-factory must run on Node >= 26 (native type-stripping + node:sqlite; the TUI additionally
 # needs FFI). Prefer the caller's active `node` when it's new enough; otherwise re-exec with the
 # Node path the CLI baked on a prior >= 26 run (config.nodePathFile / cli bakeNodePath) — in a
@@ -29,7 +38,7 @@ node_major() { local v; v="$("$1" -v 2>/dev/null)" || return 1; v="${v#v}"; prin
 
 m="$(node_major node || true)"
 if [ -n "$m" ] && [ "$m" -ge 26 ]; then
-  exec node src/cli/index.ts "$@"
+  exec node "$entry" "$@"
 fi
 
 baked="${HERDR_FACTORY_STATE_ROOT:-${HOME:-}/.local/state/herdr-factory}/node-path"
@@ -38,7 +47,7 @@ if [ -r "$baked" ]; then
   if [ -n "$bnode" ] && [ -x "$bnode" ]; then
     bm="$(node_major "$bnode" || true)"
     if [ -n "$bm" ] && [ "$bm" -ge 26 ]; then
-      exec "$bnode" src/cli/index.ts "$@"
+      exec "$bnode" "$entry" "$@"
     fi
   fi
 fi
