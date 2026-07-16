@@ -990,7 +990,17 @@ export async function bounceStep(
   reason: string,
 ): Promise<{ ok: boolean; escalated?: boolean; message?: string }> {
   const fromStep = run.step;
-  if (run.phase !== "running" || !fromStep) return { ok: false, message: "no running step to bounce from" };
+  // A step has three legal terminals: step-done, bounce, ask-human. A step-execution watchdog park
+  // (budget / stall / capture cap) is a backstop against a STUCK agent, never a veto on its
+  // decision — a genuine step-done from the parked step un-parks the run (reconcileAttention's
+  // auto-rescue), and a genuine BOUNCE must land the same way: the agent finished its assessment
+  // and concluded the work has to go back. Every other park (source stale, PR closed, bounce cap,
+  // human loop, config error) stays a hard gate — those need a human decision.
+  const watchdogParked =
+    run.phase === "attention" && STEP_WATCHDOG_ATTENTION.has(deps.store.lastAttentionReasonCode(run.id) ?? "");
+  if ((run.phase !== "running" && !watchdogParked) || !fromStep) {
+    return { ok: false, message: "no running step to bounce from" };
+  }
   const from = stepByName(belt, fromStep);
   const to = stepByName(belt, toStep);
   if (!from || !to) return { ok: false, message: `step "${toStep}" is not in belt "${belt.name}"` };
@@ -1016,6 +1026,21 @@ export async function bounceStep(
       detail: { fromStep, toStep, bounces },
     });
     return { ok: true, escalated: true, message: `bounce limit exceeded — escalated to attention` };
+  }
+
+  // Un-park bookkeeping for a bounce that rescues a watchdog park (the rewind below flips the
+  // phase back to running anyway): record the rescue and restore the pane label the escalation
+  // overwrote with "⚠ ATTENTION …" — mirrors reconcileAttention's step-done rescue.
+  if (watchdogParked) {
+    deps.store.recordEvent({
+      runId: run.id,
+      repo: deps.config.repoName,
+      ticketKey: run.ticketKey,
+      type: "resumed",
+      detail: { reason: "bounce_after_watchdog_park", step: fromStep },
+    });
+    if (run.paneId) await deps.herdr.agentRename(run.paneId, `${fromStep}:${run.ticketKey}`).catch(() => {});
+    deps.log("info", `${run.ticketKey}: ${fromStep} bounced after a watchdog park — un-parking`);
   }
 
   releaseStepLocks(deps, run, from); // bouncing away from this step → free any exclusive_resource it held
@@ -1156,13 +1181,14 @@ const HUMAN_POLL_ERROR_ESCALATE = 20;
 
 /** Attention reasons raised by a STEP's own execution watchdog that trips while the step's agent is
  *  RUNNING — the evidence flaky-capture cap, the per-step budget, and the commit-stall heartbeat.
- *  These are backstops against a stuck agent, NOT a veto on finished work: an agent that reaches
- *  step-done is by definition not looping, so a genuine step-done from the parked step un-parks the
- *  run and lets the pipeline advance (reconcileAttention). The layout-pane wait is NOT here: it trips
- *  BEFORE the agent exists (no pane ⇒ no agent ⇒ its step-done can never arrive), so it is rescued by
- *  re-attempting the spawn instead — see STEP_RESPAWN_ATTENTION. Every OTHER park — source item gone,
- *  PR closed, bounce oscillation, human loop, config error — needs a human decision and is never
- *  auto-rescued. */
+ *  These are backstops against a stuck agent, NOT a veto on its terminal decision: an agent that
+ *  reaches a terminal signal is by definition not looping, so a genuine step-done from the parked
+ *  step un-parks the run and advances it (reconcileAttention), and a genuine BOUNCE from it lands
+ *  the same way (bounceStep accepts a watchdog-parked bouncer). The layout-pane wait is NOT here:
+ *  it trips BEFORE the agent exists (no pane ⇒ no agent ⇒ no terminal signal can ever arrive), so
+ *  it is rescued by re-attempting the spawn instead — see STEP_RESPAWN_ATTENTION. Every OTHER
+ *  park — source item gone, PR closed, bounce oscillation, human loop, config error — needs a
+ *  human decision and is never auto-rescued. */
 // DERIVED (not a hardcoded literal) as the union of every registered step primitive's guards whose
 // `autoRescueOnDone` is true. A plugin guard that parks a run participates automatically — no edit
 // to a literal Set. read_only_violation / source_item_stale / pr_closed / bounce_limit / human /

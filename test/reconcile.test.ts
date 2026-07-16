@@ -398,6 +398,37 @@ describe("applySignal — shared run-scoped agent signal effect", () => {
   });
 });
 
+// A step-execution watchdog park (budget / stall / capture cap) is a backstop against a STUCK
+// agent, never a veto on its terminal decision. step-done from the parked step already un-parked
+// the run (reconcileAttention's auto-rescue); bounce — the step's other legal terminal — must land
+// symmetrically, instead of being rejected while the agent that issued it has already stopped.
+describe("bounce from a watchdog-parked step", () => {
+  it("a bounce from a step parked by its own watchdog un-parks the run and rewinds it", async () => {
+    const { deps, store, worktree } = build();
+    const run = seed(store, worktree, "K-BP1", "attention", "review", { attentionReason: "review step over budget (worker: idle)" });
+    store.upsertRunStep(run.id, "fix", { paneId: "w1:pfix", done: true });
+    store.recordEvent({ runId: run.id, repo: "demo", ticketKey: "K-BP1", type: "attention", detail: { reason: "step_budget", step: "review" } });
+    const res = await applySignal(deps, "bounce", { key: "K-BP1", toStep: "fix", reason: "the fix regressed the toast", step: "review", pass: 1 });
+    expect(res.ok).toBe(true);
+    const fresh = store.getRun(run.id)!;
+    expect(fresh.phase).toBe("running");
+    expect(fresh.step).toBe("fix");
+    const resumed = store.timeline("demo", "K-BP1").filter((e) => e.type === "resumed").map((e) => JSON.parse(e.detail ?? "{}").reason);
+    expect(resumed).toContain("bounce_after_watchdog_park");
+  });
+
+  it("a bounce from a human park (pr_closed, bounce_limit, …) stays rejected — those need a person", async () => {
+    const { deps, store, worktree } = build();
+    const run = seed(store, worktree, "K-BP2", "attention", "review", { attentionReason: "PR #7 closed without merging" });
+    store.upsertRunStep(run.id, "fix", { paneId: "w1:pfix", done: true });
+    store.recordEvent({ runId: run.id, repo: "demo", ticketKey: "K-BP2", type: "attention", detail: { reason: "pr_closed" } });
+    const res = await applySignal(deps, "bounce", { key: "K-BP2", toStep: "fix", reason: "redo", step: "review", pass: 1 });
+    expect(res.ok).toBe(false);
+    expect(store.getRun(run.id)!.phase).toBe("attention"); // untouched
+    expect(store.getRun(run.id)!.step).toBe("review");
+  });
+});
+
 // Pass stamping: bounce rewinds make per-step progress non-monotonic, so every entry into a step
 // opens a new PASS (run_steps.pass), the pass is stamped into the rendered prompt's signal commands
 // (--pass N), and a signal carrying a stale stamp is rejected instead of completing/rewinding a

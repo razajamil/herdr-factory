@@ -267,8 +267,9 @@ review }, { type: pr }]` — the engine ships each primitive's prompt:
   and records a per-criterion verdict table (with the public URLs) in its handoff. If the evidence
   doesn't prove a criterion it **bounces the run back to work** with findings. A flaky app that keeps
   re-capturing past `max_capture_attempts` parks for attention — but only as a backstop against a
-  stuck agent: if the evidence step then genuinely finishes and signals `step-done`, the run un-parks
-  and advances (evidence is non-gating — the cap never vetoes completed evidence). This station runs only when
+  stuck agent: if the parked step then genuinely reaches a terminal — `step-done`, or a bounce back
+  to work — the run un-parks and follows it (evidence is non-gating — the cap never vetoes a
+  completed verdict, pass or fail). This station runs only when
   the belt's layout provides its pane (`tab` + `pane` in config; see [Layouts](#layouts)) — without one the belt is simply
   work → review → pr.
 - **review** — a strict read-only gate with fresh eyes: it never edits or commits (if it commits, the

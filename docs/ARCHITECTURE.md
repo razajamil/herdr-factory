@@ -717,9 +717,11 @@ duplicated). The evidence step separately signals each capture try
 via `capture-attempt`; past `max_capture_attempts` (default 5, reset per fresh pass into the step)
 the run parks for `attention` — a flaky app that can't be captured cleanly surfaces instead of
 looping. That park is a backstop, not a gate: it's raised by a step-execution watchdog (the capture
-cap or the per-step budget/stall), and if the parked step's agent goes on to
-signal `step-done`, `reconcileAttention` un-parks the run and lets the pipeline advance — an agent
-that reaches `step-done` is by definition not looping, so completed evidence is never vetoed. The
+cap or the per-step budget/stall), and if the parked step's agent goes on to reach a **terminal
+signal**, the run follows it — a `step-done` un-parks and advances (`reconcileAttention`), and a
+**bounce** from the parked step un-parks and rewinds the same way (`bounceStep` accepts a
+watchdog-parked bouncer) — an agent that reaches a terminal is by definition not looping, so
+neither completed evidence nor a completed send-it-back verdict is ever vetoed. The
 **layout-pane wait** is the one watchdog that trips *before* the step's agent exists (no pane ⇒ no
 agent ⇒ its `step-done` can never arrive), so a `layout_wait_timeout` park is instead rescued by
 **re-attempting the spawn**: the guard's bounded respawn budget (`autoRespawnLimit`, 3) re-arms an
