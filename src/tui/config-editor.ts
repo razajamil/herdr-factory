@@ -83,6 +83,7 @@ function createFieldPanel(
     width: "100%",
     flexDirection: "column",
     flexGrow: 0,
+    flexShrink: 0,
     height: COLLAPSED_HEIGHT,
     backgroundColor: theme.bg,
     border: true,
@@ -95,6 +96,8 @@ function createFieldPanel(
   });
   const scroll = new ScrollBoxRenderable(renderer, {
     flexGrow: 1,
+    flexShrink: 1,
+    minHeight: 0, // allow the scroll to be smaller than its content (clip + scroll, don't grow the box)
     width: "100%",
     scrollY: true,
     backgroundColor: theme.bg,
@@ -378,8 +381,23 @@ function createFieldPanel(
   function setExpanded(on: boolean): void {
     scroll.visible = on;
     summary.visible = !on;
-    outer.flexGrow = on ? 1 : 0;
-    outer.height = on ? "auto" : COLLAPSED_HEIGHT;
+    if (on) {
+      // Fill the space the collapsed panels + status line leave — NOT the content's height. A plain
+      // Box sizes to its content, so with `flexBasis: 0` + `minHeight: 0` it grows from zero to the
+      // available space instead of overflowing the viewport; the inner scroll clips the overflow.
+      outer.flexGrow = 1;
+      outer.flexShrink = 1;
+      outer.flexBasis = 0;
+      outer.minHeight = 0;
+      outer.height = "auto";
+    } else {
+      // Fixed, non-shrinking title bar so every collapsed panel stays visible.
+      outer.flexGrow = 0;
+      outer.flexShrink = 0;
+      outer.flexBasis = COLLAPSED_HEIGHT;
+      outer.minHeight = COLLAPSED_HEIGHT;
+      outer.height = COLLAPSED_HEIGHT;
+    }
   }
 
   function setActive(on: boolean): void {
@@ -462,7 +480,7 @@ export function createConfigEditor(renderer: CliRenderer, confirm: ConfirmFn): T
 
   // ── sections 2/3/4: the accordion + status line ─────────────────────────────────────────────
   const rightCol = new BoxRenderable(renderer, { flexDirection: "column", flexGrow: 1, height: "100%", backgroundColor: theme.bg });
-  const status = new TextRenderable(renderer, { content: "", height: 1, wrapMode: "none", fg: theme.text.tertiary, paddingLeft: 1 });
+  const status = new TextRenderable(renderer, { content: "", height: 1, flexShrink: 0, wrapMode: "none", fg: theme.text.tertiary, paddingLeft: 1 });
 
   root.add(repoPanel);
   root.add(rightCol);
