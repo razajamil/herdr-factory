@@ -629,6 +629,47 @@ describe("reconcile pipeline (work_to_pull_request belt)", () => {
     expect(store.getRunStep(run.id, "review")!.done).toBe(false); // review re-runs fresh
   });
 
+  it("RWR-18147: after a bounce, an intermediate step's STALE budget clock doesn't wedge the re-advance in attention", async () => {
+    // The exact stuck run: fix→evidence→review, review bounced to fix, fix reworked + signalled
+    // step-done — then the pipeline advanced back into evidence, whose run_step still carried the
+    // started_at from its FIRST pass. spawnStep returned "waiting" (the evidence layout pane wasn't
+    // idle yet), so it never re-based the clock; the next tick's budget watchdog saw the hours-old
+    // started_at and parked the run ("evidence step over budget (worker: idle)") — never re-running it.
+    const { deps, store, state, worktree, shipBelt, setNow } = build();
+    shipBelt.steps = [stepCfg("fix"), stepCfg("evidence"), stepCfg("review"), stepCfg("pr")]; // 4-step belt (adds evidence)
+    const run = seed(store, worktree, "K-RWR", "running", "review");
+    // fix + evidence completed on the first forward pass; evidence's budget clock (3600s) is ancient.
+    store.upsertRunStep(run.id, "fix", { paneId: "w1:pfix", done: true });
+    store.upsertRunStep(run.id, "evidence", { paneId: "w1:pev", done: true, startedAt: 1000, progressSig: "sha-x" });
+    const src = deps.resolveSource("jira")!;
+    await bounceStep(deps, store.getRun(run.id)!, shipBelt, src, "fix", "the evidence didn't prove the fix");
+    expect(store.getRun(run.id)!.step).toBe("fix");
+    expect(store.getRunStep(run.id, "evidence")!.startedAt).toBe(1000); // bounce leaves the stale clock in place
+
+    // Tick 1: fix signals done far in the future (the rework took a while); the evidence LAYOUT pane
+    // isn't idle yet, so the forward-advance dispatch returns "waiting".
+    setNow(101_000); // 100_000s ≫ evidence's 3600s budget, measured from the stale started_at
+    state.paneState = "working";
+    store.markStepDone(run.id, "fix");
+    await reconcileRun(deps, store.getRun(run.id)!);
+    const afterAdvance = store.getRun(run.id)!;
+    expect(afterAdvance.phase).toBe("running");
+    expect(afterAdvance.step).toBe("evidence"); // advanced fix → evidence
+    const ev = store.getRunStep(run.id, "evidence")!;
+    expect(ev.startedAt).toBe(101_000); // budget clock RE-BASED on entry (was 1000, hours over budget)
+    expect(ev.paneId).toBe(null); // pane cleared → routes through the (!rs.paneId) spawn+wait gate
+
+    // Tick 2: the layout pane frees up; evidence must actually re-run, NOT get parked for step_budget.
+    setNow(101_010);
+    state.paneState = "idle";
+    await reconcileRun(deps, store.getRun(run.id)!);
+    const got = store.getRun(run.id)!;
+    expect(got.phase).toBe("running"); // regression guard: was "attention" (evidence over budget, idle)
+    expect(got.step).toBe("evidence");
+    expect(got.attentionReason).toBe(null);
+    expect(store.getRunStep(run.id, "evidence")!.paneId).toBeTruthy(); // evidence actually re-spawned
+  });
+
   it("exceeding max_bounces escalates to attention instead of bouncing again", async () => {
     const { deps, store, worktree, calls, shipBelt } = build();
     const run = seed(store, worktree, "K-B3", "running", "review");

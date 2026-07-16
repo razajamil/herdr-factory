@@ -1309,12 +1309,23 @@ async function reconcileStep(deps: Deps, run: Run, belt: BeltRuntime, src: Sourc
     const next = nextStep(belt, step.name);
     if (next) {
       deps.store.updateRun(run.id, { phase: "running", step: next.name });
-      // Fresh pass into an evidence step ⇒ reset its flaky-capture budget (this is the ONLY reset on
-      // the forward path; a crash-recovery respawn below deliberately does NOT reset, so a self-crash
-      // can't refill the cap). Cheap + scoped: only a gathersEvidence step ever holds a nonzero count.
+      // Fresh pass into an evidence step ⇒ reset its flaky-capture budget (the capture cap is reset
+      // ONLY here on the forward path; a crash-recovery respawn below deliberately does NOT reset it,
+      // so a self-crash can't refill the cap). Cheap + scoped: only a gathersEvidence step holds a count.
       if (next.gathersEvidence) deps.store.resetGuardCounter(run.id, next.name, "capture_cap");
+      // Re-base the next step's execution state as we ENTER it, so a stale clock/pane left by a PRIOR
+      // pass into that step can't misfire. This bites after a bounce: bounceStep clears an intermediate
+      // step's `done` (so it re-runs) but its started_at / pane_id survive from the first pass — and if
+      // the layout pane isn't instantly ready, spawnStep returns "waiting" WITHOUT re-basing the clock,
+      // so the very next tick's budget watchdog sees the ancient started_at and parks the run in
+      // `attention` before it ever re-runs (RWR-18147: review→work bounce → work re-done → evidence
+      // "over budget (idle)", never re-spawned). A first-ever entry is unaffected — the row doesn't
+      // exist yet, so this is a plain insert. Clearing pane_id also routes a not-yet-ready layout pane
+      // back through the (!rs.paneId) spawn+wait gate below instead of awaiting a dead idle pane forever.
+      deps.store.upsertRunStep(run.id, next.name, { done: false, startedAt: deps.now(), progressSig: null, progressAt: null, paneId: null, absentAt: null });
       deps.log("info", `${run.ticketKey}: ${step.name} done -> ${next.name}`);
-      await spawnStep(deps, run, belt, src, next.name);
+      const res = await spawnStep(deps, run, belt, src, next.name);
+      if (res.status === "waiting") await handleLayoutWait(deps, run, belt, next);
       return;
     }
     // Last step of the belt.
