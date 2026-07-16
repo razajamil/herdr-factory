@@ -28,7 +28,8 @@ interface FakeState {
   sig: ReviewSig;
   paneState: string;
   deadPanes: Set<string>; // panes herdr no longer tracks (paneAlive → false)
-  tabPane: string | null; // what tabPaneByLabel resolves (null ⇒ the configured label no longer matches any pane)
+  tabPane: string | null; // what tabPaneByLabel resolves for the CONFIGURED label ("agent") — null ⇒ no match
+  tabPaneByName: Record<string, string>; // what tabPaneByLabel resolves for a NON-configured label (the renamed dispatch name `${step}:${key}`)
   headSha: string;
   sessionId: string | null;
   workspaceExists: boolean; // does the workspace still exist after a worktree remove?
@@ -84,7 +85,7 @@ function build(opts: { multi?: boolean } = {}) {
   let now = 1000;
   let uidN = 0; // deterministic per-claim branch suffix (u1, u2, …) so re-claims get distinct branches
   const store = new Store(openDb(":memory:"), () => now);
-  const state: FakeState = { eligible: [], eligible2: [], pr: null, sig: { unresolved: 0, failing: 0, sig: "s0" }, paneState: "idle", deadPanes: new Set(), tabPane: "w1:p1", headSha: "sha0", sessionId: "sess-1", workspaceExists: false, focusedPane: { paneId: "w1:p1", workspaceId: "w1", tabId: "w1:t1", label: "agent" }, humanReply: null, herdrUnreachable: false, failTransitions: false, failTransitionStates: new Set(), staleTransitionStates: new Set(), humanPollError: null, humanAskError: null, failEligible: false, authFail: false, itemLabels: {} };
+  const state: FakeState = { eligible: [], eligible2: [], pr: null, sig: { unresolved: 0, failing: 0, sig: "s0" }, paneState: "idle", deadPanes: new Set(), tabPane: "w1:p1", tabPaneByName: {}, headSha: "sha0", sessionId: "sess-1", workspaceExists: false, focusedPane: { paneId: "w1:p1", workspaceId: "w1", tabId: "w1:t1", label: "agent" }, humanReply: null, herdrUnreachable: false, failTransitions: false, failTransitionStates: new Set(), staleTransitionStates: new Set(), humanPollError: null, humanAskError: null, failEligible: false, authFail: false, itemLabels: {} };
   const calls = {
     transitions: [] as [string, WorkState][],
     agentSend: [] as [string, string][],
@@ -177,7 +178,9 @@ function build(opts: { multi?: boolean } = {}) {
       return !state.deadPanes.has(id);
     },
     agentSessionId: async () => state.sessionId,
-    tabPaneByLabel: async () => state.tabPane,
+    // Configured label ("agent") resolves to state.tabPane; a renamed dispatch name resolves from
+    // state.tabPaneByName (empty ⇒ null), mirroring how the first dispatch renames a pane's label.
+    tabPaneByLabel: async (_ws, _tab, pane) => (pane === "agent" ? state.tabPane : (state.tabPaneByName[pane] ?? null)),
     agentStart: async () => { calls.agentStart += 1; return "w1:p2"; },
     paneRun: async () => {},
     tabCreate: async () => ({ tabId: "w1:t2", paneId: "w1:pN" }),
@@ -675,6 +678,29 @@ describe("reconcile pipeline (work_to_pull_request belt)", () => {
     state.paneState = "working"; // evidence is now doing the re-capture
     await reconcileRun(deps, store.getRun(run.id)!);
     expect(store.getRun(run.id)!.phase).toBe("running");
+  });
+
+  it("re-entry re-finds a step's renamed pane by its dispatch name when the recorded id was lost", async () => {
+    // A run parked by the pre-fix code (which cleared the re-entered step's pane_id) resumes into a
+    // step whose LAYOUT pane still exists — but under its first-dispatch name (evidence:KEY), so the
+    // configured label (evidence/agent) no longer resolves it. With no recorded id AND no label match,
+    // dispatch must still recover the pane by its deterministic dispatch name, or the run re-wedges in
+    // a layout-wait timeout the instant it's resumed.
+    const { deps, store, state, worktree, shipBelt, calls } = build();
+    shipBelt.steps = [stepCfg("fix"), stepCfg("evidence"), stepCfg("review"), stepCfg("pr")];
+    const run = seed(store, worktree, "K-REN", "running", "evidence");
+    store.upsertRunStep(run.id, "evidence", { paneId: null }); // recorded id lost by the old code path
+    state.tabPane = null; // configured label "agent" no longer matches — the pane was renamed
+    state.tabPaneByName = { "evidence:K-REN": "w1:pev" }; // but it's still there under its dispatch name
+    calls.agentSend.length = 0;
+
+    await reconcileRun(deps, store.getRun(run.id)!);
+
+    const got = store.getRun(run.id)!;
+    expect(got.phase).toBe("running"); // recovered — NOT parked in a layout-wait timeout
+    expect(got.step).toBe("evidence");
+    expect(store.getRunStep(run.id, "evidence")!.paneId).toBe("w1:pev"); // re-found by dispatch name + re-recorded
+    expect(calls.agentSend.some(([p]) => p === "w1:pev")).toBe(true);
   });
 
   it("exceeding max_bounces escalates to attention instead of bouncing again", async () => {

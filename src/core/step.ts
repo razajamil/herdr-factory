@@ -83,12 +83,13 @@ export type DispatchResult = { status: "ready"; paneId: string } | { status: "wa
  *    (setup commands, dev servers, agent startup) settle before work begins.
  *    RE-ENTRY (bounce rework / forward re-advance after a bounce / crash respawn) passes the
  *    pane this step was ALREADY dispatched to as `knownPaneId`: the first dispatch renames the
- *    pane from its configured label to `${step}:${key}`, so re-resolving by `tab`/`pane` would no
- *    longer find it (the run would wedge in a layout-wait timeout — "pane never became available").
- *    A live known pane is our durable handle, so we re-prompt it directly, skipping the label
- *    lookup + the idle gate (it finished its prior pass and is idle-at-prompt) — mirroring how
- *    `bounceStep` re-enters its target. The label lookup runs only on FIRST entry (no known pane)
- *    or once the known pane is gone.
+ *    pane from its configured label to `${step}:${key}` (= `paneName`), so re-resolving by
+ *    `tab`/`pane` would no longer find it (the run would wedge in a layout-wait timeout — "pane
+ *    never became available"). So we resolve in order: a live `knownPaneId` (the durable handle) →
+ *    the configured label (FIRST entry, before any rename) → the renamed `paneName` (a re-entry
+ *    whose recorded id was lost). A re-entry pane finished its prior pass and is idle-at-prompt, so
+ *    we re-prompt it directly, skipping the idle gate — mirroring how `bounceStep` re-enters its
+ *    target; only a fresh configured-label pane must clear the idle gate first.
  *  - **Not configured** (no tab/pane): spawn a dedicated claude pane ourselves. This is the
  *    only path that creates a pane.
  *
@@ -117,14 +118,28 @@ async function dispatchToLayoutImpl(
   opts: { workspaceId: string; worktree: string; tab?: string; pane?: string; prompt: string; paneName: string; ticketKey: string; knownPaneId?: string },
 ): Promise<DispatchResult> {
   if (opts.tab && opts.pane) {
-    // Re-entry: prefer the pane this step already owns over re-resolving the (now-renamed)
-    // configured label — see the dispatchToLayout doc. Only a LIVE known pane qualifies; a dead one
-    // falls back to the label lookup (which, for a genuinely gone layout pane, waits → attention).
-    const reused = opts.knownPaneId != null && (await deps.herdr.paneAlive(opts.knownPaneId));
-    const target = reused ? opts.knownPaneId! : await deps.herdr.tabPaneByLabel(opts.workspaceId, opts.tab, opts.pane);
+    // Resolve this step's pane, in order (see the dispatchToLayout doc):
+    //   1. the recorded pane id, if it's still a live agent — a re-entry's durable handle;
+    //   2. the configured label — a FIRST entry (before the pane is renamed);
+    //   3. the deterministic dispatch name `${step}:${key}` (= opts.paneName) — a re-entry whose
+    //      recorded id was lost (e.g. a run parked by the pre-fix code that had cleared it), whose
+    //      pane still exists but under its renamed label. Without this the run wedges in a layout wait.
+    // (1) and (3) are RE-ENTRIES: the pane already ran a pass, so it's idle-at-prompt — re-prompt it
+    // directly, skipping the idle gate + startup settle (mirrors bounceStep). Only a FRESH (2) pane
+    // must be present AND idle before we send (its agent may still be starting up).
+    let target: string | null = null;
+    let reused = false;
+    if (opts.knownPaneId != null && (await deps.herdr.paneAlive(opts.knownPaneId))) {
+      target = opts.knownPaneId;
+      reused = true;
+    } else {
+      target = await deps.herdr.tabPaneByLabel(opts.workspaceId, opts.tab, opts.pane);
+      if (!target) {
+        target = await deps.herdr.tabPaneByLabel(opts.workspaceId, opts.tab, opts.paneName);
+        reused = target != null;
+      }
+    }
     if (!target) return { status: "waiting" }; // the layout hasn't created this tab/pane yet
-    // A freshly-resolved layout pane must be present AND idle before we send (its agent may still be
-    // starting up); a reused pane is already ours and idle-at-prompt, so re-prompt it directly.
     if (!reused && (await deps.herdr.paneState(target)) !== "idle") return { status: "waiting" }; // no agent, or still busy
     if (!reused) await deps.sleep(2000); // settle a just-started agent so the first keystrokes aren't dropped
     await deps.herdr.agentSend(target, opts.prompt);
