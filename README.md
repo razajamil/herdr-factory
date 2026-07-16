@@ -582,6 +582,12 @@ the factory is now itself a herdr plugin (registered by `install.sh`, or manuall
 `herdr plugin link <checkout>`) that listens for `worktree.created` and builds the matching layout
 into **any** new worktree — whether you created it by hand or the factory claimed a ticket.
 
+> **Don't run another herdr layout plugin for repos the factory manages.** Because the factory now
+> owns layout application on `worktree.created`, a second layout plugin — e.g.
+> [workspace-manager](https://github.com/razajamil/herdr-plugin-workspace-manager) — would fire on
+> the same event and build a competing (or duplicate) layout into the same worktree. Disable that
+> plugin's mapping for any factory-managed repo, or uninstall it.
+
 Define a repo-level library and point belts at it:
 
 ```yaml
