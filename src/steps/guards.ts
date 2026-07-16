@@ -5,12 +5,16 @@
 //
 // The union of guards with autoRescueOnDone===true is STEP_WATCHDOG_ATTENTION (a genuine step-done
 // un-parks a run a watchdog parked); bounce_limit / pr_closed / source_item_stale / human / config
-// parks are not here.
+// parks are not here. layout_wait is the one guard that trips BEFORE the step's agent exists (the
+// pane never came up ⇒ no agent ⇒ its step-done can never arrive), so step-done rescue is
+// categorically wrong for it: it declares autoRescueOnDone:false and recovers by RE-ATTEMPTING THE
+// SPAWN instead — `autoRespawnLimit` bounds how many extra wait windows the engine grants (in place,
+// or by auto-un-parking an already-parked run) before the park needs a human `resume`.
 import type { GuardSpec } from "../types.ts";
 
 export const BUDGET_GUARD: GuardSpec = { kind: "budget", escalationReason: "step_budget", autoRescueOnDone: true };
 export const HEARTBEAT_GUARD: GuardSpec = { kind: "heartbeat", escalationReason: "step_stalled", autoRescueOnDone: true, requiresProduct: "commits" };
-export const LAYOUT_WAIT_GUARD: GuardSpec = { kind: "layout_wait", escalationReason: "layout_wait_timeout", autoRescueOnDone: true, attachWhen: "layoutTarget" };
+export const LAYOUT_WAIT_GUARD: GuardSpec = { kind: "layout_wait", escalationReason: "layout_wait_timeout", autoRescueOnDone: false, autoRespawnLimit: 3, attachWhen: "layoutTarget" };
 export const CAPTURE_CAP_GUARD: GuardSpec = { kind: "capture_cap", escalationReason: "capture_limit", autoRescueOnDone: true, reset: "forward_entry", cumulative: false, requiresProduct: "evidence", counterScope: "run+step+guard" };
 // A machine-global exclusive resource the step's agent holds while driving the app (the capture
 // mutex). NOT a watchdog (never parks/auto-rescues) and not a counter — its @@CAPTURE_LOCK_*_CMD@@

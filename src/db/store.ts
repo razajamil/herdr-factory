@@ -545,11 +545,11 @@ export class Store {
   }
 
   /** The machine `reason` of the run's most recent `attention` escalation (read from the event log —
-   *  the run row carries only the human-readable string). Lets reconcileAttention tell a
-   *  step-execution watchdog park (evidence capture cap / per-step budget / stall / layout wait —
-   *  auto-rescuable by a genuine step-done) apart from a source-stale / pr-closed / bounce / human /
-   *  config park, which a human must resolve. null if the run was never parked (or the reason is
-   *  unrecorded). */
+   *  the run row carries only the human-readable string). Lets reconcileAttention tell an
+   *  auto-rescuable park apart from a human-only one: a step-execution watchdog park (evidence
+   *  capture cap / per-step budget / stall) is rescued by a genuine step-done, a layout-wait park by
+   *  the bounded spawn re-attempt, and a source-stale / pr-closed / bounce / human / config park only
+   *  by a human. null if the run was never parked (or the reason is unrecorded). */
   lastAttentionReasonCode(runId: number): string | null {
     const row = this.db
       .prepare("SELECT detail FROM events WHERE run_id = ? AND type = 'attention' ORDER BY id DESC LIMIT 1")

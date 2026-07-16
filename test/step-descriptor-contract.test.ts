@@ -79,7 +79,26 @@ describe("StepDescriptor contract (per registered step primitive)", () => {
         .filter((g) => g.autoRescueOnDone)
         .map((g) => g.escalationReason),
     );
-    expect([...union].sort()).toEqual(["capture_limit", "layout_wait_timeout", "step_budget", "step_stalled"]);
+    // layout_wait is deliberately NOT here: it trips before the step's agent exists (no pane ⇒ no
+    // agent ⇒ its step-done can never arrive), so it recovers by bounded respawn instead.
+    expect([...union].sort()).toEqual(["capture_limit", "step_budget", "step_stalled"]);
+  });
+
+  it("layout_wait recovers by bounded respawn, never by step-done (no pane ⇒ no agent ⇒ no signal)", () => {
+    const layoutGuards = STEP_DESCRIPTORS.flatMap((d) => d.guards).filter((g) => g.kind === "layout_wait");
+    expect(layoutGuards.length).toBeGreaterThan(0);
+    for (const g of layoutGuards) {
+      expect(g.autoRescueOnDone).toBe(false); // a step-done rescue is categorically wrong for this guard
+      expect(g.autoRespawnLimit ?? 0).toBeGreaterThan(0); // the park must be able to self-heal, bounded
+      expect(g.attachWhen).toBe("layoutTarget"); // only steps with a configured tab/pane ever wait
+    }
+    // The respawn-rescued reason set is exactly the layout wait today.
+    const respawn = new Set(
+      STEP_DESCRIPTORS.flatMap((d) => d.guards)
+        .filter((g) => (g.autoRespawnLimit ?? 0) > 0)
+        .map((g) => g.escalationReason),
+    );
+    expect([...respawn]).toEqual(["layout_wait_timeout"]);
   });
 
   it("the shipped primitives are exactly work/evidence/review/pr/custom", () => {

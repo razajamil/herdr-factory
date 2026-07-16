@@ -5,7 +5,7 @@ import { classifyS3Error, probeEvidenceCreds, uploadEvidence } from "../clients/
 import { runEffect } from "../runtime/effect.ts";
 import { HerdrUnreachableError, type BeltRuntime, type Deps, type SourceRuntime } from "./deps.ts";
 import type { StepConfig } from "../config.ts";
-import type { HumanQuestion, HumanReply, MatchItem, Outcome, PrInfo, PrSnapshot, Run, RunStep, Ticket, TransitionIntent, WorkState } from "../types.ts";
+import type { GuardSpec, HumanQuestion, HumanReply, MatchItem, Outcome, PrInfo, PrSnapshot, Run, RunStep, Ticket, TransitionIntent, WorkState } from "../types.ts";
 import { outcomeToWorkState, StaleItemError, ticketOf } from "../types.ts";
 import { branchName } from "./branch.ts";
 import { firstStep, indexOfStep, materializeWork, MEMORY_DIR, nextStep, spawnStep, stepByName } from "./step.ts";
@@ -1088,12 +1088,15 @@ export async function recordCaptureAttempt(
  *  are allowed to be slow). At the 5-min backoff cap this is ~100 min of a failing source. */
 const HUMAN_POLL_ERROR_ESCALATE = 20;
 
-/** Attention reasons raised by a STEP's own execution watchdog — the evidence flaky-capture cap, the
- *  per-step budget, the commit-stall heartbeat, and the layout-pane wait. These are backstops against
- *  a stuck agent, NOT a veto on finished work: an agent that reaches step-done is by definition not
- *  looping, so a genuine step-done from the parked step un-parks the run and lets the pipeline advance
- *  (reconcileAttention). Every OTHER park — source item gone, PR closed, bounce oscillation, human
- *  loop, config error — needs a human decision and is never auto-rescued. */
+/** Attention reasons raised by a STEP's own execution watchdog that trips while the step's agent is
+ *  RUNNING — the evidence flaky-capture cap, the per-step budget, and the commit-stall heartbeat.
+ *  These are backstops against a stuck agent, NOT a veto on finished work: an agent that reaches
+ *  step-done is by definition not looping, so a genuine step-done from the parked step un-parks the
+ *  run and lets the pipeline advance (reconcileAttention). The layout-pane wait is NOT here: it trips
+ *  BEFORE the agent exists (no pane ⇒ no agent ⇒ its step-done can never arrive), so it is rescued by
+ *  re-attempting the spawn instead — see STEP_RESPAWN_ATTENTION. Every OTHER park — source item gone,
+ *  PR closed, bounce oscillation, human loop, config error — needs a human decision and is never
+ *  auto-rescued. */
 // DERIVED (not a hardcoded literal) as the union of every registered step primitive's guards whose
 // `autoRescueOnDone` is true. A plugin guard that parks a run participates automatically — no edit
 // to a literal Set. read_only_violation / source_item_stale / pr_closed / bounce_limit / human /
@@ -1101,6 +1104,18 @@ const HUMAN_POLL_ERROR_ESCALATE = 20;
 const STEP_WATCHDOG_ATTENTION = new Set(
   STEP_DESCRIPTORS.flatMap((d) => d.guards)
     .filter((g) => g.autoRescueOnDone)
+    .map((g) => g.escalationReason),
+);
+
+/** Attention reasons whose park is rescued by RE-ATTEMPTING THE SPAWN, bounded by the guard's
+ *  `autoRespawnLimit` — today only the layout-pane wait (`layout_wait_timeout`). Its park means the
+ *  step's pane never came up, so no agent exists to ever signal step-done; the only recovery that can
+ *  work is re-running the dispatch (RWR-18147: the same spawn succeeded immediately on manual resume —
+ *  the original timeout was a transient race, and every such park used to be permanent until a human
+ *  resumed it). Derived like STEP_WATCHDOG_ATTENTION, so a plugin guard participates automatically. */
+const STEP_RESPAWN_ATTENTION = new Set(
+  STEP_DESCRIPTORS.flatMap((d) => d.guards)
+    .filter((g) => (g.autoRespawnLimit ?? 0) > 0)
     .map((g) => g.escalationReason),
 );
 
@@ -1209,10 +1224,20 @@ async function reconcileWaitingForHuman(deps: Deps, run: Run, belt: BeltRuntime,
   await resumeAfterHumanReply(deps, run, belt, src, answered, replyFile);
 }
 
+/** The step's layout-wait guard (attached only when the step ref configures a tab/pane) and its
+ *  bounded respawn budget. The budget's counter lives in `guard_counters` keyed by the guard's kind,
+ *  bumped once per consumed wait window and reset on successful dispatch (spawnStep) or human resume. */
+const layoutWaitGuard = (step: StepConfig): GuardSpec | undefined => step.guards.find((g) => g.kind === "layout_wait");
+
 /** A step is waiting for its configured layout pane to come up (an idle agent in tab/pane).
- *  Stay put and retry next tick, but escalate to attention once we've waited past
- *  `layout_wait_seconds` (measured from the step row's started_at). Only steps that HAVE a
- *  tab/pane ever wait — steps without one spawn their own pane and never reach here. */
+ *  Stay put and retry next tick. Once we've waited past `layout_wait_seconds` (measured from the
+ *  step row's started_at), consume one of the guard's bounded respawn credits and RE-ARM the wait in
+ *  place: this guard trips before the step's agent exists, so a transient herdr/layout race must be
+ *  retried by the engine, not handed to a human (RWR-18147: the identical spawn succeeded the moment
+ *  a human resumed — the timeout was a race, not a down layout). Only once the credits are exhausted
+ *  does the run park for attention — a pane that is genuinely never coming up still surfaces, just
+ *  after (1 + autoRespawnLimit) full windows. Only steps that HAVE a tab/pane ever wait — steps
+ *  without one spawn their own pane and never reach here. */
 async function handleLayoutWait(deps: Deps, run: Run, belt: BeltRuntime, step: StepConfig): Promise<void> {
   const where = `${step.tab}/${step.pane}`;
   const since = deps.store.getRunStep(run.id, step.name)?.startedAt ?? deps.now();
@@ -1221,11 +1246,28 @@ async function handleLayoutWait(deps: Deps, run: Run, belt: BeltRuntime, step: S
     deps.log("info", `${run.ticketKey}: ${step.name} waiting for layout pane ${where} (${waited}s/${deps.config.limits.layoutWaitSeconds}s)`);
     return;
   }
+  const guard = layoutWaitGuard(step);
+  const limit = guard?.autoRespawnLimit ?? 0;
+  if (guard && deps.store.guardCounter(run.id, step.name, guard.kind) < limit) {
+    const attempt = deps.store.bumpGuardCounter(run.id, step.name, guard.kind);
+    // Re-arm: each retry gets a FULL fresh window, so the budget bounds wall-clock at
+    // (1 + limit) × layout_wait_seconds rather than being burned in `limit` consecutive ticks.
+    deps.store.upsertRunStep(run.id, step.name, { startedAt: deps.now() });
+    deps.store.recordEvent({
+      runId: run.id,
+      repo: deps.config.repoName,
+      ticketKey: run.ticketKey,
+      type: "layout_wait_retry",
+      detail: { step: step.name, tab: step.tab, pane: step.pane, attempt, limit },
+    });
+    deps.log("warn", `${run.ticketKey}: ${step.name} layout pane ${where} not up after ${waited}s — re-arming the wait (retry ${attempt}/${limit})`);
+    return;
+  }
   await escalateAttention(deps, run, {
     reason: "layout_wait_timeout",
     attentionReason: `${step.name}: layout pane ${where} never became available`,
-    body: `${step.name} step (belt ${belt.name}): configured pane ${where} didn't come up with an idle agent within ${Math.round(deps.config.limits.layoutWaitSeconds / 60)}min — is the herdr layout for this worktree running?`,
-    detail: { step: step.name, tab: step.tab, pane: step.pane },
+    body: `${step.name} step (belt ${belt.name}): configured pane ${where} didn't come up with an idle agent within ${Math.round(deps.config.limits.layoutWaitSeconds / 60)}min${limit > 0 ? ` (${limit} automatic retries exhausted)` : ""} — is the herdr layout for this worktree running?`,
+    detail: { step: step.name, tab: step.tab, pane: step.pane, respawnsUsed: limit },
   });
 }
 
@@ -1510,15 +1552,17 @@ async function reconcileReviewing(deps: Deps, run: Run, src: SourceRuntime, ctx:
  * to miss, and a parked run must never go silently stale.
  */
 async function reconcileAttention(deps: Deps, run: Run, belt: BeltRuntime, src: SourceRuntime, ctx: TickCtx): Promise<void> {
-  // A step-execution watchdog (evidence flaky-capture cap, per-step budget/stall, layout wait) parked
-  // this run — but its agent went on to genuinely FINISH the step and signal step-done, which set
-  // rs.done while the run sat here. Since that watchdog is a backstop against a stuck agent, not a
-  // veto on completed work, honor the step-done: un-park and delegate to reconcileStep, which sees
-  // rs.done and advances forward normally (the evidence step → review, etc.). This is what keeps a
-  // non-gating step (evidence) from wedging the pipeline when a flaky app needed more than the capped
-  // number of takes. Fires on the step-done nudge AND on any later tick, so a nudge dropped on run-lock
-  // contention still heals here. Guarded to a still-active belt step that reports done, and only for
-  // the watchdog reasons — a source-stale / pr-closed / bounce / human / config park is left for a human.
+  // A step-execution watchdog (evidence flaky-capture cap, per-step budget/stall) parked this run —
+  // but its agent went on to genuinely FINISH the step and signal step-done, which set rs.done while
+  // the run sat here. Since that watchdog is a backstop against a stuck agent, not a veto on completed
+  // work, honor the step-done: un-park and delegate to reconcileStep, which sees rs.done and advances
+  // forward normally (the evidence step → review, etc.). This is what keeps a non-gating step
+  // (evidence) from wedging the pipeline when a flaky app needed more than the capped number of takes.
+  // Fires on the step-done nudge AND on any later tick, so a nudge dropped on run-lock contention
+  // still heals here. Guarded to a still-active belt step that reports done, and only for the watchdog
+  // reasons — a source-stale / pr-closed / bounce / human / config park is left for a human, and a
+  // layout-wait park (whose step never got an agent, so no step-done can arrive) is rescued by the
+  // bounded respawn branch below instead.
   if (run.step) {
     const step = stepByName(belt, run.step);
     const rs = deps.store.getRunStep(run.id, run.step);
@@ -1540,6 +1584,43 @@ async function reconcileAttention(deps: Deps, run: Run, belt: BeltRuntime, src: 
   if (belt.watchPr && run.prNumber) {
     const pr = ctx.prSnapshots?.get(run.prNumber) ?? (await currentPr(deps, run));
     if (pr?.state === "MERGED") return teardown(deps, run, "merged", src);
+  }
+  // A layout-wait park can NEVER heal via step-done — the pane never came up, so no agent exists to
+  // signal it. Its rescue is to RE-ATTEMPT THE SPAWN: while the guard's bounded respawn budget lasts,
+  // un-park the run back to where it was (running its step, or claiming when the belt's first
+  // dispatch never landed), re-arm the wait clock, and re-dispatch on this same pass. This is also
+  // what heals runs parked by pre-fix code (their budget is untouched). Once the budget is exhausted
+  // the park is a genuine human park: the re-notify below keeps it visible until a human `resume`
+  // (which grants a fresh budget). Idempotent + run-locked like every other pass over this run.
+  const reasonCode = deps.store.lastAttentionReasonCode(run.id);
+  if (reasonCode && STEP_RESPAWN_ATTENTION.has(reasonCode)) {
+    const step = run.step ? stepByName(belt, run.step) : firstStep(belt);
+    const guard = step ? step.guards.find((g) => g.escalationReason === reasonCode) : undefined;
+    const limit = guard?.autoRespawnLimit ?? 0;
+    if (step && guard && deps.store.guardCounter(run.id, step.name, guard.kind) < limit) {
+      const attempt = deps.store.bumpGuardCounter(run.id, step.name, guard.kind);
+      // Re-arm the wait window: handleLayoutWait measures from started_at, so without this the
+      // ancient clock would re-expire on the very next pass and burn the budget in a few ticks.
+      deps.store.upsertRunStep(run.id, step.name, { startedAt: deps.now(), absentAt: null });
+      const phase: Run["phase"] = run.step ? "running" : "claiming";
+      deps.store.updateRun(run.id, { phase, attentionReason: null });
+      deps.store.recordEvent({
+        runId: run.id,
+        repo: deps.config.repoName,
+        ticketKey: run.ticketKey,
+        type: "resumed",
+        detail: { reason: "layout_wait_respawn", phase, step: step.name, attempt, limit },
+      });
+      // Restore the label the escalation overwrote with "⚠ ATTENTION …". run.paneId here belongs to
+      // some EARLIER step (this step's own spawn never landed — that's why it parked), so restore the
+      // owning step's label, not the parked step's.
+      if (run.paneId) {
+        const owner = deps.store.runStepsFor(run.id).find((s) => s.paneId === run.paneId)?.step;
+        await deps.herdr.agentRename(run.paneId, `${owner ?? step.name}:${run.ticketKey}`).catch(() => {});
+      }
+      deps.log("info", `${run.ticketKey}: layout-wait park auto-rescue (${attempt}/${limit}) — re-attempting the ${step.name} dispatch`);
+      return dispatchPhase(deps, deps.store.getRun(run.id)!, belt, src, ctx);
+    }
   }
   if (deps.now() - (run.attentionNotifiedAt ?? 0) >= deps.config.limits.attentionRenotifySeconds) {
     deps.store.updateRun(run.id, { attentionNotifiedAt: deps.now() });
@@ -1585,12 +1666,13 @@ export async function resumeRun(deps: Deps, run: Run): Promise<{ ok: boolean; ph
     deps.store.resetHumanPollBackoff(pendingQuestion.id);
     phase = "waiting_for_human";
   } else if (run.step && stepByName(belt, run.step)) {
-    // Fresh slate on human resume: reset the step budget clocks AND the flaky-capture counter — a
-    // human just intervened, so a capture-cap park must not immediately re-park on the next attempt.
-    // resetGuardCounter is a no-op for a step with no capture_cap counter, so this no longer touches a
-    // non-evidence step's state (the old unconditional captureAttempts:0 reset did).
+    // Fresh slate on human resume: reset the step budget clocks AND the flaky-capture + layout-wait
+    // respawn counters — a human just intervened, so a capture-cap park must not immediately re-park
+    // on the next attempt, and a layout-wait park gets its full bounded respawn budget back.
+    // resetGuardCounter is a no-op for a step with no counter, so this never touches unrelated state.
     deps.store.upsertRunStep(run.id, run.step, { startedAt: deps.now(), progressSig: null, progressAt: null, absentAt: null });
     deps.store.resetGuardCounter(run.id, run.step, "capture_cap");
+    deps.store.resetGuardCounter(run.id, run.step, "layout_wait");
     phase = "running";
   } else if (belt.watchPr && run.prNumber) {
     // Back to watching the PR: clear the handled-signature so the next actionable review state
@@ -1598,6 +1680,12 @@ export async function resumeRun(deps: Deps, run: Run): Promise<{ ok: boolean; ph
     deps.store.updateRun(run.id, { lastThreadSig: null, resolverActive: false });
     phase = "reviewing";
   } else {
+    // Parked before the first dispatch ever landed (a claiming-time layout wait). Give the resumed
+    // claim a fresh wait window + respawn budget, or reconcileClaiming would see the ancient
+    // started_at and the spent budget and re-park on the same pass that resumed it.
+    const first = firstStep(belt);
+    deps.store.upsertRunStep(run.id, first.name, { startedAt: deps.now(), absentAt: null });
+    deps.store.resetGuardCounter(run.id, first.name, "layout_wait");
     phase = "claiming";
   }
   deps.store.updateRun(run.id, { phase, attentionReason: null, focusPending: true });

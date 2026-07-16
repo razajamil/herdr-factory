@@ -10,6 +10,7 @@ import { HerdrUnreachableError, type BeltRuntime, type Deps, type GitApi, type G
 import { SourceUnauthenticatedError } from "../src/auth/errors.ts";
 import { getAuthFailure, resetAuthGate } from "../src/auth/gate.ts";
 import type { Config, StepConfig } from "../src/config.ts";
+import { LAYOUT_WAIT_GUARD } from "../src/steps/guards.ts";
 import type { FocusedPane, HumanAskInput, HumanPollInput, HumanReply, JiraMatchItem, LocalMarkdownMatchItem, Phase, PrInfo, PrSnapshot, ReviewSig, Ticket, WorkState } from "../src/types.ts";
 import { StaleItemError } from "../src/types.ts";
 
@@ -47,7 +48,8 @@ interface FakeState {
 }
 
 /** A resolved belt step for the fakes. Budgets/heartbeat/opensPr mirror what config.ts derives for
- *  a work_to_pull_request belt; override via `opts` for custom-belt steps. */
+ *  a work_to_pull_request belt; override via `opts` for custom-belt steps. Like config.ts's
+ *  resolveStep, a step with a layout tab/pane carries the layout-wait guard (bounded respawn). */
 const stepCfg = (name: string, opts: Partial<StepConfig> = {}): StepConfig => {
   const heartbeat = opts.heartbeat ?? (name === "fix" || name === "pr");
   const opensPr = opts.opensPr ?? name === "pr";
@@ -56,11 +58,13 @@ const stepCfg = (name: string, opts: Partial<StepConfig> = {}): StepConfig => {
   if (heartbeat) produces.push("commits");
   if (opensPr) produces.push("pull_request");
   if (gathersEvidence) produces.push("evidence");
+  const tab = Object.hasOwn(opts, "tab") ? opts.tab : name;
+  const pane = Object.hasOwn(opts, "pane") ? opts.pane : "agent";
   return {
     name,
     type: name === "fix" ? "work" : name,
-    tab: name,
-    pane: "agent",
+    tab,
+    pane,
     enginePrompt: `${name.toUpperCase()} prompt`,
     budgetSeconds: name === "fix" ? 5400 : name === "review" ? 1800 : 3600,
     heartbeat,
@@ -71,7 +75,7 @@ const stepCfg = (name: string, opts: Partial<StepConfig> = {}): StepConfig => {
     requiresLayout: false,
     consumes: [],
     produces,
-    guards: [],
+    guards: tab && pane ? [LAYOUT_WAIT_GUARD] : [],
     effects: [],
     posture: {},
     ...opts,
@@ -433,18 +437,116 @@ describe("reconcile pipeline (work_to_pull_request belt)", () => {
     expect(after.step).toBe("pr"); // advanced past the read-only step
   });
 
-  it("claiming + configured pane never comes up past layout_wait → attention (no own pane)", async () => {
+  it("claiming + configured pane never comes up: bounded window re-arms, THEN attention; resume refunds the budget", async () => {
     const { deps, store, state, calls, setNow } = build();
     state.eligible = [ticket("W-2")];
-    state.paneState = "working";
+    state.paneState = "working"; // the layout pane exists but its agent never goes idle
     await reconcileRepo(deps); // first pass begins the wait (fix.started_at = 1000)
-    expect(store.activeRunForTicket("demo", "jira", "W-2")!.phase).toBe("claiming");
-    setNow(1000 + 601); // past layout_wait_seconds (600)
     const run = store.activeRunForTicket("demo", "jira", "W-2")!;
+    expect(run.phase).toBe("claiming");
+
+    // Each expired window consumes ONE respawn credit and re-arms in place — no park, no notify.
+    let t = 1000;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      t += 601; // past layout_wait_seconds (600), measured from the re-armed clock
+      setNow(t);
+      await reconcileRun(deps, store.getRun(run.id)!);
+      expect(store.getRun(run.id)!.phase).toBe("claiming"); // still waiting — not parked
+      expect(store.guardCounter(run.id, "fix", "layout_wait")).toBe(attempt);
+      expect(store.getRunStep(run.id, "fix")!.startedAt).toBe(t); // window re-armed
+      expect(calls.notify).toBe(0); // the engine self-heals quietly
+    }
+    expect(store.timeline("demo", "W-2").filter((e) => e.type === "layout_wait_retry").length).toBe(3);
+
+    // Budget exhausted → the next expiry is a genuine human park (a real outage still surfaces).
+    t += 601;
+    setNow(t);
     await reconcileRun(deps, store.getRun(run.id)!);
     expect(store.getRun(run.id)!.phase).toBe("attention");
     expect(calls.notify).toBe(1);
     expect(calls.agentStart).toBe(0); // never spawned its own
+
+    // Exhausted park stays parked on later ticks — the rescue must not ping-pong forever.
+    setNow(t + 60);
+    await reconcileRun(deps, store.getRun(run.id)!);
+    expect(store.getRun(run.id)!.phase).toBe("attention");
+
+    // A human resume grants a fresh window + respawn budget: the next expiry re-arms again
+    // instead of instantly re-parking off the ancient clock and spent budget.
+    expect((await resumeRun(deps, store.getRun(run.id)!)).ok).toBe(true);
+    expect(store.getRun(run.id)!.phase).toBe("claiming");
+    expect(store.guardCounter(run.id, "fix", "layout_wait")).toBe(0);
+    setNow(t + 60 + 601);
+    await reconcileRun(deps, store.getRun(run.id)!);
+    expect(store.getRun(run.id)!.phase).toBe("claiming"); // re-armed, not re-parked
+    expect(store.guardCounter(run.id, "fix", "layout_wait")).toBe(1);
+  });
+
+  it("a run parked with layout_wait_timeout auto-recovers on a later tick — re-spawns with NO step_done and NO human resume", async () => {
+    // The RWR-18147 stall: a forward re-advance into evidence (after a review→fix bounce) timed out
+    // waiting for its layout pane — a transient race; the identical spawn succeeded the moment a
+    // human resumed. The park could never heal on its own: the step's agent never existed, so the
+    // step-done the old rescue model waited for could not arrive. The engine must re-attempt the
+    // spawn itself. (Also the healing path for runs parked by pre-fix code.)
+    const { deps, store, state, worktree, shipBelt, calls, setNow } = build();
+    shipBelt.steps = [stepCfg("fix"), stepCfg("evidence"), stepCfg("review"), stepCfg("pr")];
+    const run = seed(store, worktree, "K-LWP", "running", "evidence", { paneId: "w1:pfix" });
+    store.upsertRunStep(run.id, "fix", { paneId: "w1:pfix", done: true });
+    // Parked by the layout wait: evidence's spawn never landed (row exists, no pane).
+    store.upsertRunStep(run.id, "evidence", { paneId: null, startedAt: 1000 });
+    store.updateRun(run.id, { phase: "attention", attentionReason: "evidence: layout pane evidence/agent never became available", attentionNotifiedAt: 1000 });
+    store.recordEvent({ runId: run.id, repo: "demo", ticketKey: "K-LWP", type: "attention", detail: { reason: "layout_wait_timeout", step: "evidence" } });
+
+    // Next tick: the pane resolves again (exactly what the production resume proved). The engine
+    // un-parks, re-attempts the dispatch on the same pass, and the pipeline advances.
+    setNow(1660);
+    state.tabPane = "w1:pev";
+    calls.agentSend.length = 0;
+    await reconcileRun(deps, store.getRun(run.id)!);
+    const got = store.getRun(run.id)!;
+    expect(got.phase).toBe("running");
+    expect(got.step).toBe("evidence");
+    expect(got.attentionReason).toBeNull();
+    expect(store.getRunStep(run.id, "evidence")!.paneId).toBe("w1:pev");
+    expect(calls.agentSend.some(([p]) => p === "w1:pev")).toBe(true); // actually re-prompted
+    // The rescue is on the timeline; the ⚠ label was restored to the pane's OWNING step (fix);
+    // and the successful dispatch refunds the respawn budget for future waits.
+    expect(store.timeline("demo", "K-LWP").some((e) => e.type === "resumed" && (e.detail ?? "").includes("layout_wait_respawn"))).toBe(true);
+    expect(calls.agentRename).toContainEqual(["w1:pfix", "fix:K-LWP"]);
+    expect(store.guardCounter(run.id, "evidence", "layout_wait")).toBe(0);
+  });
+
+  it("a parked layout wait whose pane is STILL down re-arms the wait (bounded) instead of staying parked", async () => {
+    // Rescue when the pane is not yet back: the run un-parks into a fresh full wait window (rather
+    // than burning one attempt per 60s tick), keeps retrying the spawn each tick, and heals the
+    // moment the pane appears — here under its renamed dispatch label, the RWR-18147 shape.
+    const { deps, store, state, worktree, shipBelt, calls, setNow } = build();
+    shipBelt.steps = [stepCfg("fix"), stepCfg("evidence"), stepCfg("review"), stepCfg("pr")];
+    const run = seed(store, worktree, "K-TRN", "running", "evidence");
+    store.upsertRunStep(run.id, "fix", { paneId: "w1:pfix", done: true });
+    store.upsertRunStep(run.id, "evidence", { paneId: null, startedAt: 1000 });
+    store.updateRun(run.id, { phase: "attention", attentionReason: "evidence: layout pane evidence/agent never became available", attentionNotifiedAt: 1000 });
+    store.recordEvent({ runId: run.id, repo: "demo", ticketKey: "K-TRN", type: "attention", detail: { reason: "layout_wait_timeout", step: "evidence" } });
+    state.tabPane = null; // configured label was renamed away on first dispatch; recorded id lost
+
+    setNow(1660);
+    await reconcileRun(deps, store.getRun(run.id)!);
+    let got = store.getRun(run.id)!;
+    expect(got.phase).toBe("running"); // un-parked into a fresh wait — spawn re-attempted, still waiting
+    expect(store.guardCounter(run.id, "evidence", "layout_wait")).toBe(1); // one credit consumed
+    expect(store.getRunStep(run.id, "evidence")!.startedAt).toBe(1660); // wait window re-armed
+
+    // The pane becomes resolvable again mid-window (under its renamed dispatch label) → dispatched.
+    state.tabPaneByName = { "evidence:K-TRN": "w1:pev" };
+    setNow(1720);
+    calls.agentSend.length = 0;
+    await reconcileRun(deps, store.getRun(run.id)!);
+    got = store.getRun(run.id)!;
+    expect(got.phase).toBe("running");
+    expect(got.step).toBe("evidence");
+    expect(store.getRunStep(run.id, "evidence")!.paneId).toBe("w1:pev");
+    expect(calls.agentSend.some(([p]) => p === "w1:pev")).toBe(true);
+    expect(store.guardCounter(run.id, "evidence", "layout_wait")).toBe(0); // refunded on success
   });
 
   it("step with no tab/pane configured → spawns its own dedicated pane", async () => {

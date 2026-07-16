@@ -444,6 +444,9 @@ async function spawnStepImpl(
   // not cumulatively across crash-recovery re-spawns or the preceding layout wait), and clear
   // any pending absence confirmation — this pane is definitionally alive right now.
   deps.store.upsertRunStep(run.id, stepName, { paneId: result.paneId, startedAt: deps.now(), absentAt: null });
+  // The pane came up — refund the layout-wait respawn budget, so a FUTURE wait by this step (a
+  // re-entry after a bounce, a crash respawn) starts with its full bounded-retry allowance.
+  deps.store.resetGuardCounter(run.id, stepName, "layout_wait");
   // read_only enforcement baseline: capture HEAD before the agent runs, so a later commit (a
   // read-only-contract violation) is detectable as HEAD movement in reconcileStep. Read-only steps
   // never have a heartbeat, so progressSig is free to hold this baseline.

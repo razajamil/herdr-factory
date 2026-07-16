@@ -61,6 +61,7 @@ export type EventType =
   | "review_done"
   | "step_spawned"
   | "step_done"
+  | "layout_wait_retry" // a layout-pane wait window expired; the engine re-armed it (bounded respawn budget)
   | "bounced"
   | "capture_attempt" // an evidence agent signalled a capture attempt (flaky-capture cap)
   | "evidence_uploaded" // the evidence-upload outbox delivered a capture's media to S3
@@ -381,7 +382,17 @@ export interface GuardSpec {
   /** Reason code recorded when this guard trips. The union of guards with autoRescueOnDone===true
    *  IS the STEP_WATCHDOG_ATTENTION set (a genuine step-done un-parks a run parked by such a guard). */
   escalationReason: string;
+  /** A genuine step-done from the parked step un-parks the run. Only meaningful for guards that trip
+   *  while the step's AGENT IS RUNNING (budget/heartbeat/capture_cap) — layout_wait trips before the
+   *  agent exists (no pane ⇒ no agent ⇒ no step-done), so it declares false and recovers via
+   *  `autoRespawnLimit` instead. */
   autoRescueOnDone: boolean;
+  /** Bounded spawn-retry budget for a guard that trips BEFORE the step's agent exists (layout_wait).
+   *  Each expired wait window re-arms the wait in place — and a run already parked by this guard is
+   *  auto-un-parked and re-dispatched — up to this many times (counted in `guard_counters`, guard =
+   *  the kind), before the park becomes a genuine human-attention park. Reset on successful dispatch
+   *  and on a human `resume`. */
+  autoRespawnLimit?: number;
   /** Counter guards only (capture_cap): when the counter resets. "forward_entry" = a fresh forward
    *  pass into the step, NOT a crash-recovery respawn (a self-crash must not refill the cap). */
   reset?: "forward_entry" | "never" | "resume";
