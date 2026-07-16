@@ -69,10 +69,12 @@ This document is the canonical design of the TypeScript implementation
 ## 1. Principles
 
 1. **herdr owns the terminal world; herdr-factory orchestrates it.** All
-   workspace / worktree / tab / pane / layout / agent lifecycle is performed by
-   the `herdr` CLI. herdr-factory never reimplements pane splitting, layout
-   application, terminal multiplexing, raw `git worktree add`, or spawning
-   `claude` as a bare child process. See [§4](#4-herdr-ownership-boundary).
+   workspace / worktree / tab / pane / agent lifecycle is performed by the
+   `herdr` CLI. herdr-factory never reimplements pane splitting, terminal
+   multiplexing, raw `git worktree add`, or spawning `claude` as a bare child
+   process. It *does* orchestrate **layout application** — deciding a tab/pane
+   plan and issuing the herdr commands that build it — but every split/spawn
+   itself is herdr's. See [§4](#4-herdr-ownership-boundary).
 2. **SQLite is the single source of truth for runtime state**, designed as the
    data contract for a future web UI — including a rich **event timeline**, not
    just current state. Config is never in SQLite.
@@ -156,9 +158,11 @@ herdr-factory/
   bin/herdr-factory          cwd-robust launcher → `node src/cli/index.ts` (resolves its own dir through
                           symlinks; Node >= 26 — active, else the baked node-path; no args → the TUI)
   bin/herdr-factory-tui      TUI launcher: same Node resolution + --experimental-ffi (opentui's renderer)
+  herdr-plugin.toml          herdr plugin manifest — registers the layout hook (worktree.created/workspace.*)
   .node-version              exact Node pin (26.x) — drives the vendored-runtime provisioning
   src/
     cli/index.ts          commander program; routes via server (else in-process), dispatches
+    cli/layout-hook.ts    lean herdr-event entry (the worktree.created layout hook) — kept out of index.ts
     build-deps.ts         buildDeps(repo) — shared by the server + every command's local path
     resolve.ts            pure resolveSourceName / resolveActiveRun (throw, not exit; CLI+server)
     config.ts             env map (repos/<name>/env: loadEnvMap/saveEnvValues) + repos/<name>/config.yml
@@ -190,6 +194,7 @@ herdr-factory/
       + sources/<type>/descriptor.ts   resolveConfig / create / secrets manifest / TUI fields) —
                              the single edit surface for adding source N+1 (checklist in its header)
     core/{deps,branch,step,watch,reconcile}.ts
+    core/{layout,layout-match,layout-hook}.ts   layout subsystem: plan+runner / pure matching / herdr event hook (§4)
     runtime/effect.ts        the shared Effect ManagedRuntime (also hosts the OTel layer)
     telemetry/…              OpenTelemetry spans/metrics (no-op unless HERDR_FACTORY_TELEMETRY)
     tui/…                    the opentui TUI (Dashboard · Config editor · Doctor)
@@ -227,11 +232,20 @@ out to `herdr …` and parses its JSON; it contains zero terminal/worktree logic
 - pane **list / current** (incl. the `focused` flag — which pane the user is viewing)
 - desktop **notifications**
 
-**The step layout** (a tab/pane per pipeline agent) is applied by the external
-**workspace-manager herdr plugin** on `worktree.created`. herdr-factory does **not** apply
-layouts — it relies on the plugin and simply *targets* the resulting panes: one per step, from a
-each belt step's own `tab`/`pane` (from its `steps[]` entry).
-herdr-factory **waits** for a targeted pane to come up (escalating to `attention` after
+**Layouts** — the tab/pane arrangement a worktree comes up with — are applied by **herdr-factory
+itself** (absorbed from the workspace-manager plugin). It registers as a herdr plugin
+(`herdr-plugin.toml`) and handles `worktree.created` / `workspace.created` / `workspace.focused`; on
+the event it matches the new worktree's repo root to a repo config, picks the layout (a
+factory-claimed worktree uses its owning run's belt; a hand-created one walks the repo's belts), and
+*builds* it by issuing herdr `tab create` / `pane split` / `pane run` — herdr still performs every
+split and spawn. The hook is idempotent (a per-checkout-path filesystem claim + a fresh 1-tab/1-pane
+guard + a per-workspace "decided" cache) and sits behind a **lean entry** (`src/cli/layout-hook.ts`,
+routed by `bin/herdr-factory`) that lazy-loads the heavy graph, so the constantly-firing focus event
+stays cheap. Modules: `src/core/layout-match.ts` (pure matching), `layout.ts` (plan + runner),
+`layout-hook.ts` (the event handler).
+
+A belt step then simply *targets* a resulting pane via its own `tab`/`pane` (from its `steps[]`
+entry). herdr-factory **waits** for a targeted pane to come up (escalating to `attention` after
 `layout_wait_seconds`) and only spawns a pane itself for steps that have **no** tab/pane
 configured — except `evidence`, which never spawns its own: with no tab/pane that step is
 skipped entirely (see [§8](#8-step-agent-model)).
@@ -801,7 +815,8 @@ step (`spawnStep`):
 
 1. **Dispatch** — two modes, by whether the step has a configured `tab`/`pane` (from the step's
    `steps[]` entry, resolved onto its `StepConfig`):
-   - **Configured** (the user's layout owns the pane): find that pane and require an agent
+   - **Configured** (a pane the belt's layout built — see [§4](#4-herdr-ownership-boundary)): find
+     that pane and require an agent
      that is present **and idle** (agent-agnostic — claude *or* opencode), then `agent send`
      the prompt + Enter. If the pane isn't up yet or its agent is still busy starting up,
      `spawnStep` returns `waiting` — the run stays in its phase and retries on later ticks
@@ -1033,14 +1048,15 @@ from being claimed again).
   cross-field rules — those stay at load time (below).
 - `config.ts` asserts `repo.path` is a **main checkout** (not a linked worktree), since herdr can't
   create worktrees from one. The other load-time cross-field checks: unique source/belt/step names,
-  every `belt.source` references a configured source, tab/pane both-or-neither, `{{work_id}}` in
-  `workspace_name`, and `match` / `config`-sourced `prompt_file` existence — all with readable
-  errors. The work-source *clients* are constructed in `build-deps.ts`'s `buildDeps` via each
+  every `belt.source` references a configured source, unique `layouts` ids with each belt's
+  `default_layout`/`layout_matching` resolving to a defined one, tab/pane both-or-neither,
+  `{{work_id}}` in `workspace_name`, and `match` / `config`-sourced `prompt_file` existence — all
+  with readable errors. The work-source *clients* are constructed in `build-deps.ts`'s `buildDeps` via each
   type's registry descriptor (`descriptorFor(type).create(ctx)` — the ctx carries the env map,
   `Store`, and resolved `ghRepo`); `config.ts` stays pure data + prompt resolution.
 
-Onboarding a repo is pure data: drop a `repos/<name>/` folder, define its herdr layout
-(workspace-manager plugin), and `herdr-factory reload` so the running server discovers it (or
+Onboarding a repo is pure data: drop a `repos/<name>/` folder, optionally define its `layouts`
+(built by the factory's own worktree hook — [§4](#4-herdr-ownership-boundary)), and `herdr-factory reload` so the running server discovers it (or
 `restart`). There is **no per-repo install** — the supervisor + `serve` are machine-wide and
 serve every repo under `repos/` (`listConfiguredRepos`); the one-time `herdr-factory install`
 sets up the supervisor itself, not a repo.

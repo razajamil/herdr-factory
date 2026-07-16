@@ -13,7 +13,9 @@
 #   5. installs pnpm (via the vendored Node) and runs `pnpm install` (resolves opentui's native
 #      per-platform binary AND the @aws-sdk deps — so evidence upload needs no `aws` CLI),
 #   6. drops `herdr-factory` / `herdr-factory-tui` shims on PATH,
-#   7. installs the machine-wide supervisor service (launchd on macOS, systemd --user on Linux).
+#   7. registers this checkout as a herdr plugin (the layout hook — so each new worktree of a
+#      managed repo gets its per-belt herdr layout built automatically),
+#   8. installs the machine-wide supervisor service (launchd on macOS, systemd --user on Linux).
 #
 # After install, the app self-updates: a git pull that bumps .node-version re-provisions Node, and a
 # lockfile change re-runs pnpm install — automatically, on the supervisor tick.
@@ -213,6 +215,31 @@ install_shims() {
   command -v bash >/dev/null 2>&1 || warn "the herdr-factory launchers need bash (not found) — install it (Alpine: sudo apk add bash)."
 }
 
+# ── herdr plugin (the layout hook) ─────────────────────────────────────────────────────────────
+# Register this checkout as a herdr plugin so herdr fires worktree.created / workspace.created /
+# workspace.focused at it, and the factory builds each new worktree's per-belt layout (see
+# herdr-plugin.toml + src/core/layout-hook.ts). Best-effort: herdr is a runtime dependency but may
+# not be on PATH at install time (e.g. a headless bootstrap), so its absence is a warning, not a
+# failure. Idempotent — re-links only if not already pointing at this checkout.
+install_plugin() {
+  if ! command -v herdr >/dev/null 2>&1; then
+    warn "herdr not on PATH — skipping plugin link. Layouts won't auto-apply until you run: herdr plugin link '$APP_DIR'"
+    return 0
+  fi
+  linked_root="$(herdr plugin list --plugin herdr-factory --json 2>/dev/null | sed -n 's/.*"plugin_root":"\([^"]*\)".*/\1/p' | head -n1)"
+  if [ "$linked_root" = "$APP_DIR" ]; then
+    say "herdr plugin already linked ($APP_DIR)"
+    return 0
+  fi
+  # A stale link at a different path (e.g. an old checkout) would collide on the plugin id — drop it.
+  [ -n "$linked_root" ] && herdr plugin unlink herdr-factory >/dev/null 2>&1
+  if herdr plugin link "$APP_DIR" >/dev/null 2>&1; then
+    say "linked herdr plugin (layout hook)"
+  else
+    warn "herdr plugin link failed — register it manually: herdr plugin link '$APP_DIR'"
+  fi
+}
+
 # ── Service (launchd / systemd) ────────────────────────────────────────────────────────────────
 install_service() {
   [ -z "$SKIP_SERVICE" ] || { say "skipping service install (HERDR_SKIP_SERVICE set)"; return 0; }
@@ -224,6 +251,7 @@ install_service() {
 uninstall() {
   say "uninstalling herdr-factory"
   if [ -x "$BIN_DIR/herdr-factory" ]; then "$BIN_DIR/herdr-factory" uninstall || warn "service uninstall reported an error"; fi
+  command -v herdr >/dev/null 2>&1 && herdr plugin unlink herdr-factory >/dev/null 2>&1
   rm -f "$BIN_DIR/herdr-factory" "$BIN_DIR/herdr-factory-tui"
   rm -rf "$RUNTIME_ROOT"
   say "removed shims + vendored Node runtime."
@@ -241,12 +269,14 @@ main() {
   provision_node
   install_deps
   install_shims
+  install_plugin
   install_service
   echo ""
   say "herdr-factory installed."
   echo "  • CLI:  herdr-factory --help"
   echo "  • TUI:  herdr-factory            (no args launches the TUI)"
   echo "  • The supervisor keeps the server up and auto-updates from $BRANCH."
+  echo "  • Layouts: a repo's belts can build a herdr tab/pane layout into each new worktree (herdr plugin — see README)."
 }
 
 main "$@"

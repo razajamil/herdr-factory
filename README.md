@@ -42,7 +42,9 @@ curl -fsSL https://raw.githubusercontent.com/razajamil/herdr-factory/main/instal
 ```
 
 The installer is self-contained and idempotent: it ships everything the factory
-itself needs (including its own Node runtime) and keeps it up to date.
+itself needs (including its own Node runtime) and keeps it up to date. It also registers the factory
+as a herdr plugin so each new worktree gets its [layout](#layouts) built automatically (when `herdr`
+is on PATH; otherwise link it later with `herdr plugin link <checkout>`).
 
 **You provide the tools the factory drives** — the same ones you'd use by hand:
 
@@ -267,7 +269,7 @@ review }, { type: pr }]` — the engine ships each primitive's prompt:
   re-capturing past `max_capture_attempts` parks for attention — but only as a backstop against a
   stuck agent: if the evidence step then genuinely finishes and signals `step-done`, the run un-parks
   and advances (evidence is non-gating — the cap never vetoes completed evidence). This station runs only when
-  your herdr layout provides its pane (`tab` + `pane` in config) — without one the belt is simply
+  the belt's layout provides its pane (`tab` + `pane` in config; see [Layouts](#layouts)) — without one the belt is simply
   work → review → pr.
 - **review** — a strict read-only gate with fresh eyes: it never edits or commits (if it commits, the
   run parks — read-only is enforced), it either passes the work forward or **bounces back to work**.
@@ -509,7 +511,9 @@ no label concept — `local_markdown`), `priority` (default 100, lower = matched
 `{{semantic_work_prefix}}/{{work_id}}-{{work_full_slug}}`. It must contain
 `{{work_id}}`; other vars: `{{work_slug}}` (≤20), `{{work_full_slug}}` (≤50), `{{work_type}}`,
 `{{semantic_work_prefix}}` (fix/chore/feature). A short unique suffix is always appended, so
-re-claiming a previously-merged item gets a fresh branch and PR.
+re-claiming a previously-merged item gets a fresh branch and PR. Optional `default_layout` +
+`layout_matching` pick which `layouts` entry (below) the factory builds into this belt's worktrees —
+see [Layouts](#layouts).
 
 **`steps` (≥ 1)** — the ordered pipeline. Each step references a shipped primitive by `type`:
 
@@ -527,7 +531,8 @@ steps:
 
 Per step: `type` (`work` | `evidence` | `review` | `pr` | `custom`), optional `name` (defaults to
 `type`, unique within the belt), optional `tab`/`pane` (both-or-neither — with them the factory
-waits for your layout's idle pane, without them it spawns a dedicated pane; `evidence` is **skipped**
+targets the pane the belt's layout builds (see [Layouts](#layouts)), without them it spawns a
+dedicated pane; `evidence` is **skipped**
 when it has no tab/pane), optional `budget_seconds` (else the primitive's default — `work` 5400 ·
 `evidence` 2400 · `review` 1800 · `pr` 3600 — else `limits.step_budget_seconds`), and `heartbeat`
 (commit-stall detection; on for `work`/`pr`, opt-in elsewhere).
@@ -568,21 +573,59 @@ SSO, `~/.aws`, or the named `profile`) — never stored in config or handed to a
 land under `herdr-factory/<github_username>/<key_prefix>/<key>/<run>-<timestamp>/`.
 `doctor --deep` verifies the setup with a real S3 write probe.
 
-### Layout panes
+### Layouts
 
-Any step (w2pr agent or custom step) may name a `tab` + `pane` (both or neither):
+A **layout** is a herdr tab/pane arrangement the factory builds into a worktree the moment it's
+created — the dev environment a worktree needs (agent panes, dev servers, editors, log tails). This
+was absorbed from the [workspace-manager herdr plugin](https://github.com/razajamil/herdr-plugin-workspace-manager):
+the factory is now itself a herdr plugin (registered by `install.sh`, or manually with
+`herdr plugin link <checkout>`) that listens for `worktree.created` and builds the matching layout
+into **any** new worktree — whether you created it by hand or the factory claimed a ticket.
 
-- **With them**, the dispatcher waits for _your_ layout to bring that pane up with an idle agent,
-  then sends the step's prompt there. It never spawns its own pane for that step — so your
-  auto-provisioned setup (dev servers, agents, editors) can settle first. It's agent-agnostic:
-  the pane can run Claude Code, opencode, pi, codex — anything that reports idle. If the pane
-  isn't up within `limits.layout_wait_seconds`, the run parks for attention.
-- **Without them**, the factory spawns a dedicated agent pane for the step (`claude` today) —
-  zero layout setup required.
+Define a repo-level library and point belts at it:
 
-The [workspace-manager herdr plugin](https://github.com/razajamil/herdr-plugin-workspace-manager)
-makes per-repo layouts reusable — and since each belt names its worktrees distinctively
-(`workspace_name`), a layout can key off the worktree name to provision the right panes.
+```yaml
+layouts:
+  - id: app-dev
+    setup: { command: mise run setup, blocking: true } # runs once before the rest (blocking = wait for it)
+    tabs:
+      - title: work # a step with `tab: work, pane: agent` targets the pane below
+        panes:
+          - { title: agent, command: claude, setup: true } # the idle agent the step's prompt is sent to
+          - { title: server, command: mise run dev, split: right, size: "40%" }
+      - title: review
+        panes:
+          - { title: agent, command: opencode }
+
+belt:
+  - name: fix-tickets
+    source: jira
+    label: agent
+    default_layout: app-dev # built into every worktree this belt claims
+    layout_matching: # optional: pick a different layout per branch — first glob that matches wins
+      - { worktree_pattern: "hotfix/*", layout: app-dev-hotfix }
+    steps:
+      - { type: work, tab: work, pane: agent } # dispatched to the layout's work/agent pane
+      # …
+```
+
+- **Panes** — `command` runs once the pane is up. A step's `tab`+`pane` targets a pane by its tab
+  title + pane title; that pane should run an **idle agent** (`command: claude`, `opencode`, `pi`,
+  `codex` — anything that reports idle) so the step's prompt can be delivered to it. `split` is
+  `vertical`/`right` or `horizontal`/`down`; `size` is a `"30%"` percentage, a `0<n<1` fraction, or
+  an integer cell count. At most one pane may be `setup: true` — the layout-level `setup.command`
+  runs there first (`blocking: true` waits for it before any later tab spawns).
+- **Selection** — a belt builds its `default_layout`, unless an earlier `layout_matching` glob
+  matches the worktree's branch. A hand-created worktree (no owning run) resolves by walking the
+  repo's belts. Layouts are keyed to the repo by the config file (one config = one repo), so no
+  repo path is restated.
+- **Idempotent** — applied exactly once per worktree, and only to a **fresh** (1-tab/1-pane) linked
+  worktree, so it never clobbers an arranged or restored workspace.
+
+A step whose `tab`/`pane` names a pane the layout doesn't (yet) provide waits up to
+`limits.layout_wait_seconds`, then parks for attention. Omit `layouts` (and a belt's
+`default_layout`/`layout_matching`) and steps just spawn their own dedicated panes — zero layout
+setup required.
 
 ### Prompts
 
