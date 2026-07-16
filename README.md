@@ -345,6 +345,10 @@ brief's front-matter). Route bugs to one belt and stories to another, programmat
   the pane relabelled `⚠ ATTENTION`, the reason (with a ready-made resume command) posted to the
   work source, and an hourly re-notify so it can't go stale silently. `resume <KEY>` puts it right
   back where it was, with fresh clocks. Parked runs keep their worktree but hold no claim slot.
+  A layout-pane wait self-heals before it ever needs a person: no pane means no agent (so no
+  `step-done` could rescue it), so the engine re-attempts the spawn across a bounded number of
+  extra wait windows — auto-un-parking a run already parked that way — and only parks for a human
+  once that budget is spent.
 - **Crash-safe by construction.** All state is on-disk SQLite and the reconciler is idempotent —
   a tick can be killed anywhere and the next one converges. The server is a coordinator, not a
   source of truth: every command falls back to running in-process when it's down, so a worker's
@@ -433,7 +437,7 @@ is pure data (`herdr-factory reload` picks it up without a restart).
 | `tick_interval_seconds`      | 60      | reconcile cadence per repo                                      |
 | `reconcile_concurrency`      | 8       | active runs reconciled in parallel per tick                     |
 | `max_claims_per_tick`        | 10      | new-claim admission per tick (cold-start smoothing)             |
-| `layout_wait_seconds`        | 600     | how long to wait for a configured pane before attention         |
+| `layout_wait_seconds`        | 600     | wait window for a configured pane; an expired window auto-retries ×3, then attention |
 
 ### `work_sources` (≥ 1)
 
@@ -629,7 +633,9 @@ belt:
   worktree, so it never clobbers an arranged or restored workspace.
 
 A step whose `tab`/`pane` names a pane the layout doesn't (yet) provide waits up to
-`limits.layout_wait_seconds`, then parks for attention. Omit `layouts` (and a belt's
+`limits.layout_wait_seconds`; an expired window is automatically re-armed up to 3 times (a
+transient herdr/layout race self-heals — even from an already-parked run), and only then does the
+run park for attention. Omit `layouts` (and a belt's
 `default_layout`/`layout_matching`) and steps just spawn their own dedicated panes — zero layout
 setup required.
 

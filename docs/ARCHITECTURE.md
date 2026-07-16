@@ -245,8 +245,9 @@ stays cheap. Modules: `src/core/layout-match.ts` (pure matching), `layout.ts` (p
 `layout-hook.ts` (the event handler).
 
 A belt step then simply *targets* a resulting pane via its own `tab`/`pane` (from its `steps[]`
-entry). herdr-factory **waits** for a targeted pane to come up (escalating to `attention` after
-`layout_wait_seconds`) and only spawns a pane itself for steps that have **no** tab/pane
+entry). herdr-factory **waits** for a targeted pane to come up (re-arming an expired
+`layout_wait_seconds` window a bounded number of times, then escalating to `attention` —
+[§8](#8-step-agent-model)) and only spawns a pane itself for steps that have **no** tab/pane
 configured — except `evidence`, which never spawns its own: with no tab/pane that step is
 skipped entirely (see [§8](#8-step-agent-model)).
 
@@ -495,7 +496,8 @@ CREATE INDEX idx_run_steps ON run_steps(run_id, step);
 CREATE TABLE guard_counters(             -- capped-guard counters keyed (run, step, guard) (v21) —
   run_id INTEGER NOT NULL REFERENCES runs(id), step TEXT NOT NULL, guard TEXT NOT NULL,
   count INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL,   -- 'bounce_cap' (on the target step)
-  PRIMARY KEY(run_id, step, guard));     -- + 'capture_cap'; two capped guards on a step don't collide
+  PRIMARY KEY(run_id, step, guard));     -- + 'capture_cap' + 'layout_wait' (the bounded respawn
+                                         -- budget); capped guards on a step don't collide
 
 CREATE TABLE events(                     -- the timeline (web-UI gold)
   id INTEGER PRIMARY KEY AUTOINCREMENT, run_id INTEGER, repo TEXT, ticket_key TEXT,
@@ -591,7 +593,8 @@ worktree, stay deduped, and still poll for a PR merge) but **no longer hold a cl
 pile of runs waiting on humans must not starve the belt of new claims. History is never deleted
 (we set `ended_at`), so the web UI can show attempts, outcomes, and durations.
 
-**event types:** `claimed · transition · worktree_created · step_spawned · step_done · bounced ·
+**event types:** `claimed · transition · worktree_created · step_spawned · step_done ·
+layout_wait_retry · bounced ·
 capture_attempt · evidence_uploaded · evidence_upload_failed · stale · human_question · human_reply ·
 focus_applied · pr_opened · resolver_woken · merged · closed · torn_down · attention · resumed · error`
 (plus legacy `worker_*` / `review_*` kept for old-run history).
@@ -674,10 +677,16 @@ past the cap the run parks for `attention`). The evidence step separately signal
 via `capture-attempt`; past `max_capture_attempts` (default 5, reset per fresh pass into the step)
 the run parks for `attention` — a flaky app that can't be captured cleanly surfaces instead of
 looping. That park is a backstop, not a gate: it's raised by a step-execution watchdog (the capture
-cap, the per-step budget/stall, or the layout-pane wait), and if the parked step's agent goes on to
+cap or the per-step budget/stall), and if the parked step's agent goes on to
 signal `step-done`, `reconcileAttention` un-parks the run and lets the pipeline advance — an agent
-that reaches `step-done` is by definition not looping, so completed evidence is never vetoed (a
-source-stale / PR-closed / bounce-limit / human / config park stays put for a human). After the last step, the run enters the `reviewing`
+that reaches `step-done` is by definition not looping, so completed evidence is never vetoed. The
+**layout-pane wait** is the one watchdog that trips *before* the step's agent exists (no pane ⇒ no
+agent ⇒ its `step-done` can never arrive), so a `layout_wait_timeout` park is instead rescued by
+**re-attempting the spawn**: the guard's bounded respawn budget (`autoRespawnLimit`, 3) re-arms an
+expired wait window in place — and auto-un-parks + re-dispatches an already-parked run — until the
+budget is exhausted, after which the park is a genuine human park (a successful dispatch or a human
+`resume` refunds the budget). A
+source-stale / PR-closed / bounce-limit / human / config park stays put for a human. After the last step, the run enters the `reviewing`
 human-review watch (watches the PR, wakes a resolver). A **custom** belt runs the same machinery
 over user-defined steps with no PR watch — its last `step-done` tears the run down with outcome
 `completed`.
@@ -821,7 +830,13 @@ step (`spawnStep`):
      the prompt + Enter. If the pane isn't up yet or its agent is still busy starting up,
      `spawnStep` returns `waiting` — the run stays in its phase and retries on later ticks
      (the wait is bounded by `layout_wait_seconds`, measured from the `run_steps` row's
-     `started_at`; on timeout the reconciler escalates to `attention`). It **never** spawns
+     `started_at`). An expired window is **re-armed in place** up to the layout-wait guard's
+     `autoRespawnLimit` (3) — a transient herdr/layout race must be retried by the engine, not
+     handed to a human — and only once that budget is spent does the reconciler escalate to
+     `attention`; a run already parked with `layout_wait_timeout` is likewise auto-un-parked and
+     re-dispatched while budget remains (see [§7](#7-the-reconciler--multi-agent-pipeline)), so
+     such a park needs no `step-done` (its agent never existed) and no human `resume` unless the
+     pane is genuinely never coming up. It **never** spawns
      its own pane when a tab/pane is configured — so the user's auto-spawned layout (setup
      commands, dev servers, agent startup) can settle before work begins.
    - **Not configured** (no tab/pane): `agent start` a dedicated claude pane — the only path
@@ -909,8 +924,10 @@ externally, so the label is the persistent cue), and **posts the reason to the w
 parked, the run **re-notifies every `attention_renotify_seconds`** (default 1h) and — for a
 belt with a PR — keeps polling for a merge (which still tears it down). The operator
 un-parks it with **`herdr-factory --repo <name> resume <KEY>`**: back to its active step (budget/
-heartbeat/absence clocks reset — the stale clocks are usually why it parked), to the PR watch
-(fresh deadline, cleared thread signature), or to `claiming`, and it reconciles on the same pass.
+heartbeat/absence clocks reset — the stale clocks are usually why it parked — and the capture +
+layout-wait respawn budgets refunded), to the PR watch
+(fresh deadline, cleared thread signature), or to `claiming` (with the first step's wait clock +
+respawn budget likewise refreshed), and it reconciles on the same pass.
 Parked runs hold **no claim slot** (§6). Teardown remains the abandon path.
 
 The capture lock stays **machine-global** (one dev-server / browser across all
