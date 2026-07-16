@@ -28,6 +28,7 @@ interface FakeState {
   sig: ReviewSig;
   paneState: string;
   deadPanes: Set<string>; // panes herdr no longer tracks (paneAlive → false)
+  tabPane: string | null; // what tabPaneByLabel resolves (null ⇒ the configured label no longer matches any pane)
   headSha: string;
   sessionId: string | null;
   workspaceExists: boolean; // does the workspace still exist after a worktree remove?
@@ -83,7 +84,7 @@ function build(opts: { multi?: boolean } = {}) {
   let now = 1000;
   let uidN = 0; // deterministic per-claim branch suffix (u1, u2, …) so re-claims get distinct branches
   const store = new Store(openDb(":memory:"), () => now);
-  const state: FakeState = { eligible: [], eligible2: [], pr: null, sig: { unresolved: 0, failing: 0, sig: "s0" }, paneState: "idle", deadPanes: new Set(), headSha: "sha0", sessionId: "sess-1", workspaceExists: false, focusedPane: { paneId: "w1:p1", workspaceId: "w1", tabId: "w1:t1", label: "agent" }, humanReply: null, herdrUnreachable: false, failTransitions: false, failTransitionStates: new Set(), staleTransitionStates: new Set(), humanPollError: null, humanAskError: null, failEligible: false, authFail: false, itemLabels: {} };
+  const state: FakeState = { eligible: [], eligible2: [], pr: null, sig: { unresolved: 0, failing: 0, sig: "s0" }, paneState: "idle", deadPanes: new Set(), tabPane: "w1:p1", headSha: "sha0", sessionId: "sess-1", workspaceExists: false, focusedPane: { paneId: "w1:p1", workspaceId: "w1", tabId: "w1:t1", label: "agent" }, humanReply: null, herdrUnreachable: false, failTransitions: false, failTransitionStates: new Set(), staleTransitionStates: new Set(), humanPollError: null, humanAskError: null, failEligible: false, authFail: false, itemLabels: {} };
   const calls = {
     transitions: [] as [string, WorkState][],
     agentSend: [] as [string, string][],
@@ -176,7 +177,7 @@ function build(opts: { multi?: boolean } = {}) {
       return !state.deadPanes.has(id);
     },
     agentSessionId: async () => state.sessionId,
-    tabPaneByLabel: async () => "w1:p1",
+    tabPaneByLabel: async () => state.tabPane,
     agentStart: async () => { calls.agentStart += 1; return "w1:p2"; },
     paneRun: async () => {},
     tabCreate: async () => ({ tabId: "w1:t2", paneId: "w1:pN" }),
@@ -629,45 +630,51 @@ describe("reconcile pipeline (work_to_pull_request belt)", () => {
     expect(store.getRunStep(run.id, "review")!.done).toBe(false); // review re-runs fresh
   });
 
-  it("RWR-18147: after a bounce, an intermediate step's STALE budget clock doesn't wedge the re-advance in attention", async () => {
-    // The exact stuck run: fix→evidence→review, review bounced to fix, fix reworked + signalled
-    // step-done — then the pipeline advanced back into evidence, whose run_step still carried the
-    // started_at from its FIRST pass. spawnStep returned "waiting" (the evidence layout pane wasn't
-    // idle yet), so it never re-based the clock; the next tick's budget watchdog saw the hours-old
-    // started_at and parked the run ("evidence step over budget (worker: idle)") — never re-running it.
-    const { deps, store, state, worktree, shipBelt, setNow } = build();
+  it("RWR-18147: after a bounce, the forward re-advance re-runs the next step even when its layout pane was renamed", async () => {
+    // The exact stuck run (belt fix→evidence→review→pr): review bounced to fix, fix reworked +
+    // signalled step-done, and the pipeline advanced back into evidence — which had ALREADY run once.
+    // Two things had to line up for it to re-run, and both had regressed:
+    //   1. evidence's run_step still carried the started_at from its FIRST pass (ancient), so a naive
+    //      re-advance parked it "over budget (idle)" without re-running it.
+    //   2. evidence's layout pane was RENAMED on its first dispatch (agent → evidence:KEY), so
+    //      re-resolving the configured label (evidence/agent) finds NOTHING (tabPane = null) — the run
+    //      then wedged in a layout-wait timeout ("evidence/agent never became available").
+    // The fix re-bases the clock on entry AND re-prompts the pane evidence already owns instead of
+    // re-resolving the (renamed) label.
+    const { deps, store, state, worktree, shipBelt, setNow, calls } = build();
     shipBelt.steps = [stepCfg("fix"), stepCfg("evidence"), stepCfg("review"), stepCfg("pr")]; // 4-step belt (adds evidence)
     const run = seed(store, worktree, "K-RWR", "running", "review");
-    // fix + evidence completed on the first forward pass; evidence's budget clock (3600s) is ancient.
+    // fix + evidence completed on the first forward pass; evidence's budget clock (3600s) is ancient,
+    // and its live layout pane is w1:pev (still tracked by herdr — the agent finished + is idle-at-prompt).
     store.upsertRunStep(run.id, "fix", { paneId: "w1:pfix", done: true });
     store.upsertRunStep(run.id, "evidence", { paneId: "w1:pev", done: true, startedAt: 1000, progressSig: "sha-x" });
+    state.tabPane = null; // the configured label no longer resolves — the first dispatch renamed the pane
     const src = deps.resolveSource("jira")!;
     await bounceStep(deps, store.getRun(run.id)!, shipBelt, src, "fix", "the evidence didn't prove the fix");
     expect(store.getRun(run.id)!.step).toBe("fix");
     expect(store.getRunStep(run.id, "evidence")!.startedAt).toBe(1000); // bounce leaves the stale clock in place
 
-    // Tick 1: fix signals done far in the future (the rework took a while); the evidence LAYOUT pane
-    // isn't idle yet, so the forward-advance dispatch returns "waiting".
+    // fix signals done far in the future (the rework took a while). The forward advance must re-enter
+    // evidence and actually re-dispatch it — not park it for budget, and not wedge on the missing label.
     setNow(101_000); // 100_000s ≫ evidence's 3600s budget, measured from the stale started_at
-    state.paneState = "working";
     store.markStepDone(run.id, "fix");
-    await reconcileRun(deps, store.getRun(run.id)!);
-    const afterAdvance = store.getRun(run.id)!;
-    expect(afterAdvance.phase).toBe("running");
-    expect(afterAdvance.step).toBe("evidence"); // advanced fix → evidence
-    const ev = store.getRunStep(run.id, "evidence")!;
-    expect(ev.startedAt).toBe(101_000); // budget clock RE-BASED on entry (was 1000, hours over budget)
-    expect(ev.paneId).toBe(null); // pane cleared → routes through the (!rs.paneId) spawn+wait gate
-
-    // Tick 2: the layout pane frees up; evidence must actually re-run, NOT get parked for step_budget.
-    setNow(101_010);
-    state.paneState = "idle";
+    calls.agentSend.length = 0;
     await reconcileRun(deps, store.getRun(run.id)!);
     const got = store.getRun(run.id)!;
-    expect(got.phase).toBe("running"); // regression guard: was "attention" (evidence over budget, idle)
-    expect(got.step).toBe("evidence");
+    expect(got.phase).toBe("running"); // regression guard: was "attention" (over budget, or layout-wait timeout)
+    expect(got.step).toBe("evidence"); // advanced fix → evidence
     expect(got.attentionReason).toBe(null);
-    expect(store.getRunStep(run.id, "evidence")!.paneId).toBeTruthy(); // evidence actually re-spawned
+    const ev = store.getRunStep(run.id, "evidence")!;
+    expect(ev.startedAt).toBe(101_000); // budget clock RE-BASED on entry (was 1000, hours over budget)
+    expect(ev.done).toBe(false); // its stale done is cleared so it re-runs, not skipped
+    expect(ev.paneId).toBe("w1:pev"); // REUSED the pane it already owned — not re-resolved by the renamed label
+    expect(calls.agentSend.some(([p]) => p === "w1:pev")).toBe(true); // and was actually re-prompted
+
+    // A later tick keeps it running (its live pane is watched) rather than re-parking it.
+    setNow(101_010);
+    state.paneState = "working"; // evidence is now doing the re-capture
+    await reconcileRun(deps, store.getRun(run.id)!);
+    expect(store.getRun(run.id)!.phase).toBe("running");
   });
 
   it("exceeding max_bounces escalates to attention instead of bouncing again", async () => {

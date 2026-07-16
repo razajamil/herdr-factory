@@ -81,6 +81,14 @@ export type DispatchResult = { status: "ready"; paneId: string } | { status: "wa
  *    `waiting` — we NEVER spawn our own when a tab/pane is configured; the caller waits (and
  *    eventually escalates to attention). This is what lets the user's auto-spawned layout
  *    (setup commands, dev servers, agent startup) settle before work begins.
+ *    RE-ENTRY (bounce rework / forward re-advance after a bounce / crash respawn) passes the
+ *    pane this step was ALREADY dispatched to as `knownPaneId`: the first dispatch renames the
+ *    pane from its configured label to `${step}:${key}`, so re-resolving by `tab`/`pane` would no
+ *    longer find it (the run would wedge in a layout-wait timeout — "pane never became available").
+ *    A live known pane is our durable handle, so we re-prompt it directly, skipping the label
+ *    lookup + the idle gate (it finished its prior pass and is idle-at-prompt) — mirroring how
+ *    `bounceStep` re-enters its target. The label lookup runs only on FIRST entry (no known pane)
+ *    or once the known pane is gone.
  *  - **Not configured** (no tab/pane): spawn a dedicated claude pane ourselves. This is the
  *    only path that creates a pane.
  *
@@ -88,7 +96,7 @@ export type DispatchResult = { status: "ready"; paneId: string } | { status: "wa
  */
 export async function dispatchToLayout(
   deps: Deps,
-  opts: { workspaceId: string; worktree: string; tab?: string; pane?: string; prompt: string; paneName: string; ticketKey: string },
+  opts: { workspaceId: string; worktree: string; tab?: string; pane?: string; prompt: string; paneName: string; ticketKey: string; knownPaneId?: string },
 ): Promise<DispatchResult> {
   return telemetrySpan(
     "step.dispatch",
@@ -106,17 +114,23 @@ export async function dispatchToLayout(
 
 async function dispatchToLayoutImpl(
   deps: Deps,
-  opts: { workspaceId: string; worktree: string; tab?: string; pane?: string; prompt: string; paneName: string; ticketKey: string },
+  opts: { workspaceId: string; worktree: string; tab?: string; pane?: string; prompt: string; paneName: string; ticketKey: string; knownPaneId?: string },
 ): Promise<DispatchResult> {
   if (opts.tab && opts.pane) {
-    const target = await deps.herdr.tabPaneByLabel(opts.workspaceId, opts.tab, opts.pane);
+    // Re-entry: prefer the pane this step already owns over re-resolving the (now-renamed)
+    // configured label — see the dispatchToLayout doc. Only a LIVE known pane qualifies; a dead one
+    // falls back to the label lookup (which, for a genuinely gone layout pane, waits → attention).
+    const reused = opts.knownPaneId != null && (await deps.herdr.paneAlive(opts.knownPaneId));
+    const target = reused ? opts.knownPaneId! : await deps.herdr.tabPaneByLabel(opts.workspaceId, opts.tab, opts.pane);
     if (!target) return { status: "waiting" }; // the layout hasn't created this tab/pane yet
-    if ((await deps.herdr.paneState(target)) !== "idle") return { status: "waiting" }; // no agent, or still busy
-    await deps.sleep(2000); // settle so the first keystrokes aren't dropped
+    // A freshly-resolved layout pane must be present AND idle before we send (its agent may still be
+    // starting up); a reused pane is already ours and idle-at-prompt, so re-prompt it directly.
+    if (!reused && (await deps.herdr.paneState(target)) !== "idle") return { status: "waiting" }; // no agent, or still busy
+    if (!reused) await deps.sleep(2000); // settle a just-started agent so the first keystrokes aren't dropped
     await deps.herdr.agentSend(target, opts.prompt);
     await deps.herdr.paneSendKeys(target, "Enter");
     await deps.herdr.agentRename(target, opts.paneName);
-    deps.log("info", `${opts.ticketKey}: dispatched to layout pane ${target} (${opts.tab}/${opts.pane})`);
+    deps.log("info", `${opts.ticketKey}: ${reused ? "re-dispatched to reused" : "dispatched to layout"} pane ${target} (${opts.tab}/${opts.pane})`);
     return { status: "ready", paneId: target };
   }
 
@@ -394,6 +408,11 @@ async function spawnStepImpl(
   // only reset below once we actually dispatch.)
   deps.store.upsertRunStep(run.id, stepName);
 
+  // Any pane this step was ALREADY dispatched to (a re-entry: bounce rework, forward re-advance,
+  // crash respawn). dispatchToLayout re-prompts a live one instead of re-resolving the configured
+  // label — which the first dispatch renamed out from under a fresh lookup. Undefined on first entry.
+  const knownPaneId = deps.store.getRunStep(run.id, stepName)?.paneId ?? undefined;
+
   const result = await dispatchToLayout(deps, {
     workspaceId,
     worktree,
@@ -402,6 +421,7 @@ async function spawnStepImpl(
     prompt: dispatchPrompt(stepName),
     paneName: `${stepName}:${run.ticketKey}`,
     ticketKey: run.ticketKey,
+    knownPaneId,
   });
   if (result.status === "waiting") return result; // still waiting on the user's layout pane
 
