@@ -763,9 +763,13 @@ keys jump to a numbered section, arrows move within it, `Esc` pops back out, `q`
   configuration, work counts, and a live source/pickup health check for every belt. Press `l`
   on a repo to log in to one of its Jira OAuth sources; it opens your browser and the resident server
   auto-captures the callback, falling back to a paste prompt when the callback listener is unavailable.
-- **Config** — a repo list and a full `config.yml` editor: edits the YAML surgically (comments
-  and the schema modeline preserved), validates against the engine schema, `^S` saves, `[`/`]`
-  reorder list entries. Credentials appear as masked, replace-only `secrets (env)` fields —
+- **Config** — a repo list `[1]` and a full `config.yml` editor split across three bordered panels:
+  `[2]` config (repo · limits · secrets · evidence), `[3]` work sources, `[4]` belts. The three
+  panels are an accordion — collapsed by default, and jumping to one (number keys `2`/`3`/`4`, a
+  click, or `↵` from the repo list) expands it and collapses the others, so only one is open at a
+  time. It edits the YAML surgically (comments and the schema modeline preserved), validates against
+  the engine schema, `^S` saves, `[`/`]` reorder list entries. Credentials appear as masked,
+  replace-only `secrets (env)` fields —
   declared per source type (`JIRA_EMAIL`/`JIRA_API_TOKEN` for jira, `GITHUB_TOKEN` for
   github_issues, `JIRA_OAUTH_CLIENT_SECRET` for a jira `oauth` source) — written separately to the
   `env` file (`chmod 600`). OAuth sign-in itself is `auth login` (the Dashboard's `l` surfaces it).

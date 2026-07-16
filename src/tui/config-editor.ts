@@ -1,11 +1,15 @@
-// Config tab — two numbered sections: [1] a repo list, [2] a full editor for the selected repo's
-// config.yml. Section 2 renders a flat, browsable list of rows generated from a live `yaml` Document
-// (config-fields.ts). Array-of-object items (work_sources, belts, steps) render as collapsible
-// `group` rows — collapsed by default, toggled with ↵/Space/←→ or a mouse click — so long configs
-// stay scannable. Text fields, cyclable enums, bool toggles, source refs, and add/remove action
-// rows fill in when a group is expanded. Navigation follows the shell's lazygit model (↑↓ move, Esc
-// → top). Structural edits mutate the Document surgically so comments + the schema modeline are
-// preserved; save validates against RepoConfigSchema before writing.
+// Config tab — four numbered sections. [1] a repo list on the left; on the right, three bordered
+// panels stacked in rows, each an editor over one slice of the selected repo's config.yml: [2] the
+// singleton blocks (repo · limits · secrets · evidence), [3] work_sources, [4] belts. The three
+// right-hand panels are an ACCORDION — collapsed by default, and moving to one (number keys 2/3/4, a
+// click, or ↵ from the repo list) expands it and collapses the others, so only one is open at a
+// time and a long config stays scannable. Each panel renders a flat, browsable list of rows built
+// from a live `yaml` Document (config-fields.ts): array-of-object items (work_sources, belts, steps)
+// are collapsible `group` rows, and text fields / cyclable enums / bool toggles / source refs /
+// add-remove actions fill in when a group is expanded. Navigation follows the shell's lazygit model
+// (↑↓ move within the focused panel, Esc → top). Structural edits mutate the Document surgically so
+// comments + the schema modeline are preserved; save validates the whole config against
+// RepoConfigSchema before writing.
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { BoxRenderable, InputRenderable, ScrollBoxRenderable, SelectRenderable, TextRenderable, type CliRenderer } from "@opentui/core";
@@ -21,12 +25,403 @@ import type { ConfirmFn, TabView } from "./types.ts";
 const LABEL_WIDTH = 28;
 const IND = (n?: number) => "  ".repeat(n ?? 0);
 const gut = (on: boolean) => (on ? "▶ " : "  ");
+const COLLAPSED_HEIGHT = 3; // border top + one summary line + border bottom
 
 interface RowRef {
   desc: FieldDesc;
   container: Renderable;
   input?: InputRenderable;
   setHighlighted: (on: boolean) => void;
+}
+
+/** Shared state + callbacks the editor hands to each accordion panel. The panels own their own row
+ *  list and highlight; everything below is common (one draft, one env map, one collapse WeakSet). */
+interface PanelCtx {
+  renderer: CliRenderer;
+  getDraft: () => Document | null;
+  expandedNodes: WeakSet<object>;
+  secretGet: (envKey: string) => string;
+  secretSet: (envKey: string, v: string) => void;
+  /** Commit every panel's typed edits into the draft/env before a structural rebuild. */
+  flushAll: () => void;
+  markUnsaved: () => void;
+  setStatus: (content: string, fg: string) => void;
+  /** Make section `n` the active + sole-expanded panel (used by mouse clicks). */
+  focusSection: (n: number) => void;
+}
+
+interface FieldPanel {
+  section: number;
+  outer: BoxRenderable;
+  /** Rebuild rows from the current draft, preserving the highlighted index. */
+  render: () => void;
+  flushInputs: () => void;
+  /** Focus this panel's scroll and re-apply its highlight. */
+  focusInto: () => void;
+  setExpanded: (on: boolean) => void;
+  setActive: (on: boolean) => void;
+  /** Move the highlight while editing a text field (↑/↓ from the shell). */
+  editMove: (dir: -1 | 1) => void;
+  showMessage: (text: string, fg: string) => void;
+  clearErrors: () => void;
+  addError: (text: string) => void;
+  hasRows: () => boolean;
+}
+
+/** One accordion panel: a bordered box holding a scrollable field list plus a one-line summary
+ *  shown when it's collapsed. All navigation/editing state (focusRows, browseIndex) is local; the
+ *  draft it reads and the flush/rebuild it triggers are shared through `ctx`. */
+function createFieldPanel(
+  section: number,
+  title: string,
+  buildDescs: () => FieldDesc[],
+  summaryFn: () => string,
+  ctx: PanelCtx,
+): FieldPanel {
+  const { renderer } = ctx;
+  const outer = new BoxRenderable(renderer, {
+    width: "100%",
+    flexDirection: "column",
+    flexGrow: 0,
+    height: COLLAPSED_HEIGHT,
+    backgroundColor: theme.bg,
+    border: true,
+    borderStyle: BORDER,
+    borderColor: theme.border.inactive,
+    title,
+    titleColor: theme.focusText.unfocused,
+    paddingLeft: 1,
+    paddingRight: 1,
+  });
+  const scroll = new ScrollBoxRenderable(renderer, {
+    flexGrow: 1,
+    width: "100%",
+    scrollY: true,
+    backgroundColor: theme.bg,
+    visible: false, // collapsed by default
+  });
+  const summary = new TextRenderable(renderer, { content: "", height: 1, wrapMode: "none", fg: theme.text.tertiary });
+  outer.add(scroll);
+  outer.add(summary);
+
+  let focusRows: RowRef[] = [];
+  let browseIndex = 0;
+  let errorNodes: Renderable[] = [];
+  let currentDraft: Document | null = null;
+
+  function clearScroll(): void {
+    for (const c of [...scroll.getChildren()]) {
+      scroll.remove(c.id);
+      c.destroy();
+    }
+  }
+
+  function textLine(content: string, fg: string): TextRenderable {
+    return new TextRenderable(renderer, { content, fg, width: "100%", height: 1, wrapMode: "none" });
+  }
+
+  // Render one descriptor into the scroll; returns a RowRef for focusable ones, null for headers.
+  function renderDescriptor(d: FieldDesc): RowRef | null {
+    if (d.kind === "header") {
+      const fg = d.level === 1 ? theme.accent : theme.text.secondary;
+      scroll.add(new TextRenderable(renderer, { content: IND(d.indent) + d.label, fg, width: "100%", height: 1, wrapMode: "none" }));
+      return null;
+    }
+    if (d.kind === "group") {
+      const body = () => `${IND(d.indent)}${d.expanded ? "▾" : "▸"} ${d.label}`;
+      const t = new TextRenderable(renderer, { content: gut(false) + body(), fg: theme.text.primary, width: "100%", height: 1, wrapMode: "none" });
+      scroll.add(t);
+      return { desc: d, container: t, setHighlighted: (on) => { t.content = gut(on) + body(); t.fg = on ? theme.focusText.focused : theme.text.primary; } };
+    }
+    if (d.kind === "action") {
+      const t = new TextRenderable(renderer, { content: gut(false) + IND(d.indent) + d.label, fg: theme.accent, width: "100%", height: 1, wrapMode: "none" });
+      scroll.add(t);
+      return { desc: d, container: t, setHighlighted: (on) => { t.content = gut(on) + IND(d.indent) + d.label; t.fg = on ? theme.focusText.focused : theme.accent; } };
+    }
+
+    const container = new BoxRenderable(renderer, { flexDirection: "row", width: "100%", height: 1, backgroundColor: theme.bg });
+    const labelText = IND(d.indent) + d.label.padEnd(LABEL_WIDTH);
+    const labelW = 2 + (d.indent ?? 0) * 2 + LABEL_WIDTH + 1;
+    const label = new TextRenderable(renderer, { content: gut(false) + labelText, fg: theme.text.secondary, width: labelW, height: 1, wrapMode: "none" });
+    container.add(label);
+
+    if (d.kind === "text") {
+      let initial = "";
+      let placeholder = d.placeholder ?? "";
+      if (d.env) {
+        // env-backed credential: token is replace-only (never render the stored value).
+        if (d.masked) placeholder = ctx.secretGet(d.env) ? "•••••••• (set — type to replace)" : "not set";
+        else initial = ctx.secretGet(d.env);
+      } else {
+        const v = currentDraft?.getIn(d.path!);
+        initial = v == null ? "" : String(v);
+      }
+      const input = new InputRenderable(renderer, {
+        value: initial,
+        placeholder,
+        flexGrow: 1,
+        backgroundColor: theme.input.bg,
+        focusedBackgroundColor: theme.input.focusBg,
+        textColor: theme.input.fg,
+        focusedTextColor: theme.input.focusFg,
+        placeholderColor: theme.input.placeholder,
+      });
+      input.on("input", ctx.markUnsaved);
+      input.on("enter", () => moveHighlight(browseIndex + 1, true));
+      container.add(input);
+      scroll.add(container);
+      return {
+        desc: d,
+        container,
+        input,
+        setHighlighted: (on) => {
+          label.content = gut(on) + labelText;
+          label.fg = on ? theme.focusText.focused : theme.text.secondary;
+          input.backgroundColor = on ? theme.input.focusBg : theme.input.bg;
+        },
+      };
+    }
+
+    // enum | ref | bool → a value chip
+    const display = d.kind === "bool" ? (d.value ? "[x] on" : "[ ] off") : `‹ ${d.value} ›`;
+    const val = new TextRenderable(renderer, { content: display, fg: theme.text.primary, flexGrow: 1, height: 1, wrapMode: "none" });
+    container.add(val);
+    scroll.add(container);
+    return {
+      desc: d,
+      container,
+      setHighlighted: (on) => {
+        label.content = gut(on) + labelText;
+        label.fg = on ? theme.focusText.focused : theme.text.secondary;
+        val.fg = on ? theme.accent : theme.text.primary;
+      },
+    };
+  }
+
+  function render(): void {
+    const keep = browseIndex;
+    currentDraft = ctx.getDraft();
+    clearScroll();
+    focusRows = [];
+    errorNodes = [];
+    summary.content = summaryFn();
+    if (!currentDraft) {
+      browseIndex = 0;
+      return;
+    }
+    for (const d of buildDescs()) {
+      const rr = renderDescriptor(d);
+      if (!rr) continue;
+      focusRows.push(rr);
+      const idx = focusRows.length - 1;
+      // Mouse: click a row to focus this panel + highlight it; click a group to toggle expand/collapse.
+      rr.container.onMouseDown = () => {
+        ctx.focusSection(section);
+        setHighlight(idx);
+        if (d.kind === "group") toggleGroup(d.node);
+      };
+    }
+    // Re-apply the highlight visually (no scroll/focus change — focusInto does that for the active panel).
+    if (focusRows.length > 0) {
+      browseIndex = Math.max(0, Math.min(keep, focusRows.length - 1));
+      focusRows.forEach((r, i) => r.setHighlighted(i === browseIndex));
+    } else {
+      browseIndex = 0;
+    }
+  }
+
+  function setHighlight(i: number): void {
+    if (focusRows.length === 0) return;
+    browseIndex = Math.max(0, Math.min(i, focusRows.length - 1));
+    focusRows.forEach((r, idx) => r.setHighlighted(idx === browseIndex));
+    scroll.scrollChildIntoView(focusRows[browseIndex]!.container.id);
+  }
+
+  /** Commit this panel's visible text fields into the draft (so nothing is lost on rebuild/save). */
+  function flushInputs(): void {
+    const draft = ctx.getDraft();
+    if (!draft) return;
+    for (const r of focusRows) {
+      if (r.desc.kind !== "text" || !r.input) continue;
+      const d = r.desc;
+      const raw = r.input.value;
+      if (d.env) {
+        // token (masked) is replace-only: blank keeps the existing one; email always applies.
+        if (d.masked) { if (raw.trim() !== "") ctx.secretSet(d.env, raw.trim()); } else ctx.secretSet(d.env, raw.trim());
+        continue;
+      }
+      const t = raw.trim();
+      if (t === "") continue;
+      const value = d.numeric && Number.isFinite(Number(t)) ? Number(t) : t;
+      draft.setIn(d.path!, value);
+    }
+  }
+
+  // Expand/collapse a group. View-only (doesn't touch the config), so it flushes this panel's edits
+  // and re-renders it without marking unsaved. Group nodes live in exactly one panel.
+  function toggleGroup(node: object): void {
+    flushInputs();
+    if (ctx.expandedNodes.has(node)) ctx.expandedNodes.delete(node);
+    else ctx.expandedNodes.add(node);
+    render();
+    focusInto();
+  }
+
+  function enterEdit(i: number): void {
+    setHighlight(i);
+    const row = focusRows[browseIndex];
+    if (row?.input) {
+      row.input.focus();
+      ctx.setStatus("editing — ↵ next · Esc: top · ^S save", theme.text.secondary);
+    }
+  }
+
+  function moveHighlight(target: number, edit: boolean): void {
+    flushInputs();
+    if (focusRows.length === 0) return;
+    setHighlight(target);
+    const row = focusRows[browseIndex];
+    if (edit && row?.input) row.input.focus();
+    else scroll.focus();
+  }
+
+  function cycle(desc: Extract<FieldDesc, { kind: "enum" | "ref" }>, dir: 1 | -1): void {
+    ctx.flushAll(); // capture typed edits everywhere before the mutation shifts draft paths
+    const cs = desc.choices;
+    if (cs.length === 0) return;
+    const i = cs.indexOf(desc.value);
+    const next = i < 0 ? cs[0]! : cs[(i + dir + cs.length) % cs.length]!;
+    desc.apply(next); // mutates draft → rebuildAll()
+  }
+
+  function activate(row: RowRef | undefined): void {
+    if (!row) return;
+    const d = row.desc;
+    if (d.kind === "text") {
+      enterEdit(browseIndex);
+    } else if (d.kind === "enum" || d.kind === "ref") {
+      cycle(d, 1);
+    } else if (d.kind === "bool") {
+      ctx.flushAll();
+      d.apply(!d.value);
+    } else if (d.kind === "action") {
+      ctx.flushAll();
+      d.run();
+    } else if (d.kind === "group") {
+      toggleGroup(d.node);
+    }
+  }
+
+  // Browse-mode keys — only fire while this panel's scroll is focused.
+  scroll.onKeyDown = (key: KeyEvent) => {
+    if (focusRows.length === 0) return;
+    const row = focusRows[browseIndex];
+    const cyclable = !!row && (row.desc.kind === "enum" || row.desc.kind === "ref");
+    const group = row && row.desc.kind === "group" ? row.desc : null;
+    // Reorder a group within its array: Shift+↑/↓ or [ / ].
+    if (group) {
+      const up = (key.name === "up" && key.shift) || key.name === "[";
+      const down = (key.name === "down" && key.shift) || key.name === "]";
+      if (up || down) {
+        ctx.flushAll();
+        if (up) group.moveUp?.();
+        else group.moveDown?.();
+        key.preventDefault();
+        return;
+      }
+    }
+    switch (key.name) {
+      case "up":
+        moveHighlight(browseIndex - 1, false);
+        key.preventDefault();
+        break;
+      case "down":
+        moveHighlight(browseIndex + 1, false);
+        key.preventDefault();
+        break;
+      case "return":
+      case "enter":
+        activate(row);
+        key.preventDefault();
+        break;
+      case "space":
+        if (row && (cyclable || row.desc.kind === "bool" || row.desc.kind === "group")) {
+          activate(row);
+          key.preventDefault();
+        }
+        break;
+      case "left":
+        if (cyclable) cycle(row!.desc as Extract<FieldDesc, { kind: "enum" | "ref" }>, -1);
+        else if (group && ctx.expandedNodes.has(group.node)) toggleGroup(group.node);
+        else break;
+        key.preventDefault();
+        break;
+      case "right":
+        if (cyclable) cycle(row!.desc as Extract<FieldDesc, { kind: "enum" | "ref" }>, 1);
+        else if (group && !ctx.expandedNodes.has(group.node)) toggleGroup(group.node);
+        else break;
+        key.preventDefault();
+        break;
+    }
+  };
+
+  function focusInto(): void {
+    scroll.focus();
+    if (focusRows.length > 0) setHighlight(Math.min(browseIndex, focusRows.length - 1));
+  }
+
+  function setExpanded(on: boolean): void {
+    scroll.visible = on;
+    summary.visible = !on;
+    outer.flexGrow = on ? 1 : 0;
+    outer.height = on ? "auto" : COLLAPSED_HEIGHT;
+  }
+
+  function setActive(on: boolean): void {
+    outer.borderColor = on ? theme.border.active : theme.border.inactive;
+    outer.titleColor = on ? theme.focusText.focused : theme.focusText.unfocused;
+  }
+
+  function showMessage(text: string, fg: string): void {
+    currentDraft = null;
+    clearScroll();
+    focusRows = [];
+    errorNodes = [];
+    browseIndex = 0;
+    scroll.add(textLine(text, fg));
+  }
+
+  function clearErrors(): void {
+    for (const n of errorNodes) {
+      scroll.remove(n.id);
+      n.destroy();
+    }
+    errorNodes = [];
+  }
+
+  function addError(text: string): void {
+    const node = textLine(text, theme.status.bad);
+    scroll.add(node, errorNodes.length); // stack errors at the very top, in order
+    errorNodes.push(node);
+    scroll.scrollTop = 0;
+  }
+
+  outer.onMouseDown = () => ctx.focusSection(section);
+
+  return {
+    section,
+    outer,
+    render,
+    flushInputs,
+    focusInto,
+    setExpanded,
+    setActive,
+    editMove: (dir) => moveHighlight(browseIndex + dir, true),
+    showMessage,
+    clearErrors,
+    addError,
+    hasRows: () => focusRows.length > 0,
+  };
 }
 
 export function createConfigEditor(renderer: CliRenderer, confirm: ConfirmFn): TabView {
@@ -60,24 +455,9 @@ export function createConfigEditor(renderer: CliRenderer, confirm: ConfirmFn): T
   });
   repoPanel.add(repoSelect);
 
-  // ── section 2: editor form + status line ──────────────────────────────────────────────────
+  // ── sections 2/3/4: the accordion + status line ─────────────────────────────────────────────
   const rightCol = new BoxRenderable(renderer, { flexDirection: "column", flexGrow: 1, height: "100%", backgroundColor: theme.bg });
-  const form = new ScrollBoxRenderable(renderer, {
-    flexGrow: 1,
-    width: "100%",
-    scrollY: true,
-    backgroundColor: theme.bg,
-    border: true,
-    borderStyle: BORDER,
-    borderColor: theme.border.inactive,
-    title: " 2 · config ",
-    titleColor: theme.focusText.unfocused,
-    paddingLeft: 1,
-    paddingRight: 1,
-  });
   const status = new TextRenderable(renderer, { content: "", height: 1, wrapMode: "none", fg: theme.text.tertiary, paddingLeft: 1 });
-  rightCol.add(form);
-  rightCol.add(status);
 
   root.add(repoPanel);
   root.add(rightCol);
@@ -86,11 +466,10 @@ export function createConfigEditor(renderer: CliRenderer, confirm: ConfirmFn): T
   let loadedRepo: string | null = null;
   let loadedText = "";
   let draft: Document | null = null;
-  let focusRows: RowRef[] = [];
-  let browseIndex = 0;
-  let lastSection = 1;
-  let errorNodes: Renderable[] = [];
-  let expandedNodes = new WeakSet<object>(); // which array-item nodes are expanded (view state)
+  // Group-collapse view state, keyed by yaml node identity. Kept across repo loads: a re-parsed
+  // document has fresh nodes, so nothing carries over (everything starts collapsed) and stale
+  // entries are GC'd — no reset needed.
+  const expandedNodes = new WeakSet<object>();
   // Per-repo credentials (separate `env` file). `envValues` is live (updated by flush);
   // `loadedEnv` is the on-disk snapshot, so save only writes when they differ. Which keys are
   // shown comes from the source descriptors' secrets manifests — not hardcoded per backend.
@@ -99,8 +478,20 @@ export function createConfigEditor(renderer: CliRenderer, confirm: ConfirmFn): T
   const secretGet = (envKey: string) => envValues[envKey] ?? "";
   const secretSet = (envKey: string, v: string) => { envValues[envKey] = v; };
 
-  // The env-backed credential fields, prepended above the config.yml form: every source type's
-  // manifest, deduped by env key (a key two types share renders once).
+  // Accordion + focus state. `expandedSection` is the sole open right-hand panel (null = all
+  // collapsed, the default); `activeSection` is where focus is (1 = repo list).
+  let expandedSection: number | null = null;
+  let activeSection = 1;
+  let lastSection = 1;
+
+  function setStatus(content: string, fg: string): void {
+    status.content = content;
+    status.fg = fg;
+  }
+  const markUnsaved = () => setStatus("● unsaved changes — ^S to save", theme.status.warn);
+
+  // The env-backed credential fields, shown at the top of panel [2]: every source type's manifest,
+  // deduped by env key (a key two types share renders once).
   const secretDescriptors = (): FieldDesc[] => {
     const rows: FieldDesc[] = [{ kind: "header", label: "secrets (env)", level: 1 }];
     const seen = new Set<string>();
@@ -114,301 +505,113 @@ export function createConfigEditor(renderer: CliRenderer, confirm: ConfirmFn): T
     return rows;
   };
 
-  function setStatus(content: string, fg: string): void {
-    status.content = content;
-    status.fg = fg;
-  }
-  const markUnsaved = () => setStatus("● unsaved changes — ^S to save", theme.status.warn);
+  let panels: FieldPanel[] = [];
+  const activePanel = () => panels.find((p) => p.section === activeSection);
 
-  function setActiveSection(n: 1 | 2): void {
-    repoPanel.borderColor = n === 1 ? theme.border.active : theme.border.inactive;
-    repoPanel.titleColor = n === 1 ? theme.focusText.focused : theme.focusText.unfocused;
-    form.borderColor = n === 2 ? theme.border.active : theme.border.inactive;
-    form.titleColor = n === 2 ? theme.focusText.focused : theme.focusText.unfocused;
+  function flushAll(): void {
+    for (const p of panels) p.flushInputs();
   }
 
-  function clearFormChildren(): void {
-    for (const c of [...form.getChildren()]) {
-      form.remove(c.id);
-      c.destroy();
-    }
-  }
-
-  function clearErrors(): void {
-    for (const n of errorNodes) {
-      form.remove(n.id);
-      n.destroy();
-    }
-    errorNodes = [];
-  }
-
-  function textLine(content: string, fg: string): TextRenderable {
-    return new TextRenderable(renderer, { content, fg, width: "100%", height: 1, wrapMode: "none" });
-  }
-
-  // Render one descriptor into the form; returns a RowRef for focusable ones, null for headers.
-  function renderDescriptor(d: FieldDesc): RowRef | null {
-    if (d.kind === "header") {
-      const fg = d.level === 1 ? theme.accent : theme.text.secondary;
-      form.add(new TextRenderable(renderer, { content: IND(d.indent) + d.label, fg, width: "100%", height: 1, wrapMode: "none" }));
-      return null;
-    }
-    if (d.kind === "group") {
-      const body = () => `${IND(d.indent)}${d.expanded ? "▾" : "▸"} ${d.label}`;
-      const t = new TextRenderable(renderer, { content: gut(false) + body(), fg: theme.text.primary, width: "100%", height: 1, wrapMode: "none" });
-      form.add(t);
-      return { desc: d, container: t, setHighlighted: (on) => { t.content = gut(on) + body(); t.fg = on ? theme.focusText.focused : theme.text.primary; } };
-    }
-    if (d.kind === "action") {
-      const t = new TextRenderable(renderer, { content: gut(false) + IND(d.indent) + d.label, fg: theme.accent, width: "100%", height: 1, wrapMode: "none" });
-      form.add(t);
-      return { desc: d, container: t, setHighlighted: (on) => { t.content = gut(on) + IND(d.indent) + d.label; t.fg = on ? theme.focusText.focused : theme.accent; } };
-    }
-
-    const container = new BoxRenderable(renderer, { flexDirection: "row", width: "100%", height: 1, backgroundColor: theme.bg });
-    const labelText = IND(d.indent) + d.label.padEnd(LABEL_WIDTH);
-    const labelW = 2 + (d.indent ?? 0) * 2 + LABEL_WIDTH + 1;
-    const label = new TextRenderable(renderer, { content: gut(false) + labelText, fg: theme.text.secondary, width: labelW, height: 1, wrapMode: "none" });
-    container.add(label);
-
-    if (d.kind === "text") {
-      let initial = "";
-      let placeholder = d.placeholder ?? "";
-      if (d.env) {
-        // env-backed credential: token is replace-only (never render the stored value).
-        if (d.masked) placeholder = secretGet(d.env) ? "•••••••• (set — type to replace)" : "not set";
-        else initial = secretGet(d.env);
-      } else {
-        const v = draft?.getIn(d.path!);
-        initial = v == null ? "" : String(v);
-      }
-      const input = new InputRenderable(renderer, {
-        value: initial,
-        placeholder,
-        flexGrow: 1,
-        backgroundColor: theme.input.bg,
-        focusedBackgroundColor: theme.input.focusBg,
-        textColor: theme.input.fg,
-        focusedTextColor: theme.input.focusFg,
-        placeholderColor: theme.input.placeholder,
-      });
-      input.on("input", markUnsaved);
-      input.on("enter", () => moveHighlight(browseIndex + 1, true));
-      container.add(input);
-      form.add(container);
-      return {
-        desc: d,
-        container,
-        input,
-        setHighlighted: (on) => {
-          label.content = gut(on) + labelText;
-          label.fg = on ? theme.focusText.focused : theme.text.secondary;
-          input.backgroundColor = on ? theme.input.focusBg : theme.input.bg;
-        },
-      };
-    }
-
-    // enum | ref | bool → a value chip
-    const display = d.kind === "bool" ? (d.value ? "[x] on" : "[ ] off") : `‹ ${d.value} ›`;
-    const val = new TextRenderable(renderer, { content: display, fg: theme.text.primary, flexGrow: 1, height: 1, wrapMode: "none" });
-    container.add(val);
-    form.add(container);
-    return {
-      desc: d,
-      container,
-      setHighlighted: (on) => {
-        label.content = gut(on) + labelText;
-        label.fg = on ? theme.focusText.focused : theme.text.secondary;
-        val.fg = on ? theme.accent : theme.text.primary;
-      },
-    };
-  }
-
-  function render(): void {
-    clearFormChildren();
-    focusRows = [];
-    errorNodes = [];
-    if (!draft) return;
-    for (const d of [...secretDescriptors(), ...buildDescriptors(draft, rebuild, confirm, expandedNodes)]) {
-      const rr = renderDescriptor(d);
-      if (!rr) continue;
-      focusRows.push(rr);
-      const idx = focusRows.length - 1;
-      // Mouse: click any row to highlight it; click a group to toggle expand/collapse.
-      rr.container.onMouseDown = () => {
-        setHighlight(idx);
-        if (d.kind === "group") toggleGroup(d.node);
-      };
-    }
-  }
-
-  function setHighlight(i: number): void {
-    if (focusRows.length === 0) return;
-    browseIndex = Math.max(0, Math.min(i, focusRows.length - 1));
-    focusRows.forEach((r, idx) => r.setHighlighted(idx === browseIndex));
-    form.scrollChildIntoView(focusRows[browseIndex]!.container.id);
-  }
-
-  /** Commit every visible text field's value into the draft (so nothing is lost on rebuild/save). */
-  function flushInputs(): void {
-    if (!draft) return;
-    for (const r of focusRows) {
-      if (r.desc.kind !== "text" || !r.input) continue;
-      const d = r.desc;
-      const raw = r.input.value;
-      if (d.env) {
-        // token (masked) is replace-only: blank keeps the existing one; email always applies.
-        if (d.masked) { if (raw.trim() !== "") secretSet(d.env, raw.trim()); } else secretSet(d.env, raw.trim());
-        continue;
-      }
-      const t = raw.trim();
-      if (t === "") continue;
-      const value = d.numeric && Number.isFinite(Number(t)) ? Number(t) : t;
-      draft.setIn(d.path!, value);
-    }
-  }
-
-  // Regenerate rows after a STRUCTURAL change (add/remove/type-switch). Callers flush BEFORE mutating
-  // the draft (see activate/cycle), so this must not flush again — paths have shifted.
-  function rebuild(): void {
-    const keep = browseIndex;
-    render();
-    setHighlight(keep);
-    form.focus();
+  // Regenerate rows across ALL panels after a STRUCTURAL change (add/remove/type-switch/reorder) —
+  // a work_source edit can change a belt's source-ref choices, so panels can't rebuild in isolation.
+  // Callers flush BEFORE mutating the draft (see cycle/activate), so this must NOT flush again.
+  function rebuildAll(): void {
+    for (const p of panels) p.render();
+    activePanel()?.focusInto();
     markUnsaved();
   }
 
-  // Expand/collapse a group. View-only (doesn't touch the config), so it flushes visible edits and
-  // re-renders without marking unsaved.
-  function toggleGroup(node: object): void {
-    flushInputs();
-    if (expandedNodes.has(node)) expandedNodes.delete(node);
-    else expandedNodes.add(node);
-    const keep = browseIndex;
-    render();
-    setHighlight(keep);
-    form.focus();
+  function summaryGeneral(): string {
+    const p = (draft?.toJS() as any)?.repo?.path;
+    return p ? `repo: ${p}` : "repo · limits · secrets · evidence";
+  }
+  function summarySources(): string {
+    const arr = ((draft?.toJS() as any)?.work_sources ?? []) as any[];
+    if (!Array.isArray(arr) || arr.length === 0) return "no work sources — ↵ to add";
+    const names = arr.map((s, i) => String(s?.name ?? s?.type ?? `source${i}`));
+    return `${arr.length} source${arr.length === 1 ? "" : "s"}: ${names.join(", ")}`;
+  }
+  function summaryBelts(): string {
+    const arr = ((draft?.toJS() as any)?.belt ?? []) as any[];
+    if (!Array.isArray(arr) || arr.length === 0) return "no belts — ↵ to add";
+    const names = arr.map((b, i) => String(b?.name ?? `belt${i}`));
+    return `${arr.length} belt${arr.length === 1 ? "" : "s"}: ${names.join(", ")}`;
   }
 
-  function enterEdit(i: number): void {
-    setHighlight(i);
-    const row = focusRows[browseIndex];
-    if (row?.input) {
-      row.input.focus();
-      setStatus("editing — ↵ next · Esc: top · ^S save", theme.text.secondary);
-    }
-  }
-
-  function moveHighlight(target: number, edit: boolean): void {
-    flushInputs();
-    if (focusRows.length === 0) return;
-    setHighlight(target);
-    const row = focusRows[browseIndex];
-    if (edit && row?.input) row.input.focus();
-    else form.focus();
-  }
-
-  function cycle(desc: Extract<FieldDesc, { kind: "enum" | "ref" }>, dir: 1 | -1): void {
-    flushInputs(); // capture typed edits before the mutation shifts draft paths
-    const cs = desc.choices;
-    if (cs.length === 0) return;
-    const i = cs.indexOf(desc.value);
-    const next = i < 0 ? cs[0]! : cs[(i + dir + cs.length) % cs.length]!;
-    desc.apply(next); // mutates draft → rebuild()
-  }
-
-  function activate(row: RowRef | undefined): void {
-    if (!row) return;
-    const d = row.desc;
-    if (d.kind === "text") {
-      enterEdit(browseIndex);
-    } else if (d.kind === "enum" || d.kind === "ref") {
-      cycle(d, 1);
-    } else if (d.kind === "bool") {
-      flushInputs();
-      d.apply(!d.value);
-    } else if (d.kind === "action") {
-      flushInputs();
-      d.run();
-    } else if (d.kind === "group") {
-      toggleGroup(d.node);
-    }
-  }
-
-  // Browse-mode keys — only fire while the form itself is focused.
-  form.onKeyDown = (key: KeyEvent) => {
-    if (focusRows.length === 0) return;
-    const row = focusRows[browseIndex];
-    const cyclable = !!row && (row.desc.kind === "enum" || row.desc.kind === "ref");
-    const group = row && row.desc.kind === "group" ? row.desc : null;
-    // Reorder a group within its array: Shift+↑/↓ or [ / ].
-    if (group) {
-      const up = (key.name === "up" && key.shift) || key.name === "[";
-      const down = (key.name === "down" && key.shift) || key.name === "]";
-      if (up || down) {
-        flushInputs();
-        if (up) group.moveUp?.();
-        else group.moveDown?.();
-        key.preventDefault();
-        return;
-      }
-    }
-    switch (key.name) {
-      case "up":
-        moveHighlight(browseIndex - 1, false);
-        key.preventDefault();
-        break;
-      case "down":
-        moveHighlight(browseIndex + 1, false);
-        key.preventDefault();
-        break;
-      case "return":
-      case "enter":
-        activate(row);
-        key.preventDefault();
-        break;
-      case "space":
-        if (row && (cyclable || row.desc.kind === "bool" || row.desc.kind === "group")) {
-          activate(row);
-          key.preventDefault();
-        }
-        break;
-      case "left":
-        if (cyclable) cycle(row!.desc as Extract<FieldDesc, { kind: "enum" | "ref" }>, -1);
-        else if (group && expandedNodes.has(group.node)) toggleGroup(group.node);
-        else break;
-        key.preventDefault();
-        break;
-      case "right":
-        if (cyclable) cycle(row!.desc as Extract<FieldDesc, { kind: "enum" | "ref" }>, 1);
-        else if (group && !expandedNodes.has(group.node)) toggleGroup(group.node);
-        else break;
-        key.preventDefault();
-        break;
-    }
+  const ctx: PanelCtx = {
+    renderer,
+    getDraft: () => draft,
+    expandedNodes,
+    secretGet,
+    secretSet,
+    flushAll,
+    markUnsaved,
+    setStatus,
+    focusSection: (n) => focusSection(n),
   };
+
+  panels = [
+    createFieldPanel(2, " 2 · config ", () => [...secretDescriptors(), ...buildDescriptors(draft!, rebuildAll, confirm, expandedNodes, "general")], summaryGeneral, ctx),
+    createFieldPanel(3, " 3 · work sources ", () => buildDescriptors(draft!, rebuildAll, confirm, expandedNodes, "work_sources"), summarySources, ctx),
+    createFieldPanel(4, " 4 · belts ", () => buildDescriptors(draft!, rebuildAll, confirm, expandedNodes, "belt"), summaryBelts, ctx),
+  ];
+  for (const p of panels) rightCol.add(p.outer);
+  rightCol.add(status);
+
+  const configPanel = () => panels[0]!; // panel [2] owns the repo-level title + load messages
+
+  function setExpandedSection(n: number | null): void {
+    expandedSection = n;
+    for (const p of panels) p.setExpanded(p.section === n);
+  }
+
+  function setActiveBorders(n: number): void {
+    repoPanel.borderColor = n === 1 ? theme.border.active : theme.border.inactive;
+    repoPanel.titleColor = n === 1 ? theme.focusText.focused : theme.focusText.unfocused;
+    for (const p of panels) p.setActive(p.section === n);
+  }
+
+  function focusSection(n: number): void {
+    if (n === 1) {
+      // Back to the repo list — leaves whatever accordion panel was open expanded (still ≤ 1 open),
+      // just de-focuses it.
+      lastSection = 1;
+      activeSection = 1;
+      setActiveBorders(1);
+      repoSelect.focus();
+      return;
+    }
+    const panel = panels.find((p) => p.section === n);
+    if (!panel) return;
+    lastSection = n;
+    activeSection = n;
+    setExpandedSection(n); // expand this one, collapse the others
+    setActiveBorders(n);
+    panel.focusInto();
+  }
 
   function loadRepo(name: string): void {
     loadedRepo = null;
     draft = null;
-    focusRows = [];
-    errorNodes = [];
-    browseIndex = 0;
-    expandedNodes = new WeakSet(); // fresh document → fresh collapse state (all collapsed)
-    clearFormChildren();
+    // Fresh document → all panels collapsed (the default) + cleared.
+    setExpandedSection(null);
+    activeSection = 1;
+    for (const p of panels) p.render();
 
     const path = join(repoConfigDir(name), "config.yml");
     if (!existsSync(path)) {
-      form.title = ` 2 · ${name} `;
-      form.add(textLine(`no config.yml at ${path}`, theme.status.bad));
+      configPanel().outer.title = ` 2 · ${name} `;
+      configPanel().showMessage(`no config.yml at ${path}`, theme.status.bad);
+      setExpandedSection(2); // surface the message
       setStatus("", theme.text.tertiary);
       return;
     }
     loadedText = readFileSync(path, "utf8");
     const doc = parseDocument(loadedText);
-    form.title = ` 2 · ${name}/config.yml `;
+    configPanel().outer.title = ` 2 · ${name}/config.yml `;
     if (doc.errors.length > 0) {
-      form.add(textLine(`✗ cannot parse YAML: ${doc.errors[0]?.message ?? "parse error"}`, theme.status.bad));
+      configPanel().showMessage(`✗ cannot parse YAML: ${doc.errors[0]?.message ?? "parse error"}`, theme.status.bad);
+      setExpandedSection(2);
       setStatus("fix the YAML before editing", theme.status.bad);
       return;
     }
@@ -416,9 +619,8 @@ export function createConfigEditor(renderer: CliRenderer, confirm: ConfirmFn): T
     draft = doc;
     loadedEnv = loadEnvMap(repoConfigDir(name));
     envValues = { ...loadedEnv };
-    render();
-    setHighlight(0);
-    setStatus("↑↓ move · ↵ open/edit/cycle · ^S save", theme.text.secondary);
+    for (const p of panels) p.render();
+    setStatus("↑↓ move · ↵ open/edit/cycle · ^S save · 2/3/4 sections", theme.text.secondary);
   }
 
   function save(): void {
@@ -426,7 +628,7 @@ export function createConfigEditor(renderer: CliRenderer, confirm: ConfirmFn): T
       setStatus("select a repo first", theme.text.tertiary);
       return;
     }
-    flushInputs();
+    flushAll();
     // Credentials live in a separate `env` file (no schema validation) — save them independently
     // of config validity when they've changed.
     const changed = Object.entries(envValues).filter(([k, v]) => v !== (loadedEnv[k] ?? ""));
@@ -434,13 +636,15 @@ export function createConfigEditor(renderer: CliRenderer, confirm: ConfirmFn): T
       saveEnvValues(repoConfigDir(loadedRepo), Object.fromEntries(changed));
       loadedEnv = { ...loadedEnv, ...Object.fromEntries(changed) };
     }
-    clearErrors();
+    for (const p of panels) p.clearErrors();
     const parsed = RepoConfigSchema.safeParse(draft.toJS());
     if (!parsed.success) {
-      parsed.error.issues.slice(0, 6).forEach((iss, idx) => {
-        const node = textLine(`  ✗ ${iss.path.join(".") || "(root)"}: ${iss.message}`, theme.status.bad);
-        form.add(node, idx);
-        errorNodes.push(node);
+      // Surface the (whole-config) errors in the focused panel — expanding one if we're at the repo
+      // list — so they're visible where the user is working.
+      const target = activePanel() ?? configPanel();
+      if (activeSection === 1) focusSection(target.section);
+      parsed.error.issues.slice(0, 6).forEach((iss) => {
+        target.addError(`  ✗ ${iss.path.join(".") || "(root)"}: ${iss.message}`);
       });
       setStatus(`✗ ${parsed.error.issues.length} validation error(s) — not saved`, theme.status.bad);
       return;
@@ -466,26 +670,13 @@ export function createConfigEditor(renderer: CliRenderer, confirm: ConfirmFn): T
     const opt = repoSelect.getSelectedOption();
     if (opt && opt.name !== "(none configured)") {
       loadRepo(opt.name);
-      focusSection(2); // jump straight into the fields after opening a repo
+      if (draft) focusSection(2); // jump straight into the fields after opening a valid repo
     }
   });
 
-  function focusSection(n: number): void {
-    if (n === 1) {
-      lastSection = 1;
-      setActiveSection(1);
-      repoSelect.focus();
-    } else if (n === 2) {
-      lastSection = 2;
-      setActiveSection(2);
-      form.focus();
-      if (focusRows.length > 0) setHighlight(Math.min(browseIndex, focusRows.length - 1));
-    }
-  }
-
   return {
     root,
-    sectionCount: 2,
+    sectionCount: 4,
     focusSection,
     restoreFocus() {
       focusSection(lastSection);
@@ -499,7 +690,7 @@ export function createConfigEditor(renderer: CliRenderer, confirm: ConfirmFn): T
     },
     save,
     editMove(dir: -1 | 1) {
-      moveHighlight(browseIndex + dir, true);
+      activePanel()?.editMove(dir);
     },
   };
 }

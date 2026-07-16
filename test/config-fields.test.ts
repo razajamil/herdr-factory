@@ -14,6 +14,7 @@ function fieldsFor(doc: Document): FieldDesc[] {
     () => {},
     async () => true,
     expanded,
+    "work_sources",
   );
 }
 
