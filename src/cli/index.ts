@@ -505,6 +505,11 @@ program
         console.log(`${key}: ${d.message ?? "no active run"}`);
         return;
       }
+      if (d.queued) {
+        // The durable intent is recorded; the next reconcile pass posts it. Nothing else to do.
+        console.log(`${key}: ${d.message}`);
+        return;
+      }
       console.log(`${key}: waiting for human answer (question #${d.questionId}${d.posted ? "" : ", posting deferred"})`);
       if (d.message) console.log(d.message);
     } catch (e) {
@@ -524,6 +529,11 @@ program
       const d = await dispatchSignal(requireRepo(), "bounce", { key, toStep, source: opts.source, reason });
       if (d.ok === false) {
         console.log(`${key}: ${d.message ?? "bounce failed"}`);
+        return;
+      }
+      if (d.queued) {
+        // The durable intent is recorded; the next reconcile pass applies it. The agent can stop.
+        console.log(`${key}: ${d.message}`);
         return;
       }
       if (d.escalated) {

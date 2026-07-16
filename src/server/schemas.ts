@@ -54,9 +54,11 @@ const StepDoneResponse = z
   .object({ ok: z.boolean(), advanced: z.boolean().optional(), message: z.string().optional() })
   .openapi("StepDone");
 const AskHumanResponse = z
-  .object({ ok: z.boolean(), questionId: z.number().optional(), posted: z.boolean().optional(), message: z.string().optional() })
+  .object({ ok: z.boolean(), questionId: z.number().optional(), posted: z.boolean().optional(), queued: z.boolean().optional(), message: z.string().optional() })
   .openapi("AskHuman");
-const BounceResponse = z.object({ ok: z.boolean(), escalated: z.boolean().optional(), message: z.string().optional() }).openapi("Bounce");
+const BounceResponse = z
+  .object({ ok: z.boolean(), escalated: z.boolean().optional(), queued: z.boolean().optional(), message: z.string().optional() })
+  .openapi("Bounce");
 const CaptureAttemptResponse = z
   .object({ ok: z.boolean(), attempts: z.number().optional(), escalated: z.boolean().optional(), message: z.string().optional() })
   .openapi("CaptureAttempt");

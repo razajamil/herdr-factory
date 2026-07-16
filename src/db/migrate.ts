@@ -397,6 +397,36 @@ const MIGRATIONS: { version: number; sql: string }[] = [
       );
     `,
   },
+  {
+    version: 22,
+    // pending_signals: the non-monotonic agent signals (bounce / ask-human) as durable per-run
+    // INTENTS, mirroring the transition outbox. A bounce used to exist only as one in-flight CLI
+    // call: if the run's lock stayed contended past the bounded wait (a slow herdr subprocess can
+    // hold a reconcile of the same run for minutes), the signal was dropped with no trace — the
+    // agent had already been told to stop, and the run degraded to a step_budget park with the
+    // findings never acted on. Now the intent is persisted BEFORE the lock is attempted; the
+    // immediate apply is just the low-latency path, and reconcileRun consumes any unconsumed intent
+    // at the top of each pass, so a contended (or crashed-mid-apply) signal converges on the next
+    // tick instead of vanishing. At most one unconsumed intent per run (enforced by
+    // supersede-on-enqueue, not an index — a superseded row keeps a consumed_result for the
+    // timeline). step-done is NOT here: its done flag is already durable before the nudge.
+    sql: `
+      CREATE TABLE pending_signals (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        run_id INTEGER NOT NULL REFERENCES runs(id),
+        repo TEXT NOT NULL,
+        ticket_key TEXT NOT NULL,
+        signal TEXT NOT NULL CHECK (signal IN ('bounce','ask_human')),
+        step TEXT,
+        to_step TEXT,
+        payload TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        consumed_at INTEGER,
+        consumed_result TEXT
+      );
+      CREATE INDEX idx_pending_signals_unconsumed ON pending_signals(run_id) WHERE consumed_at IS NULL;
+    `,
+  },
 ];
 
 /** Apply pending migrations in a transaction. Idempotent. */

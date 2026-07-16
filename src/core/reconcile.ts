@@ -625,6 +625,18 @@ async function reconcileRunImpl(deps: Deps, run: Run, ctx: TickCtx): Promise<voi
       return;
     }
   }
+  // Consume a durable pending agent signal (bounce / ask-human) exactly once, before the phase
+  // dispatch. The immediate apply at signal time is only the low-latency path — this is the
+  // convergence backstop for an intent whose apply lost the run-lock race or crashed mid-way
+  // (see applySignal). Applied ⇒ the signal re-pointed the run and dispatched what it needed, so
+  // the pass is complete; rejected ⇒ stamped + logged, and the normal pass continues fresh.
+  if (run.phase !== "done" && run.phase !== "tearing_down") {
+    const consumed = await consumePendingSignal(deps, run, belt, src);
+    if (consumed) {
+      if (consumed.ok) return;
+      run = deps.store.getRun(run.id)!;
+    }
+  }
   await dispatchPhase(deps, run, belt, src, ctx);
   // Then, on every pass for every active run, try to apply any deferred focus shift. Doing
   // it here (not only on the tick that transitioned) is what lets a transition in an
@@ -1040,6 +1052,49 @@ export async function bounceStep(
   await spawnStep(deps, deps.store.getRun(run.id)!, belt, src, toStep);
   deps.log("info", `${run.ticketKey}: respawned ${toStep} for rework`);
   return { ok: true };
+}
+
+/**
+ * Consume the run's unconsumed pending signal, if any — the durable half of the non-monotonic
+ * agent signals (bounce / ask-human; see applySignal and the pending_signals table). MUST be
+ * called under the run's lock; takes no locks itself. Applies the effect, stamps the intent with
+ * its outcome, and returns the effect's result — or null when there was nothing to consume (the
+ * common case, and the consume race: an intent enqueued by applySignal may be consumed by a tick
+ * that beat the enqueuer to the lock; the enqueuer then reads the stamped outcome instead).
+ * A bounce intent whose issuing step is no longer the run's active step is STALE — the run moved
+ * on (e.g. a racing step-done advanced it) — and is rejected rather than applied to the wrong step.
+ */
+export async function consumePendingSignal(
+  deps: Deps,
+  run: Run,
+  belt: BeltRuntime | undefined,
+  src: SourceRuntime,
+): Promise<{ ok: boolean; escalated?: boolean; questionId?: number; posted?: boolean; message?: string } | null> {
+  const sig = deps.store.unconsumedPendingSignalForRun(run.id);
+  if (!sig) return null;
+  const reject = (why: string) => {
+    deps.store.markPendingSignalConsumed(sig.id, `rejected: ${why}`);
+    deps.store.recordEvent({
+      runId: run.id,
+      repo: deps.config.repoName,
+      ticketKey: run.ticketKey,
+      type: "signal_rejected",
+      detail: { signal: sig.signal, step: sig.step, toStep: sig.toStep, why },
+    });
+    deps.log("warn", `${run.ticketKey}: queued ${sig.signal} signal rejected: ${why}`);
+    return { ok: false, message: why };
+  };
+  if (sig.signal === "bounce") {
+    if (!belt) return reject(`belt "${run.belt}" is not configured`);
+    if (sig.step && sig.step !== run.step) return reject(`issued by step "${sig.step}" but the run has moved to "${run.step ?? "(none)"}"`);
+    const res = await bounceStep(deps, run, belt, src, sig.toStep ?? "", sig.payload);
+    if (!res.ok) return reject(res.message ?? "bounce not applicable");
+    deps.store.markPendingSignalConsumed(sig.id, res.escalated ? "escalated" : "applied");
+    return res;
+  }
+  const res = await requestHumanInput(deps, run, sig.step ?? run.step ?? "", sig.payload);
+  deps.store.markPendingSignalConsumed(sig.id, "applied");
+  return res;
 }
 
 /**

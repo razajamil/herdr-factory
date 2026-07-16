@@ -63,6 +63,8 @@ export type EventType =
   | "step_done"
   | "layout_wait_retry" // a layout-pane wait window expired; the engine re-armed it (bounded respawn budget)
   | "bounced"
+  | "signal_queued" // a durable bounce/ask-human intent couldn't apply immediately (run lock busy) — the tick consumes it
+  | "signal_rejected" // a consumed bounce/ask-human intent was invalid by the time it applied (stale/misaddressed)
   | "capture_attempt" // an evidence agent signalled a capture attempt (flaky-capture cap)
   | "evidence_uploaded" // the evidence-upload outbox delivered a capture's media to S3
   | "evidence_upload_failed" // the evidence-upload outbox hit a permanent (non-retryable) failure
@@ -153,6 +155,24 @@ export interface RunStep {
 export type RunStepPatch = Partial<
   Pick<RunStep, "paneId" | "sessionId" | "progressSig" | "progressAt" | "done" | "startedAt" | "absentAt">
 >;
+
+/** A durable agent-signal intent (`pending_signals`): bounce / ask-human persisted BEFORE the run
+ *  lock is attempted, so a contended or crashed apply converges on a later tick instead of being
+ *  dropped (the transition-outbox pattern applied to the non-monotonic signals). At most one
+ *  unconsumed intent per run — enqueue supersedes. */
+export interface PendingSignal {
+  id: number;
+  runId: number;
+  repo: string;
+  ticketKey: string;
+  signal: "bounce" | "ask_human";
+  step: string | null; // the issuing step (bounce: the bouncer; ask_human: the asking step)
+  toStep: string | null; // bounce only: the rework target
+  payload: string; // bounce reason / human question
+  createdAt: number;
+  consumedAt: number | null;
+  consumedResult: string | null; // applied | escalated | superseded | rejected: <why>
+}
 
 /** A local_markdown work item's internally-tracked lifecycle row (the `work_items` table).
  *  This is herdr-factory's own status ledger for sources that have no external status of record. */

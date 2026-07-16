@@ -6,6 +6,7 @@ import type {
   HumanQuestion,
   HumanQuestionPatch,
   Outcome,
+  PendingSignal,
   Run,
   RunPatch,
   RunStep,
@@ -242,6 +243,36 @@ function toHumanQuestion(r: HumanQuestionRow): HumanQuestion {
     createdAt: r.created_at,
     updatedAt: r.updated_at,
     answeredAt: r.answered_at,
+  };
+}
+
+interface PendingSignalRow {
+  id: number;
+  run_id: number;
+  repo: string;
+  ticket_key: string;
+  signal: string;
+  step: string | null;
+  to_step: string | null;
+  payload: string;
+  created_at: number;
+  consumed_at: number | null;
+  consumed_result: string | null;
+}
+
+function toPendingSignal(r: PendingSignalRow): PendingSignal {
+  return {
+    id: r.id,
+    runId: r.run_id,
+    repo: r.repo,
+    ticketKey: r.ticket_key,
+    signal: r.signal as PendingSignal["signal"],
+    step: r.step,
+    toStep: r.to_step,
+    payload: r.payload,
+    createdAt: r.created_at,
+    consumedAt: r.consumed_at,
+    consumedResult: r.consumed_result,
   };
 }
 
@@ -1040,6 +1071,62 @@ export class Store {
     const requeued = Number(info.changes);
     if (requeued > 0) telemetryEvent("store.evidence_upload.creds_recovered", { repo, "evidence_upload.requeued": requeued });
     return requeued;
+  }
+
+  // --- pending agent signals (durable bounce/ask-human intents) -------------
+  // The transition-outbox pattern applied to the non-monotonic agent signals: the intent is
+  // persisted BEFORE the run lock is attempted, so a signal whose immediate apply loses the lock
+  // race (or crashes mid-apply) is consumed by a later reconcile pass instead of being dropped
+  // after the agent was already told to stop.
+
+  getPendingSignal(id: number): PendingSignal | undefined {
+    const row = this.db.prepare("SELECT * FROM pending_signals WHERE id = ?").get(id) as PendingSignalRow | undefined;
+    return row ? toPendingSignal(row) : undefined;
+  }
+
+  unconsumedPendingSignalForRun(runId: number): PendingSignal | undefined {
+    const row = this.db
+      .prepare("SELECT * FROM pending_signals WHERE run_id = ? AND consumed_at IS NULL ORDER BY id DESC LIMIT 1")
+      .get(runId) as PendingSignalRow | undefined;
+    return row ? toPendingSignal(row) : undefined;
+  }
+
+  /** Persist a bounce/ask-human intent. At most one unconsumed intent per run: an earlier
+   *  unconsumed one is superseded (newest wins — an agent re-deciding replaces its prior signal),
+   *  keeping its row + result for the timeline. Transactional so two racing enqueues can't leave
+   *  two unconsumed intents. */
+  enqueuePendingSignal(input: {
+    runId: number;
+    repo: string;
+    ticketKey: string;
+    signal: PendingSignal["signal"];
+    step?: string | null;
+    toStep?: string | null;
+    payload: string;
+  }): PendingSignal {
+    const t = this.now();
+    const id = tx(this.db, () => {
+      this.db
+        .prepare("UPDATE pending_signals SET consumed_at = ?, consumed_result = 'superseded' WHERE run_id = ? AND consumed_at IS NULL")
+        .run(t, input.runId);
+      const info = this.db
+        .prepare(
+          `INSERT INTO pending_signals (run_id, repo, ticket_key, signal, step, to_step, payload, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(input.runId, input.repo, input.ticketKey, input.signal, input.step ?? null, input.toStep ?? null, input.payload, t);
+      return Number(info.lastInsertRowid);
+    });
+    const sig = this.getPendingSignal(id);
+    if (!sig) throw new Error("enqueuePendingSignal: row vanished after insert");
+    telemetryEvent("store.pending_signal.enqueue", { repo: sig.repo, "run.id": sig.runId, "signal.id": sig.id, signal: sig.signal, "work.key": sig.ticketKey, step: sig.step ?? undefined });
+    return sig;
+  }
+
+  /** Stamp an intent consumed with its outcome: applied | escalated | rejected: <why>. */
+  markPendingSignalConsumed(id: number, result: string): void {
+    this.db.prepare("UPDATE pending_signals SET consumed_at = ?, consumed_result = ? WHERE id = ?").run(this.now(), result, id);
+    telemetryEvent("store.pending_signal.consumed", { "signal.id": id, result });
   }
 
   // --- human-in-the-loop questions ------------------------------------------

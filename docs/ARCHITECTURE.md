@@ -526,6 +526,20 @@ CREATE TABLE human_questions(            -- ask-human park: one pending question
   created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, answered_at INTEGER);
 CREATE UNIQUE INDEX idx_human_questions_one_pending_run ON human_questions(run_id) WHERE status='pending';
 
+CREATE TABLE pending_signals(            -- bounce / ask-human as durable per-run INTENTS (v22) —
+  id INTEGER PRIMARY KEY AUTOINCREMENT,  -- the outbox pattern applied to the non-monotonic agent
+  run_id INTEGER NOT NULL REFERENCES runs(id),  -- signals. Persisted BEFORE the run lock is tried:
+  repo TEXT NOT NULL, ticket_key TEXT NOT NULL, -- an apply that loses the lock race (or crashes
+  signal TEXT NOT NULL CHECK (signal IN ('bounce','ask_human')), -- mid-way) is consumed by a later
+  step TEXT,                             -- reconcile pass instead of being dropped after the agent
+  to_step TEXT,                          -- was told to stop. step = the ISSUING step (stale-signal
+  payload TEXT NOT NULL,                 -- guard); to_step = a bounce's rework target.
+  created_at INTEGER NOT NULL,           -- At most one unconsumed intent per run (supersede-on-
+  consumed_at INTEGER,                   -- enqueue). consumed_result: applied | escalated |
+  consumed_result TEXT);                 -- superseded | rejected: <why>. step-done is NOT here —
+CREATE INDEX idx_pending_signals_unconsumed    -- its done flag is durable before the nudge.
+  ON pending_signals(run_id) WHERE consumed_at IS NULL;
+
 CREATE TABLE transition_outbox(          -- source status write-backs as persisted INTENTS (v11)
   id INTEGER PRIMARY KEY AUTOINCREMENT, run_id INTEGER NOT NULL REFERENCES runs(id),
   repo TEXT NOT NULL, work_source TEXT NOT NULL, ticket_key TEXT NOT NULL,
@@ -575,7 +589,9 @@ so the CLI's inline attempt and the Phase-0 flush never double-claim a row, `rec
 — backoff + `error_kind`, `markEvidenceDelivered`/`markEvidencePermanentFailed`,
 `undeliveredEvidenceUploadsForRun`), the human
 questions (`createHumanQuestion`/`pendingHumanQuestionForRun`/`answerHumanQuestion`/
-`recordHumanPollMiss`/`recordHumanPollError`),
+`recordHumanPollMiss`/`recordHumanPollError`), the **pending agent signals**
+(`enqueuePendingSignal` — supersedes any unconsumed intent for the run, `unconsumedPendingSignalForRun`,
+`markPendingSignalConsumed`, `getPendingSignal`),
 and the `work_items` ledger: `getWorkItem`, `listWorkItems(repo,source,status?)`,
 `setWorkItemStatus(repo,source,key,status,meta?)` (idempotent, tolerant any→any, returns false
 if already there).
@@ -594,7 +610,7 @@ pile of runs waiting on humans must not starve the belt of new claims. History i
 (we set `ended_at`), so the web UI can show attempts, outcomes, and durations.
 
 **event types:** `claimed · transition · worktree_created · step_spawned · step_done ·
-layout_wait_retry · bounced ·
+layout_wait_retry · bounced · signal_queued · signal_rejected ·
 capture_attempt · evidence_uploaded · evidence_upload_failed · stale · human_question · human_reply ·
 focus_applied · pr_opened · resolver_woken · merged · closed · torn_down · attention · resumed · error`
 (plus legacy `worker_*` / `review_*` kept for old-run history).
@@ -773,8 +789,16 @@ by what they actually need:
   mid-pass, only contending with work on their own run (in which case the flag is already down
   and the pass advances it anyway). The non-monotonic nudges — `bounce` (rewinds `run.step` +
   re-dispatches), `ask-human` (flips the phase), `resume` (un-parks) — use the waiting variant
-  (`withRunLockWaiting`, ~15s bounded) because dropping them on contention isn't acceptable and
-  a concurrent reconcile from a stale snapshot would fight the mutation.
+  (`withRunLockWaiting`, ~15s bounded) because a concurrent reconcile from a stale snapshot would
+  fight the mutation. **bounce and ask-human are additionally DURABLE**: the signal is persisted
+  as a `pending_signals` intent *before* the lock is attempted, so a lock that stays contended
+  past the bounded wait (a slow herdr subprocess can hold a run's reconcile for minutes) queues
+  the signal instead of dropping it — the agent is told "recorded; applies on the next pass", and
+  `reconcileRun` consumes any unconsumed intent at the top of each pass (`consumePendingSignal`,
+  under the same run lock). A bounce intent whose issuing step is no longer the run's active step
+  is rejected as stale rather than applied to the wrong step. This mirrors the transition outbox:
+  the healthy path is unchanged (apply-on-the-spot), and only delivery *assurance* moved to the
+  tick. `step-done` needs none of this — its done flag is durable before the nudge fires.
 
 ### How it's wired
 

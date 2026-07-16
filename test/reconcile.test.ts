@@ -316,6 +316,79 @@ describe("applySignal — shared run-scoped agent signal effect", () => {
     expect(res.ok).toBe(true);
     expect(store.getRun(run.id)!.step).toBe("fix");
     expect(store.getRunStep(run.id, "fix")!.done).toBe(false);
+    // The happy path consumes its own durable intent on the spot.
+    expect(store.unconsumedPendingSignalForRun(run.id)).toBeUndefined();
+  });
+
+  it("bounce: a contended run lock queues a durable intent instead of dropping the signal; the tick applies it", async () => {
+    const { deps, store, worktree } = build();
+    const run = seed(store, worktree, "K-QB1", "running", "review");
+    store.upsertRunStep(run.id, "fix", { paneId: "w1:pfix", done: true });
+    // Someone else holds this run's lock for the whole bounded wait (a tick mid-pass on this run).
+    expect(store.acquireLock(`run:${run.id}`, "tick", 600)).toBe(true);
+    const res = await applySignal(deps, "bounce", { key: "K-QB1", toStep: "fix", reason: "regressed" });
+    expect(res.ok).toBe(true);
+    expect(res.queued).toBe(true);
+    expect(store.getRun(run.id)!.step).toBe("review"); // not applied yet — but not lost either
+    const intent = store.unconsumedPendingSignalForRun(run.id)!;
+    expect(intent.signal).toBe("bounce");
+    expect(intent.step).toBe("review"); // attribution: the issuing step at enqueue time
+    expect(intent.toStep).toBe("fix");
+    expect(store.timeline("demo", "K-QB1").some((e) => e.type === "signal_queued")).toBe(true);
+    // The tick comes around (lock free again), consumes the intent, and the bounce lands.
+    store.releaseLock(`run:${run.id}`, "tick");
+    await reconcileRun(deps, store.getRun(run.id)!);
+    expect(store.getRun(run.id)!.step).toBe("fix");
+    expect(store.getRunStep(run.id, "fix")!.done).toBe(false);
+    expect(store.unconsumedPendingSignalForRun(run.id)).toBeUndefined();
+    expect(store.getPendingSignal(intent.id)!.consumedResult).toBe("applied");
+  });
+
+  it("bounce: a queued intent whose issuing step has moved on is rejected, never applied to the wrong step", async () => {
+    const { deps, store, worktree } = build();
+    const run = seed(store, worktree, "K-QB2", "running", "pr");
+    store.upsertRunStep(run.id, "fix", { paneId: "w1:pfix", done: true });
+    // An old bounce recorded while `review` ran; by consume time the run has advanced to `pr`.
+    const intent = store.enqueuePendingSignal({ runId: run.id, repo: "demo", ticketKey: "K-QB2", signal: "bounce", step: "review", toStep: "fix", payload: "stale findings" });
+    await reconcileRun(deps, store.getRun(run.id)!);
+    expect(store.getRun(run.id)!.step).toBe("pr"); // unchanged
+    expect(store.getRunStep(run.id, "fix")!.done).toBe(true); // rework pass NOT wrongly opened
+    expect(store.getPendingSignal(intent.id)!.consumedResult).toMatch(/^rejected: issued by step "review"/);
+    expect(store.timeline("demo", "K-QB2").some((e) => e.type === "signal_rejected")).toBe(true);
+  });
+
+  it("ask-human: a contended run lock queues the question durably; the tick posts it and parks the run", async () => {
+    const { deps, store, calls, worktree } = build();
+    const run = seed(store, worktree, "K-QH1", "running", "review");
+    expect(store.acquireLock(`run:${run.id}`, "tick", 600)).toBe(true);
+    const res = await applySignal(deps, "ask-human", { key: "K-QH1", step: "review", question: "which auth flow?" });
+    expect(res.ok).toBe(true);
+    expect(res.queued).toBe(true);
+    expect(store.getRun(run.id)!.phase).toBe("running"); // not applied yet
+    expect(calls.humanAsk.length).toBe(0);
+    store.releaseLock(`run:${run.id}`, "tick");
+    await reconcileRun(deps, store.getRun(run.id)!);
+    expect(store.getRun(run.id)!.phase).toBe("waiting_for_human");
+    expect(calls.humanAsk.length).toBe(1);
+    expect(store.pendingHumanQuestionForRun(run.id)!.question).toBe("which auth flow?");
+  });
+
+  it("bounce: an unknown target step fails loudly at the agent and persists no intent", async () => {
+    const { deps, store, worktree } = build();
+    const run = seed(store, worktree, "K-QB3", "running", "review");
+    const res = await applySignal(deps, "bounce", { key: "K-QB3", toStep: "wrk", reason: "typo" });
+    expect(res.ok).toBe(false);
+    expect(res.message).toContain("not in belt");
+    expect(store.unconsumedPendingSignalForRun(run.id)).toBeUndefined();
+  });
+
+  it("enqueuePendingSignal: a newer intent supersedes an unconsumed older one (newest decision wins)", async () => {
+    const { store, worktree } = build();
+    const run = seed(store, worktree, "K-QB4", "running", "review");
+    const first = store.enqueuePendingSignal({ runId: run.id, repo: "demo", ticketKey: "K-QB4", signal: "ask_human", step: "review", payload: "q1" });
+    const second = store.enqueuePendingSignal({ runId: run.id, repo: "demo", ticketKey: "K-QB4", signal: "bounce", step: "review", toStep: "fix", payload: "findings" });
+    expect(store.getPendingSignal(first.id)!.consumedResult).toBe("superseded");
+    expect(store.unconsumedPendingSignalForRun(run.id)!.id).toBe(second.id);
   });
 });
 

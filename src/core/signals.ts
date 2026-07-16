@@ -11,7 +11,7 @@
 import type { Deps } from "./deps.ts";
 import { resolveActiveRun } from "../resolve.ts";
 import { stepByName } from "./step.ts";
-import { bounceStep, reconcileRun, recordCaptureAttempt, requestHumanInput, withRunLock, withRunLockWaiting } from "./reconcile.ts";
+import { consumePendingSignal, reconcileRun, recordCaptureAttempt, withRunLock, withRunLockWaiting } from "./reconcile.ts";
 
 /** The parsed body an agent signal carries — a superset; each signal reads only the fields it needs.
  *  Structurally compatible with every run-scoped route's validated JSON body (StepDoneBody, …). */
@@ -33,6 +33,7 @@ export interface SignalResult {
   posted?: boolean; // ask-human: was the question posted to the source (vs deferred)?
   attempts?: number; // capture-attempt: attempts recorded this pass
   escalated?: boolean; // bounce / capture-attempt: cap hit → parked for attention
+  queued?: boolean; // bounce / ask-human: run lock busy — the durable intent applies on the next pass
   message?: string;
 }
 
@@ -42,6 +43,17 @@ export interface SignalResult {
 async function underRunLockWaiting(deps: Deps, runId: number, name: string, effect: () => Promise<SignalResult>): Promise<SignalResult> {
   const { ran, result } = await withRunLockWaiting(deps, runId, effect);
   return ran ? result! : { ok: false, message: `run busy — retry ${name} in a moment` };
+}
+
+/** The enqueuer lost the consume race — a concurrent tick consumed its intent while it waited for
+ *  the run lock. Translate the stamped outcome into the caller-facing result so the agent still
+ *  learns what actually happened to its signal. */
+function consumedElsewhere(deps: Deps, intentId: number): SignalResult {
+  const sig = deps.store.getPendingSignal(intentId);
+  const r = sig?.consumedResult ?? "applied";
+  if (r === "applied") return { ok: true, message: "applied by a concurrent reconcile pass" };
+  if (r === "escalated") return { ok: true, escalated: true, message: "cap exceeded — parked for attention" };
+  return { ok: false, message: r.replace(/^rejected: /, "") };
 }
 
 /** Apply a run-scoped agent signal to its run: resolve the run, then run the per-signal effect under
@@ -73,21 +85,42 @@ export async function applySignal(deps: Deps, name: string, body: SignalBody): P
       const step = body.step!;
       const belt = deps.resolveBelt(run.belt);
       if (belt && !stepByName(belt, step)) return { ok: false, message: `step "${step}" is not in belt "${belt.name}"` };
+      const src = deps.resolveSource(run.workSource);
+      if (!src) return { ok: false, message: `run has no configured work source "${run.workSource}"` };
+      // Durable intent FIRST (the transition-outbox pattern): if the apply below can't take the
+      // run lock within the bounded wait, the intent survives — reconcileRun consumes it on the
+      // next pass — instead of the old silent drop after the agent had already stopped.
+      const intent = deps.store.enqueuePendingSignal({ runId: run.id, repo, ticketKey: run.ticketKey, signal: "ask_human", step, payload: body.question! });
       // Non-monotonic phase flip (running → waiting_for_human): a concurrent reconcile on a stale
       // `running` snapshot could advance the step and orphan the question, so hold the run lock.
-      return underRunLockWaiting(deps, run.id, name, async () => {
-        const res = await requestHumanInput(deps, fresh(), step, body.question!);
-        await reconcileRun(deps, fresh());
+      const { ran, result } = await withRunLockWaiting(deps, run.id, async () => {
+        const res = await consumePendingSignal(deps, fresh(), belt, src);
+        if (res?.ok) await reconcileRun(deps, fresh()); // immediate-pass parity: post/poll right away
         return res;
       });
+      if (ran) return result ?? consumedElsewhere(deps, intent.id);
+      deps.store.recordEvent({ runId: run.id, repo, ticketKey: run.ticketKey, type: "signal_queued", detail: { signal: "ask_human", step, intentId: intent.id } });
+      deps.log("info", `${body.key}: run busy — ask-human queued (intent #${intent.id}); the next reconcile pass posts it`);
+      return { ok: true, queued: true, message: "run busy — question recorded; it will be posted on the next reconcile pass" };
     }
     case "bounce": {
       const belt = deps.resolveBelt(run.belt);
       if (!belt) return { ok: false, message: `run has no configured belt "${run.belt}"` };
       const src = deps.resolveSource(run.workSource);
       if (!src) return { ok: false, message: `run has no configured work source "${run.workSource}"` };
-      // Step rewind + pane re-dispatch — serialize under the run lock, not a fire-and-forget nudge.
-      return underRunLockWaiting(deps, run.id, name, () => bounceStep(deps, fresh(), belt, src, body.toStep!, body.reason!));
+      // Static validation before persisting: a typo'd target fails loudly at the agent, not queued
+      // and rejected later out of its sight. Dynamic validity (backward-only, canBounceTo, phase)
+      // is re-checked at apply time by bounceStep — run state may shift while the intent waits.
+      if (!stepByName(belt, body.toStep!)) return { ok: false, message: `step "${body.toStep}" is not in belt "${belt.name}"` };
+      // Durable intent FIRST, then the step rewind + pane re-dispatch under the run lock. A lock
+      // that stays contended past the bounded wait no longer drops the bounce — the intent is
+      // consumed by the next reconcile pass over this run.
+      const intent = deps.store.enqueuePendingSignal({ runId: run.id, repo, ticketKey: run.ticketKey, signal: "bounce", step: run.step, toStep: body.toStep!, payload: body.reason! });
+      const { ran, result } = await withRunLockWaiting(deps, run.id, () => consumePendingSignal(deps, fresh(), belt, src));
+      if (ran) return result ?? consumedElsewhere(deps, intent.id);
+      deps.store.recordEvent({ runId: run.id, repo, ticketKey: run.ticketKey, type: "signal_queued", detail: { signal: "bounce", toStep: body.toStep, intentId: intent.id } });
+      deps.log("info", `${body.key}: run busy — bounce to ${body.toStep} queued (intent #${intent.id}); the next reconcile pass applies it`);
+      return { ok: true, queued: true, message: `run busy — bounce to ${body.toStep} recorded; it will be applied on the next reconcile pass` };
     }
     case "capture-attempt": {
       const belt = deps.resolveBelt(run.belt);
