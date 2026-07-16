@@ -417,6 +417,33 @@ describe("bounce from a watchdog-parked step", () => {
     expect(resumed).toContain("bounce_after_watchdog_park");
   });
 
+  it("resume after a bounce_limit park refunds the bounce budget (the human judged the loop worth continuing)", async () => {
+    const { deps, store, worktree } = build(); // limits.maxBounces = 3 in the test config
+    const run = seed(store, worktree, "K-RB1", "running", "review");
+    store.upsertRunStep(run.id, "fix", { paneId: "w1:pfix", done: true });
+    // Burn the whole budget: 3 rework cycles (bounce → fix re-done → back at review) succeed…
+    for (let cycle = 1; cycle <= 3; cycle++) {
+      const b = await applySignal(deps, "bounce", { key: "K-RB1", toStep: "fix", reason: `round ${cycle}`, step: "review", pass: cycle });
+      expect(b.ok).toBe(true);
+      expect(b.escalated).toBeFalsy();
+      const d = await applySignal(deps, "step-done", { key: "K-RB1", step: "fix", pass: cycle + 1 });
+      expect(d.ok).toBe(true);
+      expect(store.getRun(run.id)!.step).toBe("review");
+    }
+    // …and the 4th parks the run as bounce_limit (the oscillation backstop).
+    const capped = await applySignal(deps, "bounce", { key: "K-RB1", toStep: "fix", reason: "round 4", step: "review", pass: 4 });
+    expect(capped.escalated).toBe(true);
+    expect(store.getRun(run.id)!.phase).toBe("attention");
+    // A human resume refunds the budget, so the loop can actually continue —
+    // without the refund the very next bounce would land at cap+1 and re-park immediately.
+    const resumed = await resumeRun(deps, store.getRun(run.id)!);
+    expect(resumed.ok).toBe(true);
+    const again = await applySignal(deps, "bounce", { key: "K-RB1", toStep: "fix", reason: "round 5", step: "review", pass: 4 });
+    expect(again.ok).toBe(true);
+    expect(again.escalated).toBeFalsy();
+    expect(store.getRun(run.id)!.step).toBe("fix"); // the rework cycle reopened
+  });
+
   it("a bounce from a human park (pr_closed, bounce_limit, …) stays rejected — those need a person", async () => {
     const { deps, store, worktree } = build();
     const run = seed(store, worktree, "K-BP2", "attention", "review", { attentionReason: "PR #7 closed without merging" });

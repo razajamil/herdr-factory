@@ -981,7 +981,9 @@ parked, the run **re-notifies every `attention_renotify_seconds`** (default 1h) 
 belt with a PR — keeps polling for a merge (which still tears it down). The operator
 un-parks it with **`herdr-factory --repo <name> resume <KEY>`**: back to its active step (budget/
 heartbeat/absence clocks reset — the stale clocks are usually why it parked — and the capture +
-layout-wait respawn budgets refunded), to the PR watch
+layout-wait respawn budgets refunded; a `bounce_limit` park also refunds the **bounce budget**,
+since the human has judged the rework loop worth continuing and the next bounce would otherwise
+re-park at cap+1 immediately), to the PR watch
 (fresh deadline, cleared thread signature), or to `claiming` (with the first step's wait clock +
 respawn budget likewise refreshed), and it reconciles on the same pass.
 Parked runs hold **no claim slot** (§6). Teardown remains the abandon path.

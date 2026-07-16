@@ -1768,7 +1768,10 @@ async function reconcileAttention(deps: Deps, run: Run, belt: BeltRuntime, src: 
  *   - a PR being watched (`prNumber` on a watchPr belt) → `reviewing`, idle, with a cleared thread
  *     signature (so the next actionable review state re-wakes the resolver);
  *   - neither → back to `claiming` (materialize + first dispatch are idempotent).
- * The caller reconciles right after, so the re-dispatch happens on this same pass.
+ * The caller reconciles right after, so the re-dispatch happens on this same pass. A resume from a
+ * `bounce_limit` park also refunds the bounce budget (matching the capture/layout refunds) — the
+ * human has judged the loop worth continuing, and without the refund the next bounce would re-park
+ * immediately.
  */
 export async function resumeRun(deps: Deps, run: Run): Promise<{ ok: boolean; phase?: string; message?: string }> {
   if (run.phase !== "attention") {
@@ -1778,6 +1781,16 @@ export async function resumeRun(deps: Deps, run: Run): Promise<{ ok: boolean; ph
   if (!belt) return { ok: false, message: `belt "${run.belt}" is not configured — re-add it or tear the run down` };
 
   const repo = deps.config.repoName;
+  // Resuming a bounce-cap park = the human judged the rework loop worth continuing — refund the
+  // bounce budget like the capture/layout budgets below, or the very next bounce would land at
+  // cap+1 and re-park the run on the same cycle that resumed it, making resume a dead end for this
+  // park reason (teardown was effectively the only exit). Scoped to bounce_limit parks: a resume
+  // from any other reason leaves the oscillation backstop's counts intact. The counter is keyed on
+  // the bounce TARGET step, so refund across the belt's steps.
+  if (deps.store.lastAttentionReasonCode(run.id) === "bounce_limit") {
+    for (const s of belt.steps) deps.store.resetGuardCounter(run.id, s.name, "bounce_cap");
+    deps.log("info", `${run.ticketKey}: bounce budget refunded on resume from a bounce_limit park`);
+  }
   const pendingQuestion = deps.store.pendingHumanQuestionForRun(run.id);
   let phase: Run["phase"];
   if (pendingQuestion && run.step && stepByName(belt, run.step)) {
