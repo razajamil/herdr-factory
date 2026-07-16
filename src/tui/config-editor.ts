@@ -251,7 +251,12 @@ function createFieldPanel(
         continue;
       }
       const t = raw.trim();
-      if (t === "") continue;
+      if (t === "") {
+        // A `clearable` field blanked out ⇒ DELETE its key (the only in-place way to unset an
+        // optional scalar). Others skip empties so a value can't be lost by tabbing through blank.
+        if (d.clearable) draft.deleteIn(d.path!);
+        continue;
+      }
       const value = d.numeric && Number.isFinite(Number(t)) ? Number(t) : t;
       draft.setIn(d.path!, value);
     }

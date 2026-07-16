@@ -25,7 +25,9 @@ export type ConfigSection = "general" | "work_sources" | "belt";
 export type FieldDesc =
   | { kind: "header"; label: string; level: 1 | 2; indent?: number }
   | { kind: "group"; label: string; node: object; expanded: boolean; indent?: number; moveUp?: () => void; moveDown?: () => void }
-  | { kind: "text"; label: string; path?: Path; env?: string; masked?: boolean; placeholder?: string; numeric?: boolean; indent?: number }
+  // `clearable`: blanking the field DELETES its key (vs. the default, which skips empties so a
+  // required field can't be accidentally lost) — the only way to unset an optional scalar in place.
+  | { kind: "text"; label: string; path?: Path; env?: string; masked?: boolean; placeholder?: string; numeric?: boolean; clearable?: boolean; indent?: number }
   | { kind: "enum"; label: string; value: string; choices: string[]; apply: (next: string) => void; indent?: number }
   | { kind: "bool"; label: string; value: boolean; apply: (next: boolean) => void; indent?: number }
   | { kind: "ref"; label: string; value: string; choices: string[]; apply: (next: string) => void; indent?: number }
@@ -202,8 +204,8 @@ export function buildDescriptors(draft: Document, rebuild: () => void, confirm: 
     // it's REQUIRED; a source with no label concept (local_markdown) has none, so it's hidden.
     const pickup = SOURCE_DESCRIPTORS.find((x) => x.type === sourceTypeByName.get(String(b?.source ?? "")))?.pickupLabel;
     if (pickup) d.push({ kind: "text", label: "label", path: ["belt", i, "label"], placeholder: `${pickup.noun} — required (no default)`, indent: 1 });
-    d.push({ kind: "text", label: "workspace_name", path: ["belt", i, "workspace_name"], placeholder: "{{work_id}}-{{work_slug}}", indent: 1 });
-    d.push({ kind: "text", label: "match", path: ["belt", i, "match"], placeholder: "match.ts (optional)", indent: 1 });
+    d.push({ kind: "text", label: "workspace_name", path: ["belt", i, "workspace_name"], placeholder: "{{work_id}}-{{work_slug}}", clearable: true, indent: 1 });
+    d.push({ kind: "text", label: "match", path: ["belt", i, "match"], placeholder: "match.ts (optional)", clearable: true, indent: 1 });
 
     // steps[] — an ordered list of step-primitive references. `type` picks the primitive; a `custom`
     // step's prompt_file is its whole body (required), an engine-prompted step's is an optional augment.
@@ -216,11 +218,11 @@ export function buildDescriptors(draft: Document, rebuild: () => void, confirm: 
       d.push({ kind: "text", label: "name", path: ["belt", i, "steps", j, "name"], placeholder: `${stType} (defaults to type)`, indent: 2 });
       // evidence runs ONLY when tab+pane target an existing layout agent; without them it's skipped.
       const layoutHint = stType === "evidence" ? "(evidence runs only if tab+pane set; else skipped)" : "(optional; set with the other)";
-      d.push({ kind: "text", label: "tab", path: ["belt", i, "steps", j, "tab"], placeholder: layoutHint, indent: 2 });
-      d.push({ kind: "text", label: "pane", path: ["belt", i, "steps", j, "pane"], placeholder: layoutHint, indent: 2 });
-      d.push({ kind: "text", label: "prompt_file", path: ["belt", i, "steps", j, "prompt_file"], placeholder: stType === "custom" ? "prompts/step.md (required)" : "(optional augment)", indent: 2 });
+      d.push({ kind: "text", label: "tab", path: ["belt", i, "steps", j, "tab"], placeholder: layoutHint, clearable: true, indent: 2 });
+      d.push({ kind: "text", label: "pane", path: ["belt", i, "steps", j, "pane"], placeholder: layoutHint, clearable: true, indent: 2 });
+      d.push({ kind: "text", label: "prompt_file", path: ["belt", i, "steps", j, "prompt_file"], placeholder: stType === "custom" ? "prompts/step.md (required)" : "(optional augment)", clearable: true, indent: 2 });
       d.push(optionalSource(["belt", i, "steps", j, "prompt_file_source"], st?.prompt_file_source, draft, rebuild, 2));
-      d.push({ kind: "text", label: "budget_seconds", path: ["belt", i, "steps", j, "budget_seconds"], placeholder: "(optional; default per type)", numeric: true, indent: 2 });
+      d.push({ kind: "text", label: "budget_seconds", path: ["belt", i, "steps", j, "budget_seconds"], placeholder: "(optional; default per type)", numeric: true, clearable: true, indent: 2 });
       d.push({ kind: "bool", label: "heartbeat", value: st?.heartbeat === true, indent: 2, apply: (next) => { draft.setIn(["belt", i, "steps", j, "heartbeat"], next); rebuild(); } });
       d.push({ kind: "action", label: "‹ remove step ›", indent: 2, run: () => { void confirm(`Remove step "${stepNames[j]}"?`).then((ok) => { if (ok) { draft.deleteIn(["belt", i, "steps", j]); rebuild(); } }); } });
     });
