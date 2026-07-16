@@ -149,7 +149,18 @@ async function dispatchToLayoutImpl(
     return { status: "ready", paneId: target };
   }
 
-  // No tab/pane configured for this step → spawn our own dedicated pane.
+  // No tab/pane configured for this step → a dedicated pane. A RE-ENTRY (bounce rework, forward
+  // re-advance after a bounce) re-prompts the step's own live pane — its agent holds the step's
+  // context, and starting a second dedicated agent for the same step would pile up a duplicate
+  // pane per rework cycle. Only with no live known pane (first entry, or the pane died) does this
+  // path START one — still the only path that creates a pane.
+  if (opts.knownPaneId != null && (await deps.herdr.paneAlive(opts.knownPaneId))) {
+    await deps.herdr.agentSend(opts.knownPaneId, opts.prompt);
+    await deps.herdr.paneSendKeys(opts.knownPaneId, "Enter");
+    await deps.herdr.agentRename(opts.knownPaneId, opts.paneName);
+    deps.log("info", `${opts.ticketKey}: re-dispatched to reused dedicated pane ${opts.knownPaneId}`);
+    return { status: "ready", paneId: opts.knownPaneId };
+  }
   const target = await deps.herdr.agentStart({
     workspaceId: opts.workspaceId,
     cwd: opts.worktree,
@@ -291,7 +302,11 @@ async function renderStepPromptImpl(
   // the signal resolves to the right run even when two sources share a key (the worker only knows
   // its key, via HERDR_FACTORY_TICKET).
   const repo = deps.config.repoName;
-  const stepDoneCmd = signalCommand(CLI_PATH, repo, "step-done", { key: run.ticketKey, step: step.name, source: src.name });
+  // The step's CURRENT pass stamps every terminal-signal command this prompt renders: bounce
+  // rewinds make per-step progress non-monotonic, so a step-done/bounce minted for pass N must be
+  // rejectable when it (or a duplicate of it) lands during pass N+1. Absent row ⇒ first entry ⇒ 1.
+  const pass = String(deps.store.getRunStep(run.id, step.name)?.pass ?? 1);
+  const stepDoneCmd = signalCommand(CLI_PATH, repo, "step-done", { key: run.ticketKey, step: step.name, source: src.name, pass });
   const askHumanCmd = signalCommand(CLI_PATH, repo, "ask-human", { key: run.ticketKey, step: step.name, source: src.name, "question-file": `${MEMORY_DIR}/human-question-${step.name}.md` });
   // evidence-upload publishes @@EVIDENCE_DIR@@ to S3/CloudFront (no-op if `evidence:` is unconfigured);
   // capture-attempt signals the start of a capture so the engine caps flaky-capture loops. Both are
@@ -302,7 +317,7 @@ async function renderStepPromptImpl(
   // first `canBounceTo` target with a findings file. Empty for steps that can't bounce.
   const bounceTarget = step.canBounceTo[0];
   const bounceCmd = bounceTarget
-    ? signalCommand(CLI_PATH, repo, "bounce", { key: run.ticketKey, toStep: bounceTarget, source: src.name, "reason-file": `${MEMORY_DIR}/bounce-${step.name}.md` })
+    ? signalCommand(CLI_PATH, repo, "bounce", { key: run.ticketKey, toStep: bounceTarget, source: src.name, "reason-file": `${MEMORY_DIR}/bounce-${step.name}.md`, step: step.name, pass })
     : "";
   // Where the work item's spec lives + how to describe it — the SOURCE owns this (workDoc pairs
   // with its materialize; the engine never branches on source type). It may stat the worktree's

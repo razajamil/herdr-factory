@@ -37,10 +37,20 @@ describe("signalCommand renders the exact agent-facing invocation (token ↔ com
       `${CLI} --repo ${REPO} step-done K-1 work --source jira`,
     );
   });
+  it("step-done carries the pass stamp when bound (what renderStepPrompt renders)", () => {
+    expect(signalCommand(CLI, REPO, "step-done", { key: "K-1", step: "work", source: "jira", pass: "2" })).toBe(
+      `${CLI} --repo ${REPO} step-done K-1 work --source jira --pass 2`,
+    );
+  });
   it("bounce (positional toStep + --reason-file flag)", () => {
     expect(signalCommand(CLI, REPO, "bounce", { key: "K-1", toStep: "work", source: "jira", "reason-file": ".memory/herdr-factory/bounce-review.md" })).toBe(
       `${CLI} --repo ${REPO} bounce K-1 work --source jira --reason-file .memory/herdr-factory/bounce-review.md`,
     );
+  });
+  it("bounce carries the issuing step + its pass stamp when bound (what renderStepPrompt renders)", () => {
+    expect(
+      signalCommand(CLI, REPO, "bounce", { key: "K-1", toStep: "work", source: "jira", "reason-file": ".memory/herdr-factory/bounce-review.md", step: "review", pass: "1" }),
+    ).toBe(`${CLI} --repo ${REPO} bounce K-1 work --source jira --reason-file .memory/herdr-factory/bounce-review.md --step review --pass 1`);
   });
   it("ask-human (--question-file flag)", () => {
     expect(signalCommand(CLI, REPO, "ask-human", { key: "K-1", step: "work", source: "jira", "question-file": ".memory/herdr-factory/human-question-work.md" })).toBe(

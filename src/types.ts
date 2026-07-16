@@ -149,11 +149,16 @@ export interface RunStep {
   /** When this step's pane was first CONFIRMED absent (herdr answered without it); null = believed
    *  alive. Respawn requires a second confirmed absence past the confirmation window. */
   absentAt: number | null;
+  /** Which entry into this step the row's state belongs to: 1 on first entry, bumped on every
+   *  RE-entry (bounce rewind, forward re-advance through a cleared intermediate). Rendered into the
+   *  pass's prompt commands (--pass N) so a stale signal from a prior pass is rejectable. Crash
+   *  respawns and human resumes continue the pass — no bump. */
+  pass: number;
 }
 
 /** Fields the reconciler may patch on a run step. */
 export type RunStepPatch = Partial<
-  Pick<RunStep, "paneId" | "sessionId" | "progressSig" | "progressAt" | "done" | "startedAt" | "absentAt">
+  Pick<RunStep, "paneId" | "sessionId" | "progressSig" | "progressAt" | "done" | "startedAt" | "absentAt" | "pass">
 >;
 
 /** A durable agent-signal intent (`pending_signals`): bounce / ask-human persisted BEFORE the run
@@ -169,6 +174,9 @@ export interface PendingSignal {
   step: string | null; // the issuing step (bounce: the bouncer; ask_human: the asking step)
   toStep: string | null; // bounce only: the rework target
   payload: string; // bounce reason / human question
+  /** The issuing step's pass stamp carried by the signal (bounce), so consume-time validation
+   *  survives the queue delay; null when the signal carried none (pre-pass prompts). */
+  pass: number | null;
   createdAt: number;
   consumedAt: number | null;
   consumedResult: string | null; // applied | escalated | superseded | rejected: <why>

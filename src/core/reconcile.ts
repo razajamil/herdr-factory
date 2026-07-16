@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import * as Effect from "effect/Effect";
 import { classifyS3Error, probeEvidenceCreds, uploadEvidence } from "../clients/evidence.ts";
@@ -1028,29 +1028,24 @@ export async function bounceStep(
   for (let i = idxTo; i < idxFrom; i++) {
     deps.store.upsertRunStep(run.id, belt.steps[i]!.name, { done: false, progressSig: null, progressAt: null });
   }
+  // (2) Open the TARGET's next pass — it re-enters NOW, and its re-rendered prompt stamps the new
+  //     pass into its commands so a stale step-done from the pre-bounce pass can't complete the
+  //     rework (see applySignal). Intermediates get their bump when the forward advance re-enters.
+  deps.store.upsertRunStep(run.id, toStep, { pass: (deps.store.getRunStep(run.id, toStep)?.pass ?? 0) + 1 });
   const notePath = writeBounceNote(run, fromStep, toStep, reason);
   // (5) Rewind the active-step pointer.
   deps.store.updateRun(run.id, { phase: "running", step: toStep, attentionReason: null, focusPending: true });
   deps.store.recordEvent({ runId: run.id, repo, ticketKey: run.ticketKey, type: "bounced", detail: { fromStep, toStep, bounces, notePath } });
   deps.log("info", `${run.ticketKey}: ${fromStep} bounced work back to ${toStep} (#${bounces})`);
 
-  // (6) Re-dispatch the TARGET step. Prefer re-prompting its own live pane (keeps context); else
-  //     respawn. Reusing a live pane also needs started_at reset (spawnStep does this on respawn).
-  const target = deps.store.getRunStep(run.id, toStep);
-  if (target?.paneId && (await deps.herdr.paneAlive(target.paneId))) {
-    const prompt =
-      `The ${fromStep} step sent this work back for rework (${run.ticketKey}). ` +
-      (notePath ? `Read ${notePath} in this worktree, ` : "Read the latest feedback note in this worktree, ") +
-      `address the findings, and only run step-done when the ${toStep} step is genuinely complete.`;
-    await deps.herdr.agentSend(target.paneId, prompt);
-    await deps.herdr.paneSendKeys(target.paneId, "Enter");
-    deps.store.upsertRunStep(run.id, toStep, { startedAt: deps.now() });
-    deps.store.updateRun(run.id, { paneId: target.paneId });
-    deps.log("info", `${run.ticketKey}: re-prompted ${toStep} on live pane ${target.paneId}`);
-    return { ok: true };
-  }
+  // (6) Re-dispatch the TARGET step through spawnStep — the single dispatch path. It re-renders the
+  //     step's prompt (the rework banner surfacing the feedback note first, plus the fresh pass
+  //     stamp in every command) and re-prompts the step's own live pane via knownPaneId — layout
+  //     and dedicated panes alike — or waits/spawns per the step's config. The old bespoke
+  //     live-pane message skipped the re-render, so the agent would finish the rework and run the
+  //     PRIOR pass's remembered step-done command — rejected as stale under pass validation.
   await spawnStep(deps, deps.store.getRun(run.id)!, belt, src, toStep);
-  deps.log("info", `${run.ticketKey}: respawned ${toStep} for rework`);
+  deps.log("info", `${run.ticketKey}: re-dispatched ${toStep} for rework`);
   return { ok: true };
 }
 
@@ -1087,6 +1082,13 @@ export async function consumePendingSignal(
   if (sig.signal === "bounce") {
     if (!belt) return reject(`belt "${run.belt}" is not configured`);
     if (sig.step && sig.step !== run.step) return reject(`issued by step "${sig.step}" but the run has moved to "${run.step ?? "(none)"}"`);
+    // Pass stamp (when the signal carried one): the issuing step must still be on the pass whose
+    // prompt minted this bounce — a replay surviving a full rework cycle back to the same step
+    // must not rewind the NEW pass on the old pass's findings.
+    if (sig.pass != null && sig.step) {
+      const cur = deps.store.getRunStep(run.id, sig.step)?.pass;
+      if (cur != null && sig.pass !== cur) return reject(`issued on pass ${sig.pass} of "${sig.step}" but that step is on pass ${cur}`);
+    }
     const res = await bounceStep(deps, run, belt, src, sig.toStep ?? "", sig.payload);
     if (!res.ok) return reject(res.message ?? "bounce not applicable");
     deps.store.markPendingSignalConsumed(sig.id, res.escalated ? "escalated" : "applied");
@@ -1403,6 +1405,18 @@ async function reconcileStep(deps: Deps, run: Run, belt: BeltRuntime, src: Sourc
   // Advance when the agent signalled step-done (or its PR merged out from under us).
   if (rs.done || livePr?.state === "MERGED") {
     releaseStepLocks(deps, run, step); // leaving the step → free any exclusive_resource it held
+    // The step completed this pass — archive an addressed rework note (feedback-<step>.md) under a
+    // pass-stamped name. The rework banner keys on the file's existence, so a re-render in a LATER
+    // pass must not resurrect findings that were already addressed; the archived copy keeps the
+    // trail. Best-effort (a worktree mid-teardown must not fail the advance).
+    if (run.worktreePath) {
+      const fb = join(run.worktreePath, MEMORY_DIR, `feedback-${step.name}.md`);
+      try {
+        if (existsSync(fb)) renameSync(fb, join(run.worktreePath, MEMORY_DIR, `feedback-${step.name}-addressed-pass${rs.pass}.md`));
+      } catch {
+        /* best-effort */
+      }
+    }
     const next = nextStep(belt, step.name);
     if (next) {
       deps.store.updateRun(run.id, { phase: "running", step: next.name });
@@ -1421,7 +1435,10 @@ async function reconcileStep(deps: Deps, run: Run, belt: BeltRuntime, src: Sourc
       // step's already-owned layout pane, and spawnStep re-prompts that live pane rather than
       // re-resolving the configured label (which the first dispatch renamed — re-resolution would fail
       // and wedge the run in a layout-wait timeout). A dead pane there falls back to a fresh lookup.
-      deps.store.upsertRunStep(run.id, next.name, { done: false, startedAt: deps.now(), progressSig: null, progressAt: null, absentAt: null });
+      // `pass` opens the step's next entry: the re-rendered prompt stamps its commands with it, so a
+      // stale step-done/bounce minted by a PRIOR pass is rejectable (see applySignal).
+      const prevPass = deps.store.getRunStep(run.id, next.name)?.pass ?? 0;
+      deps.store.upsertRunStep(run.id, next.name, { done: false, startedAt: deps.now(), progressSig: null, progressAt: null, absentAt: null, pass: prevPass + 1 });
       deps.log("info", `${run.ticketKey}: ${step.name} done -> ${next.name}`);
       const res = await spawnStep(deps, run, belt, src, next.name);
       if (res.status === "waiting") await handleLayoutWait(deps, run, belt, next);

@@ -22,6 +22,9 @@ export interface SignalBody {
   source?: string;
   question?: string;
   reason?: string;
+  /** The step pass whose prompt minted this signal (step-done / bounce). Absent on prompts rendered
+   *  before pass stamping existed — validation then skips the pass check (upgrade safety). */
+  pass?: number | string;
 }
 
 /** The union of fields the run-scoped signal responses use; each branch fills only its own. Messages
@@ -71,8 +74,29 @@ export async function applySignal(deps: Deps, name: string, body: SignalBody): P
       const step = body.step!;
       const belt = deps.resolveBelt(run.belt);
       if (belt && !stepByName(belt, step)) return { ok: false, message: `step "${step}" is not in belt "${belt.name}"` };
+      // Identity checks — bounce rewinds make per-step progress non-monotonic, so a replayed or
+      // late step-done (a duplicated CLI call, a server+fallback double-apply, an agent re-running
+      // a remembered command) must never complete a pass that hasn't run:
+      //  - the signal must name the run's ACTIVE step. A non-active step that is already done is
+      //    an idempotent replay (friendly noop — the agent's work is acknowledged); anything else
+      //    is misaddressed and rejected loudly instead of being recorded then silently wiped by
+      //    the next entry's re-base.
+      //  - a carried pass stamp must match the step's CURRENT pass (see SIGNAL_DESCRIPTORS).
+      if (step !== run.step) {
+        if (deps.store.getRunStep(run.id, step)?.done) {
+          return { ok: true, message: `step "${step}" is already recorded done — nothing to do` };
+        }
+        deps.log("warn", `${body.key}: step-done for "${step}" ignored — the active step is "${run.step ?? "(none)"}"`);
+        return { ok: false, message: `"${step}" is not the run's active step ("${run.step ?? "none"}") — signal ignored` };
+      }
+      const rs = deps.store.getRunStep(run.id, step);
+      const pass = body.pass != null ? Number(body.pass) : undefined;
+      if (pass != null && rs && pass !== rs.pass) {
+        deps.log("warn", `${body.key}: stale step-done for ${step} pass ${pass} ignored — the step is on pass ${rs.pass}`);
+        return { ok: false, message: `stale step-done for pass ${pass} — the ${step} step is on pass ${rs.pass}; finish the current pass and run its own step-done command` };
+      }
       deps.store.markStepDone(run.id, step);
-      deps.store.recordEvent({ runId: run.id, repo, ticketKey: body.key, type: "step_done", detail: { step } });
+      deps.store.recordEvent({ runId: run.id, repo, ticketKey: body.key, type: "step_done", detail: { step, pass: rs?.pass } });
       deps.log("info", `${body.key}: step-done ${step} recorded`);
       // fire-and-forget (lockDiscipline "fire-and-forget"): the done flag is a monotonic edge, so a
       // per-run lock is enough — the nudge lands even mid-tick, and if this run is busy the next pass
@@ -114,8 +138,20 @@ export async function applySignal(deps: Deps, name: string, body: SignalBody): P
       if (!stepByName(belt, body.toStep!)) return { ok: false, message: `step "${body.toStep}" is not in belt "${belt.name}"` };
       // Durable intent FIRST, then the step rewind + pane re-dispatch under the run lock. A lock
       // that stays contended past the bounded wait no longer drops the bounce — the intent is
-      // consumed by the next reconcile pass over this run.
-      const intent = deps.store.enqueuePendingSignal({ runId: run.id, repo, ticketKey: run.ticketKey, signal: "bounce", step: run.step, toStep: body.toStep!, payload: body.reason! });
+      // consumed by the next reconcile pass over this run. The intent carries the ISSUING step
+      // (--step, rendered into the bouncing step's prompt; processing-time run.step is only the
+      // legacy fallback) and its pass stamp, so consume-time validation rejects a signal that
+      // outlived its pass instead of rewinding the wrong one.
+      const intent = deps.store.enqueuePendingSignal({
+        runId: run.id,
+        repo,
+        ticketKey: run.ticketKey,
+        signal: "bounce",
+        step: body.step ?? run.step,
+        toStep: body.toStep!,
+        payload: body.reason!,
+        pass: body.pass != null ? Number(body.pass) : null,
+      });
       const { ran, result } = await withRunLockWaiting(deps, run.id, () => consumePendingSignal(deps, fresh(), belt, src));
       if (ran) return result ?? consumedElsewhere(deps, intent.id);
       deps.store.recordEvent({ runId: run.id, repo, ticketKey: run.ticketKey, type: "signal_queued", detail: { signal: "bounce", toStep: body.toStep, intentId: intent.id } });

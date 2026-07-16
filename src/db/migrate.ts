@@ -427,6 +427,24 @@ const MIGRATIONS: { version: number; sql: string }[] = [
       CREATE INDEX idx_pending_signals_unconsumed ON pending_signals(run_id) WHERE consumed_at IS NULL;
     `,
   },
+  {
+    version: 23,
+    // run_steps.pass: which entry into the step this row's state belongs to — 1 on first entry,
+    // bumped on every RE-entry (a bounce rewind opening a rework pass; the forward advance
+    // re-entering a cleared intermediate step). Bounces make per-step progress non-monotonic, so a
+    // step-done/bounce signal minted for pass N (the commands are rendered into each pass's prompt
+    // with --pass N) must not complete or rewind pass N+1 — a duplicated CLI call, a
+    // server+fallback double-apply, or an agent re-running a remembered command otherwise lands as
+    // a legitimate signal for a pass that never ran. Crash respawns and human resumes CONTINUE a
+    // pass (no bump). pending_signals.pass carries the same stamp on a queued bounce so consume-time
+    // validation survives the queue delay. Backfill DEFAULT 1 = "first pass", correct for every
+    // in-flight run; their already-rendered prompts carry no --pass, which validation treats as
+    // "not stamped — skip the pass check" (upgrade safety).
+    sql: `
+      ALTER TABLE run_steps ADD COLUMN pass INTEGER NOT NULL DEFAULT 1;
+      ALTER TABLE pending_signals ADD COLUMN pass INTEGER;
+    `,
+  },
 ];
 
 /** Apply pending migrations in a transaction. Idempotent. */

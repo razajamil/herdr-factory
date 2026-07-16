@@ -26,6 +26,10 @@ export interface SignalDescriptor {
 
 export const SIGNAL_DESCRIPTORS: readonly SignalDescriptor[] = [
   {
+    // `pass` stamps the signal with the step pass whose prompt rendered it (run_steps.pass), so a
+    // replayed/duplicated step-done from pass N is rejected instead of completing pass N+1 — bounce
+    // rewinds make per-step progress non-monotonic, so "done" alone is not idempotent across passes.
+    // Optional: prompts rendered before the pass column existed carry no stamp (upgrade safety).
     name: "step-done",
     scope: "run",
     lockDiscipline: "fire-and-forget",
@@ -34,9 +38,14 @@ export const SIGNAL_DESCRIPTORS: readonly SignalDescriptor[] = [
       { name: "key", required: true },
       { name: "step", required: true },
       { name: "source", required: false, flag: true },
+      { name: "pass", required: false, flag: true },
     ],
   },
   {
+    // `step` names the ISSUING step (like capture-attempt's explicit step): the engine used to
+    // attribute a bounce to whatever run.step was at processing time, so a late/replayed bounce
+    // from an old pass could rewind the CURRENT step. `pass` stamps the issuing step's pass, same
+    // rationale as step-done. Both optional for upgrade safety.
     name: "bounce",
     scope: "run",
     lockDiscipline: "waiting",
@@ -46,6 +55,8 @@ export const SIGNAL_DESCRIPTORS: readonly SignalDescriptor[] = [
       { name: "toStep", required: true },
       { name: "source", required: false, flag: true },
       { name: "reason-file", required: false, flag: true },
+      { name: "step", required: false, flag: true },
+      { name: "pass", required: false, flag: true },
     ],
   },
   {

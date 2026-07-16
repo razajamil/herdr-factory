@@ -97,6 +97,7 @@ interface RunStepRow {
   started_at: number | null;
   done_at: number | null;
   absent_at: number | null;
+  pass: number;
 }
 
 function toRunStep(r: RunStepRow): RunStep {
@@ -112,6 +113,7 @@ function toRunStep(r: RunStepRow): RunStep {
     startedAt: r.started_at,
     doneAt: r.done_at,
     absentAt: r.absent_at,
+    pass: r.pass,
   };
 }
 
@@ -255,6 +257,7 @@ interface PendingSignalRow {
   step: string | null;
   to_step: string | null;
   payload: string;
+  pass: number | null;
   created_at: number;
   consumed_at: number | null;
   consumed_result: string | null;
@@ -270,6 +273,7 @@ function toPendingSignal(r: PendingSignalRow): PendingSignal {
     step: r.step,
     toStep: r.to_step,
     payload: r.payload,
+    pass: r.pass,
     createdAt: r.created_at,
     consumedAt: r.consumed_at,
     consumedResult: r.consumed_result,
@@ -627,6 +631,7 @@ export class Store {
     if (patch.progressAt !== undefined) set("progress_at", patch.progressAt);
     if (patch.startedAt !== undefined) set("started_at", patch.startedAt);
     if (patch.absentAt !== undefined) set("absent_at", patch.absentAt);
+    if (patch.pass !== undefined) set("pass", patch.pass);
     if (patch.done !== undefined) {
       set("done", patch.done ? 1 : 0);
       set("done_at", patch.done ? this.now() : null);
@@ -1103,6 +1108,7 @@ export class Store {
     step?: string | null;
     toStep?: string | null;
     payload: string;
+    pass?: number | null;
   }): PendingSignal {
     const t = this.now();
     const id = tx(this.db, () => {
@@ -1111,10 +1117,10 @@ export class Store {
         .run(t, input.runId);
       const info = this.db
         .prepare(
-          `INSERT INTO pending_signals (run_id, repo, ticket_key, signal, step, to_step, payload, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+          `INSERT INTO pending_signals (run_id, repo, ticket_key, signal, step, to_step, payload, pass, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
-        .run(input.runId, input.repo, input.ticketKey, input.signal, input.step ?? null, input.toStep ?? null, input.payload, t);
+        .run(input.runId, input.repo, input.ticketKey, input.signal, input.step ?? null, input.toStep ?? null, input.payload, input.pass ?? null, t);
       return Number(info.lastInsertRowid);
     });
     const sig = this.getPendingSignal(id);

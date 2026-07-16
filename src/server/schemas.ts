@@ -148,16 +148,27 @@ const TimelineResponse = z
 // ---- request bodies -------------------------------------------------------
 // `step` is any string — it's validated against the run's resolved belt in the handler, since the
 // valid step set is belt-specific (and the belt isn't known until the run is resolved from `key`).
+// `pass` (step-done / bounce) is the pass stamp the issuing prompt rendered — optional (older
+// prompts carry none), coerced because the CLI forwards it as a string.
 export const StepDoneBody = z
-  .object({ key: z.string(), step: z.string(), source: z.string().optional() })
+  .object({ key: z.string(), step: z.string(), source: z.string().optional(), pass: z.coerce.number().int().positive().optional() })
   .openapi("StepDoneBody");
 export const AskHumanBody = z
   .object({ key: z.string(), step: z.string(), source: z.string().optional(), question: z.string().min(1) })
   .openapi("AskHumanBody");
 // `toStep` is validated against the run's resolved belt in the handler (must be an earlier step the
 // current step is allowed to bounce to) — like `step` on step-done, the valid set is belt-specific.
+// `step` names the ISSUING step (attribution — the engine no longer assumes run.step at processing
+// time is the bouncer); optional for prompts rendered before it existed.
 export const BounceBody = z
-  .object({ key: z.string(), toStep: z.string(), source: z.string().optional(), reason: z.string().min(1) })
+  .object({
+    key: z.string(),
+    toStep: z.string(),
+    source: z.string().optional(),
+    reason: z.string().min(1),
+    step: z.string().optional(),
+    pass: z.coerce.number().int().positive().optional(),
+  })
   .openapi("BounceBody");
 // No step field: the attempt always applies to the run's current running step (the engine validates
 // it is a gathersEvidence step), so the agent can't misattribute it.

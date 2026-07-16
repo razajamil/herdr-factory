@@ -482,9 +482,10 @@ program
   .command("step-done <key> <step>")
   .description("a belt agent signals it finished its step — event-nudges the dispatcher")
   .option("--source <name>", "the work source the run belongs to (passed by the agent)")
-  .action(cliAction("step-done", async (key: string, step: string, opts: { source?: string }) => {
+  .option("--pass <n>", "the step pass this signal belongs to (stamped into the rendered prompt command)")
+  .action(cliAction("step-done", async (key: string, step: string, opts: { source?: string; pass?: string }) => {
     try {
-      const d = await dispatchSignal(requireRepo(), "step-done", { key, step, source: opts.source });
+      const d = await dispatchSignal(requireRepo(), "step-done", { key, step, source: opts.source, pass: opts.pass });
       if (d.ok === false) console.log(`${key}: ${d.message ?? "no active run"}`);
     } catch (e) {
       fail(e);
@@ -523,10 +524,12 @@ program
   .option("--source <name>", "the work source the run belongs to (passed by the agent)")
   .option("--reason <text>", "why it's being sent back (the findings the earlier step must address)")
   .option("--reason-file <path>", "file containing the reason/findings")
-  .action(cliAction("bounce", async (key: string, toStep: string, opts: { source?: string; reason?: string; reasonFile?: string }) => {
+  .option("--step <name>", "the issuing step (stamped into the rendered prompt command)")
+  .option("--pass <n>", "the issuing step's pass this signal belongs to")
+  .action(cliAction("bounce", async (key: string, toStep: string, opts: { source?: string; reason?: string; reasonFile?: string; step?: string; pass?: string }) => {
     try {
       const reason = bounceReasonText(opts);
-      const d = await dispatchSignal(requireRepo(), "bounce", { key, toStep, source: opts.source, reason });
+      const d = await dispatchSignal(requireRepo(), "bounce", { key, toStep, source: opts.source, reason, step: opts.step, pass: opts.pass });
       if (d.ok === false) {
         console.log(`${key}: ${d.message ?? "bounce failed"}`);
         return;

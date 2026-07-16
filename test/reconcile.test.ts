@@ -392,6 +392,104 @@ describe("applySignal — shared run-scoped agent signal effect", () => {
   });
 });
 
+// Pass stamping: bounce rewinds make per-step progress non-monotonic, so every entry into a step
+// opens a new PASS (run_steps.pass), the pass is stamped into the rendered prompt's signal commands
+// (--pass N), and a signal carrying a stale stamp is rejected instead of completing/rewinding a
+// pass it doesn't belong to.
+describe("pass stamping — signals are bound to the step pass that minted them", () => {
+  it("a bounce opens the target's next pass, re-renders its prompt with the new stamp, and re-prompts its own pane", async () => {
+    const { deps, store, calls, worktree } = build();
+    const run = seed(store, worktree, "K-P1", "running", "review");
+    store.upsertRunStep(run.id, "fix", { paneId: "w1:pfix", done: true });
+    expect(store.getRunStep(run.id, "fix")!.pass).toBe(1);
+    const res = await applySignal(deps, "bounce", { key: "K-P1", toStep: "fix", reason: "regressed", step: "review", pass: 1 });
+    expect(res.ok).toBe(true);
+    expect(store.getRunStep(run.id, "fix")!.pass).toBe(2);
+    // The re-dispatch goes through spawnStep: prompt re-rendered (rework banner + fresh stamp),
+    // then the step's own live pane is re-prompted to read it.
+    const prompt = readFileSync(join(worktree, ".memory/herdr-factory/prompt-fix.md"), "utf8");
+    expect(prompt).toContain("--pass 2");
+    expect(prompt).toContain("Rework requested — READ THIS FIRST");
+    const sent = calls.agentSend.find(([pane]) => pane === "w1:pfix");
+    expect(sent?.[1]).toContain("prompt-fix.md");
+  });
+
+  it("a stale step-done from the pre-bounce pass cannot complete the rework pass", async () => {
+    const { deps, store, worktree } = build();
+    const run = seed(store, worktree, "K-P2", "running", "review");
+    store.upsertRunStep(run.id, "fix", { paneId: "w1:pfix", done: true });
+    await applySignal(deps, "bounce", { key: "K-P2", toStep: "fix", reason: "regressed", step: "review", pass: 1 });
+    // A duplicated/replayed `step-done fix --pass 1` (server+fallback double-apply, re-run command)
+    // lands after the rewind cleared fix's done flag: it must NOT complete pass 2.
+    const stale = await applySignal(deps, "step-done", { key: "K-P2", step: "fix", pass: 1 });
+    expect(stale.ok).toBe(false);
+    expect(stale.message).toContain("stale step-done");
+    expect(store.getRunStep(run.id, "fix")!.done).toBe(false);
+    expect(store.getRun(run.id)!.step).toBe("fix"); // rework still open
+    // The rework pass's own command (pass 2) completes normally.
+    const good = await applySignal(deps, "step-done", { key: "K-P2", step: "fix", pass: 2 });
+    expect(good.ok).toBe(true);
+    expect(store.getRun(run.id)!.step).toBe("review"); // advanced forward again
+    expect(store.getRunStep(run.id, "review")!.pass).toBe(2); // forward re-entry opened review's next pass
+  });
+
+  it("a step-done for a non-active step is rejected loudly (or acknowledged as a done replay), never silently wiped", async () => {
+    const { deps, store, worktree } = build();
+    const run = seed(store, worktree, "K-P3", "running", "review");
+    // Misaddressed: fix is not the active step and not done — rejected, not recorded-then-wiped.
+    const misaddressed = await applySignal(deps, "step-done", { key: "K-P3", step: "fix" });
+    expect(misaddressed.ok).toBe(false);
+    expect(misaddressed.message).toContain("not the run's active step");
+    expect(store.getRunStep(run.id, "fix")?.done ?? false).toBe(false);
+    // Replay of an already-done earlier step: acknowledged as a noop (the agent's work IS done).
+    store.upsertRunStep(run.id, "fix", { paneId: "w1:pfix", done: true });
+    const replay = await applySignal(deps, "step-done", { key: "K-P3", step: "fix" });
+    expect(replay.ok).toBe(true);
+    expect(replay.message).toContain("already recorded done");
+    expect(store.getRun(run.id)!.step).toBe("review"); // untouched
+  });
+
+  it("a queued bounce whose pass stamp went stale is rejected at consume time", async () => {
+    const { deps, store, worktree } = build();
+    const run = seed(store, worktree, "K-P4", "running", "review");
+    store.upsertRunStep(run.id, "review", { pass: 3 });
+    // A bounce minted by review's pass 2 (an old prompt) surviving in the queue until pass 3.
+    const intent = store.enqueuePendingSignal({ runId: run.id, repo: "demo", ticketKey: "K-P4", signal: "bounce", step: "review", toStep: "fix", payload: "old findings", pass: 2 });
+    await reconcileRun(deps, store.getRun(run.id)!);
+    expect(store.getRun(run.id)!.step).toBe("review"); // no rewind
+    expect(store.getPendingSignal(intent.id)!.consumedResult).toMatch(/^rejected: issued on pass 2/);
+  });
+
+  it("completing a rework pass archives its feedback note under a pass-stamped name", async () => {
+    const { deps, store, worktree } = build();
+    const run = seed(store, worktree, "K-P5", "running", "review");
+    store.upsertRunStep(run.id, "fix", { paneId: "w1:pfix", done: true });
+    await applySignal(deps, "bounce", { key: "K-P5", toStep: "fix", reason: "toast still 500s", step: "review", pass: 1 });
+    expect(existsSync(join(worktree, ".memory/herdr-factory/feedback-fix.md"))).toBe(true);
+    await applySignal(deps, "step-done", { key: "K-P5", step: "fix", pass: 2 });
+    // Advanced out of fix: the addressed note is archived, so a later re-render can't resurrect it.
+    expect(existsSync(join(worktree, ".memory/herdr-factory/feedback-fix.md"))).toBe(false);
+    expect(existsSync(join(worktree, ".memory/herdr-factory/feedback-fix-addressed-pass2.md"))).toBe(true);
+  });
+
+  it("a bounce to a dedicated-pane step (no tab/pane) re-prompts its live pane instead of spawning a duplicate", async () => {
+    const { deps, store, calls, worktree } = build();
+    const src = deps.resolveSource("jira")!;
+    const belt: BeltRuntime = {
+      name: "ship", beltType: "work_to_pull_request", source: "jira", priority: 1, watchPr: true,
+      steps: [stepCfg("fix", { tab: undefined, pane: undefined }), stepCfg("review"), stepCfg("pr")],
+    };
+    const run = seed(store, worktree, "K-P6", "running", "review");
+    store.upsertRunStep(run.id, "fix", { paneId: "w1:pfix", done: true });
+    const res = await bounceStep(deps, store.getRun(run.id)!, belt, src, "fix", "redo");
+    expect(res.ok).toBe(true);
+    expect(calls.agentStart).toBe(0); // no duplicate dedicated pane
+    const sent = calls.agentSend.find(([pane]) => pane === "w1:pfix");
+    expect(sent?.[1]).toContain("prompt-fix.md");
+    expect(store.getRunStep(run.id, "fix")!.paneId).toBe("w1:pfix");
+  });
+});
+
 describe("exclusive_resource guard (the capture mutex)", () => {
   const LOCK_GUARD = { kind: "exclusive_resource" as const, resourceName: "capture", escalationReason: "capture_lock", autoRescueOnDone: false };
 

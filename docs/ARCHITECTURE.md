@@ -490,8 +490,12 @@ CREATE TABLE run_steps(                  -- one row per pipeline agent (migratio
   progress_sig TEXT, progress_at INTEGER,   -- per-step commit heartbeat
   done INTEGER NOT NULL DEFAULT 0, started_at INTEGER, done_at INTEGER,
   bounces INTEGER NOT NULL DEFAULT 0,    -- SUPERSEDED (with capture_attempts) by guard_counters (v21),
-  absent_at INTEGER);                    -- left unread. absent_at: pane first CONFIRMED absent (v10)
-CREATE INDEX idx_run_steps ON run_steps(run_id, step);
+  absent_at INTEGER,                     -- left unread. absent_at: pane first CONFIRMED absent (v10)
+  pass INTEGER NOT NULL DEFAULT 1);      -- which ENTRY into the step this state belongs to (v23):
+CREATE INDEX idx_run_steps ON run_steps(run_id, step);   -- 1 on first entry, +1 per re-entry (bounce
+                                         -- rewind / forward re-advance); crash respawns + human
+                                         -- resumes CONTINUE a pass. Stamped into the pass's prompt
+                                         -- commands (--pass N) so stale signals are rejectable.
 
 CREATE TABLE guard_counters(             -- capped-guard counters keyed (run, step, guard) (v21) —
   run_id INTEGER NOT NULL REFERENCES runs(id), step TEXT NOT NULL, guard TEXT NOT NULL,
@@ -685,11 +689,25 @@ stay declaration-driven (they branch on the resolved `StepConfig`, never a step 
 supplies each station's layout pane + optional augmenting `prompt_file`. **`evidence` is opt-in**:
 its descriptor is `requiresLayout`, so it materializes only when its step ref sets `tab`+`pane` —
 otherwise the pipeline is work → review → pr; it never spawns its own pane. A **bounce**
-(`bounce <KEY> work --reason-file …`, the target resolved to the earliest earlier step that consumes
+(`bounce <KEY> work --reason-file … --step review --pass N`, the target resolved to the earliest
+earlier step that consumes
 `bounce_feedback`) rewinds `run.step`, writes the findings to `feedback-work.md` in the worktree,
 clears the target's *and* the intermediate steps' completion
 so they re-run, and counts toward `max_bounces` (default 6; per-belt override; `0` disables —
-past the cap the run parks for `attention`). The evidence step separately signals each capture try
+past the cap the run parks for `attention`). Every (re-)entry into a step opens a new **pass**
+(`run_steps.pass`): the target's pass bumps on the bounce rewind, an intermediate's on the forward
+re-advance, and each pass's re-rendered prompt stamps its `step-done`/`bounce` commands with
+`--pass N` (+ the bounce's issuing `--step`). A signal carrying a stale stamp — a duplicated CLI
+call, a server+fallback double-apply, an agent re-running a remembered command from a previous
+pass — is **rejected** instead of completing (or rewinding) a pass it doesn't belong to; a
+`step-done` naming a non-active step is likewise rejected loudly (or acknowledged as a no-op when
+that step is already done) rather than recorded and silently wiped by the next entry's re-base.
+When a rework pass completes, its `feedback-<step>.md` is archived as
+`feedback-<step>-addressed-pass<N>.md`, so a later pass's re-render can't resurrect
+already-addressed findings. The bounce re-dispatch goes through `spawnStep` — the single dispatch
+path — so the target's prompt is re-rendered (rework banner first, fresh pass stamp) and its own
+live pane re-prompted, layout and dedicated panes alike (a dedicated-pane step is re-prompted, not
+duplicated). The evidence step separately signals each capture try
 via `capture-attempt`; past `max_capture_attempts` (default 5, reset per fresh pass into the step)
 the run parks for `attention` — a flaky app that can't be captured cleanly surfaces instead of
 looping. That park is a backstop, not a gate: it's raised by a step-execution watchdog (the capture
