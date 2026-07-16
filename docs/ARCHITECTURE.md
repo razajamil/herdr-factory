@@ -1128,7 +1128,10 @@ from being claimed again).
 - `config.ts` asserts `repo.path` is a **main checkout** (not a linked worktree), since herdr can't
   create worktrees from one. The other load-time cross-field checks: unique source/belt/step names,
   every `belt.source` references a configured source, unique `layouts` ids with each belt's
-  `default_layout`/`layout_matching` resolving to a defined one, tab/pane both-or-neither,
+  `default_layout`/`layout_matching` resolving to a defined one, tab/pane both-or-neither, a
+  (tab, pane) target unique across one belt's steps (the first dispatch renames the pane to
+  `<step>:<KEY>`, so a second step sharing it could never resolve its label and would burn its
+  layout wait into a park — one agent pane per step),
   `{{work_id}}` in `workspace_name`, and `match` / `config`-sourced `prompt_file` existence — all
   with readable errors. The work-source *clients* are constructed in `build-deps.ts`'s `buildDeps` via each
   type's registry descriptor (`descriptorFor(type).create(ctx)` — the ctx carries the env map,

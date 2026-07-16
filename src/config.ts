@@ -421,6 +421,7 @@ export const RepoConfigSchema = z
         return d ? !stepSkipped(d, s) : true;
       });
       const stepNames = new Set<string>();
+      const paneTargets = new Map<string, string>(); // "tab\0pane" → first claiming step name
       b.steps.forEach((s, j) => {
         const d = stepDescriptorFor(s.type);
         if (!d) return; // the schema enum already rejected an unknown type
@@ -429,6 +430,18 @@ export const RepoConfigSchema = z
           ctx.addIssue({ code: "custom", message: `belt "${b.name}" has duplicate step name "${name}" (name defaults to type — give one an explicit unique name)`, path: ["belt", i, "steps", j, "name"] });
         }
         stepNames.add(name);
+        // Two steps of one belt must not target the same layout pane: the first dispatch renames
+        // the pane to `<step>:<KEY>`, so the second step's label lookup can never resolve — it
+        // would burn its whole layout-wait budget and park the run. One agent pane per step.
+        if (s.tab && s.pane && !stepSkipped(d, s)) {
+          const paneKey = `${s.tab}\0${s.pane}`;
+          const owner = paneTargets.get(paneKey);
+          if (owner) {
+            ctx.addIssue({ code: "custom", message: `belt "${b.name}" steps "${owner}" and "${name}" target the same layout pane (tab "${s.tab}", pane "${s.pane}") — each step needs its own agent pane`, path: ["belt", i, "steps", j, "pane"] });
+          } else {
+            paneTargets.set(paneKey, name);
+          }
+        }
         if (d.promptFileRequired && !s.prompt_file) {
           ctx.addIssue({ code: "custom", message: `belt "${b.name}" step "${name}" (type ${s.type}) needs a prompt_file — it has no built-in prompt`, path: ["belt", i, "steps", j, "prompt_file"] });
         }

@@ -597,6 +597,34 @@ describe("loadConfig — work sources + belts", () => {
     expect(loadConfig("demo").config.belts.map((b) => b.label)).toEqual(["agent-bug", "agent-chore"]);
   });
 
+  it("rejects two steps of one belt targeting the same layout pane (the first dispatch renames it away)", () => {
+    setup(
+      cfg(JIRA_SRC, `  - name: ship
+    source: jira
+    label: agent
+    steps: [{ type: work, tab: work, pane: agent }, { type: review, tab: work, pane: agent }, { type: pr }]
+`),
+      { prompts: {} },
+    );
+    expect(() => loadConfig("demo")).toThrow(/target the same layout pane/);
+  });
+
+  it("allows two belts to reuse the same tab/pane labels (each run gets its own workspace)", () => {
+    setup(
+      cfg(JIRA_SRC, `  - name: bugs
+    source: jira
+    label: agent-bug
+    steps: [{ type: work, tab: work, pane: agent }, { type: pr }]
+  - name: chores
+    source: jira
+    label: agent-chore
+    steps: [{ type: work, tab: work, pane: agent }, { type: pr }]
+`),
+      { prompts: {} },
+    );
+    expect(loadConfig("demo").config.belts.length).toBe(2);
+  });
+
   it("rejects a belt with duplicate step names (name defaults to type — collide on two customs)", () => {
     setup(
       cfg(LM_SRC, `  - name: gen
