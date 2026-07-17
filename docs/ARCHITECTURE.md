@@ -994,7 +994,11 @@ layout-wait respawn budgets refunded; a `bounce_limit` park also refunds the **b
 since the human has judged the rework loop worth continuing and the next bounce would otherwise
 re-park at cap+1 immediately), to the PR watch
 (fresh deadline, cleared thread signature), or to `claiming` (with the first step's wait clock +
-respawn budget likewise refreshed), and it reconciles on the same pass.
+respawn budget likewise refreshed), and it reconciles on the same pass. A step resume also
+**re-prompts the step's own idle agent** — the commonest watchdog park is an agent that finished
+without running `step-done`, which un-parking alone would leave idle until the fresh budget
+re-parked it (resume was a dead end for exactly the case it exists to heal); a `working` pane is
+left mid-turn, and a dead one is respawned by the liveness path.
 Parked runs hold **no claim slot** (§6). Teardown remains the abandon path.
 
 The capture lock stays **machine-global** (one dev-server / browser across all

@@ -345,7 +345,9 @@ brief's front-matter). Route bugs to one belt and stories to another, programmat
   stalled commits, a closed PR, a pane that never appeared — the run parks: desktop notification,
   the pane relabelled `⚠ ATTENTION`, the reason (with a ready-made resume command) posted to the
   work source, and an hourly re-notify so it can't go stale silently. `resume <KEY>` puts it right
-  back where it was, with fresh clocks. Parked runs keep their worktree but hold no claim slot.
+  back where it was, with fresh clocks — and re-prompts the step's own idle agent, so a step that
+  finished but never signalled `step-done` completes on resume instead of quietly re-parking.
+  Parked runs keep their worktree but hold no claim slot.
   A layout-pane wait self-heals before it ever needs a person: no pane means no agent (so no
   `step-done` could rescue it), so the engine re-attempts the spawn across a bounded number of
   extra wait windows — auto-un-parking a run already parked that way — and only parks for a human

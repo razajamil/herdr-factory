@@ -1800,7 +1800,11 @@ async function reconcileAttention(deps: Deps, run: Run, belt: BeltRuntime, src: 
  *
  * The return target is derived from what the run had already reached:
  *   - an active step (`run.step` still in the belt) → `running` with that step's clocks reset
- *     (fresh budget/heartbeat/absence — the stale ones are usually why it parked);
+ *     (fresh budget/heartbeat/absence — the stale ones are usually why it parked), and the step's
+ *     own IDLE agent re-prompted — the commonest watchdog park is an agent that finished without
+ *     running step-done, and without the nudge the resumed run would sit "awaiting step-done"
+ *     until the fresh budget re-parked it (a `working` pane is left mid-turn; a dead one is the
+ *     respawn path's job);
  *   - a PR being watched (`prNumber` on a watchPr belt) → `reviewing`, idle, with a cleared thread
  *     signature (so the next actionable review state re-wakes the resolver);
  *   - neither → back to `claiming` (materialize + first dispatch are idempotent).
@@ -1860,7 +1864,37 @@ export async function resumeRun(deps: Deps, run: Run): Promise<{ ok: boolean; ph
     phase = "claiming";
   }
   deps.store.updateRun(run.id, { phase, attentionReason: null, focusPending: true });
-  deps.store.recordEvent({ runId: run.id, repo, ticketKey: run.ticketKey, type: "resumed", detail: { phase, step: run.step } });
+  // Re-prompt the resumed step's own agent when it's sitting idle (best-effort). A human resume is
+  // a signal the pane never receives on its own, and the commonest watchdog park is an agent that
+  // finished (or drifted off) WITHOUT running step-done — un-parking alone left that agent idle
+  // until the fresh budget expired and re-parked the run, making resume a dead end for exactly the
+  // case it exists to heal. Only an IDLE pane is nudged: a `working` pane is mid-turn (its own
+  // work, an on-demand question, or human-driven — injecting a foreign turn interleaves two
+  // conversations), and a dead pane is the respawn machinery's job (absence confirmation →
+  // spawnStep). The nudge points at the pass's rendered prompt file, whose baked step-done command
+  // carries the still-valid --pass stamp (resume never bumps the pass).
+  let nudged = false;
+  if (phase === "running" && run.step) {
+    const paneId = deps.store.getRunStep(run.id, run.step)?.paneId;
+    if (paneId) {
+      try {
+        if ((await deps.herdr.paneState(paneId)) === "idle") {
+          await deps.herdr.agentSend(
+            paneId,
+            `A human resumed ${run.ticketKey} after it was parked (${run.attentionReason ?? "attention"}). ` +
+              `Continue the ${run.step} step in this worktree — re-read ${MEMORY_DIR}/prompt-${run.step}.md if you need the full brief. ` +
+              `If the step is already complete, write your handoff note and run the step-done command from that prompt now, then stop.`,
+          );
+          await deps.herdr.paneSendKeys(paneId, "Enter");
+          nudged = true;
+          deps.log("info", `${run.ticketKey}: nudged the resumed ${run.step} agent (pane ${paneId})`);
+        }
+      } catch {
+        /* best-effort — herdr unreachable / pane gone; the reconcile that follows owns recovery */
+      }
+    }
+  }
+  deps.store.recordEvent({ runId: run.id, repo, ticketKey: run.ticketKey, type: "resumed", detail: { phase, step: run.step, nudged } });
   // Undo the ⚠ pane label (best-effort; a re-spawn would rename it anyway).
   if (run.paneId) await deps.herdr.agentRename(run.paneId, `${run.step ?? "watch"}:${run.ticketKey}`).catch(() => {});
   deps.log("info", `${run.ticketKey}: resumed from attention -> ${phase}${run.step ? ` (${run.step})` : ""}`);

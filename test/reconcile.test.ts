@@ -2303,3 +2303,45 @@ describe("human-reply resume — a stray step-done can never skip the reply", ()
     expect(store.getRun(run.id)!.step).toBe("review");
   });
 });
+
+describe("resume nudges the resumed step's idle agent", () => {
+  it("an idle pane is re-prompted — the finished-but-never-signalled park is no longer a dead end", async () => {
+    const { deps, store, worktree, calls } = build();
+    const run = seed(store, worktree, "K-NU1", "attention", "fix", { attentionReason: "fix step over budget (worker: idle)" });
+    const res = await resumeRun(deps, store.getRun(run.id)!);
+    expect(res).toMatchObject({ ok: true, phase: "running" });
+    const [pane, msg] = calls.agentSend.at(-1)!;
+    expect(pane).toBe("w1:p1"); // the step's OWN recorded pane
+    expect(msg).toContain("A human resumed K-NU1");
+    expect(msg).toContain("fix step over budget"); // the park reason, so the agent knows why
+    expect(msg).toContain("prompt-fix.md"); // points at the pass's rendered prompt (valid --pass stamp)
+    expect(msg).toContain("step-done");
+  });
+
+  it("a working pane is left mid-turn — no foreign message is injected", async () => {
+    const { deps, store, state, worktree, calls } = build();
+    const run = seed(store, worktree, "K-NU2", "attention", "fix");
+    state.paneState = "working";
+    const res = await resumeRun(deps, store.getRun(run.id)!);
+    expect(res).toMatchObject({ ok: true, phase: "running" });
+    expect(calls.agentSend).toHaveLength(0);
+  });
+
+  it("herdr unreachable → the nudge is skipped but the resume itself still lands", async () => {
+    const { deps, store, state, worktree, calls } = build();
+    const run = seed(store, worktree, "K-NU3", "attention", "fix");
+    state.herdrUnreachable = true;
+    const res = await resumeRun(deps, store.getRun(run.id)!);
+    expect(res).toMatchObject({ ok: true, phase: "running" });
+    expect(calls.agentSend).toHaveLength(0);
+    expect(store.getRun(run.id)!.phase).toBe("running");
+  });
+
+  it("a resume that returns to the PR watch (no active step) never nudges a step pane", async () => {
+    const { deps, store, worktree, calls } = build();
+    const run = seed(store, worktree, "K-NU4", "attention", null, { prNumber: 7 });
+    const res = await resumeRun(deps, store.getRun(run.id)!);
+    expect(res).toMatchObject({ ok: true, phase: "reviewing" });
+    expect(calls.agentSend).toHaveLength(0);
+  });
+});
