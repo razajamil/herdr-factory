@@ -482,6 +482,8 @@ CREATE TABLE runs(                       -- ONE attempt at a work item (history 
   outcome TEXT,                          -- merged|closed|abandoned|timeout|completed|NULL
   created_at INTEGER, updated_at INTEGER, ended_at INTEGER);
 CREATE INDEX idx_runs_active ON runs(repo) WHERE ended_at IS NULL;
+CREATE UNIQUE INDEX idx_runs_active_ticket ON runs(repo, work_source, ticket_key)
+  WHERE ended_at IS NULL;                -- ONE active run per item — the claim-race arbiter (v25)
 
 CREATE TABLE run_steps(                  -- one row per pipeline agent (migration v4)
   id INTEGER PRIMARY KEY AUTOINCREMENT, run_id INTEGER NOT NULL,
@@ -497,7 +499,10 @@ CREATE TABLE run_steps(                  -- one row per pipeline agent (migratio
                                          -- CONTINUE a pass. Stamped into the pass's prompt commands
                                          -- (--pass N) so stale signals are rejectable.
   dispatched_at INTEGER);                -- when THIS pass's prompt reached an agent; null = the
-CREATE INDEX idx_run_steps ON run_steps(run_id, step);   -- pass still needs its dispatch (v24).
+CREATE UNIQUE INDEX idx_run_steps ON run_steps(run_id, step);   -- pass still needs its dispatch (v24).
+                                         -- UNIQUE since v25: exactly one row per (run, step) — the
+                                         -- atomic ON CONFLICT upsert's target (markStepDone runs
+                                         -- outside the run lock, so the DB must referee racers).
                                          -- pane_id can't carry this (it's KEPT across re-entries as
                                          -- the reuse handle), so the spawn branch keys on this —
                                          -- an undispatched pass retries under the bounded layout
@@ -1399,8 +1404,24 @@ Hard-won from the bash prototype — encode as types/tests/asserts:
   every nudge (step-done / bounce / ask-human / resume). `ask-human` in particular is a
   non-monotonic phase flip; unserialized it can be overwritten by a stale-snapshot reconcile,
   orphaning the question forever (the bug that motivated the lock).
+- **At most one ACTIVE run per (repo, source, key) — enforced by the DB, not just checked.** Both
+  claim paths are check-then-create with a network call between the dedup check and the insert
+  (Phase B's `listEligible`, the manual claim's `describe()`), and the manual `claim` holds no
+  tick lock — so the v25 partial unique index is the arbiter: the race's loser fails its INSERT
+  and `claimImpl` treats that as "already claimed" (a warn + skip), never an error. Likewise
+  `run_steps` is UNIQUE on (run_id, step) with an atomic ON CONFLICT upsert, because
+  `markStepDone` runs outside the run lock.
 - **Locks heartbeat while held; owner tokens are unique per acquisition.** TTL expiry means the
-  holder process is dead, not slow — never size a TTL to "the longest healthy pass" again.
+  holder process is dead, not slow — never size a TTL to "the longest healthy pass" again. A beat
+  that finds its lock stolen (`extendLock` → false — e.g. an event-loop stall starved the
+  heartbeat past the TTL) stops beating and goes LOUD (error log + telemetry) instead of silently
+  re-asserting: from that moment the pass may be racing the new holder, and stealing the lock
+  back mid-someone-else's-pass would be worse.
+- **A human-reply resume re-bases the resumed step** (`resumeAfterHumanReply`): it clears any
+  `done` recorded while the question was pending and resets the budget/absence clocks — an
+  out-of-order step-done must not auto-advance the step the instant the reply lands, and a run
+  that waited on a human past its step budget must not re-park on the pre-ask clock. The pass is
+  NOT bumped: the agent continues the same pass, so its prompt's baked `--pass` stamp stays valid.
 - **The claim cap counts working runs** (`countOccupying`); parked `attention`/
   `waiting_for_human` runs keep their worktree + dedup but hold no slot.
 - **`prSnapshots` and `reviewSignature` must hash identically** — `lastThreadSig` continuity is

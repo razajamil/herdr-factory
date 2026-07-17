@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import { DatabaseSync } from "node:sqlite";
 import { openDb } from "../src/db/index.ts";
 import { migrate } from "../src/db/migrate.ts";
-import { Store } from "../src/db/store.ts";
+import { isUniqueViolation, Store } from "../src/db/store.ts";
 
 function makeStore(start = 1000) {
   let now = start;
@@ -199,14 +199,15 @@ describe("Store", () => {
   it("migration v6 backfills pre-existing runs to 'jira' and adds work_items (idempotent)", () => {
     const db = new DatabaseSync(":memory:");
     // Simulate a pre-v6 DB: schema_version=5, a runs table WITHOUT work_source, one in-flight row.
-    // Include watch_deadline + pr_number + last_thread_sig (all part of the v1 CREATE TABLE) so v17's
-    // and v18's DROP COLUMNs apply cleanly (resolver_active is ADDED by v17, then dropped by v18), and
+    // Include watch_deadline + pr_number + last_thread_sig + outcome (all part of the v1 CREATE
+    // TABLE) so v17's and v18's DROP COLUMNs and v25's duplicate-active sweep apply cleanly
+    // (resolver_active is ADDED by v17, then dropped by v18), and
     // seed run_steps (created back in v4) so v9's ALTER applies — a genuine v5 DB always has both.
     db.exec(`
       CREATE TABLE schema_version (version INTEGER NOT NULL);
       INSERT INTO schema_version (version) VALUES (5);
       CREATE TABLE runs (id INTEGER PRIMARY KEY AUTOINCREMENT, repo TEXT, ticket_key TEXT, phase TEXT,
-        pr_number INTEGER, last_thread_sig TEXT,
+        pr_number INTEGER, last_thread_sig TEXT, outcome TEXT,
         watch_deadline INTEGER, created_at INTEGER, updated_at INTEGER, ended_at INTEGER);
       INSERT INTO runs (repo, ticket_key, phase, created_at, updated_at) VALUES ('r','OLD-1','fixing',1,1);
       CREATE TABLE run_steps (id INTEGER PRIMARY KEY AUTOINCREMENT, run_id INTEGER NOT NULL, step TEXT NOT NULL,
@@ -405,5 +406,53 @@ describe("Store", () => {
       store.markTransitionDelivered(held.id);
       expect(store.retryTransitionsForSource("r", "jira")).toBe(0);
     });
+  });
+});
+
+describe("Store — uniqueness guarantees (v25)", () => {
+  it("rejects a second ACTIVE run for the same (repo, source, key); ending the first frees the slot", () => {
+    const { store } = makeStore();
+    const first = store.createRun({ repo: "r", workSource: "jira", belt: "ship", ticketKey: "K-U1" });
+    // The concurrent-claim loser: same item while the first run is still active.
+    expect(() => store.createRun({ repo: "r", workSource: "jira", belt: "ship", ticketKey: "K-U1" }))
+      .toThrow(/UNIQUE constraint failed/);
+    expect(store.countActive("r")).toBe(1);
+    // History is not uniqueness: once the first run ends, a re-claim gets a fresh run.
+    store.endRun(first.id, "merged");
+    const again = store.createRun({ repo: "r", workSource: "jira", belt: "ship", ticketKey: "K-U1" });
+    expect(again.id).not.toBe(first.id);
+    expect(store.countActive("r")).toBe(1);
+  });
+
+  it("the same key stays claimable in two different sources (dedup is source-scoped)", () => {
+    const { store } = makeStore();
+    store.createRun({ repo: "r", workSource: "jira", belt: "ship", ticketKey: "K-U2" });
+    expect(() => store.createRun({ repo: "r", workSource: "lm", belt: "lmship", ticketKey: "K-U2" })).not.toThrow();
+    expect(store.activeRunsForKey("r", "K-U2")).toHaveLength(2);
+  });
+
+  it("isUniqueViolation matches the node:sqlite constraint error and nothing else", () => {
+    const { store } = makeStore();
+    store.createRun({ repo: "r", workSource: "jira", belt: "ship", ticketKey: "K-U3" });
+    try {
+      store.createRun({ repo: "r", workSource: "jira", belt: "ship", ticketKey: "K-U3" });
+      expect.unreachable("duplicate active run must throw");
+    } catch (e) {
+      expect(isUniqueViolation(e)).toBe(true);
+    }
+    expect(isUniqueViolation(new Error("some other failure"))).toBe(false);
+    expect(isUniqueViolation("not an error")).toBe(false);
+  });
+
+  it("run_steps holds exactly one row per (run, step): upsert never duplicates, a raw racer's insert loses", () => {
+    const { store, db } = makeStore();
+    const run = store.createRun({ repo: "r", workSource: "jira", belt: "ship", ticketKey: "K-U4" });
+    store.upsertRunStep(run.id, "fix", { paneId: "p1" });
+    store.upsertRunStep(run.id, "fix", { done: true }); // patch, not a second insert
+    const rows = db.prepare("SELECT COUNT(*) AS n FROM run_steps WHERE run_id = ? AND step = 'fix'").get(run.id) as { n: number };
+    expect(rows.n).toBe(1);
+    // A racer that skipped the upsert (the old unlocked read-then-insert shape) is rejected by the index.
+    expect(() => db.prepare("INSERT INTO run_steps (run_id, step, started_at) VALUES (?, 'fix', 1)").run(run.id))
+      .toThrow(/UNIQUE constraint failed/);
   });
 });

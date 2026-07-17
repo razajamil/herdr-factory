@@ -462,6 +462,48 @@ const MIGRATIONS: { version: number; sql: string }[] = [
       UPDATE run_steps SET dispatched_at = started_at WHERE pane_id IS NOT NULL;
     `,
   },
+  {
+    version: 25,
+    // Two uniqueness guarantees the coordination model always assumed but never enforced:
+    //
+    // (1) runs: at most ONE active run per (repo, work_source, ticket_key). Both claim paths are
+    //     check-then-create with a network call between the check and the insert (Phase B's
+    //     listEligible, the manual claim's describe()) — and the manual `claim` holds no tick
+    //     lock — so two concurrent claimers could each pass activeRunForTicket and create two runs
+    //     (two worktrees, two step-1 agents) for one item. The partial unique index makes the DB
+    //     the arbiter: the loser's INSERT fails and claimImpl converts that into a friendly
+    //     "already claimed" skip. NULL work_source rows (pre-v6 legacy) stay exempt — SQLite
+    //     treats NULLs as distinct. Pre-existing duplicate actives (minted by the very race this
+    //     closes) are ended as 'abandoned' first, keeping the OLDEST (it owns the worktree the
+    //     belt has been driving); the keeper set is materialized into a temp table so the sweep
+    //     is not self-referential mid-update.
+    //
+    // (2) run_steps: exactly ONE row per (run_id, step). upsertRunStep was read-then-insert with
+    //     no constraint behind it, and markStepDone runs OUTSIDE the run lock (step-done is the
+    //     fire-and-forget monotonic signal), so a cross-process race could double-insert a step
+    //     row. Duplicates tracked together (updates hit every copy), so collapsing to the earliest
+    //     row loses nothing; the old non-unique index is replaced by a UNIQUE one of the same name
+    //     so the store's atomic ON CONFLICT(run_id, step) upsert has its conflict target. An
+    //     old-code process still draining through a restart only reads via these columns — an
+    //     index swap is invisible to it.
+    sql: `
+      CREATE TEMP TABLE _v25_keep_runs AS
+        SELECT MIN(id) AS id FROM runs WHERE ended_at IS NULL AND work_source IS NOT NULL
+         GROUP BY repo, work_source, ticket_key;
+      UPDATE runs SET ended_at = unixepoch(), phase = 'done',
+                      outcome = COALESCE(outcome, 'abandoned'), updated_at = unixepoch()
+       WHERE ended_at IS NULL AND work_source IS NOT NULL
+         AND id NOT IN (SELECT id FROM _v25_keep_runs);
+      DROP TABLE _v25_keep_runs;
+      CREATE UNIQUE INDEX idx_runs_active_ticket ON runs(repo, work_source, ticket_key) WHERE ended_at IS NULL;
+
+      CREATE TEMP TABLE _v25_keep_steps AS SELECT MIN(id) AS id FROM run_steps GROUP BY run_id, step;
+      DELETE FROM run_steps WHERE id NOT IN (SELECT id FROM _v25_keep_steps);
+      DROP TABLE _v25_keep_steps;
+      DROP INDEX IF EXISTS idx_run_steps;
+      CREATE UNIQUE INDEX idx_run_steps ON run_steps(run_id, step);
+    `,
+  },
 ];
 
 /** Apply pending migrations in a transaction. Idempotent. */

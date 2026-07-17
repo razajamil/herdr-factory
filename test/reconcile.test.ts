@@ -1,4 +1,4 @@
-import { describe, it, expect, afterEach } from "vitest";
+import { describe, it, expect, afterEach, vi } from "vitest";
 import { mkdirSync, mkdtempSync, rmSync, readFileSync, existsSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -2223,5 +2223,83 @@ describe("work-source auth gate (unauthenticated → pause + auto-resume, never 
     expect(store.getTransitionIntent(intent.id)?.deliveredAt).toBeNull(); // still queued for retry
     expect(getAuthFailure("demo", "jira")).toBeDefined();
     expect(calls.notify).toBe(1);
+  });
+});
+
+describe("claim-race hardening — the v25 one-active-run index is the arbiter", () => {
+  it("a manual claim that loses the createRun race is a friendly skip, not an error (one run survives)", async () => {
+    const { deps, store } = build();
+    // Simulate Phase B winning INSIDE the manual claim's race window: between claimTicket's dedup
+    // check and its createRun sits a network call (describe) — the fake's describe() claims first.
+    const client = deps.sources[0]!.client;
+    const origDescribe = client.describe;
+    client.describe = async (key) => {
+      store.createRun({ repo: "demo", workSource: "jira", belt: "ship", ticketKey: key, summary: "s", issueType: "Bug", branch: `fix/${key}-race` });
+      return origDescribe(key);
+    };
+    await expect(claimTicket(deps, "ship", "K-RACE")).resolves.toBeUndefined();
+    expect(store.activeRunsForKey("demo", "K-RACE")).toHaveLength(1);
+  });
+});
+
+describe("heartbeat lock loss is loud, never silent", () => {
+  it("a beat that finds its lock stolen logs an error, stops beating, and leaves the thief's hold alone", async () => {
+    vi.useFakeTimers();
+    try {
+      const { deps, store, setNow } = build();
+      const logs: string[] = [];
+      deps.log = (level, msg) => { logs.push(`${level}: ${msg}`); };
+      let release!: () => void;
+      const gate = new Promise<void>((r) => { release = r; });
+      const p = withRunLock(deps, 42, () => gate);
+      await vi.advanceTimersByTimeAsync(0); // let the acquisition land before stealing
+      // Lapse the TTL (300s) and steal the lock — what a holder stalled past its heartbeat suffers.
+      setNow(1000 + 301);
+      expect(store.acquireLock("run:42", "thief", 300)).toBe(true);
+      // The next beat (ttl/3 = 100s): extendLock is owner-checked and reports the loss.
+      await vi.advanceTimersByTimeAsync(100_000);
+      expect(logs.some((l) => l.startsWith("error:") && l.includes("lock run:42 lost mid-hold"))).toBe(true);
+      // The thief's hold is untouched — neither re-extended by us nor stolen back.
+      expect(store.acquireLock("run:42", "other", 300)).toBe(false);
+      // And the loss is reported exactly once — the beat stops instead of re-logging forever.
+      await vi.advanceTimersByTimeAsync(300_000);
+      expect(logs.filter((l) => l.includes("lost mid-hold"))).toHaveLength(1);
+      release();
+      await expect(p).resolves.toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe("human-reply resume — a stray step-done can never skip the reply", () => {
+  it("clears a done recorded while waiting_for_human and re-bases the budget clock; the belt advances only on a fresh signal", async () => {
+    const { deps, store, state, worktree, calls, setNow } = build();
+    const run = seed(store, worktree, "K-HD", "running", "fix");
+    await requestHumanInput(deps, run, "fix", "Which flag wins?");
+    expect(store.getRun(run.id)!.phase).toBe("waiting_for_human");
+    // The out-of-order agent signal: a step-done recorded while the question is pending (applySignal
+    // accepts it — "fix" is still the active step — so the flag lands exactly like this).
+    store.markStepDone(run.id, "fix");
+
+    state.humanReply = { body: "Do B.", externalId: "a-1", author: "PM" };
+    setNow(1000 + 61);
+    await reconcileRun(deps, store.getRun(run.id)!);
+
+    const got = store.getRun(run.id)!;
+    expect(got.phase).toBe("running");
+    expect(got.step).toBe("fix"); // NOT auto-advanced on the stale done the moment the reply landed
+    const rs = store.getRunStep(run.id, "fix")!;
+    expect(rs.done).toBe(false); // cleared for the continuation
+    expect(rs.startedAt).toBe(1061); // budget clock re-based to the resume, not the pre-ask dispatch
+    expect(calls.agentSend.at(-1)?.[1]).toContain("Human guidance has arrived");
+
+    // Later passes keep waiting for the agent's own decision…
+    await reconcileRun(deps, store.getRun(run.id)!);
+    expect(store.getRun(run.id)!.step).toBe("fix");
+    // …and a fresh step-done (the agent finished acting on the reply) advances normally.
+    const res = await applySignal(deps, "step-done", { key: "K-HD", step: "fix" });
+    expect(res.ok).toBe(true);
+    expect(store.getRun(run.id)!.step).toBe("review");
   });
 });

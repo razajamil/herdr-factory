@@ -7,6 +7,7 @@ import { HerdrUnreachableError, type BeltRuntime, type Deps, type SourceRuntime 
 import type { StepConfig } from "../config.ts";
 import type { GuardSpec, HumanQuestion, HumanReply, MatchItem, Outcome, PrInfo, PrSnapshot, Run, RunStep, Ticket, TransitionIntent, WorkState } from "../types.ts";
 import { outcomeToWorkState, StaleItemError, ticketOf } from "../types.ts";
+import { isUniqueViolation } from "../db/store.ts";
 import { branchName } from "./branch.ts";
 import { firstStep, indexOfStep, materializeWork, MEMORY_DIR, nextStep, spawnStep, stepByName } from "./step.ts";
 import { STEP_DESCRIPTORS } from "../steps/registry.ts";
@@ -269,7 +270,17 @@ async function withHeartbeatLock(deps: Deps, key: string, ttlSec: number, fn: ()
   const timer = setInterval(
     () => {
       try {
-        deps.store.extendLock(key, owner, ttlSec);
+        if (!deps.store.extendLock(key, owner, ttlSec)) {
+          // The lock is no longer ours: the TTL lapsed (e.g. an event-loop stall starved the
+          // heartbeat past it) and another actor stole the lock. `fn` is already mid-flight and
+          // can't be safely aborted — but the loss must be LOUD, because from here this pass may
+          // be racing the new holder on the same run/repo. Stop beating (re-extending would rip
+          // the lock back out from under the new holder mid-pass); the owner-scoped release in
+          // the finally is a no-op against the stolen row, so the new holder is undisturbed.
+          clearInterval(timer);
+          deps.log("error", `lock ${key} lost mid-hold (owner ${owner}) — a concurrent holder may be reconciling the same target`);
+          telemetryEvent("store.lock.lost", { "lock.name": key, "lock.owner": owner });
+        }
       } catch {
         /* next beat retries; TTL expiry is the backstop */
       }
@@ -535,15 +546,30 @@ async function claimImpl(deps: Deps, belt: BeltRuntime, src: SourceRuntime, tick
   // The per-run uid makes the branch unique to THIS attempt, so a re-claimed ticket doesn't reuse a
   // branch name whose prior PR was already merged (which the pr step would otherwise treat as done).
   const branch = branchName(ticket.key, ticket.type, ticket.summary, belt.workspaceName, deps.uid());
-  const run = deps.store.createRun({
-    repo,
-    workSource: src.name,
-    belt: belt.name,
-    ticketKey: ticket.key,
-    summary: ticket.summary,
-    issueType: ticket.type,
-    branch,
-  });
+  let run: Run;
+  try {
+    run = deps.store.createRun({
+      repo,
+      workSource: src.name,
+      belt: belt.name,
+      ticketKey: ticket.key,
+      summary: ticket.summary,
+      issueType: ticket.type,
+      branch,
+    });
+  } catch (e) {
+    // The v25 one-active-run-per-(repo, source, key) index is the arbiter of the claim race both
+    // paths leave open: each is check-then-create with a network call between the dedup check and
+    // this insert (Phase B's listEligible, the manual claim's describe()), and the manual path
+    // holds no tick lock. Losing the insert means the item IS claimed — the end state the caller
+    // wanted — so log and stop instead of surfacing a constraint error (Phase B would record it
+    // as a claim failure; the manual CLI would exit 1 on a success).
+    if (isUniqueViolation(e)) {
+      deps.log("warn", `${belt.name}/${ticket.key}: already claimed by a concurrent pass — skipping duplicate claim`);
+      return;
+    }
+    throw e;
+  }
   deps.store.recordEvent({ runId: run.id, repo, ticketKey: ticket.key, type: "claimed", detail: { branch, source: src.name, belt: belt.name } });
   deps.log("info", `${belt.name}/${ticket.key}: claimed -> ${branch}`);
   // Under the run lock like every other mutation of this run (uncontended for a fresh claim; the
@@ -925,6 +951,16 @@ async function resumeAfterHumanReply(deps: Deps, run: Run, belt: BeltRuntime, sr
     return;
   }
 
+  // Re-base the step for the continuation. Two halves, both load-bearing:
+  //  - done:false — clear any step-done recorded while the question was pending. An out-of-order
+  //    agent signal (ask-human then step-done, or a replay) must not auto-advance the step the
+  //    instant the reply lands, when the agent is being told below to CONTINUE and only run
+  //    step-done once the step is actually complete — the reply would be silently skipped.
+  //  - fresh budget/absence clocks — the run may have waited on the human far past the step
+  //    budget; without a re-base the next watchdog pass reads the pre-ask clock and re-parks the
+  //    freshly-resumed step. The pass is NOT bumped: the agent continues the same pass, and the
+  //    --pass stamp baked into its prompt's commands must stay valid.
+  deps.store.upsertRunStep(run.id, step, { done: false, startedAt: deps.now(), absentAt: null });
   deps.store.updateRun(run.id, { phase: "running", step, attentionReason: null, focusPending: true });
   const prompt =
     `Human guidance has arrived for ${run.ticketKey} question #${q.id}. ` +
@@ -970,8 +1006,8 @@ function writeBounceNote(run: Run, fromStep: string, toStep: string, reason: str
 /**
  * Backward transition: the current (running) step sends the run BACK to an earlier step for rework.
  * The counterpart to reconcileStep's forward `nextStep` advance and the analog of the ask-human
- * park/resume — but re-pointed at an earlier step, with three things resumeAfterHumanReply does NOT
- * do (each load-bearing):
+ * park/resume — but re-pointed at an earlier step, with three load-bearing extras beyond a human
+ * resume's own-step re-base (resumeAfterHumanReply clears only the RESUMED step's done + clocks):
  *   1. CLEAR the target step's `done` (+ reset its heartbeat clocks) — else reconcileStep advances
  *      the just-bounced step instantly on the next tick (it re-reads rs.done, reconcileStep §done).
  *   2. Re-dispatch the TARGET step's own pane (getRunStep(toStep).paneId) — NOT run.paneId, which is

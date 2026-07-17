@@ -285,6 +285,16 @@ function toPendingSignal(r: PendingSignalRow): PendingSignal {
 type Bind = string | number | null;
 const patchFields = (patch: Record<string, unknown>): string[] => Object.keys(patch).filter((k) => patch[k] !== undefined).sort();
 
+/** True when `e` is a SQLite UNIQUE-constraint violation. node:sqlite surfaces it as errcode 2067
+ *  (SQLITE_CONSTRAINT_UNIQUE) with a "UNIQUE constraint failed: …" message — check both so a
+ *  wrapped/re-thrown error still matches on the message. Callers use this to treat losing an
+ *  insert race (e.g. createRun vs the v25 one-active-run-per-item index) as data, not failure. */
+export function isUniqueViolation(e: unknown): boolean {
+  if (!(e instanceof Error)) return false;
+  if ((e as { errcode?: number }).errcode === 2067) return true;
+  return e.message.startsWith("UNIQUE constraint failed");
+}
+
 /** Typed repository over the SQLite DB. All methods are synchronous. */
 export class Store {
   private readonly db: DatabaseSync;
@@ -615,12 +625,15 @@ export class Store {
     );
   }
 
-  /** Insert the step row if missing, then apply the patch. Returns the fresh row. */
+  /** Insert the step row if missing, then apply the patch. Returns the fresh row. The insert is
+   *  atomic against the v25 UNIQUE(run_id, step) index: markStepDone runs outside the run lock, so
+   *  a cross-process racer must lose the insert cleanly (ON CONFLICT DO NOTHING) instead of
+   *  double-inserting the row the old read-then-insert could produce. */
   upsertRunStep(runId: number, step: StepName, patch: RunStepPatch = {}): RunStep {
-    const created = !this.getRunStep(runId, step);
-    if (created) {
-      this.db.prepare("INSERT INTO run_steps (run_id, step, started_at) VALUES (?, ?, ?)").run(runId, step, this.now());
-    }
+    const info = this.db
+      .prepare("INSERT INTO run_steps (run_id, step, started_at) VALUES (?, ?, ?) ON CONFLICT(run_id, step) DO NOTHING")
+      .run(runId, step, this.now());
+    const created = Number(info.changes) > 0;
     const sets: string[] = [];
     const vals: Bind[] = [];
     const set = (col: string, v: Bind) => {
