@@ -1,3 +1,7 @@
+> [!WARNING]
+> **🚧 Under construction — not yet ready for use.** A beta release is coming.
+> Use the current version at your own risk.
+
 <div align="center">
 
 # 🏭 herdr-factory
