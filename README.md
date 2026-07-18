@@ -442,6 +442,7 @@ is pure data (`herdr-factory reload` picks it up without a restart).
 | `max_bounces`                | 6       | bounces to any one step before attention; `0` disables bouncing |
 | `max_capture_attempts`       | 5       | evidence capture attempts per pass before attention (flaky-capture cap) |
 | `tick_interval_seconds`      | 60      | reconcile cadence per repo                                      |
+| `source_poll_interval_seconds` | = `tick_interval_seconds` | how often each work source is polled for new work; a per-source `poll_interval_seconds` overrides it. `≤ tick` polls every tick (unchanged); larger drains that source's backlog at `max_claims_per_tick` per **poll window** |
 | `reconcile_concurrency`      | 8       | active runs reconciled in parallel per tick                     |
 | `max_claims_per_tick`        | 10      | new-claim admission per tick (cold-start smoothing)             |
 | `layout_wait_seconds`        | 600     | wait window for a configured pane; an expired window auto-retries ×3, then attention |
@@ -449,7 +450,9 @@ is pure data (`herdr-factory reload` picks it up without a restart).
 ### `work_sources` (≥ 1)
 
 Each entry: a `type`, an optional `name` (default = the type; must be unique per repo — belts
-reference it), and a type block:
+reference it), an optional `poll_interval_seconds` (how often this source is polled for new work;
+overrides `limits.source_poll_interval_seconds` — handy for a rate-limited board polled slower than
+the tick), and a type block:
 
 - **`jira`** — `base_url`, `project`, and a `status` map: `todo` (default `To Do`),
   `in_development` (default `In Progress`), `review` (default `In Review`), and an optional `done`

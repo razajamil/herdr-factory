@@ -42,9 +42,10 @@ const STEP_TYPE_CHOICES = STEP_DESCRIPTORS.map((d) => d.name);
 // A layout pane's split direction (mirrors PaneSplitSchema in config.ts). vertical/right → a pane to
 // the RIGHT of the previous one; horizontal/down → BELOW it. Ignored on a tab's first pane.
 const SPLIT_CHOICES = ["vertical", "horizontal", "right", "down"];
-const sourceNode = (type: SourceType, name?: unknown) => ({
+const sourceNode = (type: SourceType, name?: unknown, pollInterval?: unknown) => ({
   type,
   ...(name != null ? { name } : {}),
+  ...(pollInterval != null ? { poll_interval_seconds: pollInterval } : {}),
   [type]: descriptorFor(type).tui.defaultBlock(),
 });
 // A newly-added step defaults to the generic `custom` primitive (its prompt_file is the whole body);
@@ -62,6 +63,7 @@ const LIMITS: [string, string][] = [
   ["max_capture_attempts", "5"],
   ["step_budget_seconds", "3600"],
   ["tick_interval_seconds", "60"],
+  ["source_poll_interval_seconds", "= tick_interval_seconds"],
   ["reconcile_concurrency", "8"],
   ["max_claims_per_tick", "10"],
   ["layout_wait_seconds", "600"],
@@ -147,6 +149,9 @@ export function buildDescriptors(draft: Document, rebuild: () => void, confirm: 
       d.push({ kind: "group", label: `${sourceNames[i]} (${type})`, node: node(["work_sources", i]), expanded: isOpen(["work_sources", i]), indent: 0, ...mover(["work_sources"], i, sources.length) });
       if (!isOpen(["work_sources", i])) return;
       d.push({ kind: "text", label: "name", path: ["work_sources", i, "name"], placeholder: type, indent: 1 });
+      // Common (type-agnostic) source field: how often to poll THIS source for new work. Optional —
+      // clearable back to the repo-wide default (limits.source_poll_interval_seconds, itself the tick).
+      d.push({ kind: "text", label: "poll_interval_seconds", path: ["work_sources", i, "poll_interval_seconds"], placeholder: "= source_poll_interval_seconds", numeric: true, clearable: true, indent: 1 });
       d.push({
         kind: "enum",
         label: "type",
@@ -156,7 +161,8 @@ export function buildDescriptors(draft: Document, rebuild: () => void, confirm: 
         apply: (next) => {
           if (next === type) return;
           const name = draft.getIn(["work_sources", i, "name"]);
-          draft.setIn(["work_sources", i], draft.createNode(sourceNode(next as SourceType, name)));
+          const poll = draft.getIn(["work_sources", i, "poll_interval_seconds"]); // common field survives the type switch
+          draft.setIn(["work_sources", i], draft.createNode(sourceNode(next as SourceType, name, poll)));
           open(["work_sources", i]); // keep expanded after switching type
           rebuild();
         },

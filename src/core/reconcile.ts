@@ -471,7 +471,24 @@ async function reconcileRepoImpl(deps: Deps): Promise<void> {
     const cacheKey = `${src.name}\0${label ?? ""}`;
     const cached = eligibleCache.get(cacheKey);
     if (cached) return cached;
+    // Poll-window gate (drain-per-window): when a source's interval exceeds the tick, skip its poll
+    // — and thus all its claims — until the interval elapses. Only engages when interval > tick, so
+    // the default (interval == tick) polls every pass exactly as before; a small tolerance below the
+    // interval keeps a "5 min" cadence from slipping a whole tick on timer jitter. Between polls the
+    // source contributes no eligible items, so nothing new is claimed from it this tick.
+    if (src.pollIntervalSeconds > deps.config.limits.tickIntervalSeconds) {
+      const last = src.lastPolledAt.get(label ?? ""); // epoch seconds (deps.now() is seconds)
+      const toleranceSec = Math.min(deps.config.limits.tickIntervalSeconds / 2, 5);
+      if (last != null && deps.now() - last < src.pollIntervalSeconds - toleranceSec) {
+        eligibleCache.set(cacheKey, []);
+        return [];
+      }
+    }
     let items: MatchItem[];
+    // Stamp the poll BEFORE the call (on the attempt, not just success): a paused/erroring source
+    // then backs off to its interval instead of retrying every tick — matching the degrade-to-[]
+    // path below, which is also a completed poll for cadence purposes.
+    src.lastPolledAt.set(label ?? "", deps.now());
     try {
       items = await src.client.listEligible(label);
       noteSourceAuthRecovered(deps, src.name); // a successful poll ⇒ auth is fine (clears any gate)

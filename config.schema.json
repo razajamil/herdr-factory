@@ -78,6 +78,11 @@
           "exclusiveMinimum": 0,
           "maximum": 9007199254740991
         },
+        "source_poll_interval_seconds": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991
+        },
         "layout_wait_seconds": {
           "default": 600,
           "type": "integer",
@@ -101,6 +106,11 @@
               "name": {
                 "type": "string",
                 "minLength": 1
+              },
+              "poll_interval_seconds": {
+                "type": "integer",
+                "exclusiveMinimum": 0,
+                "maximum": 9007199254740991
               },
               "jira": {
                 "type": "object",
@@ -203,6 +213,11 @@
                 "type": "string",
                 "minLength": 1
               },
+              "poll_interval_seconds": {
+                "type": "integer",
+                "exclusiveMinimum": 0,
+                "maximum": 9007199254740991
+              },
               "local_markdown": {
                 "type": "object",
                 "properties": {
@@ -231,6 +246,11 @@
               "name": {
                 "type": "string",
                 "minLength": 1
+              },
+              "poll_interval_seconds": {
+                "type": "integer",
+                "exclusiveMinimum": 0,
+                "maximum": 9007199254740991
               },
               "github_issues": {
                 "type": "object",

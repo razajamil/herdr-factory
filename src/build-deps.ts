@@ -62,7 +62,13 @@ export async function buildDeps(repoName: string): Promise<Deps> {
     const sources: SourceRuntime[] = config.sources.map((s) => {
       const sourceAttrs = { repo: repoName, "work.source": s.name, "source.type": s.type };
       const client = descriptorFor(s.type).create({ repoName, sourceName: s.name, cfg: s.cfg, env, store, ghRepo, log });
-      return { name: s.name, type: s.type, client: instrumentObject(client, "source", sourceAttrs) };
+      return {
+        name: s.name,
+        type: s.type,
+        client: instrumentObject(client, "source", sourceAttrs),
+        pollIntervalSeconds: s.pollIntervalSeconds,
+        lastPolledAt: new Map<string, number>(),
+      };
     });
     const sourceByName = new Map(sources.map((s) => [s.name, s]));
     // config.belts is already priority-ordered; load each belt's match predicate (if any).

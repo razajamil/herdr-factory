@@ -187,6 +187,47 @@ describe("loadConfig — work sources + belts", () => {
     expect(config.belts[0]!.label).toBe("factory"); // the belt's trigger/pickup label
   });
 
+  describe("poll interval resolution", () => {
+    it("defaults each source's poll interval to the tick interval (poll every tick)", () => {
+      setup(cfg(JIRA_SRC, SHIP_BELT));
+      const { config } = loadConfig("demo");
+      expect(config.limits.tickIntervalSeconds).toBe(60); // default
+      expect(config.sources[0]!.pollIntervalSeconds).toBe(60); // == tick ⇒ unchanged behavior
+    });
+
+    it("follows a custom tick interval when neither poll field is set", () => {
+      setup(cfg(JIRA_SRC, SHIP_BELT, "repo:\n  path: __REPO__\nlimits: { tick_interval_seconds: 30 }\n"));
+      expect(loadConfig("demo").config.sources[0]!.pollIntervalSeconds).toBe(30);
+    });
+
+    it("limits.source_poll_interval_seconds is the repo-wide default for every source", () => {
+      setup(cfg(`${JIRA_SRC}${LM_SRC}`, SHIP_BELT, "repo:\n  path: __REPO__\nlimits: { source_poll_interval_seconds: 300 }\n"));
+      const { config } = loadConfig("demo");
+      expect(config.sources.map((s) => s.pollIntervalSeconds)).toEqual([300, 300]);
+    });
+
+    it("a per-source poll_interval_seconds overrides the repo default", () => {
+      const jiraSlow = `  - type: jira
+    poll_interval_seconds: 600
+    jira: { base_url: https://x.atlassian.net, project: RWR }
+`;
+      setup(cfg(`${jiraSlow}${LM_SRC}`, SHIP_BELT, "repo:\n  path: __REPO__\nlimits: { source_poll_interval_seconds: 120 }\n"));
+      const { config } = loadConfig("demo");
+      // jira gets its own 600; the unqualified local_markdown falls back to the repo default 120.
+      expect(config.sources.find((s) => s.type === "jira")!.pollIntervalSeconds).toBe(600);
+      expect(config.sources.find((s) => s.type === "local_markdown")!.pollIntervalSeconds).toBe(120);
+    });
+
+    it("rejects a non-positive poll_interval_seconds", () => {
+      const bad = `  - type: jira
+    poll_interval_seconds: 0
+    jira: { base_url: https://x.atlassian.net, project: RWR }
+`;
+      setup(cfg(bad, SHIP_BELT));
+      expect(() => loadConfig("demo")).toThrow();
+    });
+  });
+
   it("github_issues: repo may be omitted (defaults to the PR repo at build time); bad shapes rejected", () => {
     setup(
       cfg(

@@ -142,7 +142,7 @@ function build(opts: { multi?: boolean } = {}) {
     },
     health: async () => {},
   };
-  const sources: SourceRuntime[] = [{ name: "jira", type: "jira", client: jiraClient }];
+  const sources: SourceRuntime[] = [{ name: "jira", type: "jira", client: jiraClient, pollIntervalSeconds: 60, lastPolledAt: new Map() }];
   // The default belt: a work_to_pull_request belt on the jira source (today's fix→review→pr flow).
   const shipBelt: BeltRuntime = { name: "ship", beltType: "work_to_pull_request", source: "jira", priority: 1, steps: prSteps(), watchPr: true };
   const belts: BeltRuntime[] = [shipBelt];
@@ -162,7 +162,7 @@ function build(opts: { multi?: boolean } = {}) {
       pollHumanReply: async (input) => { calls.humanPoll.push(input); return state.humanReply; },
       health: async () => {},
     };
-    sources.push({ name: "lm", type: "local_markdown", client: lmClient });
+    sources.push({ name: "lm", type: "local_markdown", client: lmClient, pollIntervalSeconds: 60, lastPolledAt: new Map() });
     lmBelt = { name: "lmship", beltType: "work_to_pull_request", source: "lm", priority: 2, workspaceName: "feature/{{work_id}}", steps: prSteps(), watchPr: true };
     belts.push(lmBelt);
   }
@@ -233,7 +233,7 @@ function build(opts: { multi?: boolean } = {}) {
     repoName: "demo",
     repo: { path: "/main-checkout", baseRef: "origin/master" },
     limits: { maxActiveWorkspaces: 3, attentionRenotifySeconds: 3600, stallSeconds: 2700, maxBounces: 3, maxCaptureAttempts: 5, stepBudgetSeconds: 3600, tickIntervalSeconds: 60, reconcileConcurrency: 8, maxClaimsPerTick: 10, layoutWaitSeconds: 600 },
-    sources: sources.map((s) => ({ name: s.name, type: s.type, cfg: {} })),
+    sources: sources.map((s) => ({ name: s.name, type: s.type, pollIntervalSeconds: s.pollIntervalSeconds, cfg: {} })),
     belts,
     layouts: [],
     guidance: undefined,
@@ -644,6 +644,49 @@ describe("exclusive_resource guard (the capture mutex)", () => {
     const res = await bounceStep(deps, store.getRun(run.id)!, belt, src, "fix", "redo");
     expect(res.ok).toBe(true);
     expect(store.acquireLock("capture", "other", 1200)).toBe(true); // freed on bounce (backstop)
+  });
+});
+
+describe("reconcile — Phase B source poll interval", () => {
+  it("polls a source every tick when its interval equals the tick interval (the default)", async () => {
+    const { deps, setNow } = build();
+    const src = deps.resolveSource("jira")!;
+    expect(src.pollIntervalSeconds).toBe(60); // harness default == tick ⇒ gate never engages
+    let polls = 0;
+    const orig = src.client.listEligible.bind(src.client);
+    src.client.listEligible = async (l) => { polls += 1; return orig(l); };
+
+    await reconcileRepo(deps); // t=1000
+    setNow(1060); await reconcileRepo(deps);
+    setNow(1120); await reconcileRepo(deps);
+    expect(polls).toBe(3); // one poll per tick — unchanged behavior
+  });
+
+  it("skips a source's poll — and thus its claims — until a longer interval elapses (drain-per-window)", async () => {
+    const { deps, store, state, setNow } = build();
+    const src = deps.resolveSource("jira")!;
+    src.pollIntervalSeconds = 300; // 5 min, well above the 60s tick
+    let polls = 0;
+    const orig = src.client.listEligible.bind(src.client);
+    src.client.listEligible = async (l) => { polls += 1; return orig(l); };
+
+    // t=1000: the first tick polls and claims P-1.
+    state.eligible = [ticket("P-1")];
+    await reconcileRepo(deps);
+    expect(polls).toBe(1);
+    expect(store.activeRunForTicket("demo", "jira", "P-1")).toBeTruthy();
+
+    // A second item shows up, but we're inside the poll window: ticks neither poll nor claim it.
+    state.eligible = [ticket("P-1"), ticket("P-2")];
+    setNow(1060); await reconcileRepo(deps); // +60s
+    setNow(1290); await reconcileRepo(deps); // +290s — still under 300 − tolerance
+    expect(polls).toBe(1);
+    expect(store.activeRunForTicket("demo", "jira", "P-2")).toBeFalsy();
+
+    // Once the interval elapses, the source is polled again and the backlog item is claimed.
+    setNow(1300); await reconcileRepo(deps);
+    expect(polls).toBe(2);
+    expect(store.activeRunForTicket("demo", "jira", "P-2")).toBeTruthy();
   });
 });
 

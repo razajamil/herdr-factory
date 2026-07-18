@@ -28,6 +28,26 @@ const jiraDoc = () =>
 belt: []
 `);
 
+describe("config-fields: source poll_interval_seconds", () => {
+  it("renders a clearable numeric poll_interval_seconds row for every source (common field)", () => {
+    const f = fieldsFor(jiraDoc()).find(
+      (x) => x.kind === "text" && x.label === "poll_interval_seconds" && "path" in x && (x.path as (string | number)[])?.[2] === "poll_interval_seconds",
+    );
+    if (f?.kind !== "text") throw new Error("expected the poll_interval_seconds text field");
+    expect(f.numeric).toBe(true);
+    expect(f.clearable).toBe(true); // blank ⇒ falls back to the repo default, not written
+    expect(f.path).toEqual(["work_sources", 0, "poll_interval_seconds"]);
+  });
+
+  it("surfaces source_poll_interval_seconds in the limits panel", () => {
+    const doc = parseDocument("work_sources: []\nbelt: []\n");
+    const general = buildDescriptors(doc, () => {}, async () => true, new WeakSet(), "general");
+    const lim = general.find((x) => x.kind === "text" && x.label === "source_poll_interval_seconds");
+    expect(lim).toBeTruthy();
+    if (lim?.kind === "text") expect(lim.path).toEqual(["limits", "source_poll_interval_seconds"]);
+  });
+});
+
 describe("config-fields: jira auth.method", () => {
   it("renders auth.method as an enum (api_token | oauth), defaulting to api_token when unset", () => {
     const auth = fieldsFor(jiraDoc()).find((f) => f.kind === "enum" && f.label === "auth.method");

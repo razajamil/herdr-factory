@@ -668,7 +668,15 @@ removed escalates to `attention`; a `tearing_down` run still finishes local clea
 **Phase B** walks belts in **priority order** and claims eligible work up to the cap — which
 counts **working** runs only (`countOccupying`; parked runs hold no slot) and admits at most
 `limits.max_claims_per_tick` (default 10) new claims per pass, smoothing a big-backlog cold
-start (each claim ≈ a worktree checkout + ~5 source calls) over successive ticks. An item with
+start (each claim ≈ a worktree checkout + ~5 source calls) over successive ticks. Each source's
+`listEligible` poll is **rate-gated by its `pollIntervalSeconds`** (the resolved per-source
+`poll_interval_seconds` ?? `limits.source_poll_interval_seconds` ?? `tick_interval_seconds`): the
+gate engages only when that interval **exceeds** the tick (so the default polls every tick,
+unchanged), and between polls the source contributes **no** eligible items — so its backlog drains
+at `max_claims_per_tick` per *poll window*, not per tick (**drain-per-window**). The last-poll time
+is held per `(source, label)` in-memory on the long-lived per-repo runtime (`SourceRuntime.lastPolledAt`),
+stamped on the *attempt* so a paused/erroring source still backs off to its interval; a fresh
+process (a one-shot `tick`) starts empty and polls immediately. An item with
 an **undelivered status write-back is skipped** — its "eligible" listing is known-stale (this is
 what prevents a merged run whose transition never landed from being claimed and re-done). One
 source's backend hiccup is caught per-source and never starves the others. Per-run errors are
@@ -809,7 +817,9 @@ them into a 60 s tick injects N× latency for nothing. The target splits transit
 by what they actually need:
 
 - **Tick (level-triggered) — robustness backbone.** External-state polling
-  (PR / CI / Jira — no cheap event source locally), per-step watchdogs / timeouts /
+  (PR / CI / Jira — no cheap event source locally; new-work polling can additionally be gated to a
+  slower per-source `poll_interval_seconds`, decoupling a rate-limited board's poll cadence from the
+  tick — the Phase B poll gate in §7), per-step watchdogs / timeouts /
   liveness, and the self-healing reconcile pass that re-derives truth and catches a
   dropped signal. *More* valuable here than before: more steps = more signals = more
   chances to miss one.
@@ -1060,6 +1070,9 @@ from being claimed again).
       / `step_budget_seconds` (fallback per-step budget — used when a step sets no `budget_seconds`
       and its primitive declares no default; the primitive defaults are `work` 5400 / `evidence` 2400
       / `review` 1800 / `pr` 3600) / `tick_interval_seconds`
+      / `source_poll_interval_seconds` (how often a source is polled for new work — defaults to
+      `tick_interval_seconds`, i.e. every tick; a per-source `poll_interval_seconds` overrides it;
+      `≤ tick` is a no-op — see the Phase B poll gate in §7)
       / `reconcile_concurrency` (Phase-A parallelism, default 8) / `max_claims_per_tick`
       (claim admission, default 10) / `layout_wait_seconds`.
     - `work_sources` — **required, ≥1** (`zod` discriminated union on `type`, assembled from the

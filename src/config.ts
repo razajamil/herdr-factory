@@ -329,6 +329,14 @@ export const RepoConfigSchema = z
         // calls). Smooths a big-backlog cold start over successive ticks instead of one
         // source-hammering mega-tick; remaining slots fill on the next passes.
         max_claims_per_tick: z.coerce.number().int().positive().default(10),
+        // How often each work source is polled for new work (the `listEligible` call in Phase B).
+        // Defaults to tick_interval_seconds — poll every tick, unchanged. Raise it to spare a
+        // rate-limited source (a Jira board / GitHub issues); a per-source `poll_interval_seconds`
+        // overrides this. A value <= tick_interval is a no-op (a source can't be polled faster than
+        // the tick fires). Drain semantics: between polls a source contributes NO new claims, so its
+        // backlog drains at max_claims_per_tick per POLL WINDOW, not per tick. Optional (not
+        // defaulted) because the fallback is another limits field — resolved in loadConfig.
+        source_poll_interval_seconds: z.coerce.number().int().positive().optional(),
         // How long to wait for a step's configured tab/pane to come up (with an idle agent)
         // before flagging the item for attention. Generous by default to allow the user's
         // layout setup + dev-server startup to finish; only applies to steps with a tab/pane.
@@ -476,6 +484,9 @@ export type BeltType = "work_to_pull_request" | "custom";
 export interface WorkSourceConfig {
   name: string;
   type: SourceType;
+  /** How often this source is polled for new work (Phase B `listEligible`), in seconds. Resolved =
+   *  the source's own `poll_interval_seconds` ?? `limits.source_poll_interval_seconds` ?? tick. */
+  pollIntervalSeconds: number;
   cfg: unknown;
 }
 
@@ -812,9 +823,13 @@ export function loadConfig(repoName: string): Loaded {
   const guidancePath = join(repoDir, "guidelines-prompt.md");
   const guidance = existsSync(guidancePath) ? readFileSync(guidancePath, "utf8") : undefined;
 
+  // The per-source poll interval falls back to the repo-wide limit, which itself falls back to the
+  // tick interval — so an unset field everywhere keeps today's "poll every tick" behavior.
+  const defaultPollInterval = parsed.limits.source_poll_interval_seconds ?? parsed.limits.tick_interval_seconds;
   const sources: WorkSourceConfig[] = parsed.work_sources.map((s) => ({
     name: s.name ?? s.type,
     type: s.type,
+    pollIntervalSeconds: (s.poll_interval_seconds as number | undefined) ?? defaultPollInterval,
     cfg: descriptorFor(s.type).resolveConfig(s),
   }));
   const sourceTypeByName = new Map(sources.map((s) => [s.name, s.type]));

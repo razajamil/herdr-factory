@@ -3,6 +3,7 @@ import { JiraSource, type JiraAuthCfg, type JiraSourceCfg } from "../../clients/
 import { JiraApiTokenAuth, JiraOAuthAuth, type JiraAuth } from "../../auth/jira-provider.ts";
 import { DEFAULT_JIRA_SCOPES, resolveJiraOAuthApp } from "../../auth/jira-oauth.ts";
 import type { SourceDescriptor } from "../registry.ts";
+import { commonSourceFields } from "../common.ts";
 
 // How a Jira source authenticates — a discriminated union on `method` (same idiom as source `type`).
 // api_token (DEFAULT, back-compatible): email + token from env. oauth: browser login (PKCE public
@@ -42,8 +43,6 @@ const JiraBlockSchema = z.object({
   auth: JiraAuthSchema,
 });
 
-const sourceName = z.string().trim().min(1).optional();
-
 /** Raw parse output of the jira source object (post-zod, pre-resolve). */
 interface JiraParsed {
   type: "jira";
@@ -54,7 +53,7 @@ interface JiraParsed {
 export const jiraDescriptor: SourceDescriptor<JiraSourceCfg> = {
   type: "jira",
   pickupLabel: { noun: "label" },
-  configSchema: z.object({ type: z.literal("jira"), name: sourceName, jira: JiraBlockSchema }).strict(),
+  configSchema: z.object({ type: z.literal("jira"), ...commonSourceFields, jira: JiraBlockSchema }).strict(),
   resolveConfig(parsed) {
     const s = parsed as unknown as JiraParsed;
     const a = s.jira.auth;

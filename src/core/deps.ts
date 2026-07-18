@@ -238,6 +238,14 @@ export interface SourceRuntime {
   name: string;
   type: SourceType;
   client: WorkSource;
+  /** How often to poll this source for new work (Phase B `listEligible`), in seconds. */
+  pollIntervalSeconds: number;
+  /** Last poll time per pickup label (key = `label ?? ""`), epoch SECONDS (matches `deps.now()`).
+   *  Mutable, in-memory only —
+   *  it lives on the long-lived per-repo runtime, so serve/watch honor the interval across ticks;
+   *  a fresh process (one-shot `tick`) starts empty and polls immediately (harmless). Read/written
+   *  by the reconciler's Phase B poll gate. */
+  lastPolledAt: Map<string, number>;
 }
 
 /** A configured belt's resolved config + its loaded `match` predicate (undefined = accept all from
