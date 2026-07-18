@@ -3,7 +3,7 @@
 // section within the active tab; arrows navigate inside the focused section; Esc pops to the top
 // level (the tab bar). Runs on Node >= 26 with --experimental-ffi (see bin/herdr-factory-tui).
 // Imperative opentui core API — no JSX.
-import { BoxRenderable, InputRenderable, ScrollBoxRenderable, TabSelectRenderable, TextRenderable, createCliRenderer, type CliRenderer, type Renderable } from "@opentui/core";
+import { BoxRenderable, InputRenderable, ScrollBoxRenderable, StyledText, TabSelectRenderable, TextRenderable, bold, createCliRenderer, fg, type CliRenderer, type Renderable, type TextChunk } from "@opentui/core";
 import type { KeyEvent } from "@opentui/core";
 import { BORDER, theme } from "./theme.ts";
 import type { TabView } from "./types.ts";
@@ -287,11 +287,26 @@ export function createApp(renderer: CliRenderer): { currentTab: () => number; at
   // your place when switching tabs.
   const leftAtTop: boolean[] = views.map(() => false);
 
-  function footerHints(idx: number): string {
-    const tail = "   ·   Tab: switch view · Esc: top level · q: quit";
-    if (idx === 1) return " 1 repos · 2 config · 3 sources · 4 layouts · 5 belts   ·   ↑↓: move · ↵: open/edit · [ ]: reorder" + tail;
-    if (idx === 2) return " ↑↓: scroll · r: re-run · d: deep (gh auth, herdr daemon)" + tail;
-    return " ↑↓: move · ↵: timeline · t: tick · c: claim · x: teardown · d: detail · l: login · r: refresh" + tail;
+  // Footer keymap, lazygit-style: muted action labels with the emphasized key that triggers them
+  // (`Label: key`), pairs divided by a dim bar. Section jumps read as bracketed, accented numbers
+  // (`[1] repos`) so it's clear which digit hops where. Everything is one styled line.
+  const sep = () => fg(theme.text.tertiary)("  |  ");
+  const groupSep = () => fg(theme.text.tertiary)("   ·   ");
+  const nav = (n: number, label: string): TextChunk[] => [fg(theme.accent)(bold(`[${n}]`)), fg(theme.text.secondary)(` ${label}`)];
+  const keys = (pairs: [label: string, key: string][]): TextChunk[] =>
+    pairs.flatMap(([label, key], i) => [...(i ? [sep()] : []), fg(theme.text.secondary)(`${label}: `), fg(theme.accent)(bold(key))]);
+
+  function footerHints(idx: number): StyledText {
+    const tail = [groupSep(), ...keys([["switch view", "Tab"], ["top level", "Esc"], ["quit", "q"]])];
+    if (idx === 1) {
+      const sections = [nav(1, "repos"), nav(2, "config"), nav(3, "sources"), nav(4, "layouts"), nav(5, "belts")]
+        .flatMap((chunks, i) => (i ? [fg(theme.text.tertiary)("  "), ...chunks] : chunks));
+      return new StyledText([fg(theme.text.tertiary)(" "), ...sections, groupSep(), ...keys([["move", "↑↓"], ["open/edit", "↵"], ["reorder", "[ ]"]]), ...tail]);
+    }
+    if (idx === 2) {
+      return new StyledText([fg(theme.text.tertiary)(" "), ...keys([["scroll", "↑↓"], ["re-run", "r"], ["deep check", "d"]]), ...tail]);
+    }
+    return new StyledText([fg(theme.text.tertiary)(" "), ...keys([["move", "↑↓"], ["timeline", "↵"], ["tick", "t"], ["claim", "c"], ["teardown", "x"], ["detail", "d"], ["login", "l"], ["refresh", "r"]]), ...tail]);
   }
 
   /** Top of the hierarchy: focus the tab bar. From here numbers enter a section, ←→/Tab switch. */

@@ -22,7 +22,7 @@ export function createDoctor(renderer: CliRenderer): TabView {
     borderStyle: BORDER,
     borderColor: theme.border.inactive,
     focusedBorderColor: theme.border.active,
-    title: " doctor ",
+    title: " Doctor ",
     titleColor: theme.text.secondary,
     paddingLeft: 1,
     paddingRight: 1,

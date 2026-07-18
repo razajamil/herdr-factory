@@ -94,7 +94,7 @@ export function createDashboard(renderer: CliRenderer, actions: { confirm: Confi
     borderStyle: BORDER,
     borderColor: theme.border.inactive,
     focusedBorderColor: theme.border.active,
-    title: " status ",
+    title: " Status ",
     titleColor: theme.text.secondary,
     paddingLeft: 1,
     paddingRight: 1,

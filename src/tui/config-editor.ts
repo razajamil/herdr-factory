@@ -13,7 +13,7 @@
 // RepoConfigSchema before writing.
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { BoxRenderable, InputRenderable, ScrollBoxRenderable, SelectRenderable, TextRenderable, type CliRenderer } from "@opentui/core";
+import { BoxRenderable, InputRenderable, ScrollBoxRenderable, SelectRenderable, StyledText, TextRenderable, bold, fg, type CliRenderer } from "@opentui/core";
 import type { KeyEvent, Renderable } from "@opentui/core";
 import { parseDocument, type Document } from "yaml";
 import { RepoConfigSchema, listConfiguredRepos, loadEnvMap, repoConfigDir, saveEnvValues } from "../config.ts";
@@ -25,6 +25,9 @@ import type { ConfirmFn, TabView } from "./types.ts";
 
 const LABEL_WIDTH = 28;
 const IND = (n?: number) => "  ".repeat(n ?? 0);
+const sentenceCase = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
+// A section heading for a bordered panel: bracketed jump number + the label, sentence-cased.
+const sectionTitle = (n: number, label: string) => ` [${n}] ${sentenceCase(label)} `;
 const gut = (on: boolean) => (on ? "▶ " : "  ");
 const COLLAPSED_HEIGHT = 3; // border top + one summary line + border bottom
 
@@ -127,8 +130,11 @@ function createFieldPanel(
   // Render one descriptor into the scroll; returns a RowRef for focusable ones, null for headers.
   function renderDescriptor(d: FieldDesc): RowRef | null {
     if (d.kind === "header") {
-      const fg = d.level === 1 ? theme.accent : theme.text.secondary;
-      scroll.add(new TextRenderable(renderer, { content: IND(d.indent) + d.label, fg, width: "100%", height: 1, wrapMode: "none" }));
+      // Level-1 headers are section headings: bold + sentence-cased. Level-2 stay muted secondary text.
+      const content = d.level === 1
+        ? new StyledText([fg(theme.accent)(bold(IND(d.indent) + sentenceCase(d.label)))])
+        : IND(d.indent) + d.label;
+      scroll.add(new TextRenderable(renderer, { content, fg: theme.text.secondary, width: "100%", height: 1, wrapMode: "none" }));
       return null;
     }
     if (d.kind === "group") {
@@ -462,7 +468,7 @@ export function createConfigEditor(renderer: CliRenderer, confirm: ConfirmFn): T
     border: true,
     borderStyle: BORDER,
     borderColor: theme.border.inactive,
-    title: " 1 · repos ",
+    title: sectionTitle(1, "repos"),
     titleColor: theme.focusText.unfocused,
   });
   const repoSelect = new SelectRenderable(renderer, {
@@ -581,10 +587,10 @@ export function createConfigEditor(renderer: CliRenderer, confirm: ConfirmFn): T
   };
 
   panels = [
-    createFieldPanel(2, " 2 · config ", () => [...secretDescriptors(), ...buildDescriptors(draft!, rebuildAll, confirm, expandedNodes, "general")], summaryGeneral, ctx),
-    createFieldPanel(3, " 3 · work sources ", () => buildDescriptors(draft!, rebuildAll, confirm, expandedNodes, "work_sources"), summarySources, ctx),
-    createFieldPanel(4, " 4 · layouts ", () => buildDescriptors(draft!, rebuildAll, confirm, expandedNodes, "layouts"), summaryLayouts, ctx),
-    createFieldPanel(5, " 5 · belts ", () => buildDescriptors(draft!, rebuildAll, confirm, expandedNodes, "belt"), summaryBelts, ctx),
+    createFieldPanel(2, sectionTitle(2, "config"), () => [...secretDescriptors(), ...buildDescriptors(draft!, rebuildAll, confirm, expandedNodes, "general")], summaryGeneral, ctx),
+    createFieldPanel(3, sectionTitle(3, "work sources"), () => buildDescriptors(draft!, rebuildAll, confirm, expandedNodes, "work_sources"), summarySources, ctx),
+    createFieldPanel(4, sectionTitle(4, "layouts"), () => buildDescriptors(draft!, rebuildAll, confirm, expandedNodes, "layouts"), summaryLayouts, ctx),
+    createFieldPanel(5, sectionTitle(5, "belts"), () => buildDescriptors(draft!, rebuildAll, confirm, expandedNodes, "belt"), summaryBelts, ctx),
   ];
   for (const p of panels) rightCol.add(p.outer);
   rightCol.add(status);
@@ -631,7 +637,7 @@ export function createConfigEditor(renderer: CliRenderer, confirm: ConfirmFn): T
 
     const path = join(repoConfigDir(name), "config.yml");
     if (!existsSync(path)) {
-      configPanel().outer.title = ` 2 · ${name} `;
+      configPanel().outer.title = ` [2] Config · ${name} `;
       configPanel().showMessage(`no config.yml at ${path}`, theme.status.bad);
       setExpandedSection(2); // surface the message
       setStatus("", theme.text.tertiary);
@@ -639,7 +645,7 @@ export function createConfigEditor(renderer: CliRenderer, confirm: ConfirmFn): T
     }
     loadedText = readFileSync(path, "utf8");
     const doc = parseDocument(loadedText);
-    configPanel().outer.title = ` 2 · ${name}/config.yml `;
+    configPanel().outer.title = ` [2] Config · ${name}/config.yml `;
     if (doc.errors.length > 0) {
       configPanel().showMessage(`✗ cannot parse YAML: ${doc.errors[0]?.message ?? "parse error"}`, theme.status.bad);
       setExpandedSection(2);
@@ -651,7 +657,7 @@ export function createConfigEditor(renderer: CliRenderer, confirm: ConfirmFn): T
     loadedEnv = loadEnvMap(repoConfigDir(name));
     envValues = { ...loadedEnv };
     for (const p of panels) p.render();
-    setStatus("↑↓ move · ↵ open/edit/cycle · ^S save · 2/3/4/5 sections", theme.text.secondary);
+    setStatus("↑↓ move · ↵ open/edit/cycle · ^S save · [2] [3] [4] [5] sections", theme.text.secondary);
   }
 
   function save(): void {
