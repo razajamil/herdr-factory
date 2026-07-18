@@ -1,10 +1,11 @@
-// Config tab — four numbered sections. [1] a repo list on the left; on the right, three bordered
+// Config tab — five numbered sections. [1] a repo list on the left; on the right, four bordered
 // panels stacked in rows, each an editor over one slice of the selected repo's config.yml: [2] the
-// singleton blocks (repo · limits · secrets · evidence), [3] work_sources, [4] belts. The three
-// right-hand panels are an ACCORDION — collapsed by default, and moving to one (number keys 2/3/4, a
-// click, or ↵ from the repo list) expands it and collapses the others, so only one is open at a
-// time and a long config stays scannable. Each panel renders a flat, browsable list of rows built
-// from a live `yaml` Document (config-fields.ts): array-of-object items (work_sources, belts, steps)
+// singleton blocks (repo · limits · secrets · evidence), [3] work_sources, [4] layouts, [5] belts.
+// The four right-hand panels are an ACCORDION — collapsed by default, and moving to one (number keys
+// 2/3/4/5, a click, or ↵ from the repo list) expands it and collapses the others, so only one is
+// open at a time and a long config stays scannable. Each panel renders a flat, browsable list of rows
+// built from a live `yaml` Document (config-fields.ts): array-of-object items (work_sources, layouts,
+// belts, tabs, panes, steps)
 // are collapsible `group` rows, and text fields / cyclable enums / bool toggles / source refs /
 // add-remove actions fill in when a group is expanded. Navigation follows the shell's lazygit model
 // (↑↓ move within the focused panel, Esc → top). Structural edits mutate the Document surgically so
@@ -478,7 +479,7 @@ export function createConfigEditor(renderer: CliRenderer, confirm: ConfirmFn): T
   });
   repoPanel.add(repoSelect);
 
-  // ── sections 2/3/4: the accordion + status line ─────────────────────────────────────────────
+  // ── sections 2/3/4/5: the accordion + status line ─────────────────────────────────────────────
   const rightCol = new BoxRenderable(renderer, { flexDirection: "column", flexGrow: 1, height: "100%", backgroundColor: theme.bg });
   const status = new TextRenderable(renderer, { content: "", height: 1, flexShrink: 0, wrapMode: "none", fg: theme.text.tertiary, paddingLeft: 1 });
 
@@ -554,6 +555,12 @@ export function createConfigEditor(renderer: CliRenderer, confirm: ConfirmFn): T
     const names = arr.map((s, i) => String(s?.name ?? s?.type ?? `source${i}`));
     return `${arr.length} source${arr.length === 1 ? "" : "s"}: ${names.join(", ")}`;
   }
+  function summaryLayouts(): string {
+    const arr = ((draft?.toJS() as any)?.layouts ?? []) as any[];
+    if (!Array.isArray(arr) || arr.length === 0) return "no layouts — ↵ to add (belts spawn their own panes)";
+    const ids = arr.map((l, i) => String(l?.id ?? `layout${i}`));
+    return `${arr.length} layout${arr.length === 1 ? "" : "s"}: ${ids.join(", ")}`;
+  }
   function summaryBelts(): string {
     const arr = ((draft?.toJS() as any)?.belt ?? []) as any[];
     if (!Array.isArray(arr) || arr.length === 0) return "no belts — ↵ to add";
@@ -576,7 +583,8 @@ export function createConfigEditor(renderer: CliRenderer, confirm: ConfirmFn): T
   panels = [
     createFieldPanel(2, " 2 · config ", () => [...secretDescriptors(), ...buildDescriptors(draft!, rebuildAll, confirm, expandedNodes, "general")], summaryGeneral, ctx),
     createFieldPanel(3, " 3 · work sources ", () => buildDescriptors(draft!, rebuildAll, confirm, expandedNodes, "work_sources"), summarySources, ctx),
-    createFieldPanel(4, " 4 · belts ", () => buildDescriptors(draft!, rebuildAll, confirm, expandedNodes, "belt"), summaryBelts, ctx),
+    createFieldPanel(4, " 4 · layouts ", () => buildDescriptors(draft!, rebuildAll, confirm, expandedNodes, "layouts"), summaryLayouts, ctx),
+    createFieldPanel(5, " 5 · belts ", () => buildDescriptors(draft!, rebuildAll, confirm, expandedNodes, "belt"), summaryBelts, ctx),
   ];
   for (const p of panels) rightCol.add(p.outer);
   rightCol.add(status);
@@ -643,7 +651,7 @@ export function createConfigEditor(renderer: CliRenderer, confirm: ConfirmFn): T
     loadedEnv = loadEnvMap(repoConfigDir(name));
     envValues = { ...loadedEnv };
     for (const p of panels) p.render();
-    setStatus("↑↓ move · ↵ open/edit/cycle · ^S save · 2/3/4 sections", theme.text.secondary);
+    setStatus("↑↓ move · ↵ open/edit/cycle · ^S save · 2/3/4/5 sections", theme.text.secondary);
   }
 
   function save(): void {
@@ -699,7 +707,7 @@ export function createConfigEditor(renderer: CliRenderer, confirm: ConfirmFn): T
 
   return {
     root,
-    sectionCount: 4,
+    sectionCount: 5,
     focusSection,
     restoreFocus() {
       focusSection(lastSection);

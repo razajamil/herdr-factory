@@ -272,7 +272,7 @@ export function createApp(renderer: CliRenderer): { currentTab: () => number; at
   // ── views ─────────────────────────────────────────────────────────────────────────────────
   const views: TabView[] = [
     createDashboard(renderer, { confirm, choose, showInfo, prompt }),
-    createLazyView(renderer, 4, async () => {
+    createLazyView(renderer, 5, async () => {
       const { createConfigEditor } = await import("./config-editor.ts");
       return createConfigEditor(renderer, confirm);
     }),
@@ -289,7 +289,7 @@ export function createApp(renderer: CliRenderer): { currentTab: () => number; at
 
   function footerHints(idx: number): string {
     const tail = "   ·   Tab: switch view · Esc: top level · q: quit";
-    if (idx === 1) return " 1 repos · 2 config · 3 sources · 4 belts   ·   ↑↓: move · ↵: open/edit · [ ]: reorder" + tail;
+    if (idx === 1) return " 1 repos · 2 config · 3 sources · 4 layouts · 5 belts   ·   ↑↓: move · ↵: open/edit · [ ]: reorder" + tail;
     if (idx === 2) return " ↑↓: scroll · r: re-run · d: deep (gh auth, herdr daemon)" + tail;
     return " ↑↓: move · ↵: timeline · t: tick · c: claim · x: teardown · d: detail · l: login · r: refresh" + tail;
   }

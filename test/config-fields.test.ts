@@ -108,3 +108,85 @@ describe("config-fields: clearable optional scalars (unset-in-place regression)"
     expect(f.clearable).toBeUndefined();
   });
 });
+
+// ── section 4: layouts (the repo-level herdr tab/pane library the factory builds into worktrees) ──
+function layoutFields(doc: Document, openPaths: (string | number)[][] = []): FieldDesc[] {
+  const expanded = new WeakSet<object>();
+  for (const p of openPaths) {
+    const n = doc.getIn(p) as object;
+    if (n) expanded.add(n);
+  }
+  return buildDescriptors(doc, () => {}, async () => true, expanded, "layouts");
+}
+
+const layoutDoc = () =>
+  parseDocument(`work_sources: []
+belt: []
+layouts:
+  - id: app-dev
+    tabs:
+      - title: work
+        panes:
+          - { title: agent, command: claude }
+          - { title: server, command: mise run dev, split: right, size: "40%" }
+`);
+
+describe("config-fields: layouts section", () => {
+  it("lists each layout as a collapsible group labelled by id + tab count", () => {
+    const g = layoutFields(layoutDoc()).find((f) => f.kind === "group");
+    if (g?.kind !== "group") throw new Error("expected a layout group row");
+    expect(g.label).toBe("app-dev [1 tab]");
+  });
+
+  it("+ add layout creates a `layouts` array even when the key is absent (optional block)", () => {
+    const doc = parseDocument("work_sources: []\nbelt: []\n");
+    const add = layoutFields(doc).find((f) => f.kind === "action" && f.label === "+ add layout");
+    if (add?.kind !== "action") throw new Error("expected the add-layout action");
+    add.run();
+    expect(doc.getIn(["layouts", 0, "id"])).toBe("layout");
+    expect(doc.getIn(["layouts", 0, "tabs", 0, "panes", 0, "command"])).toBe("claude");
+  });
+
+  it("exposes a pane's split as an enum with an (unset) clear option", () => {
+    const paths = [["layouts", 0], ["layouts", 0, "tabs", 0], ["layouts", 0, "tabs", 0, "panes", 1]];
+    const split = layoutFields(layoutDoc(), paths).find((f) => f.kind === "enum" && f.label === "split");
+    if (split?.kind !== "enum") throw new Error("expected the pane split enum");
+    expect(split.value).toBe("right");
+    expect(split.choices).toEqual(["(unset)", "vertical", "horizontal", "right", "down"]);
+    split.apply("(unset)");
+  });
+
+  it("marks pane title/command/size clearable so they can be unset in place", () => {
+    const paths = [["layouts", 0], ["layouts", 0, "tabs", 0], ["layouts", 0, "tabs", 0, "panes", 0]];
+    const fields = layoutFields(layoutDoc(), paths);
+    for (const label of ["command", "size"]) {
+      const f = fields.find((x) => x.kind === "text" && x.label === label);
+      if (f?.kind !== "text") throw new Error(`expected a text field for ${label}`);
+      expect(f.clearable).toBe(true);
+    }
+  });
+});
+
+describe("config-fields: belt references a layout", () => {
+  const doc = () =>
+    parseDocument(`work_sources: []
+belt:
+  - name: b
+    source: s
+    steps: [{ type: work }]
+layouts:
+  - id: app-dev
+    tabs: [{ title: work, panes: [{ title: agent, command: claude }] }]
+`);
+
+  it("offers default_layout as an enum over the defined layout ids (+ an (unset) option)", () => {
+    const d = doc();
+    const expanded = new WeakSet<object>();
+    expanded.add(d.getIn(["belt", 0]) as object);
+    const dl = buildDescriptors(d, () => {}, async () => true, expanded, "belt").find((f) => f.kind === "enum" && f.label === "default_layout");
+    if (dl?.kind !== "enum") throw new Error("expected the default_layout enum");
+    expect(dl.choices).toEqual(["(unset)", "app-dev"]);
+    dl.apply("app-dev");
+    expect(d.getIn(["belt", 0, "default_layout"])).toBe("app-dev");
+  });
+});

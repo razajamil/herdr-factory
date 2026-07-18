@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { serve as nodeServe } from "@hono/node-server";
 import * as Effect from "effect/Effect";
-import { listConfiguredRepos, serverInfoPath, serverLogsDir, serverPort } from "../config.ts";
+import { listConfiguredRepos, serverInfoPath, serverLogsDir, serverPort, writeConfigSchema } from "../config.ts";
 import { buildDeps } from "../build-deps.ts";
 import { run } from "../clients/exec.ts";
 import { OAUTH_CALLBACK_PORT } from "../auth/jira-login.ts";
@@ -252,6 +252,16 @@ async function serveImpl(): Promise<void> {
   mkdirSync(serverLogsDir(), { recursive: true });
   writeFileSync(serverInfoPath(), JSON.stringify({ pid: process.pid, port, version: VERSION, startedAt }));
   slog("info", `serving on 127.0.0.1:${port} — repos: ${[...repos.keys()].join(", ") || "(none)"}`);
+
+  // Keep the editor-facing JSON Schema (repos/<name>/config.yml's `$schema` modeline points at it)
+  // in lock-step with THIS running code's config shape. The server re-execs onto new code after every
+  // auto-update, so regenerating here means the installed schema can never drift behind the engine —
+  // no manual `herdr-factory schema` after an upgrade. Best-effort: a write failure never blocks serving.
+  try {
+    writeConfigSchema();
+  } catch (e) {
+    slog("warn", `could not refresh the editor config schema — ${msg(e)} (continuing)`);
+  }
 
   // The OAuth callback listener rides the SAME app on a second (https) listener — best-effort, so a
   // failure here never blocks the main server coming up.

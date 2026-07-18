@@ -1,7 +1,7 @@
 // Turns a repo config.yml (as a live `yaml` Document) into a flat, ordered list of field
 // descriptors that config-editor.ts renders as browsable rows. The config tab shows these across
-// three numbered panels (see `ConfigSection`): the singletons (repo/limits/evidence), work_sources,
-// and belts — each built by passing the matching `section` here. Array-of-object items
+// four numbered panels (see `ConfigSection`): the singletons (repo/limits/evidence), work_sources,
+// layouts, and belts — each built by passing the matching `section` here. Array-of-object items
 // (work_sources, belts, steps) are emitted as collapsible `group` rows — collapsed by default,
 // labeled by their name/id — and their inner fields are only emitted when expanded. Collapse state
 // is tracked by the caller in a WeakSet keyed by the item's yaml node (stable across rebuilds +
@@ -18,9 +18,9 @@ import type { ConfirmFn } from "./types.ts";
 export type Path = (string | number)[];
 
 /** Which slice of a repo config a `buildDescriptors` call emits — one per numbered config panel.
- *  `general` = the singleton blocks (repo, limits, evidence); `work_sources` and `belt` = the two
- *  array sections that were split out so a dense config stays scannable. */
-export type ConfigSection = "general" | "work_sources" | "belt";
+ *  `general` = the singleton blocks (repo, limits, evidence); `work_sources`, `layouts`, and `belt`
+ *  = the three array sections that were split out so a dense config stays scannable. */
+export type ConfigSection = "general" | "work_sources" | "layouts" | "belt";
 
 export type FieldDesc =
   | { kind: "header"; label: string; level: 1 | 2; indent?: number }
@@ -39,6 +39,9 @@ const SOURCE_TYPE_CHOICES = SOURCE_DESCRIPTORS.map((d) => d.type);
 // Belt steps reference a registered step primitive by `type` (mirrors the source-type choices above,
 // registry-driven so a new/plugin primitive appears without editing this file).
 const STEP_TYPE_CHOICES = STEP_DESCRIPTORS.map((d) => d.name);
+// A layout pane's split direction (mirrors PaneSplitSchema in config.ts). vertical/right → a pane to
+// the RIGHT of the previous one; horizontal/down → BELOW it. Ignored on a tab's first pane.
+const SPLIT_CHOICES = ["vertical", "horizontal", "right", "down"];
 const sourceNode = (type: SourceType, name?: unknown) => ({
   type,
   ...(name != null ? { name } : {}),
@@ -90,6 +93,12 @@ export function buildDescriptors(draft: Document, rebuild: () => void, confirm: 
     moveUp: i > 0 ? () => swap(arrayPath, i, i - 1) : undefined,
     moveDown: i < count - 1 ? () => swap(arrayPath, i, i + 1) : undefined,
   });
+  // Append to a possibly-absent array (layouts / a belt's layout_matching are optional, so the YAML
+  // key may not exist yet). addIn needs an existing collection; setIn creates the sequence first.
+  const addToArray = (arrayPath: Path, item: object) => {
+    if (draft.getIn(arrayPath) == null) draft.setIn(arrayPath, draft.createNode([item]));
+    else draft.addIn(arrayPath, draft.createNode(item));
+  };
 
   // Source names are needed by both the work_sources section (dedup on add) and the belt section
   // (the `source` ref choices + which pickup label a belt shows), so compute them regardless.
@@ -183,7 +192,77 @@ export function buildDescriptors(draft: Document, rebuild: () => void, confirm: 
     return d;
   }
 
-  // ── belts (array of objects → collapsible) — panel [4]. The panel border/title labels the
+  // Defined layout ids — needed by BOTH the layouts section (dedup/label) and the belt section
+  // (default_layout / layout_matching reference them), so compute regardless of `section`.
+  const layouts: any[] = Array.isArray(cfg.layouts) ? cfg.layouts : [];
+  const layoutIds = layouts.map((l, i) => String(l?.id ?? `layout${i}`));
+
+  // ── layouts (array of objects → collapsible) — panel [4]. A repo-level library of herdr tab/pane
+  // arrangements the factory BUILDS into a worktree on creation; belts point at one via
+  // default_layout / layout_matching (in the belt section). Nested two levels deep: layout → tabs →
+  // panes. The panel border/title labels the section, so no top-level header row here. ──
+  if (section === "layouts") {
+    layouts.forEach((l, i) => {
+      const tabs: any[] = Array.isArray(l?.tabs) ? l.tabs : [];
+      d.push({ kind: "group", label: `${layoutIds[i]} [${tabs.length} tab${tabs.length === 1 ? "" : "s"}]`, node: node(["layouts", i]), expanded: isOpen(["layouts", i]), indent: 0, ...mover(["layouts"], i, layouts.length) });
+      if (!isOpen(["layouts", i])) return;
+      d.push({ kind: "text", label: "id", path: ["layouts", i, "id"], placeholder: "app-dev", indent: 1 });
+
+      // setup — an OPTIONAL layout-level command run once in the single `setup: true` pane before the
+      // rest of the tabs spawn. Modelled as an add/remove block (flushInputs never deletes keys, so a
+      // bare optional text field would be unclearable).
+      if (l?.setup == null) {
+        d.push({ kind: "action", label: "+ add setup command", indent: 1, run: () => { draft.setIn(["layouts", i, "setup"], draft.createNode({ command: "", blocking: false })); rebuild(); } });
+      } else {
+        d.push({ kind: "text", label: "setup.command", path: ["layouts", i, "setup", "command"], placeholder: "mise run setup", indent: 1 });
+        d.push({ kind: "bool", label: "setup.blocking", value: l?.setup?.blocking === true, indent: 1, apply: (next) => { draft.setIn(["layouts", i, "setup", "blocking"], next); rebuild(); } });
+        d.push({ kind: "action", label: "‹ remove setup ›", indent: 1, run: () => { draft.deleteIn(["layouts", i, "setup"]); rebuild(); } });
+      }
+
+      // tabs[] — each a herdr tab (its `title` is what a step's `tab` matches) holding ≥1 pane.
+      const tabTitles = tabs.map((t, j) => String(t?.title ?? `tab${j}`));
+      tabs.forEach((t, j) => {
+        const panes: any[] = Array.isArray(t?.panes) ? t.panes : [];
+        d.push({ kind: "group", label: `${tabTitles[j]} (${panes.length} pane${panes.length === 1 ? "" : "s"})`, node: node(["layouts", i, "tabs", j]), expanded: isOpen(["layouts", i, "tabs", j]), indent: 1, ...mover(["layouts", i, "tabs"], j, tabs.length) });
+        if (!isOpen(["layouts", i, "tabs", j])) return;
+        d.push({ kind: "text", label: "title", path: ["layouts", i, "tabs", j, "title"], placeholder: "work (a step's `tab` matches this)", clearable: true, indent: 2 });
+
+        // panes[] — each a herdr pane. The `title` is what a step's `pane` matches; an agent pane
+        // (command: claude/opencode/…) is the one the step's prompt gets delivered to.
+        const paneTitles = panes.map((p, k) => String(p?.title ?? `pane${k}`));
+        panes.forEach((p, k) => {
+          const base: Path = ["layouts", i, "tabs", j, "panes", k];
+          d.push({ kind: "group", label: paneTitles[k]!, node: node(base), expanded: isOpen(base), indent: 2, ...mover(["layouts", i, "tabs", j, "panes"], k, panes.length) });
+          if (!isOpen(base)) return;
+          d.push({ kind: "text", label: "title", path: [...base, "title"], placeholder: "agent (a step's `pane` matches this)", clearable: true, indent: 3 });
+          d.push({ kind: "text", label: "command", path: [...base, "command"], placeholder: "claude", clearable: true, indent: 3 });
+          d.push({ kind: "bool", label: "setup", value: p?.setup === true, indent: 3, apply: (next) => { draft.setIn([...base, "setup"], next); rebuild(); } });
+          // split — optional; a leading "(unset)" clears it (a tab's first pane ignores split anyway).
+          const splitCur = p?.split == null ? "(unset)" : String(p.split);
+          d.push({ kind: "enum", label: "split", value: splitCur, choices: ["(unset)", ...SPLIT_CHOICES], indent: 3, apply: (next) => { if (next === "(unset)") draft.deleteIn([...base, "split"]); else draft.setIn([...base, "split"], next); rebuild(); } });
+          d.push({ kind: "text", label: "size", path: [...base, "size"], placeholder: '"40%", a 0<n<1 fraction, or cells', clearable: true, indent: 3 });
+          d.push({ kind: "action", label: "‹ remove pane ›", indent: 3, run: () => { void confirm(`Remove pane "${paneTitles[k]}"?`).then((ok) => { if (ok) { draft.deleteIn(base); rebuild(); } }); } });
+        });
+        d.push({ kind: "action", label: "+ add pane", indent: 2, run: () => { draft.addIn(["layouts", i, "tabs", j, "panes"], draft.createNode({ title: uniqueName("pane", paneTitles), command: "" })); open(["layouts", i, "tabs", j, "panes", panes.length]); rebuild(); } });
+        d.push({ kind: "action", label: "‹ remove tab ›", indent: 2, run: () => { void confirm(`Remove tab "${tabTitles[j]}"?`).then((ok) => { if (ok) { draft.deleteIn(["layouts", i, "tabs", j]); rebuild(); } }); } });
+      });
+      d.push({ kind: "action", label: "+ add tab", indent: 1, run: () => { draft.addIn(["layouts", i, "tabs"], draft.createNode({ title: uniqueName("tab", tabTitles), panes: [{ title: "agent", command: "claude" }] })); open(["layouts", i, "tabs", tabs.length]); rebuild(); } });
+      d.push({ kind: "action", label: "‹ remove layout ›", indent: 1, run: () => { void confirm(`Remove layout "${layoutIds[i]}"?`).then((ok) => { if (ok) { draft.deleteIn(["layouts", i]); rebuild(); } }); } });
+    });
+    d.push({
+      kind: "action",
+      label: "+ add layout",
+      indent: 0,
+      run: () => {
+        addToArray(["layouts"], { id: uniqueName("layout", layoutIds), tabs: [{ title: "work", panes: [{ title: "agent", command: "claude" }] }] });
+        open(["layouts", layouts.length]);
+        rebuild();
+      },
+    });
+    return d;
+  }
+
+  // ── belts (array of objects → collapsible) — panel [5]. The panel border/title labels the
   // section, so no top-level header row here. ──
   const belts: any[] = Array.isArray(cfg.belt) ? cfg.belt : [];
   const beltNames = belts.map((b, i) => String(b?.name ?? `belt${i}`));
@@ -206,6 +285,21 @@ export function buildDescriptors(draft: Document, rebuild: () => void, confirm: 
     if (pickup) d.push({ kind: "text", label: "label", path: ["belt", i, "label"], placeholder: `${pickup.noun} — required (no default)`, indent: 1 });
     d.push({ kind: "text", label: "workspace_name", path: ["belt", i, "workspace_name"], placeholder: "{{work_id}}-{{work_slug}}", clearable: true, indent: 1 });
     d.push({ kind: "text", label: "match", path: ["belt", i, "match"], placeholder: "match.ts (optional)", clearable: true, indent: 1 });
+
+    // Layout selection — which `layouts:` entry (section 4) the factory builds into this belt's
+    // worktrees. default_layout is the fallback; a layout_matching rule picks a different one per
+    // branch (first matching glob wins). Both reference a layout id; "(unset)" clears default_layout.
+    const dlCur = b?.default_layout == null ? "(unset)" : String(b.default_layout);
+    d.push({ kind: "enum", label: "default_layout", value: dlCur, choices: ["(unset)", ...layoutIds], indent: 1, apply: (next) => { if (next === "(unset)") draft.deleteIn(["belt", i, "default_layout"]); else draft.setIn(["belt", i, "default_layout"], next); rebuild(); } });
+    const rules: any[] = Array.isArray(b?.layout_matching) ? b.layout_matching : [];
+    rules.forEach((r, k) => {
+      d.push({ kind: "group", label: `match ${String(r?.worktree_pattern ?? "?")} → ${String(r?.layout ?? "?")}`, node: node(["belt", i, "layout_matching", k]), expanded: isOpen(["belt", i, "layout_matching", k]), indent: 1, ...mover(["belt", i, "layout_matching"], k, rules.length) });
+      if (!isOpen(["belt", i, "layout_matching", k])) return;
+      d.push({ kind: "text", label: "worktree_pattern", path: ["belt", i, "layout_matching", k, "worktree_pattern"], placeholder: "hotfix/*", indent: 2 });
+      d.push({ kind: "enum", label: "layout", value: String(r?.layout ?? (layoutIds[0] ?? "")), choices: layoutIds.length ? layoutIds : [""], indent: 2, apply: (next) => { draft.setIn(["belt", i, "layout_matching", k, "layout"], next); rebuild(); } });
+      d.push({ kind: "action", label: "‹ remove rule ›", indent: 2, run: () => { void confirm("Remove this layout_matching rule?").then((ok) => { if (ok) { draft.deleteIn(["belt", i, "layout_matching", k]); rebuild(); } }); } });
+    });
+    d.push({ kind: "action", label: "+ add layout_matching rule", indent: 1, run: () => { addToArray(["belt", i, "layout_matching"], { worktree_pattern: "", layout: layoutIds[0] ?? "" }); open(["belt", i, "layout_matching", rules.length]); rebuild(); } });
 
     // steps[] — an ordered list of step-primitive references. `type` picks the primitive; a `custom`
     // step's prompt_file is its whole body (required), an engine-prompted step's is an optional augment.

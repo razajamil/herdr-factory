@@ -690,8 +690,10 @@ bounce feedback, human questions and replies, and captured evidence.
 the YAML language server at a JSON Schema generated from the engine's own zod schema (so it can't
 drift): autocomplete, required fields, enums (e.g. a valid step `type`), and unknown-key errors.
 `herdr-factory install` writes it to
-`~/.config/herdr-factory/config.schema.json`; regenerate after an upgrade with
-`herdr-factory schema`. A committed copy at the repo root serves the in-repo example (`npm run
+`~/.config/herdr-factory/config.schema.json`, and the resident `serve` process **rewrites it on every
+startup** — so an auto-update (which restarts the server onto the new code) keeps the installed schema
+in lock-step with the running engine automatically; `herdr-factory schema` regenerates it by hand if
+you ever need to. A committed copy at the repo root serves the in-repo example (`npm run
 schema`; a test guards it against drift). Cross-field rules — belt `source` refs, unique names,
 tab/pane both-or-neither, `{{work_id}}` presence, file existence — are validated at load with
 readable errors.
@@ -776,9 +778,11 @@ keys jump to a numbered section, arrows move within it, `Esc` pops back out, `q`
   configuration, work counts, and a live source/pickup health check for every belt. Press `l`
   on a repo to log in to one of its Jira OAuth sources; it opens your browser and the resident server
   auto-captures the callback, falling back to a paste prompt when the callback listener is unavailable.
-- **Config** — a repo list `[1]` and a full `config.yml` editor split across three bordered panels:
-  `[2]` config (repo · limits · secrets · evidence), `[3]` work sources, `[4]` belts. The three
-  panels are an accordion — collapsed by default, and jumping to one (number keys `2`/`3`/`4`, a
+- **Config** — a repo list `[1]` and a full `config.yml` editor split across four bordered panels:
+  `[2]` config (repo · limits · secrets · evidence), `[3]` work sources, `[4]` layouts (the
+  repo-level [layout](#layouts) library — nest into a layout to edit its tabs and panes; belts
+  point at one via `default_layout`/`layout_matching`), `[5]` belts. The four
+  panels are an accordion — collapsed by default, and jumping to one (number keys `2`/`3`/`4`/`5`, a
   click, or `↵` from the repo list) expands it and collapses the others, so only one is open at a
   time. It edits the YAML surgically (comments and the schema modeline preserved), validates against
   the engine schema, `^S` saves, `[`/`]` reorder list entries. Credentials appear as masked,
