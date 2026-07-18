@@ -3,15 +3,18 @@
 // section within the active tab; arrows navigate inside the focused section; Esc pops to the top
 // level (the tab bar). Runs on Node >= 26 with --experimental-ffi (see bin/herdr-factory-tui).
 // Imperative opentui core API — no JSX.
-import { BoxRenderable, InputRenderable, ScrollBoxRenderable, StyledText, TabSelectRenderable, TextRenderable, bold, createCliRenderer, fg, type CliRenderer, type Renderable, type TextChunk } from "@opentui/core";
+import { BoxRenderable, InputRenderable, ScrollBoxRenderable, StyledText, bold, createCliRenderer, fg, type CliRenderer, type Renderable, type TextChunk } from "@opentui/core";
 import type { KeyEvent } from "@opentui/core";
 import { BORDER, theme } from "./theme.ts";
+import { SELECTION, hoverable, input as makeInput, text } from "./render.ts";
 import type { TabView } from "./types.ts";
 import { createDashboard } from "./dashboard.ts";
 
+const TAB_WIDTH = 13;
+
 function createLazyView(renderer: CliRenderer, sectionCount: number, load: () => Promise<TabView>): TabView {
   const root = new BoxRenderable(renderer, { width: "100%", height: "100%", backgroundColor: theme.bg });
-  const loading = new TextRenderable(renderer, { content: " loading...", fg: theme.text.secondary, height: 1, wrapMode: "none" });
+  const loading = text(renderer, { content: " loading...", fg: theme.text.secondary, height: 1, wrapMode: "none" });
   root.add(loading);
   let view: TabView | null = null;
   let loadingView: Promise<void> | null = null;
@@ -68,35 +71,53 @@ export function createApp(renderer: CliRenderer): { currentTab: () => number; at
   const root = renderer.root;
 
   // ── chrome ────────────────────────────────────────────────────────────────────────────────
-  const header = new TextRenderable(renderer, {
+  const header = text(renderer, {
     content: " herdr-factory · factory control",
     fg: theme.accent,
     bg: theme.barBg,
     height: 1,
     wrapMode: "none",
   });
-  // The tab bar doubles as the "top level" focus target (reached with Esc). It's driven by the
-  // shell (Tab/←→), so its selected tab uses selectedBackgroundColor (always visible) and it
-  // highlights via focusedBackgroundColor when it is the top-level focus.
-  const tabBar = new TabSelectRenderable(renderer, {
-    height: 1,
-    options: [
-      { name: "Dashboard", description: "" },
-      { name: "Config", description: "" },
-      { name: "Doctor", description: "" },
-    ],
-    showDescription: false,
-    showUnderline: false,
-    tabWidth: 13,
-    backgroundColor: theme.barBg,
-    textColor: theme.focusText.unfocused,
-    selectedBackgroundColor: theme.accent,
-    selectedTextColor: theme.bg,
-    focusedBackgroundColor: theme.barFocusBg,
-    focusedTextColor: theme.text.primary,
+  // The tab bar doubles as the "top level" focus target (reached with Esc). It's a plain focusable
+  // row of tab cells (rather than a TabSelect) so each tab can carry its own click + hover handlers:
+  // hovering a tab tints it, clicking switches to it. Selection- and focus-state colors are painted
+  // by paintTabs(); the shell keys off `focused === tabBar` for the top level, which still holds since
+  // the box is focusable.
+  const TAB_NAMES = ["Dashboard", "Config", "Doctor"];
+  const tabLabel = (name: string) => {
+    const pad = Math.max(0, TAB_WIDTH - name.length);
+    const left = Math.floor(pad / 2);
+    return " ".repeat(left) + name + " ".repeat(pad - left);
+  };
+  const tabBar = new BoxRenderable(renderer, { height: 1, flexDirection: "row", flexShrink: 0, backgroundColor: theme.barBg, focusable: true });
+  let hoveredTab = -1;
+  const tabCells = TAB_NAMES.map((name, i) => {
+    const cell = text(renderer, { content: tabLabel(name), width: TAB_WIDTH, height: 1, wrapMode: "none", bg: theme.barBg, fg: theme.focusText.unfocused });
+    cell.onMouseDown = (e) => { showTab(i); e.stopPropagation(); };
+    cell.onMouseOver = () => { hoveredTab = i; paintTabs(); };
+    cell.onMouseOut = () => { if (hoveredTab === i) { hoveredTab = -1; paintTabs(); } };
+    tabBar.add(cell);
+    return cell;
   });
+  /** Color each tab from its state: the current tab is accent (or barFocusBg when the bar itself holds
+   *  the top-level focus); a hovered non-current tab gets the subtle hover tint; the rest are muted. */
+  function paintTabs(): void {
+    const focused = renderer.currentFocusedRenderable === tabBar;
+    tabCells.forEach((cell, i) => {
+      if (i === current) {
+        cell.bg = focused ? theme.barFocusBg : theme.accent;
+        cell.fg = focused ? theme.text.primary : theme.bg;
+      } else if (i === hoveredTab) {
+        cell.bg = theme.hoverBg;
+        cell.fg = theme.text.primary;
+      } else {
+        cell.bg = theme.barBg;
+        cell.fg = theme.focusText.unfocused;
+      }
+    });
+  }
   const content = new BoxRenderable(renderer, { flexGrow: 1, width: "100%", backgroundColor: theme.bg });
-  const footer = new TextRenderable(renderer, { content: "", fg: theme.text.tertiary, bg: theme.barBg, height: 1, wrapMode: "none" });
+  const footer = text(renderer, { content: "", fg: theme.text.tertiary, bg: theme.barBg, height: 1, wrapMode: "none" });
 
   root.add(header);
   root.add(tabBar);
@@ -129,10 +150,10 @@ export function createApp(renderer: CliRenderer): { currentTab: () => number; at
     paddingTop: 1,
     paddingBottom: 1,
   });
-  const modalTitle = new TextRenderable(renderer, { content: "", fg: theme.text.primary, height: 1, wrapMode: "none" });
+  const modalTitle = text(renderer, { content: "", fg: theme.text.primary, height: 1, wrapMode: "none" });
   const modalBody = new BoxRenderable(renderer, { flexDirection: "column", backgroundColor: theme.bg });
   card.add(modalTitle);
-  card.add(new TextRenderable(renderer, { content: "", height: 1 }));
+  card.add(text(renderer, { content: "", height: 1 }));
   card.add(modalBody);
   overlay.add(card);
 
@@ -149,9 +170,9 @@ export function createApp(renderer: CliRenderer): { currentTab: () => number; at
     paddingRight: 1,
     visible: false,
   });
-  const infoTitle = new TextRenderable(renderer, { content: "", fg: theme.accent, height: 1, wrapMode: "none" });
+  const infoTitle = text(renderer, { content: "", fg: theme.accent, height: 1, wrapMode: "none" });
   const infoScroll = new ScrollBoxRenderable(renderer, { flexGrow: 1, width: "100%", scrollY: true, backgroundColor: theme.bg });
-  const infoHint = new TextRenderable(renderer, { content: "↑↓ scroll · Esc close", fg: theme.text.tertiary, height: 1, wrapMode: "none" });
+  const infoHint = text(renderer, { content: "↑↓ / wheel scroll · Esc close", fg: theme.text.tertiary, height: 1, wrapMode: "none" });
   infoCard.add(infoTitle);
   infoCard.add(infoScroll);
   infoCard.add(infoHint);
@@ -175,19 +196,29 @@ export function createApp(renderer: CliRenderer): { currentTab: () => number; at
     }
     if (!modal || modal.kind === "info") return; // info renders into infoScroll, not modalBody
     if (modal.kind === "confirm") {
-      // "yes" is red to underscore that it's the destructive choice.
+      // "yes" is red to underscore that it's the destructive choice. Both are clickable.
       const row = new BoxRenderable(renderer, { flexDirection: "row", height: 1, backgroundColor: theme.bg });
-      row.add(new TextRenderable(renderer, { content: "[y] yes", fg: theme.status.bad, height: 1, wrapMode: "none" }));
-      row.add(new TextRenderable(renderer, { content: "      [n / Esc] no", fg: theme.text.tertiary, height: 1, wrapMode: "none" }));
+      const yes = text(renderer, { content: "[y] yes", fg: theme.status.bad, height: 1, wrapMode: "none" });
+      yes.onMouseDown = (e) => { const m = modal; if (m?.kind === "confirm") { closeModal(); m.resolve(true); } e.stopPropagation(); };
+      hoverable(yes);
+      const no = text(renderer, { content: "      [n / Esc] no", fg: theme.text.tertiary, height: 1, wrapMode: "none" });
+      no.onMouseDown = (e) => { const m = modal; if (m?.kind === "confirm") { closeModal(); m.resolve(false); } e.stopPropagation(); };
+      hoverable(no);
+      row.add(yes);
+      row.add(no);
       modalBody.add(row);
       return;
     }
     modal.options.forEach((o, i) => {
       const on = i === (modal as { index: number }).index;
-      modalBody.add(new TextRenderable(renderer, { content: (on ? "▶ " : "  ") + o.label, fg: on ? theme.accent : theme.text.primary, height: 1, wrapMode: "none" }));
+      const opt = text(renderer, { content: (on ? "▶ " : "  ") + o.label, fg: on ? theme.accent : theme.text.primary, height: 1, wrapMode: "none" });
+      // Click an option to pick it outright (no separate confirm step — clicking is the confirm).
+      opt.onMouseDown = (e) => { const m = modal; if (m?.kind === "choose") { closeModal(); m.resolve(o.value); } e.stopPropagation(); };
+      hoverable(opt);
+      modalBody.add(opt);
     });
-    modalBody.add(new TextRenderable(renderer, { content: "", height: 1 }));
-    modalBody.add(new TextRenderable(renderer, { content: "↑↓ choose · ↵ select · Esc cancel", fg: theme.text.tertiary, height: 1, wrapMode: "none" }));
+    modalBody.add(text(renderer, { content: "", height: 1 }));
+    modalBody.add(text(renderer, { content: "↑↓ choose · ↵ / click select · Esc cancel", fg: theme.text.tertiary, height: 1, wrapMode: "none" }));
   }
 
   function confirm(message: string): Promise<boolean> {
@@ -217,7 +248,9 @@ export function createApp(renderer: CliRenderer): { currentTab: () => number; at
       c.destroy();
     }
     const rendered = lines.length ? lines : ["(no events)"];
-    for (const l of rendered) infoScroll.add(new TextRenderable(renderer, { content: l, fg: theme.text.primary, width: "100%", height: 1, wrapMode: "none" }));
+    // Info content is read-only reference (a timeline, diagnostics) — keep it selectable so it can be
+    // copied, but with readable selection colors (opentui's default highlight is near-black).
+    for (const l of rendered) infoScroll.add(text(renderer, { content: l, fg: theme.text.primary, width: "100%", height: 1, wrapMode: "none", selectable: true, ...SELECTION }));
     infoScroll.scrollTop = 0;
   }
   function showInfo(title: string, lines: string[]) {
@@ -242,7 +275,7 @@ export function createApp(renderer: CliRenderer): { currentTab: () => number; at
         c.destroy();
       }
       modalTitle.content = title;
-      const input = new InputRenderable(renderer, {
+      const input = makeInput(renderer, {
         value: "",
         placeholder,
         width: 72,
@@ -253,7 +286,7 @@ export function createApp(renderer: CliRenderer): { currentTab: () => number; at
         placeholderColor: theme.input.placeholder,
       });
       modalBody.add(input);
-      modalBody.add(new TextRenderable(renderer, { content: "↵ submit · Esc cancel", fg: theme.text.tertiary, height: 1, wrapMode: "none" }));
+      modalBody.add(text(renderer, { content: "↵ submit · Esc cancel", fg: theme.text.tertiary, height: 1, wrapMode: "none" }));
       const prev = renderer.currentFocusedRenderable ?? null;
       modal = { kind: "prompt", input, prev, resolve };
       card.visible = true;
@@ -268,6 +301,17 @@ export function createApp(renderer: CliRenderer): { currentTab: () => number; at
     overlay.visible = false;
     modal = null;
   }
+  /** Dismiss the open modal as if Esc were pressed (used by a backdrop click). */
+  function cancelModal(): void {
+    const m = modal;
+    if (!m) return;
+    if (m.kind === "confirm") { closeModal(); m.resolve(false); }
+    else if (m.kind === "choose") { closeModal(); m.resolve(null); }
+    else if (m.kind === "prompt") { closeModal(); m.resolve(null); }
+    else closeModal();
+  }
+  // Click the dimmed backdrop (not the card) to dismiss — a familiar modal gesture.
+  overlay.onMouseDown = (e) => { if (e.target === overlay) cancelModal(); };
 
   // ── views ─────────────────────────────────────────────────────────────────────────────────
   const views: TabView[] = [
@@ -324,7 +368,7 @@ export function createApp(renderer: CliRenderer): { currentTab: () => number; at
       content.remove(views[current]!.root.id);
     }
     current = idx;
-    tabBar.setSelectedIndex(idx);
+    paintTabs();
     content.add(view.root);
     view.activate();
     footer.content = footerHints(idx);
@@ -351,6 +395,9 @@ export function createApp(renderer: CliRenderer): { currentTab: () => number; at
   }
   // Covers Ctrl-C (exitOnCtrlC destroys the renderer) so our poll timers don't keep Node alive.
   renderer.on("destroy", shutdown);
+  // Repaint the tab bar whenever focus moves, so the current tab reflects whether the bar itself holds
+  // the top-level focus (barFocusBg) or a view does (accent).
+  renderer.on("focused_renderable", () => paintTabs());
 
   renderer.keyInput.on("keypress", (key: KeyEvent) => {
     // A modal is open: capture only its keys; everything else is swallowed.
@@ -452,8 +499,14 @@ export async function main(mark: (name: string) => void = () => {}): Promise<voi
     exitOnCtrlC: true,
     screenMode: "alternate-screen",
     useMouse: true,
+    enableMouseMovement: true, // needed for hover (onMouseOver/onMouseOut) — see hoverable()
     backgroundColor: theme.bg, // light canvas (lighter palette)
   });
+  // Mouse pointer shape: a hand pointer everywhere (the whole UI is click-to-navigate), swapping to
+  // the text I-beam only while a text input holds focus. opentui never changes the pointer on its
+  // own, so we drive it off the focused-editor event (InputRenderable is an editor).
+  renderer.setMousePointer("pointer");
+  renderer.on("focused_editor", (current) => renderer.setMousePointer(current ? "text" : "pointer"));
   mark("renderer_ready");
   createApp(renderer);
   mark("app_ready");

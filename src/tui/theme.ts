@@ -32,6 +32,9 @@ export const theme = {
   barBg: palette.line,
   /** Tab bar fill when it holds the top-level focus. */
   barFocusBg: palette.tint,
+  /** Row / control fill on mouse hover — subtle, sits *under* the active-row highlight (which is a
+   *  gutter marker + accent text, not a background), so the two layer instead of fighting. */
+  hoverBg: palette.line,
 
   /** Panel / section borders — swap active⇄inactive on focus. */
   border: {

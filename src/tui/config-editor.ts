@@ -15,6 +15,7 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { BoxRenderable, InputRenderable, ScrollBoxRenderable, SelectRenderable, StyledText, TextRenderable, bold, fg, type CliRenderer } from "@opentui/core";
 import type { KeyEvent, Renderable } from "@opentui/core";
+import { hoverable, input as makeInput, text } from "./render.ts";
 import { parseDocument, type Document } from "yaml";
 import { RepoConfigSchema, listConfiguredRepos, loadEnvMap, repoConfigDir, saveEnvValues } from "../config.ts";
 import { SOURCE_DESCRIPTORS } from "../sources/registry.ts";
@@ -107,7 +108,7 @@ function createFieldPanel(
     backgroundColor: theme.bg,
     visible: false, // collapsed by default
   });
-  const summary = new TextRenderable(renderer, { content: "", height: 1, wrapMode: "none", fg: theme.text.tertiary });
+  const summary = text(renderer, { content: "", height: 1, wrapMode: "none", fg: theme.text.tertiary });
   outer.add(scroll);
   outer.add(summary);
 
@@ -124,7 +125,7 @@ function createFieldPanel(
   }
 
   function textLine(content: string, fg: string): TextRenderable {
-    return new TextRenderable(renderer, { content, fg, width: "100%", height: 1, wrapMode: "none" });
+    return text(renderer, { content, fg, width: "100%", height: 1, wrapMode: "none" });
   }
 
   // Render one descriptor into the scroll; returns a RowRef for focusable ones, null for headers.
@@ -134,17 +135,17 @@ function createFieldPanel(
       const content = d.level === 1
         ? new StyledText([fg(theme.accent)(bold(IND(d.indent) + sentenceCase(d.label)))])
         : IND(d.indent) + d.label;
-      scroll.add(new TextRenderable(renderer, { content, fg: theme.text.secondary, width: "100%", height: 1, wrapMode: "none" }));
+      scroll.add(text(renderer, { content, fg: theme.text.secondary, width: "100%", height: 1, wrapMode: "none" }));
       return null;
     }
     if (d.kind === "group") {
       const body = () => `${IND(d.indent)}${d.expanded ? "▾" : "▸"} ${d.label}`;
-      const t = new TextRenderable(renderer, { content: gut(false) + body(), fg: theme.text.primary, width: "100%", height: 1, wrapMode: "none" });
+      const t = text(renderer, { content: gut(false) + body(), fg: theme.text.primary, width: "100%", height: 1, wrapMode: "none" });
       scroll.add(t);
       return { desc: d, container: t, setHighlighted: (on) => { t.content = gut(on) + body(); t.fg = on ? theme.focusText.focused : theme.text.primary; } };
     }
     if (d.kind === "action") {
-      const t = new TextRenderable(renderer, { content: gut(false) + IND(d.indent) + d.label, fg: theme.accent, width: "100%", height: 1, wrapMode: "none" });
+      const t = text(renderer, { content: gut(false) + IND(d.indent) + d.label, fg: theme.accent, width: "100%", height: 1, wrapMode: "none" });
       scroll.add(t);
       return { desc: d, container: t, setHighlighted: (on) => { t.content = gut(on) + IND(d.indent) + d.label; t.fg = on ? theme.focusText.focused : theme.accent; } };
     }
@@ -152,7 +153,7 @@ function createFieldPanel(
     const container = new BoxRenderable(renderer, { flexDirection: "row", width: "100%", height: 1, backgroundColor: theme.bg });
     const labelText = IND(d.indent) + d.label.padEnd(LABEL_WIDTH);
     const labelW = 2 + (d.indent ?? 0) * 2 + LABEL_WIDTH + 1;
-    const label = new TextRenderable(renderer, { content: gut(false) + labelText, fg: theme.text.secondary, width: labelW, height: 1, wrapMode: "none" });
+    const label = text(renderer, { content: gut(false) + labelText, fg: theme.text.secondary, width: labelW, height: 1, wrapMode: "none" });
     container.add(label);
 
     if (d.kind === "text") {
@@ -166,7 +167,7 @@ function createFieldPanel(
         const v = currentDraft?.getIn(d.path!);
         initial = v == null ? "" : String(v);
       }
-      const input = new InputRenderable(renderer, {
+      const input = makeInput(renderer, {
         value: initial,
         placeholder,
         flexGrow: 1,
@@ -194,7 +195,7 @@ function createFieldPanel(
 
     // enum | ref | bool → a value chip
     const display = d.kind === "bool" ? (d.value ? "[x] on" : "[ ] off") : `‹ ${d.value} ›`;
-    const val = new TextRenderable(renderer, { content: display, fg: theme.text.primary, flexGrow: 1, height: 1, wrapMode: "none" });
+    const val = text(renderer, { content: display, fg: theme.text.primary, flexGrow: 1, height: 1, wrapMode: "none" });
     container.add(val);
     scroll.add(container);
     return {
@@ -224,12 +225,22 @@ function createFieldPanel(
       if (!rr) continue;
       focusRows.push(rr);
       const idx = focusRows.length - 1;
-      // Mouse: click a row to focus this panel + highlight it; click a group to toggle expand/collapse.
-      rr.container.onMouseDown = () => {
+      // Mouse: a click focuses this panel + highlights the row. Cheap/reversible rows also act on that
+      // first click (a group toggles expand/collapse; a text field enters edit). Mutating value rows
+      // (enum/ref/bool/action) act only on a second click of the already-focused row, so a navigational
+      // click can't accidentally cycle a value or run an action. `stopPropagation` keeps the panel's own
+      // onMouseDown from re-focusing the scroll and stealing focus from an input we just entered.
+      rr.container.onMouseDown = (e) => {
+        const wasActive = scroll.focused;
+        const wasHighlighted = idx === browseIndex;
         ctx.focusSection(section);
         setHighlight(idx);
         if (d.kind === "group") toggleGroup(d.node);
+        else if (d.kind === "text") enterEdit(idx);
+        else if (wasActive && wasHighlighted) activate(rr);
+        e.stopPropagation();
       };
+      hoverable(rr.container); // subtle tint on hover; layers under the active-row highlight
     }
     // Re-apply the highlight visually (no scroll/focus change — focusInto does that for the active panel).
     if (focusRows.length > 0) {
@@ -476,6 +487,7 @@ export function createConfigEditor(renderer: CliRenderer, confirm: ConfirmFn): T
     width: "100%",
     options: repos.length ? repos.map((r) => ({ name: r, description: "" })) : [{ name: "(none configured)", description: "" }],
     showDescription: false,
+    itemSpacing: 0, // one screen row per option, so a click's row = (y − list top)
     backgroundColor: theme.bg,
     focusedBackgroundColor: theme.bg,
     textColor: theme.text.secondary,
@@ -487,7 +499,7 @@ export function createConfigEditor(renderer: CliRenderer, confirm: ConfirmFn): T
 
   // ── sections 2/3/4/5: the accordion + status line ─────────────────────────────────────────────
   const rightCol = new BoxRenderable(renderer, { flexDirection: "column", flexGrow: 1, height: "100%", backgroundColor: theme.bg });
-  const status = new TextRenderable(renderer, { content: "", height: 1, flexShrink: 0, wrapMode: "none", fg: theme.text.tertiary, paddingLeft: 1 });
+  const status = text(renderer, { content: "", height: 1, flexShrink: 0, wrapMode: "none", fg: theme.text.tertiary, paddingLeft: 1 });
 
   root.add(repoPanel);
   root.add(rightCol);
@@ -703,13 +715,29 @@ export function createConfigEditor(renderer: CliRenderer, confirm: ConfirmFn): T
     });
   }
 
-  repoSelect.on("itemSelected", () => {
+  function openRepo(): void {
     const opt = repoSelect.getSelectedOption();
     if (opt && opt.name !== "(none configured)") {
       loadRepo(opt.name);
       if (draft) focusSection(2); // jump straight into the fields after opening a valid repo
     }
-  });
+  }
+  repoSelect.on("itemSelected", openRepo);
+  // Click a repo to select + open it (Select has no native mouse handling): map the click row to an
+  // option index off the list's top. `itemSpacing: 0` keeps that one row per option.
+  const repoRowAt = (y: number) => Math.max(0, Math.min(repos.length - 1, Math.floor(y - repoSelect.y)));
+  repoSelect.onMouseDown = (e) => {
+    focusSection(1);
+    if (repos.length === 0) return;
+    repoSelect.setSelectedIndex(repoRowAt(e.y));
+    openRepo();
+  };
+  // Hover: a Select is one composite widget (no per-item renderables to tint), so the mouse-following
+  // equivalent is to move its own selection highlight to the row under the cursor. Doesn't load a repo
+  // (that's still a click) and doesn't steal focus — just tracks the pointer.
+  repoSelect.onMouseMove = (e) => {
+    if (repos.length > 0) repoSelect.setSelectedIndex(repoRowAt(e.y));
+  };
 
   return {
     root,

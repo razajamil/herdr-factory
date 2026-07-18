@@ -4,15 +4,16 @@
 // runs the SHALLOW checks (local, side-effect-free); `d` runs the deep ones (gh auth, herdr daemon —
 // network) on demand. A generation counter drops the render if you leave the tab mid-run, so a slow
 // check never paints onto another tab.
-import { BoxRenderable, ScrollBoxRenderable, TextRenderable, type CliRenderer } from "@opentui/core";
+import { BoxRenderable, ScrollBoxRenderable, type CliRenderer } from "@opentui/core";
 import type { KeyEvent } from "@opentui/core";
+import { text } from "./render.ts";
 import { baseGroups } from "../doctor.ts";
 import { BORDER, theme } from "./theme.ts";
 import type { TabView } from "./types.ts";
 
 export function createDoctor(renderer: CliRenderer): TabView {
   const root = new BoxRenderable(renderer, { flexDirection: "column", width: "100%", height: "100%", backgroundColor: theme.bg, paddingLeft: 1, paddingRight: 1 });
-  const banner = new TextRenderable(renderer, { content: "", fg: theme.text.secondary, height: 1, wrapMode: "none" });
+  const banner = text(renderer, { content: "", fg: theme.text.secondary, height: 1, wrapMode: "none" });
   const list = new ScrollBoxRenderable(renderer, {
     flexGrow: 1,
     width: "100%",
@@ -40,13 +41,13 @@ export function createDoctor(renderer: CliRenderer): TabView {
     }
   }
   function addText(content: string, fg: string): void {
-    list.add(new TextRenderable(renderer, { content, fg, width: "100%", height: 1, wrapMode: "none" }));
+    list.add(text(renderer, { content, fg, width: "100%", height: 1, wrapMode: "none" }));
   }
   /** A check row: the ✓/✗ mark colored by status, then the name + detail. */
-  function addCheck(mark: string, markFg: string, text: string, textFg: string): void {
+  function addCheck(mark: string, markFg: string, label: string, textFg: string): void {
     const row = new BoxRenderable(renderer, { flexDirection: "row", height: 1, width: "100%", backgroundColor: theme.bg });
-    row.add(new TextRenderable(renderer, { content: `${mark} `, fg: markFg, height: 1, wrapMode: "none" }));
-    row.add(new TextRenderable(renderer, { content: text, fg: textFg, height: 1, wrapMode: "none", flexGrow: 1 }));
+    row.add(text(renderer, { content: `${mark} `, fg: markFg, height: 1, wrapMode: "none" }));
+    row.add(text(renderer, { content: label, fg: textFg, height: 1, wrapMode: "none", flexGrow: 1 }));
     list.add(row);
   }
 

@@ -10,6 +10,7 @@
 // adding/removing rows at the tail.
 import { BoxRenderable, ScrollBoxRenderable, TextRenderable, type CliRenderer } from "@opentui/core";
 import type { KeyEvent } from "@opentui/core";
+import { hoverable, text } from "./render.ts";
 import { listConfiguredRepos } from "../config-paths.ts";
 import type { JiraSourceCfg } from "../clients/jira-source.ts";
 import { fetchEligible, fetchHealth, fetchStatus, fetchTimeline, postClaim, postTeardown, postTick, serverPort, type ActiveRun, type EligibleItem, type RepoStatus } from "./api.ts";
@@ -84,7 +85,7 @@ export function createDashboard(renderer: CliRenderer, actions: { confirm: Confi
   const { confirm, choose, showInfo, prompt } = actions;
 
   const root = new BoxRenderable(renderer, { flexDirection: "column", width: "100%", height: "100%", backgroundColor: theme.bg, paddingLeft: 1, paddingRight: 1 });
-  const banner = new TextRenderable(renderer, { content: "loading…", fg: theme.text.secondary, height: 1, wrapMode: "none" });
+  const banner = text(renderer, { content: "loading…", fg: theme.text.secondary, height: 1, wrapMode: "none" });
   const list = new ScrollBoxRenderable(renderer, {
     flexGrow: 1,
     width: "100%",
@@ -99,7 +100,7 @@ export function createDashboard(renderer: CliRenderer, actions: { confirm: Confi
     paddingLeft: 1,
     paddingRight: 1,
   });
-  const actionLine = new TextRenderable(renderer, { content: "", height: 1, wrapMode: "none", fg: theme.text.tertiary, paddingLeft: 1 });
+  const actionLine = text(renderer, { content: "", height: 1, wrapMode: "none", fg: theme.text.tertiary, paddingLeft: 1 });
   root.add(banner);
   root.add(list);
   root.add(actionLine);
@@ -146,9 +147,24 @@ export function createDashboard(renderer: CliRenderer, actions: { confirm: Confi
     if (specs.length > lines.length) {
       for (let i = lines.length; i < specs.length; i++) {
         const s = specs[i]!;
-        const text = new TextRenderable(renderer, { content: "", fg: s.fg, width: "100%", height: 1, wrapMode: "none" });
-        list.add(text);
-        lines.push({ text, target: s.target, base: s.content, baseFg: s.fg });
+        const t = text(renderer, { content: "", fg: s.fg, width: "100%", height: 1, wrapMode: "none" });
+        list.add(t);
+        const node: LineNode = { text: t, target: s.target, base: s.content, baseFg: s.fg };
+        // Click a row to highlight it; click the highlighted run row again to open its timeline. Nodes
+        // are reused across reconciles (target reassigned), so resolve the row index at click time.
+        t.onMouseDown = (e) => {
+          const idx = rows.indexOf(node);
+          if (idx < 0) return; // a non-focusable line (header/divider) — nothing to select
+          const wasCurrent = list.focused && rows[hi] === node;
+          list.focus();
+          setHighlight(idx);
+          if (wasCurrent && node.target?.kind === "run") void openTimeline(node.target);
+          e.stopPropagation();
+        };
+        // Hover tint, but only on focusable rows (headers/dividers reuse the same nodes) — gate at
+        // event time since a node's target is reassigned across reconciles.
+        hoverable(t, theme.bg, () => rows.indexOf(node) >= 0);
+        lines.push(node);
       }
     } else if (specs.length < lines.length) {
       for (let i = lines.length - 1; i >= specs.length; i--) {

@@ -771,6 +771,14 @@ Plain `herdr-factory` (no arguments) opens a full-screen terminal UI built on
 [opentui](https://github.com/anomalyco/opentui). `Tab`/`Shift+Tab` switch the three tabs, number
 keys jump to a numbered section, arrows move within it, `Esc` pops back out, `q` quits.
 
+The UI is also fully mouse-navigable: click a tab to switch, click a section or row to jump to it,
+and use the scroll wheel in any list. In the config editor, clicking a group toggles it and clicking
+a text field starts editing; value controls (toggles, enums, add/remove actions) act on a second
+click of the already-focused row, so a stray navigational click can't change a value. Modal choices
+are clickable, and clicking the dimmed backdrop dismisses a dialog. Rows, tabs, and choices tint subtly on
+hover, and the mouse shows a pointer everywhere except inside a text field, where it becomes a text
+cursor.
+
 - **Dashboard** — repos contain their belts, and each belt contains its active and eligible work
   items. `↑↓` navigates, `↵` opens a run's event timeline, `t` ticks, `c` claims an eligible item,
   `x` tears down, and `r` refreshes (mutating actions require confirmation). Empty belts stay hidden.
