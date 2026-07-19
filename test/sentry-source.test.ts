@@ -87,7 +87,12 @@ function fakeSentry(opts?: { issue?: Record<string, unknown>; event?: Record<str
     const body = init?.body ? (JSON.parse(String(init.body)) as Record<string, unknown>) : undefined;
     calls.push({ url: u, method, body });
     const path = new URL(u).pathname;
-    if (/\/issues\/$/.test(path)) return json([issue]);
+    // The org issues LIST endpoint omits firstRelease/lastRelease (only the DETAIL endpoint carries
+    // them) — mirror that so the source's release-probe fallback is exercised faithfully.
+    if (/\/issues\/$/.test(path)) {
+      const { firstRelease: _f, lastRelease: _l, ...listIssue } = issue as Record<string, unknown>;
+      return json([listIssue]);
+    }
     if (/\/issues\/[^/]+\/events\/latest\/$/.test(path)) return event ? json(event) : json({}, 404);
     if (/\/issues\/[^/]+\/comments\/$/.test(path)) {
       if (method === "POST") {
@@ -281,6 +286,61 @@ describe("SentrySource", () => {
     // The ledger transition must still succeed (the load-bearing part).
     expect((await src.transition("4823", "merged", undefined, { prNumber: 1, prUrl: "u" })).kind).toBe("applied");
     expect(store.getWorkItem("r", "sentry", "4823")?.status).toBe("merged");
+  });
+
+  it("materialize records the release the issue was last seen on (into the internal ledger)", async () => {
+    fakeSentry({ issue: { ...DEFAULT_ISSUE, lastRelease: { version: "v1.2.3" } } });
+    const { src, store } = makeSource();
+    store.setWorkItemStatus("r", "sentry", "4823", "in_development"); // the claim already created the row
+    await src.materialize("4823", memDir(), () => {});
+    expect(store.getWorkItem("r", "sentry", "4823")?.lastRelease).toBe("v1.2.3");
+    expect(store.getWorkItem("r", "sentry", "4823")?.status).toBe("in_development"); // status untouched
+  });
+
+  it("a merged issue that recurs on a DIFFERENT release is reopened (ledger reset to todo, not deleted)", async () => {
+    // Sentry flags a regression; the list omits the release, so the source spends one detail fetch.
+    const { calls } = fakeSentry({ issue: { ...DEFAULT_ISSUE, substatus: "regressed", lastRelease: { version: "v2.0.0" } } });
+    const { src, store } = makeSource();
+    const before = store.getWorkItem("r", "sentry", "4823");
+    store.setWorkItemStatus("r", "sentry", "4823", "merged", { lastRelease: "v1.2.3" });
+    const rowId = store.getWorkItem("r", "sentry", "4823")!.id;
+
+    const items = await src.listEligible();
+    expect(items.map((i) => i.key)).toEqual(["4823"]); // re-admitted as eligible
+    const wi = store.getWorkItem("r", "sentry", "4823")!;
+    expect(wi.status).toBe("todo"); // reset, not suppressed
+    expect(wi.id).toBe(rowId); // same row (updated, not deleted) — the resilient choice
+    expect(wi.lastRelease).toBe("v2.0.0"); // baseline advanced to the new release
+    expect(before).toBeUndefined();
+    // Confirms the bounded detail probe fired (list omits the release).
+    expect(calls.some((c) => c.method === "GET" && /\/issues\/4823\/$/.test(new URL(c.url).pathname))).toBe(true);
+  });
+
+  it("a merged issue still on the SAME release stays suppressed (no reopen, no spurious eligibility)", async () => {
+    fakeSentry({ issue: { ...DEFAULT_ISSUE, substatus: "regressed", lastRelease: { version: "v1.2.3" } } });
+    const { src, store } = makeSource();
+    store.setWorkItemStatus("r", "sentry", "4823", "merged", { lastRelease: "v1.2.3" });
+    expect(await src.listEligible()).toHaveLength(0);
+    expect(store.getWorkItem("r", "sentry", "4823")?.status).toBe("merged");
+  });
+
+  it("a regressed merged issue with no recorded release baseline is reopened (trusting Sentry's flag)", async () => {
+    fakeSentry({ issue: { ...DEFAULT_ISSUE, substatus: "regressed" } }); // no lastRelease anywhere
+    const { src, store } = makeSource();
+    store.setWorkItemStatus("r", "sentry", "4823", "merged"); // no release recorded
+    const items = await src.listEligible();
+    expect(items.map((i) => i.key)).toEqual(["4823"]);
+    expect(store.getWorkItem("r", "sentry", "4823")?.status).toBe("todo");
+  });
+
+  it("an in_development / aborted issue is never yanked back to eligible by a release change", async () => {
+    for (const state of ["in_development", "aborted"] as const) {
+      fakeSentry({ issue: { ...DEFAULT_ISSUE, substatus: "regressed", lastRelease: { version: "v9.9.9" } } });
+      const { src, store } = makeSource();
+      store.setWorkItemStatus("r", "sentry", "4823", state, { lastRelease: "v1.2.3" });
+      expect(await src.listEligible()).toHaveLength(0);
+      expect(store.getWorkItem("r", "sentry", "4823")?.status).toBe(state);
+    }
   });
 
   it("describe accepts a shortId OR a numeric id, echoing the canonical numeric key (INV-11)", async () => {

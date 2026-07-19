@@ -39,6 +39,10 @@ export interface SentryIssue {
   type?: string | null;
   issueCategory?: string | null;
   metadata?: { type?: string; value?: string; filename?: string; function?: string; title?: string } | null;
+  // The release an issue was first/last seen on. Present on the issue DETAIL endpoint (getIssue);
+  // the org issues LIST endpoint does not include it, so a list-payload read degrades to null.
+  firstRelease?: { version?: string | null } | null;
+  lastRelease?: { version?: string | null } | null;
   project?: { id?: string; slug?: string; name?: string; platform?: string } | null;
   assignedTo?: { type?: string; id?: string; name?: string; email?: string } | null;
   [k: string]: unknown;

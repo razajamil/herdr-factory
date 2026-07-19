@@ -51,6 +51,17 @@ export interface SentrySourceCfg {
 /** INV-7 key safety: a Sentry issue id is a numeric string (always safe), but guard defensively. */
 const SAFE_KEY = /^[A-Za-z0-9._-]+$/;
 
+/** Terminal ledger states a recurrence on a NEW release should REOPEN. in_development / in_review are
+ *  actively being worked (never yank them); aborted was deliberately abandoned (don't auto-reopen);
+ *  todo is already eligible. So only these two — the "we shipped a fix" states — can be re-admitted. */
+const REOPENABLE_STATES = new Set<WorkState>(["merged", "done"]);
+
+/** Cap on issue-DETAIL fetches spent chasing a release baseline for Sentry-flagged regressions in one
+ *  poll. The org issues LIST endpoint omits the release, so confirming a regressed terminal item's
+ *  release costs one detail call each; bound it so a burst of regressions can't blow the tick's Sentry
+ *  budget (Sentry rate-limits REST polling hard). The overflow is re-checked on the next poll. */
+const MAX_REGRESSION_PROBES_PER_POLL = 20;
+
 const QUESTION_MARKER = `${HERDR_MARKER} question:`;
 const MERGED_NOTE_PREFIX = `${HERDR_MARKER}] Fixed by`;
 
@@ -156,6 +167,13 @@ export class SentrySource implements WorkSource {
     };
   }
 
+  /** The release an issue was last seen on (its `lastRelease.version`), or null when absent/blank.
+   *  Present on the issue DETAIL payload; the org issues LIST payload omits it (→ null there). */
+  private releaseOf(issue: SentryIssue): string | null {
+    const v = issue.lastRelease?.version;
+    return typeof v === "string" && v.trim() ? v.trim() : null;
+  }
+
   async listEligible(): Promise<MatchItem[]> {
     const issues = await this.sentry.listIssues({
       projects: this.cfg.projects,
@@ -164,6 +182,8 @@ export class SentrySource implements WorkSource {
       statsPeriod: this.cfg.statsPeriod,
     });
     const out: SentryMatchItem[] = [];
+    let probes = 0;
+    let probesDeferred = 0;
     for (const issue of issues) {
       const key = issue.id;
       if (!key || !SAFE_KEY.test(key)) {
@@ -171,11 +191,47 @@ export class SentrySource implements WorkSource {
         continue;
       }
       // Internal ledger gates eligibility (INV-1): a non-todo status = already claimed/terminal.
-      const status = this.store.getWorkItem(this.repo, this.name, key)?.status ?? "todo";
-      if (status !== "todo") continue;
+      const wi = this.store.getWorkItem(this.repo, this.name, key);
+      const status = wi?.status ?? "todo";
+      if (status !== "todo") {
+        // A previously-handled issue is normally suppressed by the ledger forever. REOPEN it when the
+        // same Sentry issue recurs on a DIFFERENT release than the one we fixed it on — the "we
+        // thought we fixed it, but a later release still hits it" regression. Only merged/done reopen
+        // (see REOPENABLE_STATES); everything else stays suppressed.
+        if (!REOPENABLE_STATES.has(status)) continue;
+        const regressed = issue.substatus === "regressed";
+        let current = this.releaseOf(issue); // list payload omits release → usually null here
+        if (current == null && regressed) {
+          // Sentry itself flags a regression but the list payload carries no release: spend one
+          // bounded detail call to learn which release re-introduced it (overflow retried next poll).
+          if (probes < MAX_REGRESSION_PROBES_PER_POLL) {
+            probes += 1;
+            try {
+              current = this.releaseOf(await this.sentry.getIssue(key));
+            } catch (e) {
+              this.log("warn", `sentry: could not fetch issue ${key} to check its release for reopen: ${errMsg(e)}`);
+            }
+          } else {
+            probesDeferred += 1;
+          }
+        }
+        const prior = wi?.lastRelease ?? null;
+        const releaseMoved = current != null && prior != null && current !== prior;
+        // Reopen when the release moved, OR when Sentry flags a regression and we hold no release
+        // baseline to compare against (trust Sentry's own regression detection as the fallback).
+        if (!releaseMoved && !(regressed && prior == null)) continue;
+        // Reopen by RESETTING the ledger row to todo (NOT deleting it) — the resilient choice: the
+        // row's id/history survive, the reset is an idempotent transition, and re-materialize will
+        // re-stamp the new release so the next poll sees a fresh baseline (no re-trigger loop).
+        this.store.setWorkItemStatus(this.repo, this.name, key, "todo", { lastRelease: current });
+        this.log("info", `sentry: reopening ${issue.shortId ?? key} — recurred on release ${current ?? "(unknown)"} (last fixed on ${prior ?? "unknown"})`);
+      }
       // Backstop over the run-table dedup (covers the claim -> in_development write window).
       if (this.store.activeRunForTicket(this.repo, this.name, key)) continue;
       out.push(this.toItem(issue));
+    }
+    if (probesDeferred) {
+      this.log("info", `sentry: ${probesDeferred} more regressed issue(s) not release-checked this poll (probe cap ${MAX_REGRESSION_PROBES_PER_POLL}) — retried next poll`);
     }
     return out;
   }
@@ -236,6 +292,9 @@ export class SentrySource implements WorkSource {
       log("warn", `${key}: could not fetch the Sentry issue for materialize: ${errMsg(e)}`);
       return; // next claiming tick retries (task.md not written)
     }
+    // Record the release we're fixing this issue on, so a later recurrence on a DIFFERENT release
+    // reopens it (see listEligible). The detail payload carries lastRelease; no-op if it's absent.
+    this.store.setWorkItemRelease(this.repo, this.name, key, this.releaseOf(issue));
     try {
       event = await this.sentry.getLatestEvent(key, this.cfg.environment);
     } catch (e) {

@@ -128,6 +128,7 @@ interface WorkItemRow {
   item_type: string | null;
   path: string | null;
   status: string;
+  last_release: string | null;
   created_at: number;
   updated_at: number;
 }
@@ -142,6 +143,7 @@ function toWorkItem(r: WorkItemRow): WorkItem {
     itemType: r.item_type,
     path: r.path,
     status: r.status as WorkState,
+    lastRelease: r.last_release ?? null,
     createdAt: r.created_at,
     updatedAt: r.updated_at,
   };
@@ -1307,35 +1309,46 @@ export class Store {
     source: string,
     key: string,
     status: WorkState,
-    meta: { title?: string | null; itemType?: string | null; path?: string | null } = {},
+    meta: { title?: string | null; itemType?: string | null; path?: string | null; lastRelease?: string | null } = {},
   ): boolean {
     const t = this.now();
     const existing = this.getWorkItem(repo, source, key);
     if (existing && existing.status === status) {
       // Still refresh metadata if newly provided, but report no status change.
-      if (meta.title !== undefined || meta.itemType !== undefined || meta.path !== undefined) {
+      if (meta.title !== undefined || meta.itemType !== undefined || meta.path !== undefined || meta.lastRelease !== undefined) {
         this.db
           .prepare(
-            "UPDATE work_items SET title = COALESCE(?, title), item_type = COALESCE(?, item_type), path = COALESCE(?, path), updated_at = ? WHERE repo = ? AND source = ? AND key = ?",
+            "UPDATE work_items SET title = COALESCE(?, title), item_type = COALESCE(?, item_type), path = COALESCE(?, path), last_release = COALESCE(?, last_release), updated_at = ? WHERE repo = ? AND source = ? AND key = ?",
           )
-          .run(meta.title ?? null, meta.itemType ?? null, meta.path ?? null, t, repo, source, key);
+          .run(meta.title ?? null, meta.itemType ?? null, meta.path ?? null, meta.lastRelease ?? null, t, repo, source, key);
       }
       telemetryEvent("store.work_item.status_noop", { repo, "work.source": source, "work.key": key, "work.state": status });
       return false;
     }
     this.db
       .prepare(
-        `INSERT INTO work_items (repo, source, key, title, item_type, path, status, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `INSERT INTO work_items (repo, source, key, title, item_type, path, status, last_release, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(repo, source, key) DO UPDATE SET
            status = excluded.status,
            title = COALESCE(excluded.title, work_items.title),
            item_type = COALESCE(excluded.item_type, work_items.item_type),
            path = COALESCE(excluded.path, work_items.path),
+           last_release = COALESCE(excluded.last_release, work_items.last_release),
            updated_at = excluded.updated_at`,
       )
-      .run(repo, source, key, meta.title ?? null, meta.itemType ?? null, meta.path ?? null, status, t, t);
+      .run(repo, source, key, meta.title ?? null, meta.itemType ?? null, meta.path ?? null, status, meta.lastRelease ?? null, t, t);
     telemetryEvent("store.work_item.status", { repo, "work.source": source, "work.key": key, "work.state": status });
     return true;
+  }
+
+  /** Stamp the release an item was last seen/fixed on WITHOUT touching its status (the sentry source
+   *  records this at materialize time). No-op if the row doesn't exist yet or `release` is null —
+   *  the ledger row is created at claim, before materialize records the release onto it. */
+  setWorkItemRelease(repo: string, source: string, key: string, release: string | null): void {
+    if (!release) return;
+    this.db
+      .prepare("UPDATE work_items SET last_release = ?, updated_at = ? WHERE repo = ? AND source = ? AND key = ?")
+      .run(release, this.now(), repo, source, key);
   }
 }

@@ -198,6 +198,9 @@ export interface WorkItem {
   itemType: string | null;
   path: string | null;
   status: WorkState;
+  /** The release this item was last seen/fixed on (sentry source only; null elsewhere). Drives
+   *  reopening a terminal item when the same issue recurs on a different release. */
+  lastRelease: string | null;
   createdAt: number;
   updatedAt: number;
 }

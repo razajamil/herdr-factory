@@ -461,7 +461,14 @@ reverse-engineered during the bash prototype.
   stacktrace/breadcrumbs/request as `task.md` (+ the raw `issue.json` sidecar). `describe` accepts a
   numeric id or a shortId (returns the canonical numeric id, INV-11); `health()` probes the org + each
   configured project. Sentry rate-limits REST polling, so the client's token bucket is conservative
-  and a `sentry` source should carry a higher `poll_interval_seconds`.
+  and a `sentry` source should carry a higher `poll_interval_seconds`. **Release regression reopen:**
+  `materialize` records the release the issue was last seen on into the ledger
+  (`work_items.last_release`). A later poll REOPENS a terminal item (merged/done → reset to `todo`,
+  the row is updated in place, never deleted) when the same issue recurs on a *different* release
+  than the one it was fixed on — "we thought we fixed it, but a later release still hits it." The
+  release comes from the issue-detail payload (the LIST endpoint omits it), so for a Sentry-flagged
+  regression the source spends one bounded detail fetch (`MAX_REGRESSION_PROBES_PER_POLL`, overflow
+  retried next poll); a `regressed` issue with no recorded baseline is reopened on Sentry's flag alone.
 - **`github.ts`** (`gh` via execFile) — `prForBranch(repo, branch)` (first-sighting discovery
   only), `prByNumber(repo, n)` (the durable identity once adopted — survives head-branch deletion
   on merge), `reviewSignature(repo, n) → {unresolved, failing, sig}` (graphql review threads +

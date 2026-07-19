@@ -504,6 +504,17 @@ const MIGRATIONS: { version: number; sql: string }[] = [
       CREATE UNIQUE INDEX idx_run_steps ON run_steps(run_id, step);
     `,
   },
+  {
+    version: 26,
+    // work_items.last_release: the release an internal-ledger item was last seen/fixed on (the
+    // Sentry source records the release of the issue when it materializes the fix). It lets the
+    // sentry poll REOPEN a terminal item (merged/done) when the SAME issue recurs on a DIFFERENT
+    // release — "we thought we fixed it, but a later release is still hitting it" — instead of the
+    // ledger silently suppressing it forever. Nullable: only the sentry source populates it; every
+    // other source (and every pre-upgrade row) leaves it NULL, which the reopen check treats as "no
+    // release baseline, don't reopen on release alone".
+    sql: `ALTER TABLE work_items ADD COLUMN last_release TEXT;`,
+  },
 ];
 
 /** Apply pending migrations in a transaction. Idempotent. */
