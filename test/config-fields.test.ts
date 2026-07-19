@@ -210,3 +210,48 @@ layouts:
     expect(d.getIn(["belt", 0, "default_layout"])).toBe("app-dev");
   });
 });
+
+const sentryDoc = () =>
+  parseDocument(`work_sources:
+  - type: sentry
+    sentry:
+      organization: acme
+      projects: [backend, web]
+      environment: [production]
+belt: []
+`);
+
+describe("config-fields: sentry list fields (projects/environment)", () => {
+  it("renders a header + one editable text row per element (pointing at the array indices) + an add action", () => {
+    const fields = fieldsFor(sentryDoc());
+    expect(fields.some((f) => f.kind === "header" && f.label === "sentry.projects")).toBe(true);
+    const elems = fields.filter((f) => f.kind === "text" && "path" in f && (f.path as (string | number)[])?.[3] === "projects");
+    expect(elems.map((f) => (f as Extract<FieldDesc, { kind: "text" }>).path)).toEqual([
+      ["work_sources", 0, "sentry", "projects", 0],
+      ["work_sources", 0, "sentry", "projects", 1],
+    ]);
+    expect(fields.some((f) => f.kind === "action" && f.label === "+ add sentry.projects")).toBe(true);
+    expect(fields.some((f) => f.kind === "action" && f.label === "+ add sentry.environment")).toBe(true);
+  });
+
+  it("+ add appends an empty element to the YAML array", () => {
+    const doc = sentryDoc();
+    const add = fieldsFor(doc).find((f) => f.kind === "action" && f.label === "+ add sentry.environment");
+    if (add?.kind === "action") add.run();
+    expect((doc.toJS() as { work_sources: { sentry: { environment: string[] } }[] }).work_sources[0]!.sentry.environment).toEqual(["production", ""]);
+  });
+
+  it("+ add creates the array when the key is absent", () => {
+    const doc = parseDocument("work_sources:\n  - type: sentry\n    sentry: { organization: acme }\nbelt: []\n");
+    const add = fieldsFor(doc).find((f) => f.kind === "action" && f.label === "+ add sentry.projects");
+    if (add?.kind === "action") add.run();
+    expect((doc.toJS() as { work_sources: { sentry: { projects: string[] } }[] }).work_sources[0]!.sentry.projects).toEqual([""]);
+  });
+
+  it("the first ‹ remove › deletes projects[0]", () => {
+    const doc = sentryDoc();
+    const remove = fieldsFor(doc).find((f) => f.kind === "action" && f.label === "‹ remove ›"); // projects render first
+    if (remove?.kind === "action") remove.run();
+    expect((doc.toJS() as { work_sources: { sentry: { projects: string[] } }[] }).work_sources[0]!.sentry.projects).toEqual(["web"]);
+  });
+});

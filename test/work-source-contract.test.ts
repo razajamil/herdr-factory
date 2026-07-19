@@ -12,6 +12,8 @@ import { Store } from "../src/db/store.ts";
 import { JiraSource } from "../src/clients/jira-source.ts";
 import { JiraApiTokenAuth } from "../src/auth/jira-provider.ts";
 import { LocalMarkdownSource } from "../src/clients/local-markdown-source.ts";
+import { SentryClient } from "../src/clients/sentry.ts";
+import { SentrySource, type SentrySourceCfg } from "../src/clients/sentry-source.ts";
 import { bearsHerdrMarker, HERDR_MARKER, type WorkSource } from "../src/core/deps.ts";
 import { instrumentObject } from "../src/telemetry/index.ts";
 import type { WorkState } from "../src/types.ts";
@@ -180,10 +182,129 @@ function githubIssuesHarness(): ContractCtx {
   };
 }
 
+// --- sentry harness: an in-memory Sentry behind a fetch stub + an in-memory store (internal ledger) --
+
+function sentryHarness(): ContractCtx {
+  interface FakeIssue {
+    id: string;
+    shortId: string;
+    removed?: boolean;
+  }
+  interface FakeNote {
+    id: string;
+    dateCreated: string;
+    user?: { name?: string };
+    data: { text: string };
+  }
+  const issues = new Map<string, FakeIssue>();
+  const notes = new Map<string, FakeNote[]>();
+  const store = new Store(openDb(":memory:"), () => 1000);
+  let calls = 0;
+  let idSeq = 0;
+  let noteSeq = 0;
+  let clock = 0;
+  const ts = () => {
+    clock += 1;
+    return `2026-06-28T00:00:${String(clock).padStart(2, "0")}.000Z`;
+  };
+  const json = (body: unknown, status = 200) =>
+    ({ ok: status < 300, status, text: async () => JSON.stringify(body), headers: new Headers() }) as Response;
+  const notesOf = (id: string) => {
+    if (!notes.has(id)) notes.set(id, []);
+    return notes.get(id)!;
+  };
+  const issueObj = (i: FakeIssue) => ({
+    id: i.id,
+    shortId: i.shortId,
+    title: `Error ${i.shortId}`,
+    culprit: "app.handler in run",
+    level: "error",
+    status: "unresolved",
+    permalink: `https://sentry.io/organizations/acme/issues/${i.id}/`,
+    count: "5",
+    userCount: 2,
+    firstSeen: "2026-06-01T00:00:00Z",
+    lastSeen: "2026-06-27T00:00:00Z",
+    platform: "python",
+    metadata: { type: "ValueError", value: "bad input" },
+    project: { id: "1", slug: "backend", name: "Backend" },
+  });
+  const eventObj = (id: string) => ({
+    eventID: `e${id}`,
+    dateCreated: "2026-06-27T00:00:00Z",
+    tags: [{ key: "environment", value: "production" }],
+    entries: [
+      {
+        type: "exception",
+        data: { values: [{ type: "ValueError", value: "bad input", stacktrace: { frames: [{ function: "run", filename: "app.py", lineNo: 10, inApp: true }] } }] },
+      },
+    ],
+  });
+
+  globalThis.fetch = (async (url: string | URL, init?: RequestInit) => {
+    calls += 1;
+    const path = new URL(String(url)).pathname;
+    const method = init?.method ?? "GET";
+    let m: RegExpMatchArray | null;
+    if (path.match(/\/api\/0\/(organizations|projects)\/[^/]+(\/[^/]+)?\/issues\/$/) && method === "GET") {
+      return json([...issues.values()].filter((i) => !i.removed).map(issueObj));
+    }
+    if ((m = path.match(/\/api\/0\/organizations\/[^/]+\/issues\/([^/]+)\/events\/latest\/$/))) {
+      const i = issues.get(m[1]!);
+      return i && !i.removed ? json(eventObj(m[1]!)) : json({}, 404);
+    }
+    if ((m = path.match(/\/api\/0\/organizations\/[^/]+\/issues\/([^/]+)\/comments\/$/))) {
+      const id = m[1]!;
+      if (method === "POST") {
+        const text = (JSON.parse(String(init?.body)) as { text: string }).text;
+        const note = { id: `n${++noteSeq}`, dateCreated: ts(), data: { text } };
+        notesOf(id).push(note);
+        return json(note, 201);
+      }
+      return json([...notesOf(id)].reverse()); // Sentry lists notes newest-first
+    }
+    if ((m = path.match(/\/api\/0\/organizations\/[^/]+\/issues\/([^/]+)\/$/))) {
+      const i = issues.get(m[1]!);
+      if (!i || i.removed) return json({}, 404);
+      return method === "PUT" ? json({}, 200) : json(issueObj(i));
+    }
+    if ((m = path.match(/\/api\/0\/organizations\/[^/]+\/shortids\/([^/]+)\/$/))) {
+      const i = [...issues.values()].find((x) => x.shortId === m![1] && !x.removed);
+      return i ? json({ shortId: i.shortId, groupId: i.id }) : json({}, 404);
+    }
+    if (path.match(/\/api\/0\/organizations\/[^/]+\/$/)) return json({ slug: "acme" });
+    if (path.match(/\/api\/0\/projects\/[^/]+\/[^/]+\/$/)) return json({ slug: "backend" });
+    return json({}, 404);
+  }) as typeof fetch;
+
+  const cfg: SentrySourceCfg = { baseUrl: "https://sentry.io", organization: "acme", projects: [], environment: [], query: "is:unresolved", statsPeriod: "14d", onMerge: "comment" };
+  const src = new SentrySource(cfg, new SentryClient({ baseUrl: cfg.baseUrl, organization: cfg.organization, token: "sntryu_test" }), store, "r", "sentry", () => {});
+  return {
+    src,
+    seedEligible: () => {
+      const id = String(1000 + ++idSeq);
+      issues.set(id, { id, shortId: `BACKEND-${idSeq}` });
+      return id;
+    },
+    removeItem: (key) => {
+      const i = issues.get(key);
+      if (i) i.removed = true;
+    },
+    backendCalls: () => calls,
+    postExternalComment: (key, body) => void notesOf(key).push({ id: `n${++noteSeq}`, dateCreated: ts(), user: { name: "Pat" }, data: { text: body } }),
+    memDir: () => {
+      const d = mkdtempSync(join(tmpdir(), "contract-sentry-"));
+      tmps.push(d);
+      return d;
+    },
+  };
+}
+
 const HARNESSES: Harness[] = [
   { name: "jira", make: jiraHarness },
   { name: "local_markdown", make: localMarkdownHarness },
   { name: "github_issues", make: githubIssuesHarness },
+  { name: "sentry", make: sentryHarness },
 ];
 
 // --- the charter, as tests ----------------------------------------------------------------------

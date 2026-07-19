@@ -19,6 +19,7 @@ import type { SourceType } from "../types.ts";
 import { githubIssuesDescriptor } from "./github-issues/descriptor.ts";
 import { jiraDescriptor } from "./jira/descriptor.ts";
 import { localMarkdownDescriptor } from "./local-markdown/descriptor.ts";
+import { sentryDescriptor } from "./sentry/descriptor.ts";
 
 /** One secret a source reads from the per-repo env file. Drives doctor's presence check and the
  *  TUI's credential rows — the engine itself never interprets these. */
@@ -41,6 +42,10 @@ export interface TuiFieldSpec {
   choices?: readonly string[];
   /** Enum only: the value shown when the path is unset (mirror the schema default). */
   enumDefault?: string;
+  /** When set, `path` points at a YAML sequence of scalar strings (e.g. sentry projects/environment):
+   *  the TUI renders one editable row per element plus add/remove actions, since a plain field is
+   *  otherwise scalar-only. The backing schema must accept an array (not a scalar) at this path. */
+  list?: boolean;
 }
 
 /** Everything a descriptor's create() gets to build a live client. */
@@ -81,7 +86,7 @@ export type AnySourceDescriptor = SourceDescriptor<any>;
 
 // jira MUST stay first with default name "jira" (db/migrate.ts v6 backfill invariant + the
 // generated config.schema.json's union order, which the schema-sync test pins byte-for-byte).
-export const SOURCE_DESCRIPTORS: readonly AnySourceDescriptor[] = [jiraDescriptor, localMarkdownDescriptor, githubIssuesDescriptor];
+export const SOURCE_DESCRIPTORS: readonly AnySourceDescriptor[] = [jiraDescriptor, localMarkdownDescriptor, githubIssuesDescriptor, sentryDescriptor];
 
 export function descriptorFor(type: SourceType): AnySourceDescriptor {
   const d = SOURCE_DESCRIPTORS.find((x) => x.type === type);

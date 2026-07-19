@@ -14,6 +14,7 @@ import type {
   ReviewSig,
   SourceType,
   Ticket,
+  TransitionContext,
   TransitionResult,
   WorkDocInfo,
   WorkspaceInfo,
@@ -202,8 +203,10 @@ export interface WorkSource {
    *  the backend's own automation (never reopen a closed issue). `pickupLabel` is the run's belt's
    *  `label`, threaded so a label-driven source can clear what listEligible filtered on (INV-1;
    *  github_issues consumes the trigger label on in_development). Undefined when the belt is gone
-   *  or the source has no label concept. */
-  transition(key: string, to: WorkState, pickupLabel?: string): Promise<TransitionResult>;
+   *  or the source has no label concept. `ctx` carries optional run-scoped facts for a terminal
+   *  write-back (the merged PR number/URL — see TransitionContext); a source that doesn't need it
+   *  ignores the parameter, and every impl MUST behave correctly when it is absent. */
+  transition(key: string, to: WorkState, pickupLabel?: string, ctx?: TransitionContext): Promise<TransitionResult>;
   /** Write the item's work doc (+ any media) into `memDir` for the fix agent. INV-4. */
   materialize(key: string, memDir: string, log: Logger): Promise<void>;
   /** Describe what materialize wrote (drives @@WORK_DOC@@/@@WORK_DOC_KIND@@). Local-fs-only (may

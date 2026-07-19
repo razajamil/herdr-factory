@@ -12,11 +12,13 @@ a schedule (a launchd job on macOS, a systemd `--user` timer on Linux) — see
 [§12](#12-server--supervision).
 
 **Work sources** are the pluggable front of the engine (`work_sources`, ≥1 per repo): *where*
-work is pulled, with no pipeline attached. Three types ship today — `jira` (poll a board; status
+work is pulled, with no pipeline attached. Four types ship today — `jira` (poll a board; status
 of record lives in Jira), `local_markdown` (a folder of `*.md` briefs; lifecycle tracked
-internally in SQLite), and `github_issues` (poll a repo's open issues by trigger label; status
-of record lives on GitHub as labels + open/closed state). A source is just a `type` + an
-optional unique `name` (default = the type) + its backend block.
+internally in SQLite), `github_issues` (poll a repo's open issues by trigger label; status
+of record lives on GitHub as labels + open/closed state), and `sentry` (poll a project's issues
+by a config query — no trigger label; lifecycle tracked internally in SQLite, and Sentry issues
+are never mutated for lifecycle). A source is just a `type` + an optional unique `name`
+(default = the type) + its backend block.
 
 **Belts** are the pipelines (`belt`, ≥1 per repo): *what* to do with the work. A belt pairs a
 `source` with an ordered list of steps and carries the `workspace_name` branch template, a
@@ -189,7 +191,7 @@ herdr-factory/
       provision.ts        vendored-Node download + SHA-256 verify + atomic `current` flip
     db/{index,migrate,store,tx}.ts
     clients/{exec,http,herdr,jira,jira-source,local-markdown-source,
-             github-issues,github-issues-source,github-budget,github,git}.ts
+             github-issues,github-issues-source,github-budget,github,git,sentry,sentry-source}.ts
     sources/registry.ts      the source REGISTRY: one descriptor per type (zod configSchema /
       + sources/<type>/descriptor.ts   resolveConfig / create / secrets manifest / TUI fields) —
                              the single edit surface for adding source N+1 (checklist in its header)
@@ -340,7 +342,11 @@ reverse-engineered during the bash prototype.
     automation won the race; `stale` = the item is gone (deleted/transferred — retrying cannot
     help): the outbox marks the intent delivered and flags the run for the run-locked stale
     policy (§7). A throw means "retry me". Callers never invoke this fire-and-forget — the
-    reconciler routes every transition through the **outbox** (§7).
+    reconciler routes every transition through the **outbox** (§7). An optional 4th arg
+    (`TransitionContext`) carries the merged PR's number+URL, built by the outbox delivery from the
+    run + resolved GitHub repo: an internal-ledger source with an external reply channel (`sentry`)
+    uses it to drop a "fixed by PR" note at merge. Every other source ignores it, and it may be
+    absent (a retried terminal intent for an ended run), so no source may depend on it.
   - `materialize(key, memDir, log)` (write the work doc + any media; idempotent, best-effort)
   - `workDoc(memDirAbs) → WorkDocInfo` (`{path, kind}` — describes what materialize wrote,
     driving the `@@WORK_DOC@@`/`@@WORK_DOC_KIND@@` prompt tokens; this replaced the per-type
@@ -438,6 +444,24 @@ reverse-engineered during the bash prototype.
   `health()` checks repo reachability, issues enabled, push permission, and that the trigger
   label exists. `repo` is optional (defaults to the PR repo; the descriptor's `create()` throws
   at startup when neither resolves).
+- **`sentry-source.ts`** (+ **`sentry.ts`**) — the `sentry` source. Status of record is INTERNAL
+  (spec `internal`, the `work_items` ledger, like local_markdown), so Sentry issues are NEVER moved
+  for lifecycle — INV-1 convergence is satisfied by the ledger, not by mutating Sentry. Eligibility
+  is a config filter (organization + projects + environment + a Sentry search `query`) with NO
+  pickup label, so a `sentry` belt sets no `label` and belts route by `match`/priority. Reply
+  channel is `comments` (Sentry issue notes — a stable-in-practice but `publish_status=PRIVATE`
+  endpoint). The one optional Sentry-side write is a config-driven `on_merge` note/resolve at teardown
+  (comment | resolve | resolve_in_next_release | none), which consumes the merged PR's number+URL via
+  the `TransitionContext` 4th arg to `transition` and is best-effort (a Sentry hiccup never wedges the
+  ledger transition). `sentry.ts` is a raw **Bearer-token** REST client on the `http.ts` pipeline —
+  NO OAuth; the token (`SENTRY_AUTH_TOKEN`, an Internal-Integration or personal token with
+  `event:read`+`event:write`) is read from the repo env. A 401/403 maps to
+  `SourceUnauthenticatedError` (the auth gate pauses + auto-resumes the source), a 404/410 to
+  `stale`/`StaleItemError`. `materialize` renders the issue + its latest event's
+  stacktrace/breadcrumbs/request as `task.md` (+ the raw `issue.json` sidecar). `describe` accepts a
+  numeric id or a shortId (returns the canonical numeric id, INV-11); `health()` probes the org + each
+  configured project. Sentry rate-limits REST polling, so the client's token bucket is conservative
+  and a `sentry` source should carry a higher `poll_interval_seconds`.
 - **`github.ts`** (`gh` via execFile) — `prForBranch(repo, branch)` (first-sighting discovery
   only), `prByNumber(repo, n)` (the durable identity once adopted — survives head-branch deletion
   on merge), `reviewSignature(repo, n) → {unresolved, failing, sig}` (graphql review threads +
@@ -1079,7 +1103,7 @@ from being claimed again).
       source registry's descriptors — §5; `.strict()`
       members — unknown keys are parse errors). Each entry is identity + backend only, no
       pipeline:
-      - `type` — `jira` | `local_markdown` | `github_issues`.
+      - `type` — `jira` | `local_markdown` | `github_issues` | `sentry`.
       - `name` — optional identifier, **default = `type`**, must be unique within the repo
         (validated on the *resolved* names, so two unnamed `jira` sources collide). Stored on each
         run's `work_source`. **The pre-existing Jira source must keep the default name `jira`** so
@@ -1091,10 +1115,14 @@ from being claimed again).
         optional, default = the PR repo, throws at startup when neither resolves /
         `state_labels.{in_development,in_review,aborted}`, defaulted `herdr:*` /
         `close_on.{merged,done,aborted}`, defaults `true`/`true`/`false` / `type_labels` map +
-        `default_type` (native GitHub issue type wins when present) / `max_pages`, default 1). The
+        `default_type` (native GitHub issue type wins when present) / `max_pages`, default 1) **or**
+        `sentry` (`organization` / `projects` slugs / `environment` / `query` — the config filter,
+        there is NO trigger label / `base_url`, default `https://sentry.io` / `stats_period`, default
+        `14d` / `on_merge`, default `comment`; auth is a Bearer `SENTRY_AUTH_TOKEN`, no OAuth). The
         **pickup label is per-belt** (`belt.label`), not a source field — one source can feed
         several belts, each claiming a different label. `descriptor.pickupLabel` marks the
-        label-driven types (jira, github_issues) so config validation can require/forbid it.
+        label-driven types (jira, github_issues) so config validation can require/forbid it; the
+        label-less types (local_markdown, sentry) forbid a belt `label` and route by `match`/priority.
     - `belt` — **required, ≥1** (`.strict()` members — unknown keys, including the removed
       `belt_type` / `agents`, are parse errors). Common fields:
       - `name` (unique) · `source` (must reference a `work_sources` name) · `priority` (optional,

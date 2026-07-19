@@ -6,7 +6,7 @@ import { runEffect } from "../runtime/effect.ts";
 import { HerdrUnreachableError, type BeltRuntime, type Deps, type SourceRuntime } from "./deps.ts";
 import type { StepConfig } from "../config.ts";
 import type { GuardSpec, HumanQuestion, HumanReply, MatchItem, Outcome, PrInfo, PrSnapshot, Run, RunStep, Ticket, TransitionIntent, WorkState } from "../types.ts";
-import { outcomeToWorkState, StaleItemError, ticketOf } from "../types.ts";
+import { outcomeToWorkState, StaleItemError, ticketOf, type TransitionContext } from "../types.ts";
 import { isUniqueViolation } from "../db/store.ts";
 import { branchName } from "./branch.ts";
 import { firstStep, indexOfStep, materializeWork, MEMORY_DIR, nextStep, spawnStep, stepByName } from "./step.ts";
@@ -88,8 +88,16 @@ async function deliverTransition(deps: Deps, src: SourceRuntime, intent: Transit
     // run row is only read here, never mutated. Undefined when the belt was renamed/removed (a
     // stranded run, INV-9) or the source has no label concept; the source treats that as "nothing
     // to clear". Terminal transitions don't use it (they strip state labels + close).
-    const pickupLabel = deps.resolveBelt(deps.store.getRun(intent.runId)?.belt ?? null)?.label;
-    const result = await src.client.transition(intent.ticketKey, intent.toState, pickupLabel);
+    const run = deps.store.getRun(intent.runId);
+    const pickupLabel = deps.resolveBelt(run?.belt ?? null)?.label;
+    // A merge write-back gets the PR facts, so an internal-ledger source (sentry) can note "fixed by
+    // PR" on the item. Built here because only the engine knows the run's PR number + the GitHub repo;
+    // every other source ignores it. May be undefined (a retried intent for an ended run has no PR).
+    const ctx: TransitionContext | undefined =
+      intent.toState === "merged" && run?.prNumber != null
+        ? { prNumber: run.prNumber, prUrl: deps.ghRepo ? `https://github.com/${deps.ghRepo}/pull/${run.prNumber}` : null }
+        : undefined;
+    const result = await src.client.transition(intent.ticketKey, intent.toState, pickupLabel, ctx);
     noteSourceAuthRecovered(deps, src.name); // delivery succeeded ⇒ auth is fine (clears any gate)
     switch (result.kind) {
       case "applied":
@@ -117,10 +125,10 @@ async function deliverTransition(deps: Deps, src: SourceRuntime, intent: Transit
         });
         // An ended (or already tearing-down) run needs no policy reaction — consume the flag here
         // so Phase A never sees it. Reading the run lock-free is fine; only mutation is not.
-        const run = deps.store.getRun(intent.runId);
-        if (!run || run.endedAt !== null || run.phase === "done" || run.phase === "tearing_down") {
+        const curRun = deps.store.getRun(intent.runId);
+        if (!curRun || curRun.endedAt !== null || curRun.phase === "done" || curRun.phase === "tearing_down") {
           deps.store.markTransitionStaleHandled(intent.id);
-          deps.log("warn", `${intent.ticketKey}: ${intent.toState} write-back found the item gone (${detail}) — run already ${run?.phase ?? "gone"}, nothing to do`);
+          deps.log("warn", `${intent.ticketKey}: ${intent.toState} write-back found the item gone (${detail}) — run already ${curRun?.phase ?? "gone"}, nothing to do`);
         } else {
           deps.log("warn", `${intent.ticketKey}: ${intent.toState} write-back found the item gone (${detail}) — stale policy will handle the run`);
         }

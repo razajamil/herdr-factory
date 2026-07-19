@@ -327,7 +327,7 @@ export interface HumanReply {
 
 /** The kind of backend a work source polls. Closed on purpose (zod config discrimination + TUI
  *  exhaustiveness); extended in exactly one place per new source. */
-export type SourceType = "jira" | "local_markdown" | "github_issues";
+export type SourceType = "jira" | "local_markdown" | "github_issues" | "sentry";
 
 /** Outcome of one transition delivery attempt. Replaces the old boolean: `applied`/`noop` were
  *  its true/false, `stale` is the state a boolean could not express — "retrying cannot help". */
@@ -349,6 +349,18 @@ export interface TransitionResult {
   kind: TransitionResultKind;
   /** Human-readable context; surfaces in the stale attention/abort messaging. */
   detail?: string;
+}
+
+/** Optional run-scoped context threaded into transition() so a source can enrich a TERMINAL
+ *  write-back with facts only the engine knows. Today it carries the merged PR's number + public
+ *  URL, so an internal-ledger source with an external reply channel (Sentry) can drop a "fixed by
+ *  PR" note on the item at teardown. Built by the reconciler's outbox delivery from the run +
+ *  resolved GitHub repo; a source that doesn't want it simply omits the parameter (every source but
+ *  Sentry does). Never load-bearing — a source must behave correctly when it's absent (a retried
+ *  intent for an ended run may deliver with no run to read). */
+export interface TransitionContext {
+  prNumber?: number | null;
+  prUrl?: string | null;
 }
 
 /** Typed escape for the human-question loop: the item backing a question is gone (deleted /
@@ -606,9 +618,26 @@ export interface GithubIssuesMatchItem extends MatchItem {
   body: string; // raw markdown body, for match predicates
 }
 
+/** A Sentry candidate. `key` is the Sentry issue's numeric id (stable/immutable — INV-7 safe);
+ *  `displayKey` is the shortId (e.g. "BACKEND-1AB"). `fields` is the raw Sentry issue object.
+ *  Environment is NOT a Sentry issue field (an issue aggregates events across environments — it's
+ *  filtered at poll time via the source's `environment` config), so it's absent here. */
+export interface SentryMatchItem extends MatchItem {
+  sourceType: "sentry";
+  shortId: string | null; // human id, project-prefixed (also MatchItem.displayKey)
+  project: string; // the issue's project slug
+  status: string; // Sentry issue status: unresolved | resolved | ignored
+  level: string | null; // error | warning | fatal | info | debug
+  culprit: string | null; // Sentry's picked code location
+  count: number | null; // total event count for the issue
+  userCount: number | null; // distinct users affected
+  permalink: string | null; // issue URL in the Sentry UI (also MatchItem.url)
+}
+
 export const isJiraItem = (i: MatchItem): i is JiraMatchItem => i.sourceType === "jira";
 export const isLocalMarkdownItem = (i: MatchItem): i is LocalMarkdownMatchItem => i.sourceType === "local_markdown";
 export const isGithubIssuesItem = (i: MatchItem): i is GithubIssuesMatchItem => i.sourceType === "github_issues";
+export const isSentryItem = (i: MatchItem): i is SentryMatchItem => i.sourceType === "sentry";
 
 export interface MatchContext {
   item: MatchItem;

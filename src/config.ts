@@ -253,6 +253,9 @@ export const SOURCE_PRODUCTS: Record<SourceType, ProductType[]> = {
   jira: ["work_spec", "work_raw", "human_reply"],
   local_markdown: ["work_spec", "human_reply"],
   github_issues: ["work_spec", "work_raw", "human_reply", "close_reference"],
+  // sentry: materializes task.md (work_spec) + issue.json (work_raw); ask-human via Sentry notes.
+  // No close_reference — Sentry issues have no PR-body auto-close keyword.
+  sentry: ["work_spec", "work_raw", "human_reply"],
 };
 
 /** A step ref is SKIPPED when its descriptor requires a layout pane (requiresLayout — the evidence

@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import { parse as parseYaml } from "yaml";
 import { loadConfig, assertMainCheckout, expandHome, configJsonSchema, evidenceKeyPrefix, RepoConfigSchema } from "../src/config.ts";
 import type { JiraSourceCfg } from "../src/clients/jira-source.ts";
+import type { SentrySourceCfg } from "../src/clients/sentry-source.ts";
 import type { GithubIssuesSourceCfg } from "../src/clients/github-issues-source.ts";
 import type { LocalMarkdownSourceCfg } from "../src/sources/local-markdown/descriptor.ts";
 
@@ -24,6 +25,9 @@ const JIRA_SRC = `  - type: jira
 const LM_SRC = `  - type: local_markdown
     name: ideas
     local_markdown: { folder: ~/work }
+`;
+const SENTRY_SRC = `  - type: sentry
+    sentry: { organization: acme, projects: [backend], environment: [production], query: "is:unresolved level:error" }
 `;
 // A belt is one ordered steps[] list referencing registered step primitives by `type` (the engine
 // ships their prompts). `label` is the per-belt pickup label — REQUIRED for a belt on a label-driven
@@ -602,6 +606,41 @@ describe("loadConfig — work sources + belts", () => {
       - { type: custom, name: research, prompt_file: r.md, prompt_file_source: config }
 `),
       { prompts: { "r.md": "r\n" } },
+    );
+    expect(() => loadConfig("demo")).toThrow(/no label concept/);
+  });
+
+  it("loads a sentry source — no pickup label (belts route by match/priority) — with resolved defaults", () => {
+    setup(
+      cfg(SENTRY_SRC, `  - name: fix-errors
+    source: sentry
+    steps: [{ type: work }, { type: review }, { type: pr }]
+`),
+      { prompts: {} },
+    );
+    const { config } = loadConfig("demo");
+    const src = config.sources[0]!;
+    expect(src.type).toBe("sentry");
+    expect(src.name).toBe("sentry"); // default name = type
+    const scfg = src.cfg as SentrySourceCfg;
+    expect(scfg.organization).toBe("acme");
+    expect(scfg.projects).toEqual(["backend"]);
+    expect(scfg.environment).toEqual(["production"]); // single string normalized to a list
+    expect(scfg.query).toBe("is:unresolved level:error");
+    expect(scfg.baseUrl).toBe("https://sentry.io"); // default
+    expect(scfg.statsPeriod).toBe("14d"); // default
+    expect(scfg.onMerge).toBe("comment"); // default
+    expect(config.belts[0]!.label).toBeUndefined(); // label-less, like local_markdown
+  });
+
+  it("rejects a `label` on a belt whose source is sentry (no label concept)", () => {
+    setup(
+      cfg(SENTRY_SRC, `  - name: fix-errors
+    source: sentry
+    label: nope
+    steps: [{ type: work }, { type: review }, { type: pr }]
+`),
+      { prompts: {} },
     );
     expect(() => loadConfig("demo")).toThrow(/no label concept/);
   });

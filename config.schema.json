@@ -337,6 +337,81 @@
               "github_issues"
             ],
             "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "type": {
+                "type": "string",
+                "const": "sentry"
+              },
+              "name": {
+                "type": "string",
+                "minLength": 1
+              },
+              "poll_interval_seconds": {
+                "type": "integer",
+                "exclusiveMinimum": 0,
+                "maximum": 9007199254740991
+              },
+              "sentry": {
+                "type": "object",
+                "properties": {
+                  "base_url": {
+                    "type": "string",
+                    "format": "uri"
+                  },
+                  "organization": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "projects": {
+                    "default": [],
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "minLength": 1
+                    }
+                  },
+                  "environment": {
+                    "default": [],
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "minLength": 1
+                    }
+                  },
+                  "query": {
+                    "default": "is:unresolved",
+                    "type": "string"
+                  },
+                  "stats_period": {
+                    "default": "14d",
+                    "type": "string",
+                    "pattern": "^\\d+[smhdw]$"
+                  },
+                  "on_merge": {
+                    "default": "comment",
+                    "type": "string",
+                    "enum": [
+                      "comment",
+                      "none",
+                      "resolve",
+                      "resolve_in_next_release"
+                    ]
+                  }
+                },
+                "required": [
+                  "organization"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "required": [
+              "type",
+              "sentry"
+            ],
+            "additionalProperties": false
           }
         ]
       }

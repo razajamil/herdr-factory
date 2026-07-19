@@ -97,7 +97,7 @@ export function buildDescriptors(draft: Document, rebuild: () => void, confirm: 
   });
   // Append to a possibly-absent array (layouts / a belt's layout_matching are optional, so the YAML
   // key may not exist yet). addIn needs an existing collection; setIn creates the sequence first.
-  const addToArray = (arrayPath: Path, item: object) => {
+  const addToArray = (arrayPath: Path, item: unknown) => {
     if (draft.getIn(arrayPath) == null) draft.setIn(arrayPath, draft.createNode([item]));
     else draft.addIn(arrayPath, draft.createNode(item));
   };
@@ -172,7 +172,19 @@ export function buildDescriptors(draft: Document, rebuild: () => void, confirm: 
       const descriptor = SOURCE_DESCRIPTORS.find((x) => x.type === type);
       for (const f of descriptor?.tui.fields ?? []) {
         const full: Path = ["work_sources", i, ...f.path];
-        if (f.choices) {
+        if (f.list) {
+          // A list of scalar strings (e.g. sentry projects/environment): a header + one editable text
+          // row per element + a per-element remove + an add action — the same add/remove idiom the
+          // nested arrays (panes/steps) use, since a value can't be cleared safely mid-flush.
+          const seq = draft.getIn(full) as { items?: unknown[] } | undefined;
+          const count = Array.isArray(seq?.items) ? seq.items.length : 0;
+          d.push({ kind: "header", label: f.label, level: 2, indent: 1 });
+          for (let k = 0; k < count; k++) {
+            d.push({ kind: "text", label: `[${k}]`, path: [...full, k], placeholder: f.placeholder, indent: 2 });
+            d.push({ kind: "action", label: "‹ remove ›", indent: 2, run: () => { draft.deleteIn([...full, k]); rebuild(); } });
+          }
+          d.push({ kind: "action", label: `+ add ${f.label}`, indent: 2, run: () => { addToArray(full, ""); rebuild(); } });
+        } else if (f.choices) {
           // A pick-list field (e.g. auth.method): read the current value, default to enumDefault when
           // unset, and setIn on change (creates intermediate maps like auth:{} as needed).
           const cur = draft.getIn(full);

@@ -4,6 +4,7 @@ import { createInterface } from "node:readline/promises";
 import { Command } from "commander";
 import { configJsonSchema, configSchemaPath, evidenceKeyPrefix, globalDbPath, isManagedNode, loadConfig, managedNodePath, nodePathFile, writeConfigSchema, type WorkSourceConfig } from "../config.ts";
 import type { JiraSourceCfg } from "../clients/jira-source.ts";
+import { descriptorFor } from "../sources/registry.ts";
 import { codeFromPaste, jiraOAuthLogin, openBrowser, pollServerForCode } from "../auth/jira-login.ts";
 import { resolveJiraOAuthApp } from "../auth/jira-oauth.ts";
 import { classifyS3Error, enumerateEvidenceFiles, evidenceUrls, resolveGithubUsername, uploadEvidence } from "../clients/evidence.ts";
@@ -169,7 +170,19 @@ function authStatusReport(config: ReturnType<typeof loadConfig>["config"], env: 
     } else if (s.type === "github_issues") {
       console.log(`  ${s.name} (github_issues): ${env.GITHUB_TOKEN ? "✓ GITHUB_TOKEN present" : "using the gh CLI login (`gh auth status`)"}`);
     } else {
-      console.log(`  ${s.name} (${s.type}): no authentication required`);
+      // Every other (non-OAuth) source: report its descriptor's required-secret presence generically,
+      // so an api-token source (sentry) shows the right verdict without a per-type branch here.
+      const required = descriptorFor(s.type).secrets.filter((sec) => sec.required);
+      if (required.length === 0) {
+        console.log(`  ${s.name} (${s.type}): no authentication required`);
+      } else {
+        const missing = required.filter((sec) => !env[sec.envKey]);
+        console.log(
+          missing.length === 0
+            ? `  ${s.name} (${s.type}): ✓ ${required.map((sec) => sec.envKey).join(" + ")} present`
+            : `  ${s.name} (${s.type}): ✗ set ${missing.map((sec) => sec.envKey).join(" + ")} in the repo env`,
+        );
+      }
     }
   }
 }

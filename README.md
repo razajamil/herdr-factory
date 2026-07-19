@@ -8,12 +8,13 @@
 
 **The autonomous work → pull-request factory.**
 
-Point it at a Jira board, a GitHub repo's issues, or a folder of task briefs. Walk away.
+Point it at a Jira board, a GitHub repo's issues, a Sentry project's errors, or a folder of task briefs. Walk away.
 Merged PRs come out the other end.
 
 [Install](#install) · [Quick start](#quick-start) ·
 [Markdown briefs](#markdown-briefs--work-without-a-ticket) ·
-[GitHub issues](#github-issues--label-an-issue-get-a-pr) · [The belts](#the-belts) ·
+[GitHub issues](#github-issues--label-an-issue-get-a-pr) ·
+[Sentry errors](#sentry--fix-production-errors) · [The belts](#the-belts) ·
 [Highlights](#highlights) · [Reference](#reference)
 
 </div>
@@ -247,6 +248,47 @@ the issue (the factory closes it as completed anyway, as a backstop). A failed r
 issue open, labelled `herdr:aborted`, for retriage; questions and attention notes arrive as
 issue comments — reply in a new comment and the run resumes.
 
+## Sentry — fix production errors
+
+A `sentry` source turns a Sentry project's issues (production errors) into the work queue: the
+factory polls Sentry on your filter, hands each error's **stacktrace** to an agent, and ships the fix
+as a PR. There's **no trigger label** — the config query _is_ the filter, and belts route by
+[`match`/priority](#multiple-belts) (like a `local_markdown` source):
+
+```yaml
+work_sources:
+  - type: sentry
+    poll_interval_seconds: 300 # Sentry rate-limits API polling — poll slower than the tick
+    sentry:
+      organization: my-org # the org slug (or numeric id)
+      projects: [backend, web] # project slugs; omit for every project the token can see
+      environment: [production] # environment names; omit for all environments
+      query: "is:unresolved level:error" # any Sentry issue search (default: is:unresolved)
+      # base_url: https://sentry.io          # or a region host (us./de.sentry.io) / self-hosted URL
+      # on_merge: comment                     # comment (default) | resolve | resolve_in_next_release | none
+
+belt:
+  - name: errors-to-prs
+    source: sentry
+    steps: [{ type: work }, { type: review }, { type: pr }] # no `label` — sentry has no label concept
+```
+
+Credentials are a single token in the repo's `env` (`chmod 600`):
+
+```sh
+SENTRY_AUTH_TOKEN=...   # a Sentry Internal Integration token (Settings → Developer Settings,
+                        # Issue & Event: read + write), or a personal token with event:read + event:write
+```
+
+The agents get a materialized `task.md` — the error's title, culprit, level, event/user counts, and
+the **latest event's stacktrace, breadcrumbs and request** (plus the raw payload in `issue.json`) — so
+the work agent fixes from a real stack trace. Lifecycle is tracked **internally** (herdr-factory's own
+DB, exactly like `local_markdown`): the factory reads Sentry but **never changes an issue's status**.
+The one optional Sentry-side write is a courtesy note on the issue linking the merged PR (`on_merge:
+comment`, the default); set `on_merge` to `resolve` / `resolve_in_next_release` to move the Sentry
+issue's status on merge instead, or `none` to leave Sentry entirely untouched. (OAuth isn't wired yet
+— a Bearer token only.)
+
 ## The belts
 
 A **belt** pairs a work source with an ordered pipeline of **step primitives** listed in `steps[]`.
@@ -334,8 +376,8 @@ brief's front-matter). Route bugs to one belt and stories to another, programmat
 
 ## Highlights
 
-- **Zero tokens on the factory floor.** Polling Jira or GitHub, claiming, watching PRs, liveness
-  checks, retries — all deterministic code (native `fetch`, `gh`, `herdr`). Agents run only inside
+- **Zero tokens on the factory floor.** Polling Jira, GitHub or Sentry, claiming, watching PRs,
+  liveness checks, retries — all deterministic code (native `fetch`, `gh`, `herdr`). Agents run only inside
   the steps, and the PR resolver wakes only when the review state actually changes.
 - **The ask-human cord.** A blocked or unsure agent runs `ask-human`: the factory posts the
   question through the work source (a Jira or GitHub issue comment, or an inbox file for
@@ -417,8 +459,8 @@ Everything repo-specific lives in `~/.config/herdr-factory/repos/<name>/`:
 - `config.yml` — the file described below (`<name>` is what you pass to `--repo`).
 - `env` — per-source credentials, `chmod 600`: `JIRA_EMAIL` + `JIRA_API_TOKEN` for a `jira`
   source; `GITHUB_TOKEN` for `github_issues` (optional — without it the factory uses your
-  `gh` CLI's token); `local_markdown` needs none. Strictly per-repo; there
-  is no global secrets file.
+  `gh` CLI's token); `SENTRY_AUTH_TOKEN` for a `sentry` source; `local_markdown` needs none.
+  Strictly per-repo; there is no global secrets file.
 - `guidelines-prompt.md` _(optional)_ — appended to every step prompt of every belt.
 - Any `match` predicates and `config`-sourced prompt files referenced by `config.yml`.
 
@@ -514,12 +556,29 @@ the tick), and a type block:
   # the trigger label is the belt's `label` (below), not a source field
   ```
 
+- **`sentry`** — polls a Sentry project's issues (production errors) and ships fixes as PRs.
+  `organization` (slug or id) + `projects` (slugs; omit for every accessible project) + `environment`
+  (a list of names; omit for all) + `query` (any Sentry issue search; default `is:unresolved`) are
+  the pickup filter — there is **no trigger label** (the config query IS the filter, so belts route by
+  `match`/priority like `local_markdown`; a belt on a `sentry` source must **not** set `label`).
+  `base_url` defaults to `https://sentry.io` (region hosts like `us.`/`de.sentry.io` and self-hosted
+  URLs work too); `stats_period` (default `14d`, suffix `s/m/h/d/w`) bounds how recently an error must
+  have fired to count. Auth is a Bearer token in `env` — `SENTRY_AUTH_TOKEN`, a Sentry **Internal
+  Integration** token (Settings → Developer Settings, with Issue & Event read+write) or a personal
+  token with `event:read` + `event:write`. **No OAuth yet** (a Bearer token only). Lifecycle is
+  tracked **internally** (the factory's own `work_items` ledger, like `local_markdown`) — Sentry
+  issues are never moved for state. `on_merge` (default `comment`) posts a note linking the merged PR;
+  `resolve` / `resolve_in_next_release` move the Sentry issue's status on merge instead, and `none`
+  leaves Sentry untouched. `materialize` writes the error's metadata + the latest event's
+  stacktrace/breadcrumbs/request as `task.md` (raw payload in `issue.json`). Because Sentry rate-limits
+  API polling, pair a `sentry` source with a higher `poll_interval_seconds`.
+
 ### `belt` (≥ 1)
 
 Common fields: `name` (unique), `source` (a `work_sources` name), `label` (the pickup
 label — the tag the factory looks for to claim this belt's work; **required** for a belt on a
 label-driven source — `jira` / `github_issues` — with **no default**, and omitted for a source with
-no label concept — `local_markdown`), `priority` (default 100, lower = matched first), optional
+no label concept — `local_markdown` / `sentry`), `priority` (default 100, lower = matched first), optional
 `match` (see [Multiple belts](#multiple-belts)), optional `max_bounces` override, and optional
 `workspace_name` — the branch/worktree name template, default
 `{{semantic_work_prefix}}/{{work_id}}-{{work_full_slug}}`. It must contain
@@ -799,8 +858,8 @@ cursor.
   the engine schema, `^S` saves, `[`/`]` reorder list entries. Credentials appear as masked,
   replace-only `secrets (env)` fields —
   declared per source type (`JIRA_EMAIL`/`JIRA_API_TOKEN` for jira, `GITHUB_TOKEN` for
-  github_issues, `JIRA_OAUTH_CLIENT_SECRET` for a jira `oauth` source) — written separately to the
-  `env` file (`chmod 600`). OAuth sign-in itself is `auth login` (the Dashboard's `l` surfaces it).
+  github_issues, `SENTRY_AUTH_TOKEN` for sentry, `JIRA_OAUTH_CLIENT_SECRET` for a jira `oauth`
+  source) — written separately to the `env` file (`chmod 600`). OAuth sign-in itself is `auth login` (the Dashboard's `l` surfaces it).
 - **Doctor** — the same checks as the CLI: `r` re-runs, `d` toggles deep mode (live herdr/gh/S3
   probes). The `herdr`/`gh`/`claude`/`git` presence checks resolve against the **service's** PATH
   (the environment the resident server runs its tools in), not the TUI's own — so they read the
