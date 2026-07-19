@@ -565,7 +565,10 @@ caps the repo total but no single source can monopolize it), and a type block:
 Common fields: `name` (unique), `source` (a `work_sources` name), `label` (the pickup
 label — the tag the factory looks for to claim this belt's work; **required** for a belt on a
 label-driven source — `jira` / `github_issues` — with **no default**, and omitted for a source with
-no label concept — `local_markdown` / `sentry`), `priority` (default 100, lower = matched first), optional
+no label concept — `local_markdown` / `sentry`), `priority` (default 100, lower = matched first),
+`active` (default `true`; set `false` to **temporarily pause** a belt — it then takes on no new work,
+while any of its in-flight runs progress to completion as usual; the flag only gates new claims, so
+it's a delete-free way to disable a belt), optional
 `match` (see [Multiple belts](#multiple-belts)), optional `max_bounces` override, and optional
 `workspace_name` — the branch/worktree name template, default
 `{{semantic_work_prefix}}/{{work_id}}-{{work_full_slug}}`. It must contain

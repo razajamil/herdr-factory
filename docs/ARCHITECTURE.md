@@ -697,7 +697,10 @@ GitHub GraphQL query** fetches state + review signature for every watched PR
 fallback (nudge callers, batch failure). Run resolution is unchanged: each run's
 `work_source`/`belt` resolve once at the top of `reconcileRun` (a run whose source/belt was
 removed escalates to `attention`; a `tearing_down` run still finishes local cleanup).
-**Phase B** walks belts in **priority order** and claims eligible work up to the cap — which
+**Phase B** walks belts in **priority order** and claims eligible work up to the cap — a belt marked
+`active: false` is skipped *before* its source is polled (no poll, no poll-window stamp, no claims),
+so an inactive belt is a zero-cost pause: it takes on no new work while its already-claimed runs keep
+reconciling in Phase A untouched (the flag gates claiming only). It claims eligible work — which
 counts **working** runs only (`countOccupying`; parked runs hold no slot) and admits at most
 `limits.max_claims_per_tick` (default 10) new claims per pass, smoothing a big-backlog cold
 start (each claim ≈ a worktree checkout + ~5 source calls) over successive ticks. A **per-source
