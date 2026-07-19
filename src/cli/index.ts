@@ -3,10 +3,7 @@ import { dirname, join } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { Command } from "commander";
 import { configJsonSchema, configSchemaPath, evidenceKeyPrefix, globalDbPath, isManagedNode, loadConfig, managedNodePath, nodePathFile, writeConfigSchema, type WorkSourceConfig } from "../config.ts";
-import type { JiraSourceCfg } from "../clients/jira-source.ts";
 import { descriptorFor } from "../sources/registry.ts";
-import { codeFromPaste, jiraOAuthLogin, openBrowser, pollServerForCode } from "../auth/jira-login.ts";
-import { resolveJiraOAuthApp } from "../auth/jira-oauth.ts";
 import { classifyS3Error, enumerateEvidenceFiles, evidenceUrls, resolveGithubUsername, uploadEvidence } from "../clients/evidence.ts";
 import { baseGroups, repoGroup, type DoctorGroup } from "../doctor.ts";
 import { openDb } from "../db/index.ts";
@@ -20,7 +17,6 @@ import * as service from "../watchers/service.ts";
 import { buildDeps, today } from "../build-deps.ts";
 import { resolveActiveRun, resolveBeltName } from "../resolve.ts";
 import { serve } from "../server/serve.ts";
-import { serveBroker } from "../broker/broker.ts";
 import { ensureUp, stopServer, type Log } from "../watchers/supervisor.ts";
 import { selfUpdate } from "../watchers/updater.ts";
 import { pinnedNodeVersion, provisionNode } from "../watchers/provision.ts";
@@ -123,66 +119,27 @@ async function dispatchSignal(repo: string, name: string, body: SignalBody): Pro
   return data as SignalResult;
 }
 
-/** Prompt for one line on stdin (paste-mode OAuth login). */
-async function promptLine(q: string): Promise<string> {
-  const rl = createInterface({ input: process.stdin, output: process.stdout });
-  try {
-    return (await rl.question(q)).trim();
-  } finally {
-    rl.close();
-  }
-}
-
-/** Choose the work source `auth login`/`logout` targets: an explicit --source, else the sole
- *  OAuth-configured jira source. Fails with an actionable message otherwise. */
-function pickAuthSource(config: ReturnType<typeof loadConfig>["config"], sourceName: string | undefined): WorkSourceConfig {
-  if (sourceName) {
-    const s = config.sources.find((x) => x.name === sourceName);
-    if (!s) fail(`no work source named "${sourceName}" (configured: ${config.sources.map((x) => x.name).join(", ") || "none"})`);
-    return s;
-  }
-  const oauth = config.sources.filter((s) => s.type === "jira" && (s.cfg as JiraSourceCfg).auth.method === "oauth");
-  if (oauth.length === 1) return oauth[0]!;
-  if (oauth.length === 0) fail(`no OAuth work source in repo "${config.repoName}" — set \`auth: { method: oauth }\` on a jira source (api_token sources need no login)`);
-  fail(`multiple OAuth sources (${oauth.map((s) => s.name).join(", ")}) — pass --source <name>`);
-}
-
-/** Print each source's auth method + state (no network — reads env presence + stored tokens). */
-function authStatusReport(config: ReturnType<typeof loadConfig>["config"], env: Record<string, string>, store: Store): void {
+/** Print each source's credential presence (no network — env-var presence only). Driven by each
+ *  source type's descriptor secrets manifest, so there are no per-type branches (jira: JIRA_EMAIL +
+ *  JIRA_API_TOKEN; sentry: SENTRY_AUTH_TOKEN; local_markdown: none). github_issues has a gh-CLI
+ *  fallback that the manifest can't express, so it keeps a small branch. */
+function authStatusReport(config: ReturnType<typeof loadConfig>["config"], env: Record<string, string>): void {
   console.log(`auth status — repo ${config.repoName}:`);
   for (const s of config.sources) {
-    if (s.type === "jira") {
-      const cfg = s.cfg as JiraSourceCfg;
-      if (cfg.auth.method === "oauth") {
-        const tok = store.getSourceAuth(config.repoName, s.name);
-        if (!tok?.accessToken) {
-          console.log(`  ${s.name} (jira, oauth): ✗ not logged in — run \`herdr-factory --repo ${config.repoName} auth login --source ${s.name}\``);
-        } else {
-          const exp = tok.expiresAt ? new Date(tok.expiresAt * 1000).toISOString() : "unknown";
-          const refresh = tok.refreshToken ? "auto-refreshed" : "NO refresh token — re-login needed when it expires";
-          const who = tok.accountLabel ? ` as ${tok.accountLabel}` : "";
-          console.log(`  ${s.name} (jira, oauth): ✓ ${tok.cloudUrl ?? "?"}${who} — access token expires ${exp} (${refresh})`);
-        }
-      } else {
-        const ok = !!(env.JIRA_EMAIL && env.JIRA_API_TOKEN);
-        console.log(`  ${s.name} (jira, api_token): ${ok ? "✓ JIRA_EMAIL + JIRA_API_TOKEN present" : "✗ set JIRA_EMAIL + JIRA_API_TOKEN in the repo env"}`);
-      }
-    } else if (s.type === "github_issues") {
+    if (s.type === "github_issues") {
       console.log(`  ${s.name} (github_issues): ${env.GITHUB_TOKEN ? "✓ GITHUB_TOKEN present" : "using the gh CLI login (`gh auth status`)"}`);
+      continue;
+    }
+    const required = descriptorFor(s.type).secrets.filter((sec) => sec.required);
+    if (required.length === 0) {
+      console.log(`  ${s.name} (${s.type}): no authentication required`);
     } else {
-      // Every other (non-OAuth) source: report its descriptor's required-secret presence generically,
-      // so an api-token source (sentry) shows the right verdict without a per-type branch here.
-      const required = descriptorFor(s.type).secrets.filter((sec) => sec.required);
-      if (required.length === 0) {
-        console.log(`  ${s.name} (${s.type}): no authentication required`);
-      } else {
-        const missing = required.filter((sec) => !env[sec.envKey]);
-        console.log(
-          missing.length === 0
-            ? `  ${s.name} (${s.type}): ✓ ${required.map((sec) => sec.envKey).join(" + ")} present`
-            : `  ${s.name} (${s.type}): ✗ set ${missing.map((sec) => sec.envKey).join(" + ")} in the repo env`,
-        );
-      }
+      const missing = required.filter((sec) => !env[sec.envKey]);
+      console.log(
+        missing.length === 0
+          ? `  ${s.name} (${s.type}): ✓ ${required.map((sec) => sec.envKey).join(" + ")} present`
+          : `  ${s.name} (${s.type}): ✗ set ${missing.map((sec) => sec.envKey).join(" + ")} in the repo env`,
+      );
     }
   }
 }
@@ -434,58 +391,15 @@ program
 
 program
   .command("auth <action>")
-  .description("work-source authentication: `login` (browser OAuth), `status`, or `logout`")
-  .option("--source <name>", "target a specific work source (default: the sole OAuth source)")
-  .option("--paste", "login: skip the server auto-capture — paste the redirected URL yourself (headless)")
-  .action(cliAction("auth", async (action: string, opts: { source?: string; paste?: boolean }) => {
+  .description("work-source auth: `status` reports each source's credential presence (no network). All sources authenticate from the repo `env` (no browser login)")
+  .action(cliAction("auth", async (action: string) => {
     try {
-      const repo = requireRepo();
-      const { config, env } = loadConfig(repo);
-      const store = new Store(openDb(config.paths.dbPath), systemClock);
+      const { config, env } = loadConfig(requireRepo());
       if (action === "status") {
-        authStatusReport(config, env, store);
+        authStatusReport(config, env);
         return;
       }
-      if (action === "logout") {
-        const src = pickAuthSource(config, opts.source);
-        console.log(`${src.name}: ${store.clearSourceAuth(repo, src.name) ? "logged out (stored tokens cleared)" : "no stored tokens to clear"}`);
-        return;
-      }
-      if (action === "login") {
-        const src = pickAuthSource(config, opts.source);
-        const cfg = src.cfg as JiraSourceCfg;
-        if (src.type !== "jira" || cfg.auth.method !== "oauth") {
-          fail(`source "${src.name}" isn't configured for OAuth login (set \`auth: { method: oauth }\` on a jira source)`);
-        }
-        const auth = cfg.auth as Extract<JiraSourceCfg["auth"], { method: "oauth" }>;
-        const app = resolveJiraOAuthApp({ clientId: auth.clientId, brokerUrl: env.JIRA_OAUTH_BROKER_URL });
-        // Prefer the resident server's https callback listener (auto-capture); fall back to paste when
-        // there's no server, its callback listener is down (no openssl), or --paste was passed.
-        const info = readServerInfo();
-        const health = info ? await readHealth(info.port) : null;
-        const useServer = !opts.paste && info && health?.oauthCallback === true;
-        const getCode = useServer
-          ? async ({ authUrl, state }: { authUrl: string; state: string }) => {
-              console.log("Opening your browser to authorize herdr-factory.");
-              console.log('Your browser will warn that localhost isn\'t private (a self-signed cert) — click through it (Advanced → proceed to localhost).\nWaiting for the callback…');
-              if (!(await openBrowser(authUrl))) console.log(`\nCouldn't open a browser — open this URL yourself:\n\n  ${authUrl}\n`);
-              return pollServerForCode(info.port, state);
-            }
-          : async ({ authUrl, state }: { authUrl: string; state: string }) => {
-              if (await openBrowser(authUrl)) console.log(`Opening your browser to authorize herdr-factory…\n\n  ${authUrl}\n`);
-              else console.log(`Open this URL in a browser and approve access:\n\n  ${authUrl}\n`);
-              console.log('After approving, your browser shows a "can\'t reach localhost" page — that\'s expected. Copy the full address-bar URL and paste it here.');
-              return codeFromPaste(await promptLine("Paste the redirected URL (or the code): "), state);
-            };
-        const result = await jiraOAuthLogin({ store, repo, source: src.name, siteBaseUrl: cfg.baseUrl, app, scopes: auth.scopes, now: systemClock, getCode });
-        console.log(`\n✓ ${src.name}: authenticated to ${result.cloudName} (${result.cloudUrl})`);
-        if (result.account) console.log(`  session: ${result.account.displayName}${result.account.email ? ` <${result.account.email}>` : ""}`);
-        else console.log("  session: couldn't verify the account (the token may lack the read:jira-user scope)");
-        console.log(`  scopes: ${result.scopes}`);
-        console.log(`  access token expires ${new Date(result.expiresAt * 1000).toISOString()} — refreshed automatically`);
-        return;
-      }
-      fail(`unknown auth action "${action}" — use: login | status | logout`);
+      fail(`unknown auth action "${action}" — use: status`);
     } catch (e) {
       fail(e);
     }
@@ -718,17 +632,6 @@ program
     }
   }));
 
-program
-  .command("oauth-broker")
-  .description("run the OAuth token broker (holds the Jira client secret; the factory calls it so the secret never ships to clients). Set JIRA_OAUTH_CLIENT_SECRET in its env")
-  .action(cliAction("oauth-broker", async () => {
-    residentCommand = true;
-    try {
-      await serveBroker();
-    } catch (e) {
-      fail(e);
-    }
-  }));
 
 program
   .command("ensure-up")

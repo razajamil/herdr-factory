@@ -11,7 +11,6 @@ import {
   recordDomainEventEffect,
   recordHttpClientDurationEffect,
   recordHttpServerDurationEffect,
-  recordOAuthEventEffect,
   recordRateLimitRemainingEffect,
   recordSourceAuthEventEffect,
   recordTickDurationEffect,
@@ -244,10 +243,6 @@ export function recordRateLimitRemaining(remaining: number, attrs: TelemetryAttr
 
 export function recordSourceAuthEvent(attrs: TelemetryAttributes = {}): void {
   runTelemetry(recordSourceAuthEventEffect(attrs));
-}
-
-export function recordOAuthEvent(attrs: TelemetryAttributes = {}): void {
-  runTelemetry(recordOAuthEventEffect(attrs));
 }
 
 export function instrumentObject<T extends object>(target: T, prefix: string, attrs: TelemetryAttributes = {}): T {

@@ -47,8 +47,6 @@ export interface HealthPayload {
   startedAt: number;
   uptimeSec: number;
   repos: HealthRepo[];
-  /** Whether the server's https OAuth-callback listener is up (auto-capture vs paste for `auth login`). */
-  oauthCallback?: boolean;
 }
 
 /**

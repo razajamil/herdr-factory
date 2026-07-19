@@ -95,10 +95,6 @@ JIRA_EMAIL=you@org.com
 JIRA_API_TOKEN=...          # id.atlassian.com → Security → API tokens
 ```
 
-(Prefer not to manage a token? Set `auth: { method: oauth }` on the source and run
-`herdr-factory --repo my-app auth login` to sign in through the browser instead — see
-[`work_sources`](#work_sources--1).)
-
 (Jira is the walkthrough; a [GitHub Issues source](#github-issues--label-an-issue-get-a-pr)
 needs no credentials at all beyond your already-authenticated `gh` CLI — add a `GITHUB_TOKEN`
 line to the same file only if you want it to use a dedicated token instead.)
@@ -117,6 +113,7 @@ work_sources:
     jira:
       base_url: https://your-org.atlassian.net
       project: APP
+      board: 254 # the Agile board id pickup pulls from (required)
       # status:         (defaults) — todo: To Do · in_development: In Progress · review: In Review
       #                  add `done: <status>` to move the ticket there when the PR merges (opt-in)
 
@@ -457,8 +454,8 @@ instead of waiting for the next tick.
 Everything repo-specific lives in `~/.config/herdr-factory/repos/<name>/`:
 
 - `config.yml` — the file described below (`<name>` is what you pass to `--repo`).
-- `env` — per-source credentials, `chmod 600`: `JIRA_EMAIL` + `JIRA_API_TOKEN` for a `jira`
-  source; `GITHUB_TOKEN` for `github_issues` (optional — without it the factory uses your
+- `env` — per-source credentials, `chmod 600`: `JIRA_EMAIL` + `JIRA_API_TOKEN` (both required) for a
+  `jira` source; `GITHUB_TOKEN` for `github_issues` (optional — without it the factory uses your
   `gh` CLI's token); `SENTRY_AUTH_TOKEN` for a `sentry` source; `local_markdown` needs none.
   Strictly per-repo; there is no global secrets file.
 - `guidelines-prompt.md` _(optional)_ — appended to every step prompt of every belt.
@@ -496,37 +493,24 @@ reference it), an optional `poll_interval_seconds` (how often this source is pol
 overrides `limits.source_poll_interval_seconds` — handy for a rate-limited board polled slower than
 the tick), and a type block:
 
-- **`jira`** — `base_url`, `project`, and a `status` map: `todo` (default `To Do`),
-  `in_development` (default `In Progress`), `review` (default `In Review`), and an optional `done`
-  (no default). Pickup is by JQL over the
-  project (`/rest/api/3/search/jql`) — status + the belt's label; there's no `board` (an OAuth token
-  isn't scoped for the Agile API, and the project + status + label query is the full pickup criteria).
-  The label that flags a ticket for pickup is set per **belt** (`label` — see [`belt`](#belt--1)), not
-  here. The status of
+- **`jira`** — `base_url`, `project`, a required `board` (the Agile board id, e.g. `254`), and a
+  `status` map: `todo` (default `To Do`), `in_development` (default `In Progress`), `review` (default
+  `In Review`), and an optional `done` (no default). Pickup is by the **Agile board** endpoint
+  (`/rest/agile/1.0/board/<id>/issue`): the board's own saved filter scopes the query, and the ticket
+  status + the belt's label narrow it. The label that flags a ticket for pickup is set per **belt**
+  (`label` — see [`belt`](#belt--1)), not here. The status of
   record lives in Jira. By default the factory never writes a terminal status — merged/closed is left
   to Jira's GitHub integration. Set `status.done` to opt in: a merged PR then moves the ticket to that
   status at teardown (after the merge, before the worktree is recycled); a closed/abandoned run still
   leaves the ticket untouched. Ticket description, comments, and image/video attachments are
-  materialized into the worktree for the agents. Authentication is chosen per source with an optional
-  `auth` block:
-  - `auth: { method: api_token }` (**the default** — omit `auth` entirely for it): `JIRA_EMAIL` +
-    `JIRA_API_TOKEN` in the repo's `env`.
-  - `auth: { method: oauth }`: browser login instead of an API token. Run
-    `herdr-factory --repo <name> auth login`, approve in the browser, and the factory stores the
-    tokens **locally** and refreshes them automatically — nothing to rotate by hand. It uses a
-    registered Atlassian OAuth app via a public `client_id` (shipped, or your own via `client_id`
-    here). Atlassian 3LO also requires a `client_secret` (there's no public/PKCE-only mode), but the
-    factory **never holds it** — the token exchange is delegated to an
-    [OAuth broker](#the-oauth-broker) that keeps the secret. Point the factory at the broker with
-    `JIRA_OAUTH_BROKER_URL` in the repo `env` (default: the local broker at `http://127.0.0.1:9099`).
-    Optional `scopes` overrides the defaults (`read:jira-work write:jira-work offline_access`). The
-    app must be made **Distributed** (Distribution → enable sharing) so non-owner accounts can consent.
+  materialized into the worktree for the agents. Authentication is **API token only** — `JIRA_EMAIL` +
+  `JIRA_API_TOKEN` (both required) in the repo's `env` (the Agile board API needs Basic auth, so there
+  is no OAuth).
 
-  Either way, a source that **isn't authenticated yet** (no token, or an expired OAuth session that
-  can't refresh) is *paused*, not broken: its claims and status write-backs hold, you get one
-  notification, and it resumes automatically the moment it authenticates again — so an unauthenticated
-  source never wedges the factory. `herdr-factory --repo <name> auth status` shows where each source
-  stands.
+  A source that **isn't authenticated yet** (no credentials) is *paused*, not broken: its claims and
+  status write-backs hold, you get one notification, and it resumes automatically the moment it
+  authenticates again — so an unauthenticated source never wedges the factory.
+  `herdr-factory --repo <name> auth status` shows where each source stands.
 - **`local_markdown`** — `folder`: a directory where each top-level `*.md` file _or_ top-level
   subdirectory containing at least one top-level `*.md` is one work item (key = filename stem /
   dir name; names starting `__` are skipped as still-being-drafted). Title/type come from YAML
@@ -768,7 +752,7 @@ herdr-factory --repo <name> status | eligible | runs [--all] | timeline <KEY> | 
 herdr-factory --repo <name> claim <KEY> [--belt <name>]
 herdr-factory --repo <name> teardown <KEY> [--source <name>]
 herdr-factory --repo <name> resume <KEY> [--source <name>]          # un-park an `attention` run
-herdr-factory --repo <name> auth login|status|logout [--source <name>] [--paste]   # work-source auth (OAuth)
+herdr-factory --repo <name> auth status                            # each source's credential presence (no network)
 
 # agent → dispatcher signals (rendered into every step prompt; you rarely type these)
 herdr-factory --repo <name> step-done <KEY> <step> [--source <name>]
@@ -779,7 +763,6 @@ herdr-factory capture-lock acquire|release <resource> [owner]       # machine-gl
 
 # the machine-wide server + supervisor (no --repo)
 herdr-factory serve | ensure-up [--restart] | restart | reload | update | provision-node
-herdr-factory oauth-broker                                         # OAuth token broker (holds the Jira secret)
 herdr-factory install | uninstall | start | stop
 herdr-factory schema [--stdout]
 herdr-factory doctor [--deep] [--repo <name>]
@@ -791,41 +774,14 @@ back to executing directly against the DB when it isn't; reads (`status`, `eligi
 `timeline`, `logs`) always go straight to the DB. `--source` disambiguates a key active in more
 than one source; `claim --belt` is required only when the repo has more than one belt.
 
-`auth login` runs the browser OAuth flow for a source configured with `auth.method: oauth` (only
-needed for those — an `api_token` source authenticates from `env`, and `github_issues` from your
-`gh` login). It opens a browser to Atlassian; approve, and the **resident server's** OAuth callback
-listener (an https loopback the `serve` process runs) captures the code automatically — no copying.
-Because Atlassian mandates an https callback, that listener uses a self-signed cert, so your browser
-shows a one-time "your connection is not private" warning for `localhost` that you click through
-(Advanced → proceed). If the server isn't running (or has no `openssl` to mint the cert), login falls
-back to a **paste** flow: the browser lands on a "can't reach localhost" page and you paste that URL
-back. `--paste` forces the paste flow. `auth status` reports each source's method + state; `auth
-logout` clears a source's stored tokens.
+`auth status` reports each source's credential presence (env-var presence only, no network). Every
+source authenticates from the repo `env` — `JIRA_EMAIL` + `JIRA_API_TOKEN` for `jira`,
+`SENTRY_AUTH_TOKEN` for `sentry`, `GITHUB_TOKEN` (or your `gh` login) for `github_issues` — so there
+is no browser login.
 
 `serve` binds `127.0.0.1:8765` (override with `HERDR_FACTORY_PORT`) with the OpenAPI spec at
 `/doc` and Swagger UI at `/ui`. `update` pulls the latest code (hard reset to the branch's
 upstream) and restarts onto it — the supervisor does the same automatically every ~60s.
-
-### The OAuth broker
-
-Atlassian 3LO requires a `client_secret` for the token exchange, and shipping that secret to every
-install is a non-starter. `herdr-factory oauth-broker` is a small standalone server that **holds the
-secret** and does the exchange on the factory's behalf: `auth login` (and the resident server's token
-refresh) POST the auth `code` + PKCE `code_verifier` (or a `refresh_token`) to the broker, which
-injects `client_id` + `client_secret` and forwards to Atlassian, relaying the response. **The secret
-never leaves the broker** — it isn't in the repo, the CLI, or any user's machine.
-
-Run it (its own env holds the secret):
-
-```sh
-JIRA_OAUTH_CLIENT_SECRET=… herdr-factory oauth-broker      # + optional JIRA_OAUTH_CLIENT_ID, HERDR_FACTORY_BROKER_PORT
-```
-
-The broker is a thin, stateless proxy — it stores nothing and never touches Jira data, only adds
-client authentication to the token call. It binds `127.0.0.1:9099` and does **no caller
-authentication**, so today it's safe **only on loopback** (run it on the same machine as the factory).
-Point the factory at a non-local broker with `JIRA_OAUTH_BROKER_URL`; hosting it remotely later means
-adding access control (auth, rate limits) to the broker itself.
 
 ## The TUI
 
@@ -845,9 +801,7 @@ cursor.
   items. `↑↓` navigates, `↵` opens a run's event timeline, `t` ticks, `c` claims an eligible item,
   `x` tears down, and `r` refreshes (mutating actions require confirmation). Empty belts stay hidden.
   Select a repo and press `d` to open Detail: general AWS SSO/source-auth diagnostics followed by
-  configuration, work counts, and a live source/pickup health check for every belt. Press `l`
-  on a repo to log in to one of its Jira OAuth sources; it opens your browser and the resident server
-  auto-captures the callback, falling back to a paste prompt when the callback listener is unavailable.
+  configuration, work counts, and a live source/pickup health check for every belt.
 - **Config** — a repo list `[1]` and a full `config.yml` editor split across four bordered panels:
   `[2]` config (repo · limits · secrets · evidence), `[3]` work sources, `[4]` layouts (the
   repo-level [layout](#layouts) library — nest into a layout to edit its tabs and panes; belts
@@ -858,8 +812,7 @@ cursor.
   the engine schema, `^S` saves, `[`/`]` reorder list entries. Credentials appear as masked,
   replace-only `secrets (env)` fields —
   declared per source type (`JIRA_EMAIL`/`JIRA_API_TOKEN` for jira, `GITHUB_TOKEN` for
-  github_issues, `SENTRY_AUTH_TOKEN` for sentry, `JIRA_OAUTH_CLIENT_SECRET` for a jira `oauth`
-  source) — written separately to the `env` file (`chmod 600`). OAuth sign-in itself is `auth login` (the Dashboard's `l` surfaces it).
+  github_issues, `SENTRY_AUTH_TOKEN` for sentry) — written separately to the `env` file (`chmod 600`).
 - **Doctor** — the same checks as the CLI: `r` re-runs, `d` toggles deep mode (live herdr/gh/S3
   probes). The `herdr`/`gh`/`claude`/`git` presence checks resolve against the **service's** PATH
   (the environment the resident server runs its tools in), not the TUI's own — so they read the

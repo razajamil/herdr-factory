@@ -120,7 +120,21 @@
                     "format": "uri"
                   },
                   "project": {
-                    "type": "string"
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "board": {
+                    "anyOf": [
+                      {
+                        "type": "string",
+                        "minLength": 1
+                      },
+                      {
+                        "type": "integer",
+                        "exclusiveMinimum": 0,
+                        "maximum": 9007199254740991
+                      }
+                    ]
                   },
                   "status": {
                     "default": {},
@@ -142,58 +156,16 @@
                         "type": "string",
                         "minLength": 1
                       }
-                    }
-                  },
-                  "auth": {
-                    "default": {
-                      "method": "api_token"
                     },
-                    "oneOf": [
-                      {
-                        "type": "object",
-                        "properties": {
-                          "method": {
-                            "type": "string",
-                            "const": "api_token"
-                          }
-                        },
-                        "required": [
-                          "method"
-                        ],
-                        "additionalProperties": false
-                      },
-                      {
-                        "type": "object",
-                        "properties": {
-                          "method": {
-                            "type": "string",
-                            "const": "oauth"
-                          },
-                          "client_id": {
-                            "type": "string",
-                            "minLength": 1
-                          },
-                          "scopes": {
-                            "minItems": 1,
-                            "type": "array",
-                            "items": {
-                              "type": "string",
-                              "minLength": 1
-                            }
-                          }
-                        },
-                        "required": [
-                          "method"
-                        ],
-                        "additionalProperties": false
-                      }
-                    ]
+                    "additionalProperties": false
                   }
                 },
                 "required": [
                   "base_url",
-                  "project"
-                ]
+                  "project",
+                  "board"
+                ],
+                "additionalProperties": false
               }
             },
             "required": [

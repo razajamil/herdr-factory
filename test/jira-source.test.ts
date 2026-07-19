@@ -8,10 +8,10 @@ import { JiraApiTokenAuth } from "../src/auth/jira-provider.ts";
 const CFG: JiraSourceCfg = {
   baseUrl: "https://x.atlassian.net",
   project: "RWR",
+  board: "254",
   statusTodo: "To Do",
   statusInDev: "In development",
   statusReview: "Ready for Code Review",
-  auth: { method: "api_token" },
 };
 // The belt's pickup label — a per-belt arg to listEligible now, not source config.
 const LABEL = "agent";
@@ -136,7 +136,7 @@ describe("JiraSource", () => {
   it("listEligible returns the jira match item (status + labels + raw fields)", async () => {
     globalThis.fetch = (async (url: string | URL) => {
       const u = String(url);
-      if (u.includes("/rest/api/3/search/jql")) {
+      if (u.includes("/rest/agile/1.0/board/254/issue")) {
         const issues = [{ key: "RWR-9", fields: { summary: "Crash on save", issuetype: { name: "Bug" }, status: { name: "To Do" }, labels: ["agent", "p1"] } }];
         return { ok: true, status: 200, text: async () => JSON.stringify(({ issues })), headers: new Headers() } as Response;
       }

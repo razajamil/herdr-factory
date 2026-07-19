@@ -266,7 +266,7 @@ export function createApp(renderer: CliRenderer): { currentTab: () => number; at
       },
     };
   }
-  /** A single-line text prompt (paste an OAuth redirect URL, …). Focuses a live input; typed keys
+  /** A single-line text prompt. Focuses a live input; typed keys
    *  fall through to it (the keypress handler only intercepts Enter/Esc for a prompt modal). */
   function prompt(title: string, placeholder = ""): Promise<string | null> {
     return new Promise((resolve) => {
@@ -350,7 +350,7 @@ export function createApp(renderer: CliRenderer): { currentTab: () => number; at
     if (idx === 2) {
       return new StyledText([fg(theme.text.tertiary)(" "), ...keys([["scroll", "↑↓"], ["re-run", "r"], ["deep check", "d"]]), ...tail]);
     }
-    return new StyledText([fg(theme.text.tertiary)(" "), ...keys([["move", "↑↓"], ["timeline", "↵"], ["tick", "t"], ["claim", "c"], ["teardown", "x"], ["detail", "d"], ["login", "l"], ["refresh", "r"]]), ...tail]);
+    return new StyledText([fg(theme.text.tertiary)(" "), ...keys([["move", "↑↓"], ["timeline", "↵"], ["tick", "t"], ["claim", "c"], ["teardown", "x"], ["detail", "d"], ["refresh", "r"]]), ...tail]);
   }
 
   /** Top of the hierarchy: focus the tab bar. From here numbers enter a section, ←→/Tab switch. */

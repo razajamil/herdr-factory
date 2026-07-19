@@ -87,11 +87,10 @@ describe("loadConfig — work sources + belts", () => {
     const jira = s.cfg as JiraSourceCfg; // resolved by the jira descriptor
     expect(jira.baseUrl).toBe("https://x.atlassian.net"); // trailing slash stripped
     expect(jira.project).toBe("RWR");
-    expect((jira as unknown as Record<string, unknown>).board).toBeUndefined(); // board removed — pickup queries by project via /search/jql
+    expect(jira.board).toBe("254"); // the required Agile board id pickup pulls from (coerced to string)
     expect((jira as unknown as Record<string, unknown>).label).toBeUndefined(); // label is per-belt now, not on the source
     expect(jira.statusInDev).toBe("In development");
     expect(jira.statusDone).toBeUndefined(); // opt-in: no `status.done` ⇒ terminal stays unmapped
-    expect(jira.auth).toEqual({ method: "api_token" }); // no `auth` block ⇒ api_token (back-compat)
     expect(config.limits.stallSeconds).toBe(2700); // default
     expect(config.limits.maxActiveWorkspaces).toBe(3); // default
     expect(config.limits.stepBudgetSeconds).toBe(3600); // default
@@ -115,6 +114,7 @@ describe("loadConfig — work sources + belts", () => {
     jira:
       base_url: https://x.atlassian.net
       project: RWR
+      board: 254
       status:
         done: "  Done  "
 `,
@@ -125,36 +125,17 @@ describe("loadConfig — work sources + belts", () => {
     expect(jira.statusDone).toBe("Done"); // .trim().min(1)
   });
 
-  it("resolves auth.method: oauth — default scopes, and an explicit client_id + scopes override", () => {
-    setup(
-      cfg(
-        `  - type: jira
-    jira:
-      base_url: https://x.atlassian.net
-      project: RWR
-      board: 254
-      auth: { method: oauth }
-`,
-        SHIP_BELT,
-      ),
-    );
-    const dflt = loadConfig("demo").config.sources[0]!.cfg as JiraSourceCfg;
-    expect(dflt.auth).toEqual({ method: "oauth", clientId: undefined, scopes: ["read:jira-work", "write:jira-work", "read:jira-user", "offline_access"] });
+  it("requires the Agile board (no default) and coerces a numeric id to a string", () => {
+    setup(cfg(`  - type: jira\n    jira: { base_url: https://x.atlassian.net, project: RWR }\n`, SHIP_BELT));
+    expect(() => loadConfig("demo")).toThrow(/board/); // required, no default
 
-    setup(
-      cfg(
-        `  - type: jira
-    jira:
-      base_url: https://x.atlassian.net
-      project: RWR
-      board: 254
-      auth: { method: oauth, client_id: myapp, scopes: [read:jira-work, offline_access] }
-`,
-        SHIP_BELT,
-      ),
-    );
-    const custom = loadConfig("demo").config.sources[0]!.cfg as JiraSourceCfg;
-    expect(custom.auth).toEqual({ method: "oauth", clientId: "myapp", scopes: ["read:jira-work", "offline_access"] });
+    setup(cfg(`  - type: jira\n    jira: { base_url: https://x.atlassian.net, project: RWR, board: 254 }\n`, SHIP_BELT));
+    expect((loadConfig("demo").config.sources[0]!.cfg as JiraSourceCfg).board).toBe("254");
+  });
+
+  it("rejects an unknown key in the jira block (the strict block — e.g. a stray `auth` or typo)", () => {
+    setup(cfg(`  - type: jira\n    jira: { base_url: https://x.atlassian.net, project: RWR, board: 254, auth: { method: oauth } }\n`, SHIP_BELT));
+    expect(() => loadConfig("demo")).toThrow(/[Uu]nrecognized|auth/);
   });
 
   it("maps a github_issues source with defaults (labels, close_on, type map) and camelCase resolution", () => {
@@ -213,7 +194,7 @@ describe("loadConfig — work sources + belts", () => {
     it("a per-source poll_interval_seconds overrides the repo default", () => {
       const jiraSlow = `  - type: jira
     poll_interval_seconds: 600
-    jira: { base_url: https://x.atlassian.net, project: RWR }
+    jira: { base_url: https://x.atlassian.net, project: RWR, board: 254 }
 `;
       setup(cfg(`${jiraSlow}${LM_SRC}`, SHIP_BELT, "repo:\n  path: __REPO__\nlimits: { source_poll_interval_seconds: 120 }\n"));
       const { config } = loadConfig("demo");
@@ -225,7 +206,7 @@ describe("loadConfig — work sources + belts", () => {
     it("rejects a non-positive poll_interval_seconds", () => {
       const bad = `  - type: jira
     poll_interval_seconds: 0
-    jira: { base_url: https://x.atlassian.net, project: RWR }
+    jira: { base_url: https://x.atlassian.net, project: RWR, board: 254 }
 `;
       setup(cfg(bad, SHIP_BELT));
       expect(() => loadConfig("demo")).toThrow();

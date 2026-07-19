@@ -123,15 +123,14 @@ export class JiraClient {
     return JSON.parse(res.text) as T;
   }
 
-  /** Eligible pickups in `project` at status `todoStatus` and (when given) label `label` — the
-   *  belt's pickup label — filtered server-side via the core issue-search API (`/rest/api/3/search/jql`,
-   *  the successor to the removed `/rest/api/3/search`). Returns each issue's routing fields
-   *  (status/labels + the raw fields object) so a belt's match predicate can route at claim time.
-   *  `label` is omitted only by the doctor's connectivity probe; the real belt flow always passes one.
-   *  NB: this deliberately uses the platform REST API (read:jira-work) rather than the Agile API
-   *  (/rest/agile/1.0), which OAuth tokens aren't scoped for — the project+status+label JQL is the
-   *  pickup criteria in full (the board's own saved filter added nothing the label gate doesn't). */
-  async listEligible(project: string, label: string | undefined, todoStatus: string): Promise<JiraEligible[]> {
+  /** Eligible pickups on Agile `board` at status `todoStatus` and (when given) label `label` — the
+   *  belt's pickup label. Pulls via the Agile board issue endpoint (`/rest/agile/1.0/board/<id>/issue`),
+   *  so the board's own saved filter scopes the query and the project + status + label JQL narrows
+   *  within it. Returns each issue's routing fields (status/labels + the raw fields object) so a belt's
+   *  match predicate can route at claim time. `label` is omitted only by the doctor's connectivity
+   *  probe; the real belt flow always passes one. NB: the Agile API needs Basic (api_token) auth — it
+   *  is not reachable with an OAuth token, which is why the Jira source is api_token only. */
+  async listEligible(board: string, project: string, label: string | undefined, todoStatus: string): Promise<JiraEligible[]> {
     const labelClause = label ? ` AND labels = "${label}"` : "";
     const jql = `project = "${project}" AND status = "${todoStatus}"${labelClause} ORDER BY created ASC`;
     const data = await this.getJson<{
@@ -139,7 +138,7 @@ export class JiraClient {
         key: string;
         fields: { summary: string; issuetype: { name: string }; status?: { name: string }; labels?: string[] };
       }[];
-    }>(`/rest/api/3/search/jql?jql=${encodeURIComponent(jql)}&fields=summary,issuetype,status,labels&maxResults=50`);
+    }>(`/rest/agile/1.0/board/${encodeURIComponent(board)}/issue?jql=${encodeURIComponent(jql)}&fields=summary,issuetype,status,labels&maxResults=50`);
     return (data.issues ?? []).map((i) => ({
       key: i.key,
       summary: i.fields.summary,
@@ -148,13 +147,6 @@ export class JiraClient {
       labels: i.fields.labels ?? [],
       fields: i.fields as Record<string, unknown>,
     }));
-  }
-
-  /** The authenticated account ("myself") — a whoami to confirm WHICH Jira session a token belongs
-   *  to. Needs the `read:jira-user` scope under OAuth (Basic api_token auth always has it). */
-  async whoami(): Promise<{ accountId: string; displayName: string; email?: string }> {
-    const me = await this.getJson<{ accountId: string; displayName: string; emailAddress?: string }>(`/rest/api/3/myself`);
-    return { accountId: me.accountId, displayName: me.displayName, email: me.emailAddress };
   }
 
   async getIssue(key: string): Promise<JiraIssue> {

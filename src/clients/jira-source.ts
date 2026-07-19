@@ -25,18 +25,14 @@ const isMedia = (mime: string): boolean => mime.startsWith("image/") || mime.sta
 
 const QUESTION_MARKER = `${HERDR_MARKER} question:`;
 
-/** How a Jira source authenticates (resolved from the `auth` config block). api_token reads
- *  JIRA_EMAIL + JIRA_API_TOKEN from env; oauth uses factory-managed tokens (Phase 2), optionally
- *  against a per-source OAuth app override (clientId in config, secret in env). */
-export type JiraAuthCfg = { method: "api_token" } | { method: "oauth"; clientId?: string; scopes: string[] };
-
 /** Resolved Jira-source config (the client owns its config shape; the descriptor maps YAML onto it).
  *  The pickup label is NOT here — it's per-belt and arrives as an argument to listEligible/health.
- *  `auth` is consumed by the descriptor's create() to build the JiraAuth provider (not by the
- *  source itself, which just holds the built provider). */
+ *  Auth is api_token only; the built JiraApiTokenAuth provider is passed to the constructor separately. */
 export interface JiraSourceCfg {
   baseUrl: string;
   project: string;
+  /** The Agile board id pickup pulls from (its saved filter scopes the query). */
+  board: string;
   statusTodo: string;
   statusInDev: string;
   statusReview: string;
@@ -44,7 +40,6 @@ export interface JiraSourceCfg {
    *  PR is merged and before the worktree is torn down); when undefined, the terminal stays unmapped
    *  (Jira-silent, no network) exactly as before. `aborted` is never mapped regardless. */
   statusDone?: string;
-  auth: JiraAuthCfg;
 }
 
 function bodyText(node: unknown): string {
@@ -112,7 +107,7 @@ export class JiraSource implements WorkSource {
   }
 
   async listEligible(pickupLabel?: string): Promise<MatchItem[]> {
-    const items = await this.jira.listEligible(this.cfg.project, pickupLabel, this.cfg.statusTodo);
+    const items = await this.jira.listEligible(this.cfg.board, this.cfg.project, pickupLabel, this.cfg.statusTodo);
     return items.map(
       (i): JiraMatchItem => ({
         sourceType: "jira",
@@ -241,7 +236,7 @@ export class JiraSource implements WorkSource {
     // Probe the pickup query for each belt's label (auth + project + JQL reachability); with none, a
     // label-less probe still exercises the connection. Jira belts always carry a label in practice.
     for (const label of pickupLabels.length ? pickupLabels : [undefined]) {
-      await this.jira.listEligible(this.cfg.project, label, this.cfg.statusTodo);
+      await this.jira.listEligible(this.cfg.board, this.cfg.project, label, this.cfg.statusTodo);
     }
   }
 }

@@ -2,7 +2,7 @@
 // (listConfiguredRepos); live status + eligible items come from the resident server (api.ts). Rows
 // are navigable (↑↓); contextual keys act on the highlighted row, each behind the shell's
 // confirmation modal:  t = tick a repo,  c = claim an eligible item,  x = teardown an active run,
-// d = open repo detail + diagnostics, r = refresh, l = log in (OAuth). Auto-refreshes every 3s while
+// d = open repo detail + diagnostics, r = refresh. Auto-refreshes every 3s while
 // active; when the server is down it lists the repos with a hint and actions no-op.
 //
 // Refresh is flicker-free: quick status paints first, eligible source queries fold in afterward, and
@@ -12,7 +12,6 @@ import { BoxRenderable, ScrollBoxRenderable, TextRenderable, type CliRenderer } 
 import type { KeyEvent } from "@opentui/core";
 import { hoverable, text } from "./render.ts";
 import { listConfiguredRepos } from "../config-paths.ts";
-import type { JiraSourceCfg } from "../clients/jira-source.ts";
 import { fetchEligible, fetchHealth, fetchStatus, fetchTimeline, postClaim, postTeardown, postTick, serverPort, type ActiveRun, type EligibleItem, type RepoStatus } from "./api.ts";
 import { BORDER, theme } from "./theme.ts";
 import type { ChooseFn, ConfirmFn, PromptFn, ShowInfoFn, TabView } from "./types.ts";
@@ -314,96 +313,6 @@ export function createDashboard(renderer: CliRenderer, actions: { confirm: Confi
     void refresh();
   }
 
-  /** Run the OAuth login for a red (unauthenticated) source, IN-PROCESS: open the browser, then
-   *  capture the redirected URL through the shell's prompt modal (the https callback means we read
-   *  the code back rather than auto-catch it). Tokens are saved to the local db; the auth light flips
-   *  authenticated in the repo Detail modal. Only a jira `auth.method: oauth` source can log in this way — anything
-   *  else (api_token / github_issues) is explained instead. */
-  async function doLogin(t: Target): Promise<void> {
-    if (!t.source) return;
-    let cfg: JiraSourceCfg;
-    let dbPath: string;
-    let brokerUrl: string | undefined;
-    try {
-      const { loadConfig } = await import("../config.ts");
-      const { config, env } = loadConfig(t.repo);
-      const src = config.sources.find((s) => s.name === t.source);
-      if (!src) return setAction(`✗ source "${t.source}" not in config`, theme.status.bad);
-      if (src.type !== "jira" || (src.cfg as JiraSourceCfg).auth.method !== "oauth") {
-        showInfo(`"${t.source}" doesn't use OAuth`, [
-          "Only a jira source with `auth: { method: oauth }` signs in via the browser.",
-          "An api_token source is fixed by setting its env credentials; github_issues uses the gh CLI.",
-        ]);
-        return;
-      }
-      cfg = src.cfg as JiraSourceCfg;
-      dbPath = config.paths.dbPath;
-      brokerUrl = env.JIRA_OAUTH_BROKER_URL;
-    } catch (e) {
-      return setAction(`✗ ${e instanceof Error ? e.message : String(e)}`, theme.status.bad);
-    }
-    const auth = cfg.auth as Extract<JiraSourceCfg["auth"], { method: "oauth" }>;
-    const [{ codeFromPaste, jiraOAuthLogin, OAUTH_REDIRECT_URI, openBrowser, pollServerForCode }, { resolveJiraOAuthApp }, { openDb }, { Store }, { systemClock }] = await Promise.all([
-      import("../auth/jira-login.ts"),
-      import("../auth/jira-oauth.ts"),
-      import("../db/index.ts"),
-      import("../db/store.ts"),
-      import("../types.ts"),
-    ]);
-    let app;
-    try {
-      app = resolveJiraOAuthApp({ clientId: auth.clientId, brokerUrl });
-    } catch (e) {
-      return setAction(`✗ ${e instanceof Error ? e.message : String(e)}`, theme.status.bad);
-    }
-    const db = openDb(dbPath);
-    try {
-      // Auto-capture via the resident server's https callback listener when it's up; else paste via
-      // the shell's prompt modal (openssl-less server, etc.).
-      const health = await fetchHealth();
-      const port = serverPort();
-      const getCode =
-        port && health?.oauthCallback
-          ? async ({ authUrl, state }: { authUrl: string; state: string }) => {
-              await openBrowser(authUrl);
-              setAction(`approve in your browser (click through the localhost warning) — waiting…`, theme.text.secondary);
-              return pollServerForCode(port, state);
-            }
-          : async ({ authUrl, state }: { authUrl: string; state: string }) => {
-              await openBrowser(authUrl);
-              const v = await prompt("Approve in your browser, then paste the redirected URL here", `${OAUTH_REDIRECT_URI}?code=…`);
-              if (v == null) throw new Error("login cancelled");
-              return codeFromPaste(v, state);
-            };
-      setAction(`opening a browser to authenticate "${t.source}"…`, theme.text.secondary);
-      const result = await jiraOAuthLogin({ store: new Store(db, systemClock), repo: t.repo, source: t.source, siteBaseUrl: cfg.baseUrl, app, scopes: auth.scopes, now: systemClock, getCode });
-      setAction(`✓ ${t.source}: authenticated to ${result.cloudUrl}`, theme.status.good);
-      void refresh();
-    } catch (e) {
-      setAction(`✗ login failed: ${e instanceof Error ? e.message : String(e)}`, theme.status.bad);
-    } finally {
-      db.close();
-    }
-  }
-
-  async function doRepoLogin(t: Target): Promise<void> {
-    let sources: string[];
-    try {
-      const { loadConfig } = await import("../config.ts");
-      sources = loadConfig(t.repo).config.sources
-        .filter((s) => s.type === "jira" && (s.cfg as JiraSourceCfg).auth.method === "oauth")
-        .map((s) => s.name);
-    } catch (e) {
-      return setAction(`✗ ${e instanceof Error ? e.message : String(e)}`, theme.status.bad);
-    }
-    if (sources.length === 0) {
-      showInfo(`${t.repo} — login`, ["No Jira OAuth sources are configured for this repo.", "API-token and GitHub authentication are managed through the repo env or gh CLI."]);
-      return;
-    }
-    const source = sources.length === 1 ? sources[0]! : await choose("Log in to which source?", sources.map((name) => ({ label: name, value: name })));
-    if (source) await doLogin({ repo: t.repo, kind: "source", source });
-  }
-
   async function openDetail(t: Target): Promise<void> {
     if (!serverUp) return setAction("server not running", theme.status.warn);
     const modal = showInfo(`${t.repo} — Detail`, ["Loading repository detail and running diagnostics…"]);
@@ -478,10 +387,6 @@ export function createDashboard(renderer: CliRenderer, actions: { confirm: Confi
         break;
       case "c":
         if (t?.kind === "eligible") void doClaim(t);
-        key.preventDefault();
-        break;
-      case "l":
-        if (t?.kind === "repo") void doRepoLogin(t);
         key.preventDefault();
         break;
       case "d":

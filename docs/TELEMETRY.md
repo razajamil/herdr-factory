@@ -67,7 +67,7 @@ herdr-factory install
 - Reconciler spans: repo pass, run pass, phase handlers, claims, teardown.
 - Step spans: materialization, prompt rendering, dispatch, spawn.
 - Dependency spans: source clients, Herdr, Git, GitHub, subprocess execution, server HTTP client calls.
-- Jira OAuth spans: `jira.oauth.login`, `jira.oauth.token_exchange`, `jira.oauth.token_refresh` (each nesting the broker `http.client.backend` call), and `oauth.broker.token` in the broker process. Metrics: `herdr_factory.oauth_events` (counter, labelled `oauth.phase` login|token_exchange|token_refresh|whoami|broker_forward + `oauth.outcome` ok|error) and `herdr_factory.source_auth_events` (auth-gate transitions unauthenticated|recovered). The broker process only exports when it's run with telemetry env set.
+- Work-source auth gate: `herdr_factory.source_auth_events` (counter, labelled `work.source` + `auth.state` unauthenticated|recovered) — emitted when a source can't authenticate (missing/rejected credentials) and when it recovers.
 - Span events mirrored from the existing SQLite domain timeline: `claimed`, `worktree_created`, `step_spawned`, `step_done`, `human_question`, `human_reply`, `pr_opened`, `resolver_woken`, `attention`, `torn_down`, and `error`.
 
 Telemetry does not add rows to the SQLite `events` table. The database timeline remains the product/domain timeline; OpenTelemetry is a separate observer.

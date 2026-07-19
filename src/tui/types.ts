@@ -8,7 +8,7 @@ export interface InfoModalHandle {
   update(title: string, lines: string[]): void;
 }
 export type ShowInfoFn = (title: string, lines: string[]) => InfoModalHandle;
-/** A single-line text prompt (e.g. paste an OAuth redirect URL). Resolves null when cancelled (Esc). */
+/** A single-line text prompt. Resolves null when cancelled (Esc). */
 export type PromptFn = (title: string, placeholder?: string) => Promise<string | null>;
 
 /** A top-level tab (lazygit-style navigation). The shell (index.ts) shows one view at a time and

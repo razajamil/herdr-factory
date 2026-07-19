@@ -19,11 +19,6 @@ const sourceAuthEvents = Metric.counter("herdr_factory.source_auth_events", {
   description: "Work-source auth-gate transitions (labelled work.source + auth.state unauthenticated|recovered)",
 });
 
-const oauthEvents = Metric.counter("herdr_factory.oauth_events", {
-  incremental: true,
-  description: "Jira OAuth lifecycle outcomes (labelled oauth.phase login|token_exchange|token_refresh|whoami|broker_forward + oauth.outcome ok|error)",
-});
-
 const rateLimitRemaining = Metric.gauge("herdr_factory.rate_limit.remaining", { description: "Backend-reported rate-limit remaining (per backend label)" });
 const rateLimitWaitMs = Metric.histogram(
   "herdr_factory.rate_limit.wait_ms",
@@ -95,9 +90,6 @@ export function recordSourceAuthEventEffect(attrs: TelemetryAttributes = {}): Ef
   return Metric.increment(Metric.taggedWithLabels(sourceAuthEvents, metricLabels(attrs)));
 }
 
-export function recordOAuthEventEffect(attrs: TelemetryAttributes = {}): Effect.Effect<void> {
-  return Metric.increment(Metric.taggedWithLabels(oauthEvents, metricLabels(attrs)));
-}
 
 export function recordRateLimitWaitEffect(ms: number, attrs: TelemetryAttributes = {}): Effect.Effect<void> {
   return Metric.update(Metric.taggedWithLabels(rateLimitWaitMs, metricLabels(attrs)), ms);

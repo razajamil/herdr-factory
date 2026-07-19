@@ -48,36 +48,15 @@ describe("config-fields: source poll_interval_seconds", () => {
   });
 });
 
-describe("config-fields: jira auth.method", () => {
-  it("renders auth.method as an enum (api_token | oauth), defaulting to api_token when unset", () => {
-    const auth = fieldsFor(jiraDoc()).find((f) => f.kind === "enum" && f.label === "auth.method");
-    expect(auth).toBeTruthy();
-    if (auth?.kind !== "enum") throw new Error("expected an enum field");
-    expect(auth.choices).toEqual(["api_token", "oauth"]);
-    expect(auth.value).toBe("api_token"); // no `auth` block yet ⇒ shows the schema default
+describe("config-fields: jira board (api_token only — no auth field)", () => {
+  it("renders a jira.board text field bound to the board path", () => {
+    const board = fieldsFor(jiraDoc()).find((f) => f.kind === "text" && f.label === "jira.board");
+    expect(board?.kind).toBe("text");
+    if (board?.kind === "text") expect(board.path).toEqual(["work_sources", 0, "jira", "board"]);
   });
 
-  it("picking oauth writes auth.method into the document (creating the auth block)", () => {
-    const doc = jiraDoc();
-    const auth = fieldsFor(doc).find((f) => f.kind === "enum" && f.label === "auth.method");
-    if (auth?.kind !== "enum") throw new Error("expected an enum field");
-    auth.apply("oauth");
-    expect(doc.getIn(["work_sources", 0, "jira", "auth", "method"])).toBe("oauth");
-  });
-
-  it("reflects an existing auth.method value", () => {
-    const doc = parseDocument(`work_sources:
-  - type: jira
-    jira:
-      base_url: https://x.atlassian.net
-      project: P
-      board: "1"
-      auth: { method: oauth }
-belt: []
-`);
-    const auth = fieldsFor(doc).find((f) => f.kind === "enum" && f.label === "auth.method");
-    if (auth?.kind !== "enum") throw new Error("expected an enum field");
-    expect(auth.value).toBe("oauth");
+  it("no longer offers an auth.method field (Jira is api_token only)", () => {
+    expect(fieldsFor(jiraDoc()).some((f) => f.kind === "enum" && f.label === "auth.method")).toBe(false);
   });
 });
 
