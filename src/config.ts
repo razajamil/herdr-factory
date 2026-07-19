@@ -220,6 +220,10 @@ const beltBase = {
   name: z.string().trim().min(1),
   source: z.string().trim().min(1),
   priority: z.coerce.number().int().default(100),
+  // Active/inactive toggle: an inactive belt is skipped when claiming new work (Phase B) but its
+  // in-flight runs progress exactly as usual — the status only gates taking on NEW work, letting
+  // you temporarily pause a belt without deleting it. Default true (a belt with no `active` runs).
+  active: z.boolean().default(true),
   workspace_name: WorkspaceNameSchema,
   match: z.string().optional(),
   // The label this belt picks up work by — the tag on a source item that flags it for this belt.
@@ -569,6 +573,9 @@ export interface BeltConfig {
   beltType: BeltType;
   source: string; // work_source name
   priority: number;
+  /** Whether the belt takes on new work. false ⇒ Phase B skips it (no polling, no claims); its
+   *  in-flight runs still reconcile normally. Defaults to true at parse. */
+  active: boolean;
   workspaceName?: string;
   matchFile?: string;
   /** The label this belt picks up work by, threaded into its source's listEligible/transition/
@@ -922,6 +929,7 @@ export function loadConfig(repoName: string): Loaded {
       beltType,
       source: b.source,
       priority: b.priority,
+      active: b.active,
       workspaceName: b.workspace_name,
       matchFile: b.match ? resolveFile(b.name, "match", b.match) : undefined,
       label: b.label,

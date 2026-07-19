@@ -58,6 +58,7 @@ export interface RepoStatus {
     beltType: string;
     source: string;
     priority: number;
+    active?: boolean;
     label?: string;
     steps: string[];
     diagnostic?: { state: "ok" | "down"; detail?: string };

@@ -5,7 +5,7 @@ import type { Deps } from "../src/core/deps.ts";
 
 // A minimal resolved belt (only the fields resolveBeltLayout reads matter).
 function belt(over: Partial<BeltConfig> = {}): BeltConfig {
-  return { name: "b", beltType: "custom", source: "s", priority: 100, steps: [], watchPr: false, ...over };
+  return { name: "b", beltType: "custom", source: "s", priority: 100, active: true, steps: [], watchPr: false, ...over };
 }
 
 describe("globMatch", () => {

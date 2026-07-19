@@ -104,7 +104,13 @@ describe("loadConfig — work sources + belts", () => {
     expect(belt.source).toBe("jira");
     expect(belt.label).toBe("agent"); // per-belt pickup label (no default — set in SHIP_BELT)
     expect(belt.priority).toBe(100); // default
+    expect(belt.active).toBe(true); // default — a belt takes on new work unless explicitly paused
     expect(belt.watchPr).toBe(true); // derived: a step produces pull_request
+  });
+
+  it("honors an explicit belt active: false", () => {
+    setup(cfg(JIRA_SRC, SHIP_BELT.replace("    source: jira", "    source: jira\n    active: false")));
+    expect(loadConfig("demo").config.belts[0]!.active).toBe(false);
   });
 
   it("resolves an opt-in status.done to statusDone (trimmed)", () => {

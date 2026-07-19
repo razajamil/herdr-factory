@@ -160,6 +160,7 @@ async function statusPayload(rt: RepoRuntime, quick = false, refreshDiagnostics 
       beltType: belt.beltType as string,
       source: belt.source,
       priority: belt.priority,
+      active: belt.active,
       label: belt.label,
       steps: belt.steps.map((step) => step.name),
     };

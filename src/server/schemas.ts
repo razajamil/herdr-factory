@@ -97,6 +97,7 @@ const StatusResponse = z
       beltType: z.string(),
       source: z.string(),
       priority: z.number(),
+      active: z.boolean().optional(),
       label: z.string().optional(),
       steps: z.array(z.string()),
       diagnostic: z.object({ state: z.enum(["ok", "down"]), detail: z.string().optional() }).optional(),

@@ -257,7 +257,7 @@ program
       console.log(`herdr-factory [${c.repoName}] — cap ${c.limits.maxActiveWorkspaces} workspaces`);
       console.log(`Sources: ${c.sources.map((s) => `${s.name}(${s.type})`).join(" · ")}`);
       console.log(
-        `Belts (priority order): ${c.belts.map((b) => `${b.name}(${b.beltType}, src:${b.source}, p${b.priority})`).join(" · ")}`,
+        `Belts (priority order): ${c.belts.map((b) => `${b.name}(${b.beltType}, src:${b.source}, p${b.priority}${b.active ? "" : ", INACTIVE"})`).join(" · ")}`,
       );
       console.log(`Runs: ${active.length} running (cap ${c.limits.maxActiveWorkspaces}) · ${finished.length} finished`);
       console.log("");

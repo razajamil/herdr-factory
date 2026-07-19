@@ -337,7 +337,7 @@ export function createDashboard(renderer: CliRenderer, actions: { confirm: Confi
     for (const belt of st.belts) {
       const activeCount = st.active.filter((run) => run.belt === belt.name).length;
       const eligibleCount = eligible.filter((item) => item.belt === belt.name).length;
-      output.push(`${belt.name} [${belt.beltType}]`);
+      output.push(`${belt.name} [${belt.beltType}]${belt.active === false ? " — INACTIVE" : ""}`);
       output.push(`  source: ${belt.source} · priority: ${belt.priority}${belt.label ? ` · label: ${belt.label}` : ""}`);
       output.push(`  steps: ${belt.steps?.length ? belt.steps.join(" → ") : "none"}`);
       output.push(`  work: ${activeCount} active · ${eligibleCount} eligible`);

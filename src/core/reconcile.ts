@@ -530,6 +530,13 @@ async function reconcileRepoImpl(deps: Deps): Promise<void> {
   let claimed = 0;
   for (const belt of deps.belts) {
     if (slots <= 0) break;
+    // An inactive belt takes on no new work — skipped BEFORE polling (so its source isn't polled or
+    // poll-window-stamped on its behalf). In-flight runs of this belt keep reconciling in Phase A;
+    // the flag only gates new claims, so it's a no-cost way to temporarily pause a belt.
+    if (!belt.active) {
+      deps.log("info", `belt ${belt.name}: inactive — skipping (no new claims; in-flight runs continue)`);
+      continue;
+    }
     const src = deps.resolveSource(belt.source);
     if (!src) {
       deps.log("warn", `belt ${belt.name}: source "${belt.source}" not configured — skipping`);

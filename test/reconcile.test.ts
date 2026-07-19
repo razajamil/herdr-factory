@@ -146,7 +146,7 @@ function build(opts: { multi?: boolean } = {}) {
   // global-cap tests; the dedicated per-source-cap test overrides it explicitly.
   const sources: SourceRuntime[] = [{ name: "jira", type: "jira", client: jiraClient, pollIntervalSeconds: 60, maxActiveWorkspaces: 999, lastPolledAt: new Map() }];
   // The default belt: a work_to_pull_request belt on the jira source (today's fix→review→pr flow).
-  const shipBelt: BeltRuntime = { name: "ship", beltType: "work_to_pull_request", source: "jira", priority: 1, steps: prSteps(), watchPr: true };
+  const shipBelt: BeltRuntime = { name: "ship", beltType: "work_to_pull_request", source: "jira", priority: 1, active: true, steps: prSteps(), watchPr: true };
   const belts: BeltRuntime[] = [shipBelt];
 
   let lmBelt: BeltRuntime | undefined;
@@ -165,7 +165,7 @@ function build(opts: { multi?: boolean } = {}) {
       health: async () => {},
     };
     sources.push({ name: "lm", type: "local_markdown", client: lmClient, pollIntervalSeconds: 60, maxActiveWorkspaces: 999, lastPolledAt: new Map() });
-    lmBelt = { name: "lmship", beltType: "work_to_pull_request", source: "lm", priority: 2, workspaceName: "feature/{{work_id}}", steps: prSteps(), watchPr: true };
+    lmBelt = { name: "lmship", beltType: "work_to_pull_request", source: "lm", priority: 2, active: true, workspaceName: "feature/{{work_id}}", steps: prSteps(), watchPr: true };
     belts.push(lmBelt);
   }
 
@@ -300,6 +300,16 @@ describe("applySignal — shared run-scoped agent signal effect", () => {
     expect(store.getRun(run.id)!.step).toBe("pr"); // advanced past review
     expect(store.getRunStep(run.id, "review")!.done).toBe(true);
     expect(store.timeline("demo", "K-AS1").some((e) => e.type === "step_done")).toBe(true);
+  });
+
+  it("an in-flight run whose belt is inactive still advances (inactive only gates new claims)", async () => {
+    const { deps, store, worktree, shipBelt } = build();
+    shipBelt.active = false; // the belt was paused after this run was already claimed
+    const run = seed(store, worktree, "K-INACT", "running", "review");
+    store.upsertRunStep(run.id, "fix", { done: true });
+    const res = await applySignal(deps, "step-done", { key: "K-INACT", step: "review" });
+    expect(res.ok).toBe(true);
+    expect(store.getRun(run.id)!.step).toBe("pr"); // progressed as usual despite the belt being inactive
   });
 
   it("step-done: rejects a step that isn't in the run's belt (no advance)", async () => {
@@ -603,7 +613,7 @@ describe("pass stamping — signals are bound to the step pass that minted them"
     const { deps, store, calls, worktree } = build();
     const src = deps.resolveSource("jira")!;
     const belt: BeltRuntime = {
-      name: "ship", beltType: "work_to_pull_request", source: "jira", priority: 1, watchPr: true,
+      name: "ship", beltType: "work_to_pull_request", source: "jira", priority: 1, active: true, watchPr: true,
       steps: [stepCfg("fix", { tab: undefined, pane: undefined }), stepCfg("review"), stepCfg("pr")],
     };
     const run = seed(store, worktree, "K-P6", "running", "review");
@@ -636,7 +646,7 @@ describe("exclusive_resource guard (the capture mutex)", () => {
     const { deps, store, worktree } = build();
     const src = deps.resolveSource("jira")!;
     const belt: BeltRuntime = {
-      name: "ship", beltType: "work_to_pull_request", source: "jira", priority: 1, watchPr: true,
+      name: "ship", beltType: "work_to_pull_request", source: "jira", priority: 1, active: true, watchPr: true,
       steps: [stepCfg("fix"), stepCfg("evidence", { guards: [LOCK_GUARD] }), stepCfg("review"), stepCfg("pr")],
     };
     const run = seed(store, worktree, "K-LOCK", "running", "evidence");
@@ -1044,7 +1054,7 @@ describe("reconcile pipeline (work_to_pull_request belt)", () => {
     const { deps, store, worktree } = build();
     // A 4-step belt (fix → evidence → review → pr) so there IS an intermediate step between the
     // bouncer (review) and the target (fix).
-    const belt: BeltRuntime = { name: "ship", beltType: "work_to_pull_request", source: "jira", priority: 1, watchPr: true, steps: [stepCfg("fix"), stepCfg("evidence"), stepCfg("review"), stepCfg("pr")] };
+    const belt: BeltRuntime = { name: "ship", beltType: "work_to_pull_request", source: "jira", priority: 1, active: true, watchPr: true, steps: [stepCfg("fix"), stepCfg("evidence"), stepCfg("review"), stepCfg("pr")] };
     const run = seed(store, worktree, "K-B6", "running", "review");
     store.upsertRunStep(run.id, "fix", { paneId: "w1:pfix", done: true });
     store.upsertRunStep(run.id, "evidence", { paneId: "w1:pev", done: true, progressSig: "sha-x", progressAt: 5 });
@@ -1544,6 +1554,7 @@ describe("custom belt (agent-driven, no PR)", () => {
       beltType: "custom",
       source: "jira",
       priority: 1,
+      active: true,
       steps: [
         stepCfg("research", { budgetSeconds: 3600, heartbeat: false, opensPr: false }),
         stepCfg("propose", { budgetSeconds: 3600, heartbeat: false, opensPr: false }),
@@ -1598,8 +1609,8 @@ describe("custom belt (agent-driven, no PR)", () => {
 describe("belt routing (match predicates, first match wins)", () => {
   it("claims each item with the first belt (by priority) whose match accepts it", async () => {
     const { deps, store, state } = build();
-    const bugs: BeltRuntime = { name: "bugs", beltType: "work_to_pull_request", source: "jira", priority: 1, steps: prSteps(), watchPr: true, match: (ctx) => ctx.item.type === "Bug" };
-    const rest: BeltRuntime = { name: "rest", beltType: "work_to_pull_request", source: "jira", priority: 2, steps: prSteps(), watchPr: true };
+    const bugs: BeltRuntime = { name: "bugs", beltType: "work_to_pull_request", source: "jira", priority: 1, active: true, steps: prSteps(), watchPr: true, match: (ctx) => ctx.item.type === "Bug" };
+    const rest: BeltRuntime = { name: "rest", beltType: "work_to_pull_request", source: "jira", priority: 2, active: true, steps: prSteps(), watchPr: true };
     deps.belts = [bugs, rest];
     deps.resolveBelt = (n) => deps.belts.find((b) => b.name === n);
     state.eligible = [ticket("K-bug", "Bug"), ticket("K-task", "Task")];
@@ -1610,12 +1621,35 @@ describe("belt routing (match predicates, first match wins)", () => {
 
   it("an item no belt matches is left unclaimed", async () => {
     const { deps, store, state } = build();
-    const onlyBugs: BeltRuntime = { name: "bugs", beltType: "work_to_pull_request", source: "jira", priority: 1, steps: prSteps(), watchPr: true, match: (ctx) => ctx.item.type === "Bug" };
+    const onlyBugs: BeltRuntime = { name: "bugs", beltType: "work_to_pull_request", source: "jira", priority: 1, active: true, steps: prSteps(), watchPr: true, match: (ctx) => ctx.item.type === "Bug" };
     deps.belts = [onlyBugs];
     deps.resolveBelt = (n) => (n === "bugs" ? onlyBugs : undefined);
     state.eligible = [ticket("K-task", "Task")];
     await reconcileRepo(deps);
     expect(store.activeRunForTicket("demo", "jira", "K-task")).toBeUndefined();
+    expect(store.countActive("demo")).toBe(0);
+  });
+
+  it("an inactive belt claims no new work; the next active belt still does", async () => {
+    const { deps, store, state } = build();
+    const paused: BeltRuntime = { name: "paused", beltType: "work_to_pull_request", source: "jira", priority: 1, active: false, steps: prSteps(), watchPr: true };
+    const live: BeltRuntime = { name: "live", beltType: "work_to_pull_request", source: "jira", priority: 2, active: true, steps: prSteps(), watchPr: true };
+    deps.belts = [paused, live];
+    deps.resolveBelt = (n) => deps.belts.find((b) => b.name === n);
+    state.eligible = [ticket("K-1", "Task")];
+    await reconcileRepo(deps);
+    // The higher-priority belt is inactive so it takes nothing; the item falls through to the active one.
+    expect(store.activeRunForTicket("demo", "jira", "K-1")?.belt).toBe("live");
+  });
+
+  it("all belts inactive ⇒ nothing is claimed", async () => {
+    const { deps, store, state } = build();
+    const paused: BeltRuntime = { name: "paused", beltType: "work_to_pull_request", source: "jira", priority: 1, active: false, steps: prSteps(), watchPr: true };
+    deps.belts = [paused];
+    deps.resolveBelt = (n) => (n === "paused" ? paused : undefined);
+    state.eligible = [ticket("K-1", "Task")];
+    await reconcileRepo(deps);
+    expect(store.activeRunForTicket("demo", "jira", "K-1")).toBeUndefined();
     expect(store.countActive("demo")).toBe(0);
   });
 });

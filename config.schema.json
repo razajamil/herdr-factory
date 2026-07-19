@@ -432,6 +432,10 @@
             "minimum": -9007199254740991,
             "maximum": 9007199254740991
           },
+          "active": {
+            "default": true,
+            "type": "boolean"
+          },
           "workspace_name": {
             "type": "string"
           },

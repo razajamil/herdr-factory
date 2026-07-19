@@ -105,7 +105,7 @@ describe("resolveHookLayout — factory-owned vs manual worktree", () => {
     { id: "web", tabs: [{ panes: [{ setup: false }] }] },
     { id: "hot", tabs: [{ panes: [{ setup: false }] }] },
   ];
-  const belt = (over: Partial<BeltConfig>): BeltConfig => ({ name: "b", beltType: "custom", source: "s", priority: 100, steps: [], watchPr: false, ...over });
+  const belt = (over: Partial<BeltConfig>): BeltConfig => ({ name: "b", beltType: "custom", source: "s", priority: 100, active: true, steps: [], watchPr: false, ...over });
 
   it("uses the owning run's belt when the worktree is factory-owned", () => {
     const belts = [belt({ name: "a", priority: 1, defaultLayout: "web" }), belt({ name: "b", priority: 2, defaultLayout: "hot" })];

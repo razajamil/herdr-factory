@@ -302,6 +302,8 @@ export function buildDescriptors(draft: Document, rebuild: () => void, confirm: 
     d.push({ kind: "text", label: "name", path: ["belt", i, "name"], placeholder: "my_belt", indent: 1 });
     d.push({ kind: "ref", label: "source", value: String(b?.source ?? ""), choices: sourceNames.length ? sourceNames : [""], indent: 1, apply: (next) => { draft.setIn(["belt", i, "source"], next); rebuild(); } });
     d.push({ kind: "text", label: "priority", path: ["belt", i, "priority"], placeholder: "100", numeric: true, indent: 1 });
+    // active (default true): an inactive belt takes on no new work; its in-flight runs keep going.
+    d.push({ kind: "bool", label: "active", value: b?.active !== false, indent: 1, apply: (next) => { if (next) draft.deleteIn(["belt", i, "active"]); else draft.setIn(["belt", i, "active"], false); rebuild(); } });
     // The per-belt pickup label — shown only for a label-driven source (jira/github_issues), where
     // it's REQUIRED; a source with no label concept (local_markdown) has none, so it's hidden.
     const pickup = SOURCE_DESCRIPTORS.find((x) => x.type === sourceTypeByName.get(String(b?.source ?? "")))?.pickupLabel;
