@@ -1974,7 +1974,12 @@ async function teardownImpl(deps: Deps, run: Run, outcome: Outcome, src: SourceR
     await deps.rmrf(run.worktreePath).catch(() => {});
   }
   await deps.git.worktreePrune(deps.config.repo.path).catch(() => {});
-  if (run.branch) await deps.git.branchDelete(deps.config.repo.path, run.branch);
+  if (run.branch) {
+    // branchDelete force-removes any worktree still on the branch (an abandoned-while-running run
+    // whose agent kept the dir busy) and retries; only warn if the branch STILL can't be deleted.
+    const deleted = await deps.git.branchDelete(deps.config.repo.path, run.branch);
+    if (!deleted) deps.log("warn", `${run.ticketKey}: branch ${run.branch} could not be deleted at teardown (still present after force-prune) — remove it manually`);
+  }
 
   // Best-effort drop of any still-pending evidence upload: the worktree (and its evidence dir) is gone,
   // so the bytes can't be uploaded anymore. Log the loss so it's visible rather than silent.

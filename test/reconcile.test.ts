@@ -223,7 +223,7 @@ function build(opts: { multi?: boolean } = {}) {
   };
   const git: GitApi = {
     branchExists: async () => false,
-    branchDelete: async (_cwd, b) => { calls.branchDelete.push(b); },
+    branchDelete: async (_cwd, b) => { calls.branchDelete.push(b); return true; },
     worktreePrune: async () => {},
     originUrl: async () => "git@github.com:o/n.git",
     headSha: async () => state.headSha,

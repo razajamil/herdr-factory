@@ -271,7 +271,9 @@ export interface GitHubApi {
 
 export interface GitApi {
   branchExists(repoCwd: string, branch: string): Promise<boolean>;
-  branchDelete(repoCwd: string, branch: string): Promise<void>;
+  /** Delete a local branch; resolves to whether it's gone afterward (false ⇒ still present even
+   *  after force-removing any worktree still on it — the caller should surface that). */
+  branchDelete(repoCwd: string, branch: string): Promise<boolean>;
   worktreePrune(repoCwd: string): Promise<void>;
   originUrl(repoCwd: string): Promise<string>;
   headSha(repoCwd: string): Promise<string | null>;
