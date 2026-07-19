@@ -336,6 +336,25 @@ export class Store {
     return row.n;
   }
 
+  /** Occupying-run counts (same posture as countOccupying) grouped by `work_source` — the per-source
+   *  concurrency accounting Phase B checks against each source's `max_active_workspaces`. Sources with
+   *  zero occupying runs are simply absent from the map (callers default a miss to 0). */
+  countOccupyingBySource(repo: string): Map<string, number> {
+    const rows = this.db
+      .prepare(
+        `SELECT r.work_source AS source, COUNT(*) AS n FROM runs r
+         LEFT JOIN run_products rp ON rp.run_id = r.id AND rp.product = 'pull_request'
+         WHERE r.repo = ? AND r.ended_at IS NULL
+           AND r.phase NOT IN ('attention', 'waiting_for_human')
+           AND NOT (r.phase = 'reviewing' AND COALESCE(rp.active, 0) = 0)
+         GROUP BY r.work_source`,
+      )
+      .all(repo) as { source: string | null; n: number }[];
+    const counts = new Map<string, number>();
+    for (const { source, n } of rows) if (source != null) counts.set(source, n);
+    return counts;
+  }
+
   activeRuns(repo: string): Run[] {
     const rows = this.db
       .prepare(`${RUN_SELECT} WHERE r.repo = ? AND r.ended_at IS NULL ORDER BY r.created_at`)

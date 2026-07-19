@@ -491,7 +491,10 @@ is pure data (`herdr-factory reload` picks it up without a restart).
 Each entry: a `type`, an optional `name` (default = the type; must be unique per repo — belts
 reference it), an optional `poll_interval_seconds` (how often this source is polled for new work;
 overrides `limits.source_poll_interval_seconds` — handy for a rate-limited board polled slower than
-the tick), and a type block:
+the tick), an optional `max_active_workspaces` (default **2** — the most **worked** workspaces this
+source may hold in flight at once, summed across every belt that pulls from it; belts are walked in
+priority order and claiming stops once a source hits its cap, so `limits.max_active_workspaces` still
+caps the repo total but no single source can monopolize it), and a type block:
 
 - **`jira`** — `base_url`, `project`, a required `board` (the Agile board id, e.g. `254`), and a
   `status` map: `todo` (default `To Do`), `in_development` (default `In Progress`), `review` (default

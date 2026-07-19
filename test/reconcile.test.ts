@@ -142,7 +142,9 @@ function build(opts: { multi?: boolean } = {}) {
     },
     health: async () => {},
   };
-  const sources: SourceRuntime[] = [{ name: "jira", type: "jira", client: jiraClient, pollIntervalSeconds: 60, lastPolledAt: new Map() }];
+  // Per-source cap set high (effectively unlimited) so the DEFAULT-2 cap doesn't bite the existing
+  // global-cap tests; the dedicated per-source-cap test overrides it explicitly.
+  const sources: SourceRuntime[] = [{ name: "jira", type: "jira", client: jiraClient, pollIntervalSeconds: 60, maxActiveWorkspaces: 999, lastPolledAt: new Map() }];
   // The default belt: a work_to_pull_request belt on the jira source (today's fix→review→pr flow).
   const shipBelt: BeltRuntime = { name: "ship", beltType: "work_to_pull_request", source: "jira", priority: 1, steps: prSteps(), watchPr: true };
   const belts: BeltRuntime[] = [shipBelt];
@@ -162,7 +164,7 @@ function build(opts: { multi?: boolean } = {}) {
       pollHumanReply: async (input) => { calls.humanPoll.push(input); return state.humanReply; },
       health: async () => {},
     };
-    sources.push({ name: "lm", type: "local_markdown", client: lmClient, pollIntervalSeconds: 60, lastPolledAt: new Map() });
+    sources.push({ name: "lm", type: "local_markdown", client: lmClient, pollIntervalSeconds: 60, maxActiveWorkspaces: 999, lastPolledAt: new Map() });
     lmBelt = { name: "lmship", beltType: "work_to_pull_request", source: "lm", priority: 2, workspaceName: "feature/{{work_id}}", steps: prSteps(), watchPr: true };
     belts.push(lmBelt);
   }
@@ -233,7 +235,7 @@ function build(opts: { multi?: boolean } = {}) {
     repoName: "demo",
     repo: { path: "/main-checkout", baseRef: "origin/master" },
     limits: { maxActiveWorkspaces: 3, attentionRenotifySeconds: 3600, stallSeconds: 2700, maxBounces: 3, maxCaptureAttempts: 5, stepBudgetSeconds: 3600, tickIntervalSeconds: 60, reconcileConcurrency: 8, maxClaimsPerTick: 10, layoutWaitSeconds: 600 },
-    sources: sources.map((s) => ({ name: s.name, type: s.type, pollIntervalSeconds: s.pollIntervalSeconds, cfg: {} })),
+    sources: sources.map((s) => ({ name: s.name, type: s.type, pollIntervalSeconds: s.pollIntervalSeconds, maxActiveWorkspaces: s.maxActiveWorkspaces, cfg: {} })),
     belts,
     layouts: [],
     guidance: undefined,
@@ -257,7 +259,7 @@ function build(opts: { multi?: boolean } = {}) {
     sleep: async () => {},
     rmrf: async (p) => { calls.rmrf.push(p); },
   };
-  return { deps, store, state, calls, setNow: (n: number) => { now = n; }, worktree, shipBelt, lmBelt };
+  return { deps, store, state, calls, setNow: (n: number) => { now = n; }, worktree, shipBelt, lmBelt, sources };
 }
 
 const ticket = (key: string, type = "Bug"): Ticket => ({ key, summary: "Fix the thing", type });
@@ -1638,6 +1640,31 @@ describe("multi-belt claim (Phase B)", () => {
     await reconcileRepo(deps);
     expect(store.countActive("demo")).toBe(2); // both jira slots used; lm gets none
     expect(store.activeRunForTicket("demo", "lm", "M-1")).toBeUndefined();
+  });
+
+  it("caps claims per source at its max_active_workspaces, leaving global slots for others", async () => {
+    const { deps, store, state, sources } = build({ multi: true });
+    deps.config.limits.maxActiveWorkspaces = 5; // ample global headroom
+    sources.find((s) => s.name === "jira")!.maxActiveWorkspaces = 2; // per-source cap bites first
+    state.eligible = [ticket("J-1"), ticket("J-2"), ticket("J-3"), ticket("J-4")];
+    state.eligible2 = [ticket("M-1")];
+    await reconcileRepo(deps);
+    // jira stops at 2 even though 3 global slots remain; lm still gets its claim.
+    expect(store.countOccupyingBySource("demo").get("jira")).toBe(2);
+    expect(store.activeRunForTicket("demo", "jira", "J-3")).toBeUndefined();
+    expect(store.activeRunForTicket("demo", "lm", "M-1")).toBeTruthy();
+    expect(store.countActive("demo")).toBe(3);
+  });
+
+  it("the per-source cap counts occupancy already in flight from a prior tick", async () => {
+    const { deps, store, state, sources, worktree } = build();
+    deps.config.limits.maxActiveWorkspaces = 5;
+    sources.find((s) => s.name === "jira")!.maxActiveWorkspaces = 2;
+    seed(store, worktree, "J-OLD", "running", "fix"); // one jira run already occupying
+    state.eligible = [ticket("J-1"), ticket("J-2")];
+    await reconcileRepo(deps);
+    expect(store.countOccupyingBySource("demo").get("jira")).toBe(2); // 1 old + only 1 new
+    expect(store.activeRunForTicket("demo", "jira", "J-2")).toBeUndefined();
   });
 
   it("the same key in two sources is claimed as two distinct runs", async () => {

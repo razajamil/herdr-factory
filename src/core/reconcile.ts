@@ -471,6 +471,21 @@ async function reconcileRepoImpl(deps: Deps): Promise<void> {
   // start with a big backlog into successive ticks instead of one source-hammering mega-tick.
   if (slots > deps.config.limits.maxClaimsPerTick) slots = deps.config.limits.maxClaimsPerTick;
 
+  // Per-source concurrency: each source contributes at most its own max_active_workspaces occupying
+  // runs, summed across every belt that pulls from it. Remaining source slots are computed once from
+  // current occupancy (same posture as the global cap) and decremented as we claim, so a busy
+  // high-priority source can't monopolize the repo-wide cap and starve the others.
+  const occupyingBySource = deps.store.countOccupyingBySource(repo);
+  const srcRemaining = new Map<string, number>();
+  const sourceSlots = (src: SourceRuntime): number => {
+    let remaining = srcRemaining.get(src.name);
+    if (remaining === undefined) {
+      remaining = src.maxActiveWorkspaces - (occupyingBySource.get(src.name) ?? 0);
+      srcRemaining.set(src.name, remaining);
+    }
+    return remaining;
+  };
+
   // One eligible query per (source, pickup label) per pass: a source feeding several belts is
   // fetched once PER DISTINCT label (label-driven sources filter server-side on it, so different
   // belts see disjoint items; a label-less source ignores it and collapses to one fetch).
@@ -520,8 +535,15 @@ async function reconcileRepoImpl(deps: Deps): Promise<void> {
       deps.log("warn", `belt ${belt.name}: source "${belt.source}" not configured — skipping`);
       continue;
     }
+    // Skip a belt whose source is already at its concurrency cap — checked BEFORE polling, so an
+    // exhausted source isn't polled (and doesn't have its poll-window stamped) needlessly.
+    if (sourceSlots(src) <= 0) {
+      deps.log("info", `belt ${belt.name}: source "${src.name}" at its concurrency cap (${src.maxActiveWorkspaces}) — skipping`);
+      continue;
+    }
     for (const item of await getEligible(src, belt.label)) {
       if (slots <= 0) break;
+      if (sourceSlots(src) <= 0) break; // source hit its per-source cap mid-belt
       // Dedup is per (source, key): once any belt has an active run for the item, no other belt
       // claims it — which is exactly what makes "first matching belt wins" hold across the pass.
       if (deps.store.activeRunForTicket(repo, src.name, item.key)) continue;
@@ -544,8 +566,10 @@ async function reconcileRepoImpl(deps: Deps): Promise<void> {
       }
       // claim() creates the run row FIRST (which immediately counts toward countActive), so the
       // slot is consumed even if the rest of the claim throws — decrement before the try, or a
-      // burst of claim failures in one pass would transiently spawn past maxActive.
+      // burst of claim failures in one pass would transiently spawn past maxActive. Decrement the
+      // per-source slot the same way, for the same reason.
       slots -= 1;
+      srcRemaining.set(src.name, sourceSlots(src) - 1);
       try {
         await claim(deps, belt, src, ticketOf(item));
         claimed += 1;

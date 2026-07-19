@@ -618,7 +618,8 @@ CREATE TABLE schema_version(version INTEGER);
 ```
 
 `db/store.ts` (synchronous): `countActive(repo)` / `countOccupying(repo)` (active minus parked —
-what the claim cap counts), `activeRuns(repo)`, `activeRunForTicket(repo,source,key)` (the
+what the claim cap counts) / `countOccupyingBySource(repo)` (the same posture grouped by
+`work_source` — the per-source `max_active_workspaces` accounting), `activeRuns(repo)`, `activeRunForTicket(repo,source,key)` (the
 Phase-B dedup, **source-scoped** so two sources can carry the same key), `activeRunsForKey(repo,key)`
 (key-only, across sources — for the manual CLI; the caller errors on >1 match),
 `createRun({…,workSource,belt})`, `updateRun(id,patch)`, `endRun(id,outcome)`, `recordEvent(…)`,
@@ -699,7 +700,15 @@ removed escalates to `attention`; a `tearing_down` run still finishes local clea
 **Phase B** walks belts in **priority order** and claims eligible work up to the cap — which
 counts **working** runs only (`countOccupying`; parked runs hold no slot) and admits at most
 `limits.max_claims_per_tick` (default 10) new claims per pass, smoothing a big-backlog cold
-start (each claim ≈ a worktree checkout + ~5 source calls) over successive ticks. Each source's
+start (each claim ≈ a worktree checkout + ~5 source calls) over successive ticks. A **per-source
+concurrency cap** rides alongside the global one: each source contributes at most its own
+`max_active_workspaces` (default **2**) occupying runs, summed across every belt that pulls from it
+(`countOccupyingBySource` seeds the remaining-slots accounting, decremented as claims land — before
+the try, like the global slot, so a claim failure still counts). Claiming stops for a source the
+moment it hits its cap (checked *before* the source is polled, so an exhausted source isn't polled
+needlessly), so a busy high-priority source can't monopolize the repo-wide cap and starve the
+others — the global `limits.max_active_workspaces` stays the ceiling on total worked workspaces.
+Each source's
 `listEligible` poll is **rate-gated by its `pollIntervalSeconds`** (the resolved per-source
 `poll_interval_seconds` ?? `limits.source_poll_interval_seconds` ?? `tick_interval_seconds`): the
 gate engages only when that interval **exceeds** the tick (so the default polls every tick,

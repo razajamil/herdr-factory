@@ -42,10 +42,11 @@ const STEP_TYPE_CHOICES = STEP_DESCRIPTORS.map((d) => d.name);
 // A layout pane's split direction (mirrors PaneSplitSchema in config.ts). vertical/right → a pane to
 // the RIGHT of the previous one; horizontal/down → BELOW it. Ignored on a tab's first pane.
 const SPLIT_CHOICES = ["vertical", "horizontal", "right", "down"];
-const sourceNode = (type: SourceType, name?: unknown, pollInterval?: unknown) => ({
+const sourceNode = (type: SourceType, name?: unknown, pollInterval?: unknown, maxActive?: unknown) => ({
   type,
   ...(name != null ? { name } : {}),
   ...(pollInterval != null ? { poll_interval_seconds: pollInterval } : {}),
+  ...(maxActive != null ? { max_active_workspaces: maxActive } : {}),
   [type]: descriptorFor(type).tui.defaultBlock(),
 });
 // A newly-added step defaults to the generic `custom` primitive (its prompt_file is the whole body);
@@ -152,6 +153,9 @@ export function buildDescriptors(draft: Document, rebuild: () => void, confirm: 
       // Common (type-agnostic) source field: how often to poll THIS source for new work. Optional —
       // clearable back to the repo-wide default (limits.source_poll_interval_seconds, itself the tick).
       d.push({ kind: "text", label: "poll_interval_seconds", path: ["work_sources", i, "poll_interval_seconds"], placeholder: "= source_poll_interval_seconds", numeric: true, clearable: true, indent: 1 });
+      // Common (type-agnostic) source field: per-source concurrency cap (worked workspaces across
+      // every belt on this source). Clearable back to the default of 2.
+      d.push({ kind: "text", label: "max_active_workspaces", path: ["work_sources", i, "max_active_workspaces"], placeholder: "2", numeric: true, clearable: true, indent: 1 });
       d.push({
         kind: "enum",
         label: "type",
@@ -162,7 +166,8 @@ export function buildDescriptors(draft: Document, rebuild: () => void, confirm: 
           if (next === type) return;
           const name = draft.getIn(["work_sources", i, "name"]);
           const poll = draft.getIn(["work_sources", i, "poll_interval_seconds"]); // common field survives the type switch
-          draft.setIn(["work_sources", i], draft.createNode(sourceNode(next as SourceType, name, poll)));
+          const maxActive = draft.getIn(["work_sources", i, "max_active_workspaces"]); // common field survives the type switch
+          draft.setIn(["work_sources", i], draft.createNode(sourceNode(next as SourceType, name, poll, maxActive)));
           open(["work_sources", i]); // keep expanded after switching type
           rebuild();
         },

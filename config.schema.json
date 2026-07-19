@@ -112,6 +112,12 @@
                 "exclusiveMinimum": 0,
                 "maximum": 9007199254740991
               },
+              "max_active_workspaces": {
+                "default": 2,
+                "type": "integer",
+                "exclusiveMinimum": 0,
+                "maximum": 9007199254740991
+              },
               "jira": {
                 "type": "object",
                 "properties": {
@@ -190,6 +196,12 @@
                 "exclusiveMinimum": 0,
                 "maximum": 9007199254740991
               },
+              "max_active_workspaces": {
+                "default": 2,
+                "type": "integer",
+                "exclusiveMinimum": 0,
+                "maximum": 9007199254740991
+              },
               "local_markdown": {
                 "type": "object",
                 "properties": {
@@ -220,6 +232,12 @@
                 "minLength": 1
               },
               "poll_interval_seconds": {
+                "type": "integer",
+                "exclusiveMinimum": 0,
+                "maximum": 9007199254740991
+              },
+              "max_active_workspaces": {
+                "default": 2,
                 "type": "integer",
                 "exclusiveMinimum": 0,
                 "maximum": 9007199254740991
@@ -322,6 +340,12 @@
                 "minLength": 1
               },
               "poll_interval_seconds": {
+                "type": "integer",
+                "exclusiveMinimum": 0,
+                "maximum": 9007199254740991
+              },
+              "max_active_workspaces": {
+                "default": 2,
                 "type": "integer",
                 "exclusiveMinimum": 0,
                 "maximum": 9007199254740991

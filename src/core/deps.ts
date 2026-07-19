@@ -243,6 +243,9 @@ export interface SourceRuntime {
   client: WorkSource;
   /** How often to poll this source for new work (Phase B `listEligible`), in seconds. */
   pollIntervalSeconds: number;
+  /** Per-source concurrency cap: the most WORKED workspaces this source may hold in flight at once,
+   *  summed across every belt that pulls from it (Phase B stops claiming from it once reached). */
+  maxActiveWorkspaces: number;
   /** Last poll time per pickup label (key = `label ?? ""`), epoch SECONDS (matches `deps.now()`).
    *  Mutable, in-memory only —
    *  it lives on the long-lived per-repo runtime, so serve/watch honor the interval across ticks;

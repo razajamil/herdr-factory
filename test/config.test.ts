@@ -211,6 +211,32 @@ describe("loadConfig — work sources + belts", () => {
       setup(cfg(bad, SHIP_BELT));
       expect(() => loadConfig("demo")).toThrow();
     });
+
+    it("defaults each source's max_active_workspaces to 2", () => {
+      setup(cfg(`${JIRA_SRC}${LM_SRC}`, SHIP_BELT));
+      const { config } = loadConfig("demo");
+      expect(config.sources.map((s) => s.maxActiveWorkspaces)).toEqual([2, 2]);
+    });
+
+    it("a per-source max_active_workspaces overrides the default", () => {
+      const jiraWide = `  - type: jira
+    max_active_workspaces: 5
+    jira: { base_url: https://x.atlassian.net, project: RWR, board: 254 }
+`;
+      setup(cfg(`${jiraWide}${LM_SRC}`, SHIP_BELT));
+      const { config } = loadConfig("demo");
+      expect(config.sources.find((s) => s.type === "jira")!.maxActiveWorkspaces).toBe(5);
+      expect(config.sources.find((s) => s.type === "local_markdown")!.maxActiveWorkspaces).toBe(2);
+    });
+
+    it("rejects a non-positive max_active_workspaces", () => {
+      const bad = `  - type: jira
+    max_active_workspaces: 0
+    jira: { base_url: https://x.atlassian.net, project: RWR, board: 254 }
+`;
+      setup(cfg(bad, SHIP_BELT));
+      expect(() => loadConfig("demo")).toThrow();
+    });
   });
 
   it("github_issues: repo may be omitted (defaults to the PR repo at build time); bad shapes rejected", () => {

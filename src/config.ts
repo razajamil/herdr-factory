@@ -490,6 +490,10 @@ export interface WorkSourceConfig {
   /** How often this source is polled for new work (Phase B `listEligible`), in seconds. Resolved =
    *  the source's own `poll_interval_seconds` ?? `limits.source_poll_interval_seconds` ?? tick. */
   pollIntervalSeconds: number;
+  /** Per-source concurrency cap: the most WORKED workspaces this source may hold in flight at once,
+   *  summed across every belt that pulls from it. Phase B stops claiming from the source once it hits
+   *  this; the repo-wide `limits.maxActiveWorkspaces` still caps the total. Defaults to 2. */
+  maxActiveWorkspaces: number;
   cfg: unknown;
 }
 
@@ -833,6 +837,7 @@ export function loadConfig(repoName: string): Loaded {
     name: s.name ?? s.type,
     type: s.type,
     pollIntervalSeconds: (s.poll_interval_seconds as number | undefined) ?? defaultPollInterval,
+    maxActiveWorkspaces: (s.max_active_workspaces as number | undefined) ?? 2,
     cfg: descriptorFor(s.type).resolveConfig(s),
   }));
   const sourceTypeByName = new Map(sources.map((s) => [s.name, s.type]));

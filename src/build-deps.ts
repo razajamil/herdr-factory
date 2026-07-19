@@ -67,6 +67,7 @@ export async function buildDeps(repoName: string): Promise<Deps> {
         type: s.type,
         client: instrumentObject(client, "source", sourceAttrs),
         pollIntervalSeconds: s.pollIntervalSeconds,
+        maxActiveWorkspaces: s.maxActiveWorkspaces,
         lastPolledAt: new Map<string, number>(),
       };
     });
