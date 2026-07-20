@@ -93,6 +93,8 @@ function build(opts: { multi?: boolean } = {}) {
   const state: FakeState = { eligible: [], eligible2: [], pr: null, sig: { unresolved: 0, failing: 0, sig: "s0" }, paneState: "idle", deadPanes: new Set(), tabPane: "w1:p1", tabPaneByName: {}, headSha: "sha0", sessionId: "sess-1", workspaceExists: false, focusedPane: { paneId: "w1:p1", workspaceId: "w1", tabId: "w1:t1", label: "agent" }, humanReply: null, herdrUnreachable: false, failTransitions: false, failTransitionStates: new Set(), staleTransitionStates: new Set(), humanPollError: null, humanAskError: null, failEligible: false, authFail: false, itemLabels: {} };
   const calls = {
     transitions: [] as [string, WorkState][],
+    // Belt-effect deliveries: records the source-native statusOverride whenever one is passed.
+    transitionOverrides: [] as [string, WorkState, string][],
     agentSend: [] as [string, string][],
     agentRename: [] as [string, string][],
     agentFocus: [] as string[],
@@ -121,11 +123,12 @@ function build(opts: { multi?: boolean } = {}) {
       return state.eligible.map(wrapJira);
     },
     describe: async (key) => ({ key, summary: "Fix the thing", type: "Bug" }),
-    transition: async (key, to) => {
+    transition: async (key, to, _pickup, _ctx, statusOverride) => {
       if (state.authFail) throw new SourceUnauthenticatedError({ reason: "rejected", hint: "fake: not authenticated" });
       if (state.failTransitions || state.failTransitionStates.has(to)) throw new Error(`transition to ${to} failed (fake)`);
       if (state.staleTransitionStates.has(to)) return { kind: "stale", detail: "issue deleted (fake)" };
       calls.transitions.push([key, to]);
+      if (statusOverride !== undefined) calls.transitionOverrides.push([key, to, statusOverride]);
       return { kind: "applied" };
     },
     materialize: async (_key, memDir) => { mkdirSync(memDir, { recursive: true }); writeFileSync(join(memDir, "ticket.json"), "{}"); },
@@ -2654,5 +2657,71 @@ describe("fresh-worktree memory scrub — a committed .memory can't supplant the
     state.eligible = [ticket("CATS-1")];
     await reconcileRepo(deps);
     expect(readFileSync(join(mem, "handoff-fix.md"), "utf8")).toBe("live handoff");
+  });
+});
+
+describe("belt effects — configurable task progression", () => {
+  // Build a work→evidence→review→pr belt with a configured effect, and seed a run parked at a step.
+  function withEffects(effects: BeltRuntime["effects"]) {
+    const h = build();
+    h.shipBelt.steps = [stepCfg("fix"), stepCfg("evidence"), stepCfg("review"), stepCfg("pr")];
+    h.shipBelt.effects = effects;
+    return h;
+  }
+
+  it("on evidence produce → QA: fires a source transition through the outbox (anchor in_review, status qa)", async () => {
+    const { deps, store, worktree, calls } = withEffects([{ trigger: { on: "produce", product: "evidence" }, to: "in_review", status: "qa" }]);
+    const run = seed(store, worktree, "K-QA1", "running", "evidence");
+    store.upsertRunStep(run.id, "evidence", { done: true }); // the evidence agent signalled done (passed)
+    await reconcileRun(deps, store.getRun(run.id)!);
+    // The QA move rode the outbox: to_state is the canonical anchor (in_review), to_status the
+    // source-native key (qa) — a DISTINCT intent, delivered with the statusOverride.
+    expect(store.transitionTargetsForRun(run.id)).toContainEqual({ toState: "in_review", toStatus: "qa" });
+    expect(calls.transitionOverrides).toContainEqual(["K-QA1", "in_review", "qa"]);
+    expect(store.getRun(run.id)!.step).toBe("review"); // and it advanced forward
+  });
+
+  it("is idempotent / retry-safe: re-reconciling the same completed step re-opens the SAME intent, never a second", async () => {
+    const { deps, store, worktree } = withEffects([{ trigger: { on: "produce", product: "evidence" }, to: "in_review", status: "qa" }]);
+    const run = seed(store, worktree, "K-QA2", "running", "evidence");
+    store.upsertRunStep(run.id, "evidence", { done: true });
+    await reconcileRun(deps, store.getRun(run.id)!);
+    // Re-drive the same advance (simulate a duplicate tick before the advance persisted downstream).
+    store.updateRun(run.id, { step: "evidence" });
+    store.upsertRunStep(run.id, "evidence", { done: true });
+    await reconcileRun(deps, store.getRun(run.id)!);
+    const qaIntents = store.transitionTargetsForRun(run.id).filter((t) => t.toStatus === "qa");
+    expect(qaIntents.length).toBe(1); // one row, re-opened on conflict — never duplicated
+  });
+
+  it("forward-only: an effect that would move the source BACKWARD is a noop", async () => {
+    const { deps, store, worktree, calls } = withEffects([{ trigger: { on: "produce", product: "evidence" }, to: "in_review", status: "qa" }]);
+    const run = seed(store, worktree, "K-QA3", "running", "evidence");
+    store.upsertRunStep(run.id, "evidence", { done: true });
+    // The source has already progressed to in_review (rank 2). QA anchors at in_review but ranks 1.5
+    // (a custom status sits just before its anchor), so firing it now would walk backward → skip.
+    store.enqueueTransition({ runId: run.id, repo: "demo", workSource: "jira", ticketKey: "K-QA3", toState: "in_review" });
+    await reconcileRun(deps, store.getRun(run.id)!);
+    expect(store.transitionTargetsForRun(run.id)).not.toContainEqual({ toState: "in_review", toStatus: "qa" });
+    expect(calls.transitionOverrides).toEqual([]); // qa never delivered
+  });
+
+  it("a belt with NO effects behaves exactly as the engine defaults (in_review on PR open)", async () => {
+    const { deps, store, state, worktree, calls } = build(); // shipBelt has no effects
+    const run = seed(store, worktree, "K-D1", "running", "pr", { prNumber: 21 });
+    store.markStepDone(run.id, "pr");
+    state.pr = { number: 21, state: "OPEN", url: "u" };
+    await reconcileRun(deps, store.getRun(run.id)!);
+    expect(calls.transitions).toContainEqual(["K-D1", "in_review"]); // default fired
+    expect(calls.transitionOverrides).toEqual([]); // no source-native override
+  });
+
+  it("teardown(outcome) effect overrides the terminal status", async () => {
+    const { deps, store, state, worktree, calls } = withEffects([{ trigger: { on: "teardown", outcome: "merged" }, to: "done", status: "shipped" }]);
+    const run = seed(store, worktree, "K-T1", "reviewing", null, {});
+    state.pr = { number: 30, state: "MERGED", url: "u" }; // merged PR → teardown(merged)
+    await reconcileRun(deps, store.getRun(run.id)!);
+    expect(store.getRun(run.id)!.outcome).toBe("merged");
+    expect(calls.transitionOverrides).toContainEqual(["K-T1", "done", "shipped"]);
   });
 });
