@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { SOURCE_PRODUCTS, type StepConfig } from "../config.ts";
@@ -190,6 +190,21 @@ async function dispatchToLayoutImpl(
  *  local_markdown snapshots a file to task.md or copies a directory item whole to task/. Idempotent (the source guards against
  *  re-materializing) and best-effort (it logs rather than throwing), so it's safe to call on
  *  every claiming tick while we wait for the step's layout pane to come up. */
+/** Remove a `.memory/herdr-factory/` that came with a freshly CREATED worktree's checkout. The
+ *  memory dir is factory-owned, per run: content already present in a brand-new checkout can only
+ *  be stale artifacts committed to the repo (e.g. a prior run's task doc swept into a commit) —
+ *  and because every source's materialize is skip-if-exists ("idempotent across claiming ticks"),
+ *  a committed task doc would silently supplant the real work item for every future run. Callers
+ *  must only use this on the worktree-CREATE path: a re-opened worktree's memory dir holds the
+ *  run's own live state (handoffs, feedback, prompts) and must never be scrubbed. Returns whether
+ *  anything was removed. */
+export function scrubCommittedMemoryDir(worktreePath: string): boolean {
+  const mem = join(worktreePath, MEMORY_DIR);
+  if (!existsSync(mem)) return false;
+  rmSync(mem, { recursive: true, force: true });
+  return true;
+}
+
 export async function materializeWork(deps: Deps, run: Run, src: SourceRuntime): Promise<void> {
   return telemetrySpan(
     "step.materialize_work",

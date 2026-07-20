@@ -3,3 +3,6 @@ dist/
 *.tsbuildinfo
 *.log
 .DS_Store
+# Factory-owned per-run working memory (prompts, handoffs, work docs) — never commit it: a
+# committed copy in a fresh worktree would shadow the real work doc (the engine scrubs it).
+.memory/

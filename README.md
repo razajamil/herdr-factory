@@ -757,7 +757,9 @@ sequence, so a primitive reads correctly in any belt order.
 
 Everything a run reads and writes lives in `.memory/herdr-factory/` inside its worktree: the
 rendered prompts, handoff notes, the work doc (`ticket.json`, or `task.md`/`task/`), attachments,
-bounce feedback, human questions and replies, and captured evidence.
+bounce feedback, human questions and replies, and captured evidence. Never commit this folder in
+your repo (add `.memory/` to its `.gitignore`) — a committed copy would shadow each new run's real
+work doc, so the factory removes it from every freshly created worktree.
 
 ### Editor schema
 

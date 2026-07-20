@@ -6,6 +6,7 @@ import { openDb } from "../src/db/index.ts";
 import { Store } from "../src/db/store.ts";
 import { applyPendingFocus, bounceStep, claimTicket, flushTransitionOutbox, reconcileRepo, reconcileRun, recordCaptureAttempt, requestHumanInput, resumeRun, withRunLock, withRunLockWaiting, withTickLock } from "../src/core/reconcile.ts";
 import { applySignal } from "../src/core/signals.ts";
+import { MEMORY_DIR } from "../src/core/step.ts";
 import { HerdrUnreachableError, type BeltRuntime, type Deps, type GitApi, type GitHubApi, type HerdrApi, type SourceRuntime, type WorkSource } from "../src/core/deps.ts";
 import { SourceUnauthenticatedError } from "../src/auth/errors.ts";
 import { getAuthFailure, resetAuthGate } from "../src/auth/gate.ts";
@@ -2447,5 +2448,32 @@ describe("resume nudges the resumed step's idle agent", () => {
     const res = await resumeRun(deps, store.getRun(run.id)!);
     expect(res).toMatchObject({ ok: true, phase: "reviewing" });
     expect(calls.agentSend).toHaveLength(0);
+  });
+});
+
+describe("fresh-worktree memory scrub — a committed .memory can't supplant the work doc", () => {
+  it("removes a committed .memory/herdr-factory from a freshly CREATED worktree, then materializes", async () => {
+    const { deps, state, worktree } = build();
+    // Simulate a repo that accidentally committed factory memory: the brand-new checkout already
+    // carries a stale task doc. Every source's materialize is skip-if-exists, so without the scrub
+    // this file would be handed to the work agent as its spec.
+    const mem = join(worktree, MEMORY_DIR);
+    mkdirSync(mem, { recursive: true });
+    writeFileSync(join(mem, "task.md"), "# stale committed task");
+    state.eligible = [ticket("CATS-1")];
+    await reconcileRepo(deps);
+    expect(existsSync(join(mem, "task.md"))).toBe(false); // the committed stale doc is gone
+    expect(existsSync(join(mem, "ticket.json"))).toBe(true); // the source materialized the real work doc
+  });
+
+  it("never scrubs on the worktree-REOPEN path — a re-attached worktree holds the run's live state", async () => {
+    const { deps, state, worktree } = build();
+    deps.git = { ...deps.git, branchExists: async () => true }; // branch exists ⇒ worktreeOpen, not create
+    const mem = join(worktree, MEMORY_DIR);
+    mkdirSync(mem, { recursive: true });
+    writeFileSync(join(mem, "handoff-fix.md"), "live handoff");
+    state.eligible = [ticket("CATS-1")];
+    await reconcileRepo(deps);
+    expect(readFileSync(join(mem, "handoff-fix.md"), "utf8")).toBe("live handoff");
   });
 });

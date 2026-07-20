@@ -1480,6 +1480,13 @@ Hard-won from the bash prototype — encode as types/tests/asserts:
   its `work_items.status` is absent/`todo` **and** it has no active run. `merged`/`aborted` are
   terminal — such a file is never re-listed even with no active run (the file itself is never
   modified; re-running it means resetting its `work_items` row).
+- **`.memory/herdr-factory/` is factory-owned; a freshly CREATED worktree is scrubbed of it.**
+  Every source's `materialize` is skip-if-exists (idempotent across claiming ticks), so a memory
+  dir committed into the target repo would silently supplant the real work doc for every future
+  run. `reconcileClaiming` therefore removes any committed memory dir right after
+  `worktreeCreate` (`scrubCommittedMemoryDir`), before the first materialize — and NEVER on the
+  `worktreeOpen` re-attach path, whose memory dir is the run's own live state (handoffs,
+  feedback, prompts).
 - worktree-create / agent-list JSON shapes are typed once in `herdr.ts`.
 - attachment `content` is site-host → basic-auth download; image/* + size cap.
 - each step gates on its own **`step-done`** signal (the `run_steps.done` flag), not flappy

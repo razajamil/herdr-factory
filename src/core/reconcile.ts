@@ -9,7 +9,7 @@ import type { GuardSpec, HumanQuestion, HumanReply, MatchItem, Outcome, PrInfo, 
 import { outcomeToWorkState, StaleItemError, ticketOf, type TransitionContext } from "../types.ts";
 import { isUniqueViolation } from "../db/store.ts";
 import { branchName } from "./branch.ts";
-import { firstStep, indexOfStep, materializeWork, MEMORY_DIR, nextStep, spawnStep, stepByName } from "./step.ts";
+import { firstStep, indexOfStep, materializeWork, MEMORY_DIR, nextStep, scrubCommittedMemoryDir, spawnStep, stepByName } from "./step.ts";
 import { STEP_DESCRIPTORS } from "../steps/registry.ts";
 import { wakeResolver } from "./watch.ts";
 import { recordSourceAuthEvent, recordTick, recordTickDuration, recordTickLockSkipped, telemetryEvent, telemetrySpan } from "../telemetry/index.ts";
@@ -826,6 +826,13 @@ async function reconcileClaiming(deps: Deps, run: Run, belt: BeltRuntime, src: S
     const wt = exists
       ? await deps.herdr.worktreeOpen(deps.config.repo.path, branch)
       : await deps.herdr.worktreeCreate(deps.config.repo.path, branch, deps.config.repo.baseRef);
+    // A freshly CREATED checkout owes its .memory/herdr-factory (if any) to the repo's committed
+    // tree — scrub it before materialize, whose skip-if-exists idempotence would otherwise let a
+    // committed task doc supplant this run's real work item. Never on the reopen path: a
+    // re-attached worktree's memory dir is the run's own live state.
+    if (!exists && scrubCommittedMemoryDir(wt.worktreePath)) {
+      deps.log("warn", `${run.ticketKey}: removed a committed ${MEMORY_DIR} from the fresh worktree — the repo should not track factory memory (add .memory/ to its .gitignore)`);
+    }
     deps.store.updateRun(run.id, { workspaceId: wt.workspaceId, worktreePath: wt.worktreePath });
     deps.store.recordEvent({ runId: run.id, repo, ticketKey: run.ticketKey, type: "worktree_created", detail: { workspaceId: wt.workspaceId } });
     run = deps.store.getRun(run.id)!;
