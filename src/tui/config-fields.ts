@@ -49,6 +49,16 @@ const sourceNode = (type: SourceType, name?: unknown, pollInterval?: unknown, ma
   ...(maxActive != null ? { max_active_workspaces: maxActive } : {}),
   [type]: descriptorFor(type).tui.defaultBlock(),
 });
+// Evidence publisher choices (mirrors the EvidenceBlockSchema union in config.ts). A switch preserves
+// the shared key_prefix/github_username and resets the type-specific fields to their empty defaults.
+const EVIDENCE_PUBLISHER_CHOICES = ["s3", "local", "command"];
+const evidenceNode = (publisher: string, keyPrefix?: unknown, githubUsername?: unknown) => ({
+  publisher,
+  ...(publisher === "s3" ? { bucket: "", region: "", cloudfront_domain: "" } : {}),
+  ...(publisher === "command" ? { command: "" } : {}),
+  ...(keyPrefix != null ? { key_prefix: keyPrefix } : {}),
+  ...(githubUsername != null ? { github_username: githubUsername } : {}),
+});
 // A newly-added step defaults to the generic `custom` primitive (its prompt_file is the whole body);
 // the `type` field is editable to any registered primitive. A brand-new belt starts with one valid
 // `work` step (work needs no prompt_file), which the user extends.
@@ -120,24 +130,50 @@ export function buildDescriptors(draft: Document, rebuild: () => void, confirm: 
     d.push({ kind: "header", label: "limits", level: 1 });
     for (const [k, ph] of LIMITS) d.push({ kind: "text", label: k, path: ["limits", k], placeholder: ph, numeric: true, indent: 1 });
 
-    // evidence (optional top-level block — where the evidence step publishes captured media).
-    // Non-secret pointers only; AWS creds come from the ambient AWS credential chain (no secret rows
-    // here). Modelled as an add/remove optional block (like a work source): when absent, an "add"
-    // action creates it; when present, its fields + a "remove" action are shown — so a block the user
-    // no longer wants can always be cleared (flushInputs never deletes keys, so a plain text field for
-    // an optional block would otherwise be unclearable). bucket/region/cloudfront_domain are required
-    // together once the block exists.
-    d.push({ kind: "header", label: "evidence (optional — S3 + CloudFront upload)", level: 1 });
+    // evidence (optional top-level block — where the evidence step PUBLISHES captured media). A
+    // discriminated union on `publisher` (s3 | local | command); a block with no `publisher:` key is
+    // `s3`. Non-secret pointers only; S3 creds come from the ambient AWS credential chain (no secret
+    // rows). Modelled as an add/remove optional block (like a work source): when absent, an "add"
+    // action per publisher creates it; when present, the publisher enum + its fields + the shared
+    // key_prefix/github_username + a "remove" action are shown (flushInputs never deletes keys, so an
+    // optional block needs the explicit remove to be clearable).
+    d.push({ kind: "header", label: "evidence (optional — publish captures: s3 | local | command)", level: 1 });
     if (cfg.evidence == null) {
-      d.push({ kind: "action", label: "+ add evidence upload config", indent: 1, run: () => { draft.setIn(["evidence"], draft.createNode({ bucket: "", region: "", cloudfront_domain: "" })); rebuild(); } });
+      d.push({ kind: "action", label: "+ add evidence: s3 (S3 + CloudFront)", indent: 1, run: () => { draft.setIn(["evidence"], draft.createNode({ publisher: "s3", bucket: "", region: "", cloudfront_domain: "" })); rebuild(); } });
+      d.push({ kind: "action", label: "+ add evidence: local (served by this server)", indent: 1, run: () => { draft.setIn(["evidence"], draft.createNode({ publisher: "local" })); rebuild(); } });
+      d.push({ kind: "action", label: "+ add evidence: command (custom uploader)", indent: 1, run: () => { draft.setIn(["evidence"], draft.createNode({ publisher: "command", command: "" })); rebuild(); } });
     } else {
-      d.push({ kind: "text", label: "bucket", path: ["evidence", "bucket"], placeholder: "my-evidence-bucket", indent: 1 });
-      d.push({ kind: "text", label: "region", path: ["evidence", "region"], placeholder: "us-east-1", indent: 1 });
-      d.push({ kind: "text", label: "cloudfront_domain", path: ["evidence", "cloudfront_domain"], placeholder: "d123abc.cloudfront.net", indent: 1 });
+      const publisher = String((cfg.evidence as any)?.publisher ?? "s3");
+      d.push({
+        kind: "enum",
+        label: "publisher",
+        value: publisher,
+        choices: EVIDENCE_PUBLISHER_CHOICES,
+        indent: 1,
+        apply: (next) => {
+          if (next === publisher) return;
+          // Preserve the shared fields across a publisher switch; reset the type-specific ones.
+          const keyPrefix = draft.getIn(["evidence", "key_prefix"]);
+          const githubUsername = draft.getIn(["evidence", "github_username"]);
+          draft.setIn(["evidence"], draft.createNode(evidenceNode(next, keyPrefix, githubUsername)));
+          rebuild();
+        },
+      });
+      if (publisher === "s3") {
+        d.push({ kind: "text", label: "bucket", path: ["evidence", "bucket"], placeholder: "my-evidence-bucket", indent: 1 });
+        d.push({ kind: "text", label: "region", path: ["evidence", "region"], placeholder: "us-east-1", indent: 1 });
+        d.push({ kind: "text", label: "cloudfront_domain", path: ["evidence", "cloudfront_domain"], placeholder: "d123abc.cloudfront.net", indent: 1 });
+        d.push({ kind: "text", label: "profile", path: ["evidence", "profile"], placeholder: "(optional AWS CLI profile)", indent: 1 });
+      } else if (publisher === "local") {
+        d.push({ kind: "text", label: "public_base_url", path: ["evidence", "public_base_url"], placeholder: "(optional; default http://127.0.0.1:<port>)", indent: 1 });
+      } else if (publisher === "command") {
+        d.push({ kind: "text", label: "command", path: ["evidence", "command"], placeholder: "./publish-evidence.sh", indent: 1 });
+        d.push({ kind: "text", label: "timeout_seconds", path: ["evidence", "timeout_seconds"], placeholder: "300", numeric: true, clearable: true, indent: 1 });
+      }
+      // Shared across every publisher (uniform key layout).
       d.push({ kind: "text", label: "github_username", path: ["evidence", "github_username"], placeholder: "(optional; default = gh login)", indent: 1 });
       d.push({ kind: "text", label: "key_prefix", path: ["evidence", "key_prefix"], placeholder: "(optional; after herdr-factory/<user>/)", indent: 1 });
-      d.push({ kind: "text", label: "profile", path: ["evidence", "profile"], placeholder: "(optional AWS CLI profile)", indent: 1 });
-      d.push({ kind: "action", label: "‹ remove evidence config ›", indent: 1, run: () => { void confirm("Remove the evidence upload config?").then((ok) => { if (ok) { draft.deleteIn(["evidence"]); rebuild(); } }); } });
+      d.push({ kind: "action", label: "‹ remove evidence config ›", indent: 1, run: () => { void confirm("Remove the evidence publish config?").then((ok) => { if (ok) { draft.deleteIn(["evidence"]); rebuild(); } }); } });
     }
     return d;
   }

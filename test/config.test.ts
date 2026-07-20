@@ -1279,6 +1279,75 @@ describe("loadConfig — work sources + belts", () => {
     expect(ev.keyPrefix).toBe(""); // default
   });
 
+  it("resolves a `local` publisher (public_base_url trimmed; shared key_prefix/github_username)", () => {
+    setup(
+      `repo:\n  path: __REPO__\nwork_sources:\n${JIRA_SRC}belt:\n${SHIP_BELT}evidence:
+  publisher: local
+  public_base_url: http://box.tailnet.ts.net:8765/
+  key_prefix: /app/
+  github_username: alice
+`,
+      { prompts: {} },
+    );
+    const ev = loadConfig("demo").config.evidence!;
+    expect(ev.publisher).toBe("local");
+    if (ev.publisher !== "local") throw new Error("expected local");
+    expect(ev.publicBaseUrl).toBe("http://box.tailnet.ts.net:8765"); // trailing slash stripped
+    expect(ev.keyPrefix).toBe("app");
+    expect(ev.githubUsername).toBe("alice");
+  });
+
+  it("resolves a `command` publisher (string → argv; timeout default)", () => {
+    setup(
+      `repo:\n  path: __REPO__\nwork_sources:\n${JIRA_SRC}belt:\n${SHIP_BELT}evidence:
+  publisher: command
+  command: ./publish-evidence.sh
+`,
+      { prompts: {} },
+    );
+    const ev = loadConfig("demo").config.evidence!;
+    expect(ev.publisher).toBe("command");
+    if (ev.publisher !== "command") throw new Error("expected command");
+    expect(ev.command).toEqual(["./publish-evidence.sh"]); // string normalized to a one-element argv
+    expect(ev.timeoutSeconds).toBe(300); // default
+  });
+
+  it("resolves a `command` publisher with an argv array + explicit timeout", () => {
+    setup(
+      `repo:\n  path: __REPO__\nwork_sources:\n${JIRA_SRC}belt:\n${SHIP_BELT}evidence:
+  publisher: command
+  command: [gcs-upload, --bucket, evidence]
+  timeout_seconds: 120
+`,
+      { prompts: {} },
+    );
+    const ev = loadConfig("demo").config.evidence!;
+    if (ev.publisher !== "command") throw new Error("expected command");
+    expect(ev.command).toEqual(["gcs-upload", "--bucket", "evidence"]);
+    expect(ev.timeoutSeconds).toBe(120);
+  });
+
+  it("rejects an s3-only field on a `local` block (discriminated-union strictness)", () => {
+    setup(
+      `repo:\n  path: __REPO__\nwork_sources:\n${JIRA_SRC}belt:\n${SHIP_BELT}evidence:
+  publisher: local
+  bucket: nope
+`,
+      { prompts: {} },
+    );
+    expect(() => loadConfig("demo")).toThrow();
+  });
+
+  it("rejects a `command` block with no command", () => {
+    setup(
+      `repo:\n  path: __REPO__\nwork_sources:\n${JIRA_SRC}belt:\n${SHIP_BELT}evidence:
+  publisher: command
+`,
+      { prompts: {} },
+    );
+    expect(() => loadConfig("demo")).toThrow();
+  });
+
   it("maps a per-belt workspace_name through", () => {
     setup(
       cfg(JIRA_SRC, `  - name: ship
