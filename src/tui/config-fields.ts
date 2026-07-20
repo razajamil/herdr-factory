@@ -441,6 +441,23 @@ export function buildDescriptors(draft: Document, rebuild: () => void, ctx: Fiel
       const pfRel = st?.prompt_file ? String(st.prompt_file) : "";
       const pfSource = st?.prompt_file_source == null ? "config" : String(st.prompt_file_source);
       if (pfRel && pfSource === "config" && configFileMissing(pfRel)) d.push(createStubAction(pfRel, promptStub(pfRel, stType === "custom"), 2));
+      // prompt_mode: how a prompt_file relates to the shipped base — augment (default) | replace (own
+      // the body). Only meaningful for an engine-prompted step; a `custom` step's prompt IS the body.
+      if (stType !== "custom") {
+        d.push({
+          kind: "enum",
+          label: "prompt_mode",
+          value: st?.prompt_mode == null ? "(unset)" : String(st.prompt_mode),
+          choices: ["(unset)", "augment", "replace"],
+          indent: 2,
+          // augment is the default — drop the key when it or (unset) is chosen; write only `replace`.
+          apply: (next) => {
+            if (next === "replace") draft.setIn(["belt", i, "steps", j, "prompt_mode"], next);
+            else draft.deleteIn(["belt", i, "steps", j, "prompt_mode"]);
+            rebuild();
+          },
+        });
+      }
       d.push({ kind: "text", label: "budget_seconds", path: ["belt", i, "steps", j, "budget_seconds"], placeholder: "(optional; default per type)", numeric: true, clearable: true, indent: 2 });
       d.push({ kind: "bool", label: "heartbeat", value: st?.heartbeat === true, indent: 2, apply: (next) => { draft.setIn(["belt", i, "steps", j, "heartbeat"], next); rebuild(); } });
       d.push({ kind: "action", label: "‹ remove step ›", indent: 2, run: () => { void ctx.confirm(`Remove step "${stepNames[j]}"?`).then((ok) => { if (ok) { draft.deleteIn(["belt", i, "steps", j]); rebuild(); } }); } });

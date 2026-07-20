@@ -971,7 +971,10 @@ step (`spawnStep`):
    *Focus follows the active step* — applied later, never stealing focus from another worktree).
 2. **Prompt** — the step body is resolved by the step's descriptor: a step with a `basePrompt`
    (`work`/`evidence`/`review`/`pr`) uses that engine-shipped prompt, optionally **augmented** by the
-   step ref's `prompt_file`; a `custom` step (no `basePrompt`) body *is* its (required) `prompt_file`.
+   step ref's `prompt_file` — or **replaced** by it when the ref sets `prompt_mode: replace` (the
+   file owns the body, the shipped prose is dropped; only valid on a `basePrompt` step *with* a
+   `prompt_file`, enforced at load); a `custom` step (no `basePrompt`) body *is* its (required)
+   `prompt_file`. Whichever body is chosen, the scaffold/guidelines/token wrapping is applied on top.
    Each `prompt_file` carries a `prompt_file_source` —
    `config` (the repo's config folder, read + existence-checked at load) or `repo` (the target
    repo checkout, read from the run's **worktree at render time**, so prompts can live
@@ -1219,11 +1222,14 @@ about to revert. It's driven two ways:
       - `steps` — **required, ≥1**, the ordered pipeline. Each entry references a registered step
         primitive by `type` (`work`/`evidence`/`review`/`pr`/`custom` — the enum is generated from
         `STEP_DESCRIPTORS`), with optional `name` (defaults to `type`, unique within the belt),
-        `tab`/`pane` (both-or-neither), `budget_seconds`, `heartbeat`, and `prompt_file`
-        (+ required `prompt_file_source`: `config` | `repo`). For a primitive with a built-in prompt
-        (`work`/`evidence`/`review`/`pr`) the `prompt_file` **augments** the per-type built-in
-        (`src/prompts/<type>/<slug>.md`, else `src/prompts/<slug>.md`); a `custom` step ships no
-        built-in, so its `prompt_file` is **required** and is the whole body. `evidence` is
+        `tab`/`pane` (both-or-neither), `budget_seconds`, `heartbeat`, `prompt_file`
+        (+ `prompt_file_source`: `config` | `repo`), and `prompt_mode` (`augment` default | `replace`).
+        For a primitive with a built-in prompt (`work`/`evidence`/`review`/`pr`) the `prompt_file`
+        **augments** the per-type built-in (`src/prompts/<type>/<slug>.md`, else
+        `src/prompts/<slug>.md`), or — with `prompt_mode: replace` — **replaces** it outright (the
+        file owns the body; rejected at load if there's no `prompt_file` or the step has no built-in);
+        a `custom` step ships no built-in, so its `prompt_file` is **required** and is the whole body
+        (`prompt_mode` is meaningless there). `evidence` is
         **opt-in** (its descriptor is `requiresLayout` — skipped when it has no `tab`+`pane`, so the
         pipeline is work → review → pr). The belt's lifecycle is DERIVED from its steps' declared
         `produces` (a `pull_request` producer ⇒ the `reviewing` watch + `in_review` write-back) and
