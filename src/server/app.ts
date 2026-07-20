@@ -200,6 +200,11 @@ async function eligiblePayload(rt: RepoRuntime): Promise<{ source: string; belt:
   // dedup by (source, key) since two belts could name the same source (with distinct labels).
   const seen = new Set<string>();
   for (const belt of rt.deps.belts) {
+    // An inactive belt takes on no new work — mirror Phase B and don't poll its source or surface
+    // its items. Otherwise the dashboard shows never-claimable eligible rows for the belt, and since
+    // the quick (eligible-less) paint skips an empty belt while the folded-in paint shows it, the
+    // belt block flickers in/out every refresh cycle.
+    if (!belt.active) continue;
     const src = rt.deps.resolveSource(belt.source);
     if (!src) continue;
     try {

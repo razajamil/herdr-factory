@@ -14,6 +14,7 @@ describe("dashboard server payloads", () => {
     const authStatus = vi.fn(async () => ({ state: "ok" as const }));
     const health = vi.fn(async () => undefined);
     const listEligible = vi.fn(async () => [{ key: "HF-1", summary: "Fast dashboard", type: "Task" }]);
+    const pausedEligible = vi.fn(async () => [{ key: "HF-9", summary: "Paused work", type: "Task" }]);
     const run = {
       id: 1,
       ticketKey: "HF-2",
@@ -28,6 +29,7 @@ describe("dashboard server payloads", () => {
       endedAt: null,
     };
     const source = { name: "jira", type: "jira", client: { authStatus, health, listEligible } };
+    const pausedSource = { name: "paused-jira", type: "jira", client: { authStatus, health, listEligible: pausedEligible } };
     const runtime = {
       ticking: false,
       deps: {
@@ -37,7 +39,12 @@ describe("dashboard server payloads", () => {
           sources: [{ name: "jira", type: "jira" }],
           belts: [{ name: "ship", beltType: "work_to_pull_request", source: "jira", priority: 1, label: "pickup", steps: [{ name: "work" }] }],
         },
-        belts: [{ name: "ship", source: "jira", label: "pickup" }],
+        // An inactive belt must be invisible to the eligible payload (mirrors Phase B) so the
+        // dashboard never shows never-claimable rows — the source of the flicker.
+        belts: [
+          { name: "ship", source: "jira", label: "pickup", active: true },
+          { name: "paused", source: "paused-jira", label: "pickup", active: false },
+        ],
         store: {
           activeRuns: () => [run],
           listRuns: () => [],
@@ -47,7 +54,7 @@ describe("dashboard server payloads", () => {
           undeliveredEvidenceUploadsForRun: () => [],
         },
         herdr: { paneState },
-        resolveSource: () => source,
+        resolveSource: (name: string) => (name === "paused-jira" ? pausedSource : source),
         now: () => 1,
         log: vi.fn(),
       },
@@ -85,5 +92,7 @@ describe("dashboard server payloads", () => {
     expect(await eligibleResponse.json()).toEqual({
       eligible: [{ source: "jira", belt: "ship", key: "HF-1", summary: "Fast dashboard", type: "Task" }],
     });
+    // The inactive belt's source is never polled, so its items never reach the dashboard.
+    expect(pausedEligible).not.toHaveBeenCalled();
   });
 });
