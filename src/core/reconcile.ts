@@ -5,8 +5,8 @@ import { createEvidencePublisher } from "../clients/evidence.ts";
 import { runEffect } from "../runtime/effect.ts";
 import { HerdrUnreachableError, type BeltRuntime, type Deps, type SourceRuntime } from "./deps.ts";
 import type { StepConfig } from "../config.ts";
-import type { GuardSpec, HumanQuestion, HumanReply, MatchItem, Outcome, PrInfo, PrSnapshot, Run, RunStep, Ticket, TransitionIntent, WorkState } from "../types.ts";
-import { outcomeToWorkState, StaleItemError, ticketOf, type TransitionContext } from "../types.ts";
+import type { BeltEffectTrigger, GuardSpec, HumanQuestion, HumanReply, MatchItem, Outcome, PrInfo, PrSnapshot, Run, RunStep, Ticket, TransitionIntent, WorkState } from "../types.ts";
+import { EFFECT_PRODUCE_PRODUCTS, effectRank, outcomeToWorkState, StaleItemError, ticketOf, type TransitionContext } from "../types.ts";
 import { isUniqueViolation } from "../db/store.ts";
 import { branchName } from "./branch.ts";
 import { firstStep, indexOfStep, materializeWork, MEMORY_DIR, nextStep, scrubCommittedMemoryDir, spawnStep, stepByName } from "./step.ts";
@@ -97,7 +97,10 @@ async function deliverTransition(deps: Deps, src: SourceRuntime, intent: Transit
       intent.toState === "merged" && run?.prNumber != null
         ? { prNumber: run.prNumber, prUrl: deps.ghRepo ? `https://github.com/${deps.ghRepo}/pull/${run.prNumber}` : null }
         : undefined;
-    const result = await src.client.transition(intent.ticketKey, intent.toState, pickupLabel, ctx);
+    // A belt effect's source-native status (toStatus) is delivered INSTEAD of the canonical mapping
+    // for to_state ('' ⇒ the canonical mapping, unchanged). The source validated it at config-load.
+    const statusOverride = intent.toStatus || undefined;
+    const result = await src.client.transition(intent.ticketKey, intent.toState, pickupLabel, ctx, statusOverride);
     noteSourceAuthRecovered(deps, src.name); // delivery succeeded ⇒ auth is fine (clears any gate)
     switch (result.kind) {
       case "applied":
@@ -107,7 +110,7 @@ async function deliverTransition(deps: Deps, src: SourceRuntime, intent: Transit
           repo: intent.repo,
           ticketKey: intent.ticketKey,
           type: "transition",
-          detail: { to: intent.toState, attempts: intent.attempts },
+          detail: { to: intent.toState, status: intent.toStatus || undefined, attempts: intent.attempts },
         });
         break;
       case "noop":
@@ -153,20 +156,68 @@ async function deliverTransition(deps: Deps, src: SourceRuntime, intent: Transit
 /** Enqueue a transition intent and try to deliver it immediately (the common, healthy path — the
  *  status moves on the same tick it used to). Skips the immediate attempt when an EARLIER intent
  *  for the run is still undelivered: per-run delivery is strictly in-order, else a retried
- *  in_development could fire after in_review already landed and walk the source backward. */
-async function requestTransition(deps: Deps, run: Run, src: SourceRuntime, to: WorkState): Promise<void> {
+ *  in_development could fire after in_review already landed and walk the source backward.
+ *  `toStatus` (a belt effect's source-native status key) rides alongside the canonical `to` anchor;
+ *  '' ⇒ the canonical mapping. */
+async function requestTransition(deps: Deps, run: Run, src: SourceRuntime, to: WorkState, toStatus = ""): Promise<void> {
   const intent = deps.store.enqueueTransition({
     runId: run.id,
     repo: deps.config.repoName,
     workSource: src.name,
     ticketKey: run.ticketKey,
     toState: to,
+    toStatus,
   });
   if (deps.store.undeliveredTransitionBefore(run.id, intent.id)) {
-    deps.log("warn", `${run.ticketKey}: ${to} transition queued behind an undelivered earlier transition`);
+    deps.log("warn", `${run.ticketKey}: ${to}${toStatus ? `/${toStatus}` : ""} transition queued behind an undelivered earlier transition`);
     return;
   }
   await deliverTransition(deps, src, intent);
+}
+
+/**
+ * Fire the belt's configured effect for a trigger, else the engine `defaultTo` (unchanged behavior
+ * when a belt declares no effect for the trigger). FORWARD-ONLY: an effect whose monotonicity rank
+ * is BELOW the highest rank already enqueued for the run is a noop — so a bounce re-entry / forward
+ * re-advance can never walk the source backward (the outbox re-open on enqueue would otherwise
+ * re-deliver an earlier transition). Routes through the outbox exactly like every transition.
+ * `defaultTo` omitted ⇒ no engine default: fire only if the belt configured this trigger.
+ */
+async function fireEffect(
+  deps: Deps,
+  run: Run,
+  belt: BeltRuntime,
+  src: SourceRuntime,
+  trigger: BeltEffectTrigger,
+  defaultTo?: WorkState,
+): Promise<void> {
+  const configured = (belt.effects ?? []).find((e) => sameTrigger(e.trigger, trigger));
+  const target: { to: WorkState; status?: string } | undefined = configured
+    ? { to: configured.to, status: configured.status }
+    : defaultTo != null
+      ? { to: defaultTo }
+      : undefined;
+  if (!target) return; // no belt effect + no engine default for this trigger
+  const rank = effectRank(target);
+  // Highest rank already enqueued for the run (delivered or pending). Equal ranks are allowed (a
+  // custom status and its anchor at the same stage), so only a STRICTLY-lower rank is a backward noop.
+  const maxRank = deps.store
+    .transitionTargetsForRun(run.id)
+    .reduce((m, t) => Math.max(m, effectRank({ to: t.toState, status: t.toStatus || undefined })), Number.NEGATIVE_INFINITY);
+  if (rank < maxRank) {
+    deps.log("info", `${run.ticketKey}: effect → ${target.status ?? target.to} skipped (would move backward, rank ${rank} < ${maxRank})`);
+    return;
+  }
+  await requestTransition(deps, run, src, target.to, target.status ?? "");
+}
+
+/** Structural equality of two belt-effect triggers (the config effect vs the fire-site trigger). */
+function sameTrigger(a: BeltEffectTrigger, b: BeltEffectTrigger): boolean {
+  if (a.on !== b.on) return false;
+  if (a.on === "enter" && b.on === "enter") return a.step === b.step;
+  if (a.on === "produce" && b.on === "produce") return a.product === b.product;
+  if (a.on === "teardown" && b.on === "teardown") return a.outcome === b.outcome;
+  return false;
 }
 
 /** Retry every due undelivered intent (in per-run order, stopping a run's chain at its first
@@ -858,7 +909,9 @@ async function reconcileClaiming(deps: Deps, run: Run, belt: BeltRuntime, src: S
   //    write-back from here: a failed attempt is retried each tick until the source confirms.
   deps.store.updateRun(run.id, { phase: "running", step: first.name });
   deps.log("info", `${run.ticketKey}: running ${first.name} on ${branch}`);
-  await requestTransition(deps, run, src, "in_development");
+  // belt_start: entering the first step. Engine default in_development, overridable by a belt effect
+  // on entering that step (e.g. a custom "picked up" status).
+  await fireEffect(deps, run, belt, src, { on: "enter", step: first.name }, "in_development");
 }
 
 /** Advance the active step's heartbeat when the branch HEAD moves; returns the fresh
@@ -1555,9 +1608,22 @@ async function reconcileStep(deps: Deps, run: Run, belt: BeltRuntime, src: Sourc
         /* best-effort */
       }
     }
+    // produce(...) effects for the products this step just produced — e.g. "on evidence produce →
+    // QA". pull_request is excluded here: its effect fires in enterReviewing when the PR is actually
+    // adopted (a step-done before the PR is visible must not move the source to in_review). Forward-
+    // only through the outbox, like every transition.
+    for (const product of step.produces) {
+      if (product === "pull_request") continue;
+      if ((EFFECT_PRODUCE_PRODUCTS as readonly string[]).includes(product)) {
+        await fireEffect(deps, run, belt, src, { on: "produce", product });
+      }
+    }
     const next = nextStep(belt, step.name);
     if (next) {
       deps.store.updateRun(run.id, { phase: "running", step: next.name });
+      // enter(next) effect: a belt may move the source status on entering a step (e.g. entering the
+      // QA/review step). No engine default for a non-first step, so it fires only if configured.
+      await fireEffect(deps, run, belt, src, { on: "enter", step: next.name });
       // Fresh pass into an evidence step ⇒ reset its flaky-capture budget (the capture cap is reset
       // ONLY here on the forward path; a crash-recovery respawn below deliberately does NOT reset it,
       // so a self-crash can't refill the cap). Cheap + scoped: only a gathersEvidence step holds a count.
@@ -1591,7 +1657,7 @@ async function reconcileStep(deps: Deps, run: Run, belt: BeltRuntime, src: Sourc
       // Hand off to the human-review watch, but only with a real PR. If the agent signalled done
       // before a PR is visible (push lag / never opened), fall through to the watchdog rather than
       // wedging in `reviewing` with no PR to watch.
-      if (livePr) return enterReviewing(deps, run, src, livePr.number);
+      if (livePr) return enterReviewing(deps, run, belt, src, livePr.number);
     } else {
       // A non-PR belt is complete the moment its last step signals done.
       deps.log("info", `${run.ticketKey}: ${step.name} done — belt ${belt.name} complete`);
@@ -1691,9 +1757,10 @@ async function reconcileStep(deps: Deps, run: Run, belt: BeltRuntime, src: Sourc
 
 /** Transition the work item to its review state and move the run into the human-review watch.
  *  work_to_pull_request belts only — reached after the PR step opens a PR. */
-async function enterReviewing(deps: Deps, run: Run, src: SourceRuntime, prNumber: number): Promise<void> {
+async function enterReviewing(deps: Deps, run: Run, belt: BeltRuntime, src: SourceRuntime, prNumber: number): Promise<void> {
   const repo = deps.config.repoName;
-  await requestTransition(deps, run, src, "in_review");
+  // produce(pull_request): engine default in_review, overridable by a belt effect on producing it.
+  await fireEffect(deps, run, belt, src, { on: "produce", product: "pull_request" }, "in_review");
   // Clear the active step: in `reviewing` there's no belt step running (the engine watches the PR
   // by number). Record prNumber here too so the watch is self-sufficient even if step-adoption was
   // skipped. The watch starts idle (resolverActive=false) — it holds no slot until an actionable
@@ -2024,9 +2091,14 @@ async function teardownImpl(deps: Deps, run: Run, outcome: Outcome, src: SourceR
   // Write the terminal lifecycle state back to the source (never blocks cleanup — the outbox
   // keeps retrying after the run ends). No-op for Jira (merged/aborted/done are unmapped → no
   // network); records merged/aborted/done for local_markdown so the file is never re-listed.
-  // Skipped entirely if the source is gone.
+  // Skipped entirely if the source is gone. A belt effect on teardown(outcome) overrides the
+  // canonical terminal (e.g. merged → a custom "Shipped" status); the default is unchanged
+  // (outcomeToWorkState). When the belt itself is gone (a stranded run), fall back to the default.
   if (src) {
-    await requestTransition(deps, run, src, outcomeToWorkState(outcome));
+    const belt = deps.resolveBelt(run.belt ?? null);
+    const defaultTo = outcomeToWorkState(outcome);
+    if (belt) await fireEffect(deps, run, belt, src, { on: "teardown", outcome }, defaultTo);
+    else await requestTransition(deps, run, src, defaultTo);
   }
 
   await removeRunWorktree(deps, run);
