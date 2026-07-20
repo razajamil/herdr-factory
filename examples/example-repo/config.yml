@@ -21,8 +21,8 @@ limits:
   tick_interval_seconds: 60
 
 # ── Work sources: WHERE work is pulled from. Backends only — no pipeline here. ─────────────────
-# Each has a `type` (jira | local_markdown | github_issues), an optional `name` (default = type,
-# unique per repo), and a type-specific block. Belts reference a source by this name.
+# Each has a `type` (jira | local_markdown | github_issues | sentry), an optional `name` (default =
+# type, unique per repo), and a type-specific block. Belts reference a source by this name.
 work_sources:
   - type: jira
     name: jira
@@ -85,13 +85,15 @@ belt:
   # claim, so those panes come up automatically; omit both to have herdr-factory spawn a dedicated pane — except
   # `evidence`, which runs ONLY when a tab+pane targets an agent your layout provides (drop it — or
   # its tab/pane — and the belt is work → review → pr). A step may OPTIONALLY add a `prompt_file`
-  # (+ required `prompt_file_source`: `config` = this folder, `repo` = the target repo checkout, read
-  # from the worktree at run time) that AUGMENTS its engine prompt — e.g.
+  # (+ optional `prompt_file_source`, default `config` = this folder; set `repo` to read it from the
+  # target repo checkout — the worktree — at run time) that AUGMENTS its engine prompt — e.g.
   # `{ type: work, tab: work, pane: agent, prompt_file: .herdr/work-notes.md, prompt_file_source: repo }`.
   - name: ship_bugs
     source: jira
     label: agent # pickup label — REQUIRED (no default); tickets carrying it are eligible for this belt
     priority: 1
+    # active: true # set false to temporarily PAUSE this belt: it takes on no new work, but any of its
+    #              # in-flight runs still progress to completion — a delete-free way to disable a belt
     match: match-bugs.ts # optional; omit ⇒ this belt accepts anything from `jira` carrying `label`
     workspace_name: "{{semantic_work_prefix}}/{{work_id}}-{{work_slug}}"
     default_layout: bug-dev # the layout (see `layouts:` below) the factory builds into every worktree this belt claims
@@ -104,36 +106,21 @@ belt:
       - { type: pr, tab: pr, pane: agent }
 
   # ── A fully user-defined, agent-driven flow: `custom` steps whose `prompt_file` is the whole step
-  # body (the engine adds only a handover scaffold naming the belt + sibling steps); prompt_file +
-  # prompt_file_source (`config` = this folder, `repo` = the target repo checkout) are REQUIRED for a
-  # `custom` step. No `pr` step ⇒ no PR / no review watch — the run ends when the LAST step signals
-  # step-done. budget_seconds/heartbeat are optional per step (heartbeat off by default — these steps
-  # make no commits).
+  # body (the engine adds only a handover scaffold naming the belt + sibling steps). `prompt_file` is
+  # REQUIRED for a `custom` step (it has no built-in prompt); `prompt_file_source` is optional and
+  # defaults to `config` (this folder — set `repo` to read from the target checkout instead). No `pr`
+  # step ⇒ no PR / no review watch — the run ends when the LAST step signals step-done.
+  # budget_seconds/heartbeat are optional per step (heartbeat off by default — these steps make no commits).
   - name: work_generation
     source: ideas
     priority: 2
     workspace_name: "research/{{work_id}}-{{work_slug}}"
     steps:
-      - {
-          type: custom,
-          name: research,
-          tab: research,
-          pane: agent,
-          prompt_file: prompts/work_generation/research.md,
-          prompt_file_source: config,
-        }
-      - {
-          type: custom,
-          name: propose,
-          prompt_file: prompts/work_generation/propose.md,
-          prompt_file_source: config,
-        }
-      - {
-          type: custom,
-          name: create_jira_ticket,
-          prompt_file: prompts/work_generation/create-jira-ticket.md,
-          prompt_file_source: config,
-        }
+      # prompt_file_source defaults to `config` (this folder), so these steps just name a prompt_file;
+      # add `prompt_file_source: repo` only to read a prompt from the target checkout instead.
+      - { type: custom, name: research, tab: research, pane: agent, prompt_file: prompts/work_generation/research.md }
+      - { type: custom, name: propose, prompt_file: prompts/work_generation/propose.md }
+      - { type: custom, name: create_jira_ticket, prompt_file: prompts/work_generation/create-jira-ticket.md }
 
 # ── Layouts: herdr tab/pane arrangements the factory BUILDS into each worktree on claim (absorbed
 # from the workspace-manager plugin). A belt picks one via `default_layout` (or, per branch,

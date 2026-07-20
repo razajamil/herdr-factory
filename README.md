@@ -195,24 +195,10 @@ belt:
     source: ideas
     workspace_name: "research/{{work_id}}-{{work_slug}}"
     steps: # each `type: custom` step's prompt_file IS the whole body (the engine adds only a scaffold)
-      - {
-          type: custom,
-          name: research,
-          prompt_file: prompts/research.md,
-          prompt_file_source: config,
-        }
-      - {
-          type: custom,
-          name: propose,
-          prompt_file: prompts/propose.md,
-          prompt_file_source: config,
-        }
-      - {
-          type: custom,
-          name: create_jira_ticket,
-          prompt_file: prompts/create-ticket.md,
-          prompt_file_source: config,
-        }
+      # prompt_file_source defaults to `config` (this repo's config folder), so a step just names its prompt_file
+      - { type: custom, name: research, prompt_file: prompts/research.md }
+      - { type: custom, name: propose, prompt_file: prompts/propose.md }
+      - { type: custom, name: create_jira_ticket, prompt_file: prompts/create-ticket.md }
 ```
 
 The step prompts are yours, in `repos/my-app/prompts/`
@@ -634,15 +620,18 @@ when it has no tab/pane), optional `budget_seconds` (else the primitive's defaul
 `evidence` 2400 · `review` 1800 · `pr` 3600 — else `limits.step_budget_seconds`), and `heartbeat`
 (commit-stall detection; on for `work`/`pr`, opt-in elsewhere).
 
-For `work`/`evidence`/`review`/`pr` the engine ships the prompt and `prompt_file` (+ required
+For `work`/`evidence`/`review`/`pr` the engine ships the prompt and `prompt_file` (with an optional
 `prompt_file_source`) _augments_ it. A **`custom`** step ships no prompt, so its `prompt_file` is
 **required** and is the whole body — that's how you build your own stations:
 
 ```yaml
 steps:
-  - { type: custom, name: research, prompt_file: prompts/research.md, prompt_file_source: config }
-  - { type: custom, name: propose, prompt_file: prompts/propose.md, prompt_file_source: config, budget_seconds: 1800 }
+  - { type: custom, name: research, prompt_file: prompts/research.md } # prompt_file_source defaults to `config`
+  - { type: custom, name: propose, prompt_file: prompts/propose.md, budget_seconds: 1800 }
 ```
+
+`prompt_file_source` is optional — it defaults to `config` (the repo's config folder, where custom-step
+prompts usually live), so you only set it to pin a prompt to `repo` (read from the target checkout).
 
 The belt's lifecycle is **derived** from its steps: a `pr` step (which produces a pull request) gives
 it the terminal PR watch + the `in_review` write-back; an `evidence`/`review` step gives it a bounce
@@ -737,9 +726,9 @@ setup required.
 A step's body is the engine's built-in prompt for its primitive (per source type under
 `src/prompts/`), optionally augmented by your `prompt_file` — or, for a `custom` step, your
 `prompt_file` alone.
-`prompt_file_source` says where it's read from: `config` = the repo's config folder (checked at
-load); `repo` = the target repo's checkout, read from the run's **worktree at render time**, so
-prompts can live version-controlled next to the code.
+`prompt_file_source` says where it's read from and **defaults to `config`** = the repo's config
+folder (checked at load); set it to `repo` = the target repo's checkout, read from the run's
+**worktree at render time**, so prompts can live version-controlled next to the code.
 
 Around the body the engine always adds: a handover scaffold (which belt and step this is, the
 full step sequence, the prior step's handoff note and pane/session pointer for on-demand
