@@ -244,7 +244,10 @@ install_plugin() {
 install_service() {
   [ -z "$SKIP_SERVICE" ] || { say "skipping service install (HERDR_SKIP_SERVICE set)"; return 0; }
   say "installing the supervisor service"
-  "$BIN_DIR/herdr-factory" install
+  # HERDR_FROM_INSTALLER suppresses the install command's own onboarding pointer: inside install.sh
+  # the epilogue's `doctor` run prints the context-aware forward link, so we don't want a second one
+  # buried mid-install (and a fresh-box doctor correctly says "fix your ✗ tools" rather than "init").
+  HERDR_FROM_INSTALLER=1 "$BIN_DIR/herdr-factory" install
 }
 
 # ── Epilogue: the you-provide checklist + a live doctor run ─────────────────────────────────────

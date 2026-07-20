@@ -206,7 +206,10 @@ function summarizeAndClose(deps: Deps): void {
   const c = deps.config;
   const active = deps.store.activeRuns(c.repoName);
   if (active.length === 0) {
-    console.log("\nnothing in flight — no eligible work to claim and no runs active. Done.");
+    // Onboarding pointer chain: a first `run` that finds no work is a dead end without a forward
+    // link, so point at feeding the source and at `start` (keep watching in the background).
+    console.log("\nnothing in flight — no eligible work to claim and no runs active.");
+    console.log("Next: feed the source (label a ticket / drop a *.md brief), then re-run — or `herdr-factory start` to keep the factory watching in the background.");
     return;
   }
   const parked = active.filter((r) => r.phase === "attention" || r.phase === "waiting_for_human");

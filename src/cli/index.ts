@@ -9,6 +9,7 @@ import { baseGroups, repoGroup, type DoctorGroup } from "../doctor.ts";
 import { openDb } from "../db/index.ts";
 import { Store } from "../db/store.ts";
 import { initRepo } from "../init.ts";
+import { afterDoctorHint, afterInstallHint, afterStartHint } from "../onboarding.ts";
 import { systemClock, type Run, type SourceType } from "../types.ts";
 import type { Deps } from "../core/deps.ts";
 import { claimTicket, reconcileRepo, reconcileRun, resumeRun, teardownTicket, withRunLockWaiting, withTickLock } from "../core/reconcile.ts";
@@ -788,6 +789,13 @@ program
       await ensureUp({}, consoleLog);
       console.log(`installed + loaded ${service.label()} — scheduled ensure-up keeps the server serving all configured repos`);
       console.log(`config schema at ${configSchemaPath()} (reference it with: # yaml-language-server: $schema=../../config.schema.json)`);
+      // The onboarding pointer chain (see src/onboarding.ts). Suppressed when install.sh invokes this
+      // (HERDR_FROM_INSTALLER): the installer's epilogue runs `doctor`, whose own pointer is the
+      // context-aware forward link ("fix your ✗ tools" on a fresh box vs "point it at a repo").
+      if (!process.env.HERDR_FROM_INSTALLER) {
+        console.log("");
+        console.log(afterInstallHint());
+      }
     } catch (e) {
       fail(e);
     }
@@ -814,6 +822,7 @@ program
       await service.start();
       await ensureUp({}, consoleLog);
       console.log(`started ${service.label()}`);
+      console.log(afterStartHint()); // onboarding pointer chain — see src/onboarding.ts
     } catch (e) {
       fail(e);
     }
@@ -864,8 +873,11 @@ program
       if (i > 0) console.log("");
       failed = printDoctorGroup(g) || failed;
     });
-    if (!deep) console.log("\n(shallow — add `--deep` to verify gh auth, work-source health, and evidence-bucket writes)");
-    else if (!repo) console.log("\n(run `herdr-factory --repo <name> doctor --deep` to add repo-specific checks)");
+    // The onboarding pointer chain (see src/onboarding.ts): one context-aware forward link, folding
+    // in the old shallow/no-repo nudges — ✗ → resolve & re-run; ✓ + shallow repo → deep repo doctor;
+    // ✓ + deep repo → first run; ✓ + no repo → point it at a repo with `init`.
+    console.log("");
+    console.log(afterDoctorHint({ repo, deep, failed }));
     if (failed) process.exitCode = 1; // so scripts/CI can gate on a clean doctor
   }));
 
