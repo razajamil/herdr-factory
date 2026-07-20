@@ -136,6 +136,66 @@ describe("loadConfig — work sources + belts", () => {
     expect(jira.statusDone).toBe("Done"); // .trim().min(1)
   });
 
+  describe("belt effects (configurable task progression)", () => {
+    // A jira source that declares an extra status.qa the belt can target, + a belt with effects.
+    const JIRA_QA = `  - type: jira
+    jira:
+      base_url: https://x.atlassian.net
+      project: RWR
+      board: 254
+      status: { qa: QA Review }
+`;
+    const beltWithEffects = (effects: string, steps = `      - { type: work, tab: work, pane: agent }\n      - { type: review, tab: review, pane: agent }\n      - { type: pr, tab: pr, pane: agent }`) =>
+      `  - name: ship\n    source: jira\n    label: agent\n    effects:\n${effects}    steps:\n${steps}\n`;
+
+    it("resolves a custom-status effect (anchor + source-native status) and a canonical effect", () => {
+      setup(cfg(JIRA_QA, beltWithEffects("      - { on: produce, product: pull_request, to: qa, anchor: in_review }\n      - { on: teardown, outcome: merged, to: done }\n")));
+      const jira = loadConfig("demo").config.sources[0]!.cfg as JiraSourceCfg;
+      expect(jira.statusExtra).toEqual({ qa: "QA Review" }); // widened status map
+      const effects = loadConfig("demo").config.belts[0]!.effects!;
+      expect(effects).toContainEqual({ trigger: { on: "produce", product: "pull_request" }, to: "in_review", status: "qa" });
+      // A canonical `to` resolves with no source-native status override.
+      expect(effects).toContainEqual({ trigger: { on: "teardown", outcome: "merged" }, to: "done", status: undefined });
+    });
+
+    it("a belt with no effects resolves to [] (defaults unchanged)", () => {
+      setup(cfg(JIRA_SRC, SHIP_BELT));
+      expect(loadConfig("demo").config.belts[0]!.effects).toEqual([]);
+    });
+
+    it("rejects a custom status on an INTERNAL-LEDGER source (canonical-only in v1)", () => {
+      const LM_BELT = `  - name: spikes\n    source: ideas\n    effects:\n      - { on: produce, product: pull_request, to: qa, anchor: in_review }\n    steps:\n      - { type: work, tab: work, pane: agent }\n      - { type: review, tab: review, pane: agent }\n      - { type: pr, tab: pr, pane: agent }\n`;
+      setup(cfg(LM_SRC, LM_BELT));
+      expect(() => loadConfig("demo")).toThrow(/internal-ledger|canonical states only|work_items CHECK/);
+    });
+
+    it("rejects a custom status the source does not declare", () => {
+      setup(cfg(JIRA_SRC, beltWithEffects("      - { on: produce, product: pull_request, to: staging, anchor: in_review }\n")));
+      expect(() => loadConfig("demo")).toThrow(/declares no such status|custom status "staging"/);
+    });
+
+    it("rejects a custom `to` with no anchor (needs an explicit rank)", () => {
+      setup(cfg(JIRA_QA, beltWithEffects("      - { on: produce, product: pull_request, to: qa }\n")));
+      expect(() => loadConfig("demo")).toThrow(/needs an `anchor`|not a canonical state/);
+    });
+
+    it("rejects an effect on a step the belt doesn't have", () => {
+      setup(cfg(JIRA_QA, beltWithEffects("      - { on: enter, step: qa, to: qa, anchor: in_review }\n")));
+      expect(() => loadConfig("demo")).toThrow(/no such step/);
+    });
+
+    it("rejects an effect on a product no step produces", () => {
+      // work → review → pr produces no evidence; an on: produce evidence effect is unsatisfiable.
+      setup(cfg(JIRA_QA, beltWithEffects("      - { on: produce, product: evidence, to: qa, anchor: in_review }\n")));
+      expect(() => loadConfig("demo")).toThrow(/no step in the belt produces it/);
+    });
+
+    it("rejects two effects on the same trigger", () => {
+      setup(cfg(JIRA_QA, beltWithEffects("      - { on: produce, product: pull_request, to: qa, anchor: in_review }\n      - { on: produce, product: pull_request, to: in_review }\n")));
+      expect(() => loadConfig("demo")).toThrow(/two effects on the same trigger/);
+    });
+  });
+
   it("requires the Agile board (no default) and coerces a numeric id to a string", () => {
     setup(cfg(`  - type: jira\n    jira: { base_url: https://x.atlassian.net, project: RWR }\n`, SHIP_BELT));
     expect(() => loadConfig("demo")).toThrow(/board/); // required, no default

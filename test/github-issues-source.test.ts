@@ -100,6 +100,20 @@ describe("GithubIssuesSource — transitions (GET → diff → apply)", () => {
     expect(fake.repoLabels.has("herdr:in-development")).toBe(true);
   });
 
+  it("belt-effect custom status: statusOverride swaps in the custom label, strips other state labels, keeps the issue open", async () => {
+    fake = makeFakeGithub();
+    fake.addIssue(7, { labels: ["herdr:in-development"] });
+    const src = makeSource(fake, { stateLabelsExtra: { qa: "herdr:qa" } });
+    // `to` is the anchor (in_review); the override swaps to the "herdr:qa" label instead.
+    expect(await src.transition("7", "in_review", undefined, undefined, "qa")).toEqual({ kind: "applied" });
+    const labels = fake.issues.get(7)!.labels;
+    expect(labels.has("herdr:qa")).toBe(true);
+    expect(labels.has("herdr:in-development")).toBe(false); // prior in-flight label removed
+    expect(fake.issues.get(7)!.state).toBe("open"); // a custom (pre-terminal) status never closes
+    // Idempotent re-delivery (the outbox retries) is a noop once the label is present.
+    expect(await src.transition("7", "in_review", undefined, undefined, "qa")).toEqual({ kind: "noop" });
+  });
+
   it("in_review: swaps the state labels; merged: strips labels + closes as completed", async () => {
     fake = makeFakeGithub();
     fake.addIssue(7, { labels: ["herdr:in-development"] });

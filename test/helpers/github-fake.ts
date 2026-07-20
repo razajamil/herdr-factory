@@ -16,7 +16,7 @@ function bindTrigger(src: GithubIssuesSource, trigger: string): GithubIssuesSour
   return new Proxy(src, {
     get(target, prop, receiver) {
       if (prop === "listEligible") return (label?: string) => target.listEligible(label ?? trigger);
-      if (prop === "transition") return (key: string, to: WorkState, label?: string) => target.transition(key, to, label ?? trigger);
+      if (prop === "transition") return (key: string, to: WorkState, label?: string, ctx?: unknown, statusOverride?: string) => target.transition(key, to, label ?? trigger, ctx as never, statusOverride);
       if (prop === "health") return (labels?: string[]) => target.health(labels ?? [trigger]);
       const v = Reflect.get(target, prop, receiver);
       return typeof v === "function" ? v.bind(target) : v;

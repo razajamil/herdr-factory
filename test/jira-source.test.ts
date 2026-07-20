@@ -88,6 +88,31 @@ describe("JiraSource", () => {
     });
   });
 
+  // Belt-effect custom status: transition's statusOverride resolves to a widened status.<key> entry
+  // (INV-13) and moves the ticket there INSTEAD of the canonical mapping for `to`.
+  describe("with a belt-effect custom status (statusExtra)", () => {
+    const CFG_QA: JiraSourceCfg = { ...CFG, statusExtra: { qa: "QA Review" } };
+    const qaSrc = () => new JiraSource(CFG_QA, new JiraApiTokenAuth(CFG_QA.baseUrl, "me@x.com", "tok"));
+
+    it('statusOverride "qa" transitions the ticket to "QA Review" (ignoring the canonical mapping for `to`)', async () => {
+      globalThis.fetch = (async (url: string | URL, init?: { method?: string }) => {
+        const u = String(url);
+        const method = init?.method ?? "GET";
+        fetchCalls.push({ url: u, method });
+        if (u.includes("/transitions") && method === "GET") {
+          return { ok: true, status: 200, text: async () => JSON.stringify({ transitions: [{ id: "9", to: { name: "QA Review" } }] }), headers: new Headers() } as Response;
+        }
+        const body = { key: "RWR-1", fields: { summary: "s", status: { name: "In development" }, issuetype: { name: "Bug" }, attachment: [] } };
+        return { ok: true, status: 200, text: async () => JSON.stringify(body), headers: new Headers() } as Response;
+      }) as typeof fetch;
+      // `to` is the anchor (in_review) but the override moves to "QA Review", not the canonical "In Review".
+      const result = await qaSrc().transition("RWR-1", "in_review", undefined, undefined, "qa");
+      expect(result).toEqual({ kind: "applied" });
+      const post = fetchCalls.find((c) => c.method === "POST" && c.url.includes("/transitions"));
+      expect(post).toBeDefined();
+    });
+  });
+
   it("transition(in_development) maps to the configured status and DOES hit the network", async () => {
     const result = await src().transition("RWR-1", "in_development");
     expect(result).toEqual({ kind: "noop" }); // already there (case-insensitive) → no POST, but it queried

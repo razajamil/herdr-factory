@@ -446,6 +446,35 @@ describe("Store", () => {
       expect(store.retryTransitionsForSource("r", "jira")).toBe(0);
     });
   });
+
+  describe("transition outbox — belt-effect custom status (to_status)", () => {
+    it("a canonical transition and a custom status at the same anchor are DISTINCT intents", () => {
+      const { store } = makeStore();
+      const run = store.createRun({ repo: "r", workSource: "jira", belt: "ship", ticketKey: "K-1", branch: "b" });
+      const qa = store.enqueueTransition({ runId: run.id, repo: "r", workSource: "jira", ticketKey: "K-1", toState: "in_review", toStatus: "qa" });
+      const review = store.enqueueTransition({ runId: run.id, repo: "r", workSource: "jira", ticketKey: "K-1", toState: "in_review" });
+      // Same anchor (in_review), different to_status → two rows, not an overwrite (old UNIQUE(run,to_state) would collide).
+      expect(qa.id).not.toBe(review.id);
+      expect(qa.toStatus).toBe("qa");
+      expect(review.toStatus).toBe("");
+      const targets = store.transitionTargetsForRun(run.id);
+      expect(targets).toEqual(expect.arrayContaining([
+        { toState: "in_review", toStatus: "qa" },
+        { toState: "in_review", toStatus: "" },
+      ]));
+    });
+
+    it("re-enqueueing the same (run, to_state, to_status) re-opens the SAME intent (idempotent)", () => {
+      const { store, tick } = makeStore();
+      const run = store.createRun({ repo: "r", workSource: "jira", belt: "ship", ticketKey: "K-1", branch: "b" });
+      const first = store.enqueueTransition({ runId: run.id, repo: "r", workSource: "jira", ticketKey: "K-1", toState: "in_review", toStatus: "qa" });
+      store.markTransitionDelivered(first.id);
+      tick(5);
+      const again = store.enqueueTransition({ runId: run.id, repo: "r", workSource: "jira", ticketKey: "K-1", toState: "in_review", toStatus: "qa" });
+      expect(again.id).toBe(first.id); // same row
+      expect(again.deliveredAt).toBeNull(); // re-opened for delivery
+    });
+  });
 });
 
 describe("Store — uniqueness guarantees (v25)", () => {
