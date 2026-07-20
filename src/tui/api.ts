@@ -35,13 +35,17 @@ export interface ActiveRun {
   ticketKey: string;
   workSource: string | null;
   belt: string | null;
+  issueType: string | null;
+  branch: string | null;
   phase: string;
   step: string | null;
   prNumber: number | null;
   summary: string | null;
   outcome: string | null;
+  attentionReason: string | null;
   worker: string | null;
-  steps: { step: string; done: boolean }[];
+  createdAt: number | null; // epoch seconds
+  steps: { step: string; done: boolean; startedAt: number | null; doneAt: number | null; pass: number }[];
   /** A background problem the step columns can't show — e.g. the evidence step reads "done" (URLs
    *  emitted) but its media upload is still stuck retrying. Absent when the run is healthy. */
   problem?: { kind: "evidence-upload"; detail: string };

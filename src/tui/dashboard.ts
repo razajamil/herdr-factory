@@ -16,6 +16,7 @@ import { fetchEligible, fetchHealth, fetchStatus, fetchTimeline, postClaim, post
 import { BORDER, theme } from "./theme.ts";
 import type { ChooseFn, ConfirmFn, PromptFn, ShowInfoFn, TabView } from "./types.ts";
 import { formatWorkTable, type WorkTableRow } from "./work-table.ts";
+import { formatWorkItemDetail } from "./work-detail.ts";
 
 function fmtTime(ts: number): string {
   const ms = ts < 1e12 ? ts * 1000 : ts; // tolerate seconds or milliseconds
@@ -350,14 +351,60 @@ export function createDashboard(renderer: CliRenderer, actions: { confirm: Confi
     modal.update(`${t.repo} — Detail`, output);
   }
 
+  const timelineLine = (e: { ts: number; type: string; detail: string | null }) =>
+    `${fmtTime(e.ts)}  ${e.type}${e.detail ? "  " + e.detail : ""}`;
+
   async function openTimeline(t: Target): Promise<void> {
     if (!serverUp || !t.key) return;
     setAction(`loading timeline for ${t.key}…`, theme.text.secondary);
     const res = await fetchTimeline(t.repo, t.key);
     if (!res) return setAction(`✗ could not load timeline for ${t.key}`, theme.status.bad);
-    const linesOut = res.timeline.map((e) => `${fmtTime(e.ts)}  ${e.type}${e.detail ? "  " + e.detail : ""}`);
     setAction("", theme.text.tertiary);
-    showInfo(`${t.key} — timeline`, linesOut);
+    showInfo(`${t.key} — timeline`, res.timeline.map(timelineLine));
+  }
+
+  /** Full read-only detail for one active work item: overview + belt step progress + timeline. Pulls a
+   *  fresh detailed status (so the live worker/pane state is populated, unlike the quick refresh loop)
+   *  alongside the timeline; degrades to just the timeline if the run has ended in the meantime. */
+  async function openWorkItemDetail(t: Target): Promise<void> {
+    if (!serverUp || !t.key) return;
+    const title = `${t.key} — detail`;
+    const modal = showInfo(title, ["Loading work item detail…"]);
+    const [st, tl] = await Promise.all([fetchStatus(t.repo, true), fetchTimeline(t.repo, t.key)]);
+    const timelineLines = (tl?.timeline ?? []).map(timelineLine);
+    const run = st?.active.find((r) => r.ticketKey === t.key && (!t.source || r.workSource === t.source));
+    if (!run) {
+      modal.update(title, [
+        "(run is no longer active — showing its timeline)",
+        "",
+        "Timeline",
+        ...(timelineLines.length ? timelineLines.map((l) => `  ${l}`) : ["  (no events)"]),
+      ]);
+      return;
+    }
+    const belt = st!.belts.find((b) => b.name === run.belt);
+    modal.update(title, formatWorkItemDetail(
+      {
+        key: run.ticketKey,
+        summary: run.summary,
+        issueType: run.issueType,
+        workSource: run.workSource,
+        belt: run.belt,
+        branch: run.branch,
+        phase: run.phase,
+        step: run.step,
+        prNumber: run.prNumber,
+        outcome: run.outcome,
+        worker: run.worker,
+        attentionReason: run.attentionReason,
+        problem: run.problem ? { detail: run.problem.detail } : null,
+        createdAt: run.createdAt,
+        beltSteps: belt?.steps ?? [],
+        steps: run.steps.map((s) => ({ step: s.step, done: s.done, startedAt: s.startedAt ?? null, doneAt: s.doneAt ?? null, pass: s.pass ?? 1 })),
+      },
+      timelineLines,
+      Date.now(),
+    ));
   }
 
   list.onKeyDown = (key: KeyEvent) => {
@@ -391,6 +438,7 @@ export function createDashboard(renderer: CliRenderer, actions: { confirm: Confi
         break;
       case "d":
         if (t?.kind === "repo") void openDetail(t);
+        else if (t?.kind === "run") void openWorkItemDetail(t);
         key.preventDefault();
         break;
       case "r":

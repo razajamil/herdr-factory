@@ -817,8 +817,11 @@ cursor.
 - **Dashboard** — repos contain their belts, and each belt contains its active and eligible work
   items. `↑↓` navigates, `↵` opens a run's event timeline, `t` ticks, `c` claims an eligible item,
   `x` tears down, and `r` refreshes (mutating actions require confirmation). Empty belts stay hidden.
-  Select a repo and press `d` to open Detail: general AWS SSO/source-auth diagnostics followed by
-  configuration, work counts, and a live source/pickup health check for every belt.
+  Press `d` for Detail, which is contextual: on a **run** it opens the work item's full detail — the
+  untruncated summary, type, source/belt, branch, live status and worker state, PR, age, plus the
+  belt's step-by-step progress (with per-step timing) and the event timeline; on a **repo** it opens
+  general AWS SSO/source-auth diagnostics followed by configuration, work counts, and a live
+  source/pickup health check for every belt.
 - **Config** — a repo list `[1]` and a full `config.yml` editor split across four bordered panels:
   `[2]` config (repo · limits · secrets · evidence), `[3]` work sources, `[4]` layouts (the
   repo-level [layout](#layouts) library — nest into a layout to edit its tabs and panes; belts

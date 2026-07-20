@@ -146,13 +146,19 @@ async function statusPayload(rt: RepoRuntime, quick = false, refreshDiagnostics 
       ticketKey: r.ticketKey,
       workSource: r.workSource,
       belt: r.belt,
+      issueType: r.issueType,
+      branch: r.branch,
       phase: r.phase as string,
       step: r.step,
       prNumber: r.prNumber,
       summary: r.summary,
       outcome: r.outcome as string | null,
+      attentionReason: r.attentionReason,
+      createdAt: r.createdAt,
       worker: !quick && r.paneId ? await rt.deps.herdr.paneState(r.paneId).catch(() => "unknown") : null,
-      steps: rt.deps.store.runStepsFor(r.id).map((s) => ({ step: s.step as string, done: s.done })),
+      // Per-step timing (started/done/pass) powers the detail view's step progress; the dashboard's
+      // step columns only read `step`/`done`, so the extra fields are inert there.
+      steps: rt.deps.store.runStepsFor(r.id).map((s) => ({ step: s.step as string, done: s.done, startedAt: s.startedAt, doneAt: s.doneAt, pass: s.pass })),
       ...(problem ? { problem } : {}),
     };
   };
