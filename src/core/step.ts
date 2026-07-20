@@ -1,11 +1,17 @@
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { SOURCE_PRODUCTS, type StepConfig } from "../config.ts";
+import type { StepConfig } from "../config.ts";
 import type { BeltRuntime, Deps, SourceRuntime } from "./deps.ts";
-import type { ProductType, Run, RunStep, SourceType } from "../types.ts";
+import type { Run, RunStep } from "../types.ts";
+import { productActiveFor, type PromptStepContext, stripInactiveProductBlocks, validatePromptBody } from "../prompts/contract.ts";
 import { signalCommand } from "../signals/registry.ts";
 import { telemetrySpan } from "../telemetry/index.ts";
+
+// The prompt contract (token catalog, dataflow gating, user-prompt validation) lives in one leaf
+// module so the config loader and the renderer share it without a cycle. Re-exported here because
+// these two were historically step.ts's surface (and tests import them from it).
+export { productActiveFor, stripInactiveProductBlocks } from "../prompts/contract.ts";
 
 export const CLAUDE_FLAGS = ["--dangerously-skip-permissions"];
 export const CLI_PATH = fileURLToPath(new URL("../../bin/herdr-factory", import.meta.url));
@@ -32,38 +38,6 @@ export const nextStep = (belt: BeltRuntime, name: string): StepConfig | undefine
   const i = indexOfStep(belt, name);
   return i >= 0 && i < belt.steps.length - 1 ? belt.steps[i + 1] : undefined;
 };
-
-// --- typed-dataflow gating: an optional consume unsatisfied by THIS belt is dropped -------------
-// Mirrors config.ts's load-time dataflow check at RENDER time, so a prompt never references a
-// product the belt didn't actually produce (design §8: "drop the corresponding prompt clause + token").
-
-/** Predicate: is `product` ACTIVE for `step`'s prompt in this belt? True when the step produces it,
- *  or consumes it AND it's produced upstream (an earlier step or the source's roots). An inactive
- *  optional consume gets no @@TOKEN@@ injected and its @@WHEN:<product>@@…@@END@@ clauses stripped. */
-export function productActiveFor(
-  steps: readonly Pick<StepConfig, "name" | "produces" | "consumes">[],
-  step: Pick<StepConfig, "name" | "produces" | "consumes">,
-  sourceType: SourceType,
-): (product: ProductType) => boolean {
-  const idx = steps.findIndex((s) => s.name === step.name);
-  const upstream = idx >= 0 ? steps.slice(0, idx) : [];
-  const available = new Set<ProductType>([
-    ...(SOURCE_PRODUCTS[sourceType] ?? []),
-    ...upstream.flatMap((s) => s.produces),
-    ...step.produces,
-  ]);
-  return (product) =>
-    available.has(product) && (step.produces.includes(product) || step.consumes.some((c) => c.type === product));
-}
-
-/** Strip product-gated blocks: `@@WHEN:<product>@@ … @@END@@` is kept (delimiters removed) when the
- *  product is active, else the whole block — prose AND any @@TOKEN@@s inside — is removed, so an
- *  unsatisfied optional consume leaves no dangling token and no orphaned clause. Non-nesting. */
-export function stripInactiveProductBlocks(body: string, isActive: (product: ProductType) => boolean): string {
-  return body.replace(/@@WHEN:([a-z_]+)@@([\s\S]*?)@@END@@/g, (_m, product: string, inner: string) =>
-    isActive(product as ProductType) ? inner : "",
-  );
-}
 
 const dispatchPrompt = (step: string): string =>
   `Read ${MEMORY_DIR}/prompt-${step}.md in this worktree and follow it exactly. This is an autonomous task — do not pause to ask for confirmation.`;
@@ -274,8 +248,11 @@ function scaffold(
 /** Assemble a step's prompt body at render time (before tokens/scaffold): the engine base
  *  (work_to_pull_request steps) plus, if the step configures a `promptFile`, the user prompt read
  *  from `config` (the repo's config folder) or `repo` (the run's worktree). For a w2pr step the
- *  user prompt AUGMENTS the engine base; for a custom step (no base) it IS the whole body. */
-function stepBody(deps: Deps, run: Run, step: StepConfig): string {
+ *  user prompt AUGMENTS the engine base; for a custom step (no base) it IS the whole body.
+ *  The user prompt is validated against the prompt contract for THIS step (`ctx`) — a `config`-sourced
+ *  prompt was already checked at config-load, so this is the load-time check's mirror plus the only
+ *  check a `repo`-sourced prompt (read from the worktree here) gets. */
+function stepBody(deps: Deps, run: Run, step: StepConfig, ctx: PromptStepContext): string {
   let userPrompt = "";
   if (step.promptFile) {
     if (step.promptFileSource === "repo" && !run.worktreePath) {
@@ -287,6 +264,12 @@ function stepBody(deps: Deps, run: Run, step: StepConfig): string {
       userPrompt = readFileSync(path, "utf8");
     } catch {
       throw new Error(`${run.ticketKey}: ${step.name} prompt_file not found (${step.promptFileSource}): ${path}`);
+    }
+    const problems = validatePromptBody(userPrompt, ctx);
+    if (problems.length) {
+      throw new Error(
+        `${run.ticketKey}: ${step.name} prompt_file (${step.promptFileSource}: ${path}) violates the prompt contract:\n  - ${problems.join("\n  - ")}\n(see docs/PROMPTS.md for the token reference)`,
+      );
     }
   }
   if (step.enginePrompt === undefined) return userPrompt; // custom: the user prompt is the body
@@ -395,7 +378,10 @@ async function renderStepPromptImpl(
     sub["@@CAPTURE_LOCK_RELEASE_CMD@@"] = `${CLI_PATH} capture-lock release ${lockRes} ${run.ticketKey}`;
   }
   // Strip product-gated clauses BEFORE substitution so a dropped block's tokens never dangle.
-  let out = stripInactiveProductBlocks(stepBody(deps, run, step), isActive);
+  // The ctx here is exactly what stepBody validates the user prompt against and what
+  // availablePromptTokens keys on, so validation matches this render 1:1.
+  const ctx: PromptStepContext = { isActive, guardKinds: new Set(step.guards.map((g) => g.kind)) };
+  let out = stripInactiveProductBlocks(stepBody(deps, run, step, ctx), isActive);
   for (const [token, value] of Object.entries(sub)) out = out.replaceAll(token, () => value);
   if (deps.config.guidance) out += `\n\n## Repo-specific guidance\n\n${deps.config.guidance}\n`;
   out += scaffold(belt, step, prior, stepDoneCmd, askHumanCmd, bounceCmd, bounceTarget);

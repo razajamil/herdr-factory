@@ -8,7 +8,13 @@ import { expandHome } from "./paths.ts";
 import { SOURCE_DESCRIPTORS, descriptorFor } from "./sources/registry.ts";
 import { HEARTBEAT_GUARD, STEP_DESCRIPTORS, stepDescriptorFor, type StepDescriptor } from "./steps/registry.ts";
 import { productCapabilityFor } from "./products/registry.ts";
+import { SOURCE_PRODUCTS, productActiveFor, validatePromptBody } from "./prompts/contract.ts";
 import { configDir, listConfiguredRepos, repoConfigDir, serverInfoPath, stateRoot } from "./config-paths.ts";
+
+// SOURCE_PRODUCTS + the dataflow-gating helpers live in the leaf prompt-contract module (so the
+// renderer and this loader share one definition without a cycle); re-exported here because it has
+// long been part of config.ts's surface.
+export { SOURCE_PRODUCTS } from "./prompts/contract.ts";
 
 export { listConfiguredRepos, repoConfigDir, serverInfoPath } from "./config-paths.ts";
 
@@ -248,18 +254,6 @@ const beltBase = {
 // belt_type/agents keys (clean break — no alias). Lifecycle (the terminal PR watch, the bounce cap,
 // source transitions) is DERIVED at load from what the steps produce/declare, never from a belt_type.
 const BeltSchema = z.object({ ...beltBase, steps: z.array(BeltStepSchema).min(1, "a belt needs at least one step") }).strict();
-
-// The products a source materializes at belt_start — the roots of the dataflow graph the loader
-// validates each step's `consumes` against (only work_spec is ever a REQUIRED consume; work_raw /
-// close_reference are optional, so this only needs to be right for required edges).
-export const SOURCE_PRODUCTS: Record<SourceType, ProductType[]> = {
-  jira: ["work_spec", "work_raw", "human_reply"],
-  local_markdown: ["work_spec", "human_reply"],
-  github_issues: ["work_spec", "work_raw", "human_reply", "close_reference"],
-  // sentry: materializes task.md (work_spec) + issue.json (work_raw); ask-human via Sentry notes.
-  // No close_reference — Sentry issues have no PR-body auto-close keyword.
-  sentry: ["work_spec", "work_raw", "human_reply"],
-};
 
 /** A step ref is SKIPPED when its descriptor requires a layout pane (requiresLayout — the evidence
  *  opt-in, generalized) but the ref supplies no tab/pane. Skipped steps don't run and don't
@@ -930,6 +924,23 @@ export function loadConfig(repoName: string): Loaded {
     // Apply the evidence-opt-in skip (a requiresLayout step with no tab/pane), then resolve each.
     const kept = b.steps.filter((s) => !stepSkipped(stepDescriptorFor(s.type)!, s));
     const steps: StepConfig[] = kept.map((ref, i) => resolveStep(b.name, sourceType, ref, kept, i));
+    // Validate each `config`-sourced user prompt's tokens + @@WHEN@@ clauses against the contract for
+    // its step (existence was already asserted in resolveStep). A `repo`-sourced prompt is read from
+    // the worktree at render time, so it's validated there instead. productActiveFor is the same
+    // gating the renderer uses, so what's rejected here is exactly what would reach the agent unrendered.
+    for (const step of steps) {
+      if (!step.promptFile || step.promptFileSource !== "config") continue;
+      const abs = isAbsolute(step.promptFile) ? step.promptFile : join(repoDir, step.promptFile);
+      const problems = validatePromptBody(readFileSync(abs, "utf8"), {
+        isActive: productActiveFor(steps, step, sourceType),
+        guardKinds: new Set(step.guards.map((g) => g.kind)),
+      });
+      if (problems.length) {
+        throw new Error(
+          `belt "${b.name}" step "${step.name}" prompt_file (${abs}) violates the prompt contract:\n  - ${problems.join("\n  - ")}\n(see docs/PROMPTS.md for the token reference)`,
+        );
+      }
+    }
     // Lifecycle is DERIVED, not written: a step producing pull_request (whose product carries a
     // watch) gives the belt the terminal PR-watch. beltType is a display label only now.
     const watchPr = steps.some((s) => s.produces.includes("pull_request") && productCapabilityFor("pull_request").watch != null);
