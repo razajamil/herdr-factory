@@ -168,4 +168,18 @@ layouts:
 #   key_prefix: herdr-factory                   # optional S3 key prefix
 #   profile: my-aws-profile                     # optional AWS CLI named profile
 
+# ── branch: how a work-item type maps to {{semantic_work_prefix}}, and the length caps for the slug
+# vars. OPTIONAL and repo-wide (override per belt with a belt-level `branch:` block — each field
+# resolves belt over repo over the defaults). OMIT it and branch names are unchanged: the historical
+# bug|defect → fix, chore|task → chore, else feature taxonomy + {{work_slug}} ≤20 / {{work_full_slug}}
+# ≤50. A work TYPE matches a `prefixes` key case-insensitively by SUBSTRING (so "Dev bug" → the "bug"
+# rule); a reserved `default` key is the fallback for an unmatched type (omit it ⇒ "feature").
+# branch:
+#   prefixes:
+#     story: feat                               # story-typed items → feat/… branches
+#     bug: fix
+#     default: chore                            # any unmapped type
+#   slug_max: 20                                # cap for {{work_slug}}
+#   full_slug_max: 50                           # cap for {{work_full_slug}}
+
 # guidelines-prompt.md in this folder (if present) is appended to EVERY step prompt of EVERY belt.

@@ -600,11 +600,16 @@ it's a delete-free way to disable a belt), optional
 `match` (see [Multiple belts](#multiple-belts)), optional `max_bounces` override, and optional
 `workspace_name` — the branch/worktree name template, default
 `{{semantic_work_prefix}}/{{work_id}}-{{work_full_slug}}`. It must contain
-`{{work_id}}`; other vars: `{{work_slug}}` (≤20), `{{work_full_slug}}` (≤50), `{{work_type}}`,
-`{{semantic_work_prefix}}` (fix/chore/feature). A short unique suffix is always appended, so
+`{{work_id}}`; other vars: `{{work_slug}}`, `{{work_full_slug}}`, `{{work_type}}`,
+`{{semantic_work_prefix}}`. The prefix taxonomy behind `{{semantic_work_prefix}}` and the slug-length
+caps are configurable — see [`branch`](#branch-optional) (defaults: fix/chore/feature, `{{work_slug}}`
+≤20, `{{work_full_slug}}` ≤50). A short unique suffix is always appended, so
 re-claiming a previously-merged item gets a fresh branch and PR. Optional `default_layout` +
 `layout_matching` pick which `layouts` entry (below) the factory builds into this belt's worktrees —
 see [Layouts](#layouts).
+
+Optional **`branch`** — a per-belt override of the repo-wide [`branch`](#branch-optional) taxonomy
+(prefix map + slug caps); each field resolves belt over repo over the defaults.
 
 Optional **`pr`** — belt-level **PR behavior**, applied by the `pr` step when it opens the PR (only
 valid on a belt that has a `pr` step — a stray block is rejected at load):
@@ -724,6 +729,31 @@ the token renders empty — the prompts are unchanged. Beyond the `pr` step read
 own `.github/PULL_REQUEST_TEMPLATE.md` automatically (as `@@PR_TEMPLATE@@`), this is how you steer
 the *commit* shape without editing a prompt file. (v1: the config key **is** the convention — there
 is no auto-detection of commitlint configs.)
+
+### `branch` (optional)
+
+The branch-naming taxonomy: how a work-item type maps to `{{semantic_work_prefix}}`, and the length
+caps for the `{{work_slug}}` / `{{work_full_slug}}` vars a [`workspace_name`](#belt--1) template uses.
+Repo-wide, and **overridable per belt** (a belt-level `branch:` block) — each field resolves belt over
+repo over the defaults. Omit it everywhere and branch names are **unchanged**: the historical
+`bug|defect → fix`, `chore|task → chore`, else `feature` taxonomy, with `{{work_slug}}` ≤ 20 and
+`{{work_full_slug}}` ≤ 50.
+
+```yaml
+branch:
+  prefixes:
+    story: feat # story-typed items → feat/… branches
+    bug: fix
+    default: chore # any type that matches no key above
+  slug_max: 20 # cap for {{work_slug}}
+  full_slug_max: 50 # cap for {{work_full_slug}}
+```
+
+A work **type** is matched against each `prefixes` key **case-insensitively by substring** (so a
+`Dev bug` type matches the `bug` rule, and `Sub-task` matches `task`), keys tried in declaration order
+(first match wins). The reserved `default` key is the fallback for an unmatched type — omit it and the
+fallback is `feature`. A belt's `prefixes` map **fully replaces** the repo's (it's not merged), while
+each slug cap overrides independently; unset fields fall back to the repo block, then the defaults.
 
 ### Layouts
 
