@@ -13,6 +13,7 @@ import { systemClock, type Run, type SourceType } from "../types.ts";
 import type { Deps } from "../core/deps.ts";
 import { claimTicket, reconcileRepo, reconcileRun, resumeRun, teardownTicket, withRunLockWaiting, withTickLock } from "../core/reconcile.ts";
 import { applySignal, type SignalBody, type SignalResult } from "../core/signals.ts";
+import { runForeground } from "./run.ts";
 import { MEMORY_DIR } from "../core/step.ts";
 import * as service from "../watchers/service.ts";
 import { buildDeps, today } from "../build-deps.ts";
@@ -238,6 +239,30 @@ program
       }
     }
     deps.log("info", "watch: stopped");
+    await shutdownRuntimes();
+    process.exit(0);
+  }));
+
+program
+  .command("run")
+  .description(
+    "run the factory for this repo in the FOREGROUND: reconcile on the configured cadence and stream live progress — the first-run/aha path (no background server needed; it cooperates with one via the tick lock). Exits when the repo goes idle; --follow rides it until you Ctrl-C",
+  )
+  .option("--follow", "keep following after the local work drains (stream until Ctrl-C) instead of exiting when idle")
+  .action(cliAction("run", async (opts: { follow?: boolean }) => {
+    residentCommand = true; // a long-lived foreground loop: we own runtime shutdown + exit
+    let deps: Deps;
+    try {
+      deps = await buildDeps(requireRepo());
+    } catch (e) {
+      fail(e);
+    }
+    try {
+      await runForeground(deps, { follow: !!opts.follow });
+    } catch (e) {
+      await shutdownRuntimes();
+      fail(e);
+    }
     await shutdownRuntimes();
     process.exit(0);
   }));

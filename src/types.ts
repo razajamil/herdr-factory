@@ -81,6 +81,16 @@ export type EventType =
   | "resumed"
   | "error";
 
+/** One timeline event, repo-scoped (spans every run + run-id-less admin events). The shape the
+ *  foreground `run` command tails via `Store.eventsSince`. `detail` is the raw JSON string. */
+export interface RepoEvent {
+  id: number;
+  ts: number;
+  type: string;
+  detail: string | null;
+  ticketKey: string | null;
+}
+
 /** A single attempt at running one work item through a belt. */
 export interface Run {
   id: number;

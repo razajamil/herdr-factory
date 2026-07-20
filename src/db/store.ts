@@ -7,6 +7,7 @@ import type {
   HumanQuestionPatch,
   Outcome,
   PendingSignal,
+  RepoEvent,
   Run,
   RunPatch,
   RunStep,
@@ -670,6 +671,23 @@ export class Store {
       type: string;
       detail: string | null;
     }[];
+  }
+
+  /** The current max event id for a repo — the seed for the foreground `run --follow` feed, so it
+   *  streams only events created after it started rather than replaying the whole history. 0 when
+   *  the repo has no events yet. */
+  maxEventId(repo: string): number {
+    const row = this.db.prepare("SELECT MAX(id) AS n FROM events WHERE repo = ?").get(repo) as { n: number | null };
+    return row.n ?? 0;
+  }
+
+  /** Repo-wide events created after `afterId`, oldest-first — the incremental feed the foreground
+   *  `run` command tails. Unlike `timeline` (one ticket's run) this spans every run in the repo and
+   *  includes run-id-less admin events (belt rename/delete). */
+  eventsSince(repo: string, afterId: number): RepoEvent[] {
+    return this.db
+      .prepare("SELECT id, ts, type, detail, ticket_key AS ticketKey FROM events WHERE repo = ? AND id > ? ORDER BY id")
+      .all(repo, afterId) as unknown as RepoEvent[];
   }
 
   /** The machine `reason` of the run's most recent `attention` escalation (read from the event log —

@@ -495,3 +495,35 @@ describe("Store — uniqueness guarantees (v25)", () => {
       .toThrow(/UNIQUE constraint failed/);
   });
 });
+
+describe("Store — eventsSince / maxEventId (the foreground `run` feed)", () => {
+  it("streams repo events created after a cursor, oldest-first, and spans runs + admin events", () => {
+    const { store } = makeStore();
+    const a = store.createRun({ repo: "r", workSource: "jira", belt: "ship", ticketKey: "K-1" });
+    const b = store.createRun({ repo: "r", workSource: "jira", belt: "ship", ticketKey: "K-2" });
+    store.recordEvent({ runId: a.id, repo: "r", ticketKey: "K-1", type: "claimed", detail: { belt: "ship", source: "jira" } });
+    const cursor = store.maxEventId("r"); // a follower seeds here — everything below is "new"
+    store.recordEvent({ runId: a.id, repo: "r", ticketKey: "K-1", type: "step_spawned", detail: { step: "work" } });
+    store.recordEvent({ runId: b.id, repo: "r", ticketKey: "K-2", type: "step_done", detail: { step: "work" } });
+    store.recordEvent({ repo: "r", type: "belt_deleted", detail: { belt: "old" } }); // run-id-less admin event
+
+    const fresh = store.eventsSince("r", cursor);
+    expect(fresh.map((e) => e.type)).toEqual(["step_spawned", "step_done", "belt_deleted"]);
+    expect(fresh.map((e) => e.ticketKey)).toEqual(["K-1", "K-2", null]);
+    expect(fresh.every((e) => e.id > cursor)).toBe(true); // strictly after the cursor
+    expect(fresh[0]!.detail).toContain('"step":"work"'); // raw JSON string, parsed by the formatter
+
+    // Advancing the cursor to the last id drains the feed to empty (no re-delivery).
+    expect(store.eventsSince("r", fresh.at(-1)!.id)).toHaveLength(0);
+  });
+
+  it("is repo-scoped and returns 0 for a repo with no events", () => {
+    const { store } = makeStore();
+    expect(store.maxEventId("empty")).toBe(0);
+    const run = store.createRun({ repo: "r", workSource: "jira", belt: "ship", ticketKey: "K-1" });
+    store.recordEvent({ runId: run.id, repo: "r", ticketKey: "K-1", type: "claimed" });
+    expect(store.maxEventId("other")).toBe(0); // a different repo's events are invisible
+    expect(store.eventsSince("other", 0)).toHaveLength(0);
+    expect(store.eventsSince("r", 0)).toHaveLength(1);
+  });
+});
