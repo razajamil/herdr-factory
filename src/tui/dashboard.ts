@@ -7,12 +7,15 @@
 //
 // Refresh is flicker-free: quick status paints first, eligible source queries fold in afterward, and
 // both passes reconcile in place — reusing existing text renderables and only rewriting content or
-// adding/removing rows at the tail.
+// adding/removing rows at the tail. The quick paint carries the last good eligible items forward
+// (eligibleCache) instead of blanking them, so the rows survive the phase-1 gap and a lagging or
+// failed fold-in rather than blinking out for a frame.
 import { BoxRenderable, ScrollBoxRenderable, TextRenderable, type CliRenderer } from "@opentui/core";
 import type { KeyEvent } from "@opentui/core";
 import { hoverable, text } from "./render.ts";
 import { listConfiguredRepos } from "../config-paths.ts";
 import { fetchEligible, fetchHealth, fetchStatus, fetchTimeline, postClaim, postTeardown, postTick, serverPort, type ActiveRun, type EligibleItem, type RepoStatus } from "./api.ts";
+import { foldEligible, withoutClaimed } from "./eligible-cache.ts";
 import { BORDER, theme } from "./theme.ts";
 import type { ChooseFn, ConfirmFn, PromptFn, ShowInfoFn, TabView } from "./types.ts";
 import { formatWorkTable, type WorkTableRow } from "./work-table.ts";
@@ -112,6 +115,9 @@ export function createDashboard(renderer: CliRenderer, actions: { confirm: Confi
   let rows: LineNode[] = []; // focusable subset of lines, in order
   let hi = 0; // index into rows
   const statusBelts = new Map<string, { name: string; beltType: string; source: string }[]>();
+  // Last SUCCESSFUL eligible result per repo, carried into the quick paint and across a failed
+  // fold-in so the eligible rows never blink out for a frame (see eligible-cache.ts).
+  const eligibleCache = new Map<string, { eligible: EligibleItem[] }>();
 
   const rowKey = (t: Target) => `${t.repo}|${t.kind}|${t.belt ?? ""}|${t.key ?? ""}`;
   const setAction = (msg: string, fg: string) => { actionLine.content = msg; actionLine.fg = fg; };
@@ -198,7 +204,9 @@ export function createDashboard(renderer: CliRenderer, actions: { confirm: Confi
         specs.push({ content: "  (status unavailable)", fg: theme.text.tertiary });
         continue;
       }
-      const eligible = el?.eligible ?? [];
+      // Filter carried-forward eligible items against current runs: one may have been claimed since
+      // the last successful fold-in, and would otherwise show as both a running and an eligible row.
+      const eligible = withoutClaimed(el?.eligible ?? [], active);
       for (const belt of st.belts) {
         const beltRuns = active.filter((r) => r.belt === belt.name);
         const beltEligible = eligible.filter((i) => i.belt === belt.name);
@@ -262,12 +270,15 @@ export function createDashboard(renderer: CliRenderer, actions: { confirm: Confi
       const eligibleRequests = repos.map((name) => fetchEligible(name));
       const statuses = await Promise.all(repos.map((name) => fetchStatus(name)));
       if (timer === null) return;
-      const data = repos.map((name, i) => ({ name, st: statuses[i] ?? null, el: null }));
-      renderStatus(health, repos, data);
+      // Quick paint carries the last good eligible items (eligibleCache) rather than blanking them, so
+      // the rows survive the phase-1 gap before the fold-in — the flicker in the recording.
+      renderStatus(health, repos, repos.map((name, i) => ({ name, st: statuses[i] ?? null, el: eligibleCache.get(name) ?? null })));
 
       const eligible = await Promise.all(eligibleRequests);
       if (timer === null) return;
-      renderStatus(health, repos, repos.map((name, i) => ({ name, st: statuses[i] ?? null, el: eligible[i] ?? null })));
+      // Fold fresh results in (keeping the last good value where a query failed/timed out), then paint.
+      foldEligible(eligibleCache, repos, eligible);
+      renderStatus(health, repos, repos.map((name, i) => ({ name, st: statuses[i] ?? null, el: eligibleCache.get(name) ?? null })));
     } finally {
       inFlight = false;
     }
