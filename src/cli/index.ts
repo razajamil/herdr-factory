@@ -8,7 +8,8 @@ import { classifyS3Error, enumerateEvidenceFiles, evidenceUrls, resolveGithubUse
 import { baseGroups, repoGroup, type DoctorGroup } from "../doctor.ts";
 import { openDb } from "../db/index.ts";
 import { Store } from "../db/store.ts";
-import { systemClock, type Run } from "../types.ts";
+import { initRepo } from "../init.ts";
+import { systemClock, type Run, type SourceType } from "../types.ts";
 import type { Deps } from "../core/deps.ts";
 import { claimTicket, reconcileRepo, reconcileRun, resumeRun, teardownTicket, withRunLockWaiting, withTickLock } from "../core/reconcile.ts";
 import { applySignal, type SignalBody, type SignalResult } from "../core/signals.ts";
@@ -704,6 +705,32 @@ program
         console.log("no server running — config is read fresh on the next `serve` start (try `herdr-factory start`)");
         return;
       }
+      fail(e);
+    }
+  }));
+
+program
+  .command("init")
+  .description("scaffold a repo config from inside the repo: writes ~/.config/herdr-factory/repos/<name>/config.yml (name defaults to --repo, else the checkout's dir name), inferring the repo path + github owner/name from the current checkout")
+  .option("--source <type>", "work source to scaffold: jira | github_issues | local_markdown | sentry (default: github_issues if the origin resolves, else local_markdown)")
+  .option("--path <dir>", "the repo checkout to point at (default: the git top-level of the current directory)")
+  .option("--force", "overwrite an existing config.yml")
+  .action(cliAction("init", async (opts: { source?: string; path?: string; force?: boolean }) => {
+    try {
+      const SOURCES: SourceType[] = ["jira", "github_issues", "local_markdown", "sentry"];
+      if (opts.source && !SOURCES.includes(opts.source as SourceType)) {
+        fail(`unknown --source "${opts.source}" — use one of: ${SOURCES.join(" | ")}`);
+      }
+      const repoName = (program.opts() as { repo?: string }).repo;
+      const res = await initRepo({ repoName, source: opts.source as SourceType | undefined, path: opts.path, force: opts.force });
+      console.log(`scaffolded repo "${res.repoName}" (${res.source}${res.ghRepo ? `, origin ${res.ghRepo}` : ""}) at:`);
+      console.log(`  config: ${res.configPath}`);
+      if (res.envPath) console.log(`  secrets: ${res.envPath}`);
+      console.log(`  schema: ${res.schemaPath}`);
+      console.log("");
+      console.log("next steps:");
+      for (const step of res.nextSteps) console.log(`  • ${step}`);
+    } catch (e) {
       fail(e);
     }
   }));

@@ -103,7 +103,22 @@ line to the same file only if you want it to use a dedicated token instead.)
 
 ### 2. Point it at a repo and a project
 
-`~/.config/herdr-factory/repos/my-app/config.yml`:
+Fastest path — from **inside your project checkout**, let the factory scaffold the config for you:
+
+```sh
+cd ~/dev/my-app
+herdr-factory init            # writes repos/<dir-name>/config.yml, inferring the repo path + github owner/name
+# herdr-factory --repo my-app init --source jira   # name the config folder, pick the source
+```
+
+`init` picks a zero-config source by default — `github_issues` when your checkout has a GitHub origin
+(auth is your `gh` login, the repo derives from the remote), otherwise `local_markdown`. Pass
+`--source jira|github_issues|local_markdown|sentry` to choose; credentialed sources also get a
+`chmod 600` `env` scaffold with the keys to fill in. It refuses to clobber an existing config unless
+you pass `--force`. Then edit the `EDIT`-marked placeholders and run
+`herdr-factory --repo <name> doctor --deep`.
+
+Or write it by hand — `~/.config/herdr-factory/repos/my-app/config.yml`:
 
 ```yaml
 # yaml-language-server: $schema=../../config.schema.json
@@ -779,6 +794,9 @@ herdr-factory --repo <name> bounce <KEY> <toStep> --reason|--reason-file … [--
 herdr-factory --repo <name> ask-human <KEY> <step> --question|--question-file … [--source <name>]
 herdr-factory --repo <name> evidence-upload <KEY> [--source <name>]
 herdr-factory capture-lock acquire|release <resource> [owner]       # machine-global exclusive_resource lock
+
+# scaffold a repo config from inside the repo (name defaults to --repo, else the checkout dir)
+herdr-factory [--repo <name>] init [--source jira|github_issues|local_markdown|sentry] [--path <dir>] [--force]
 
 # the machine-wide server + supervisor (no --repo)
 herdr-factory serve | ensure-up [--restart] | restart | reload | update | provision-node
