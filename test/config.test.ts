@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import { parse as parseYaml } from "yaml";
 import { loadConfig, assertMainCheckout, expandHome, configJsonSchema, evidenceKeyPrefix, RepoConfigSchema } from "../src/config.ts";
 import { DEFAULT_BRANCH_TAXONOMY, branchName } from "../src/core/branch.ts";
+import { DEFAULT_AGENT_CONFIG } from "../src/types.ts";
 import type { JiraSourceCfg } from "../src/clients/jira-source.ts";
 import type { SentrySourceCfg } from "../src/clients/sentry-source.ts";
 import type { GithubIssuesSourceCfg } from "../src/clients/github-issues-source.ts";
@@ -1365,6 +1366,76 @@ describe("loadConfig — work sources + belts", () => {
     it("rejects an unknown key in the branch block (strict)", () => {
       const head = headWithBranch("  nope: true\n");
       setup(cfg(JIRA_SRC, SHIP_BELT, head), { prompts: {} });
+      expect(() => loadConfig("demo")).toThrow();
+    });
+  });
+
+  describe("agent: harness block", () => {
+    // A repo-level agent block goes in the config `head` (before work_sources/belt).
+    const headWithAgent = (body: string) => `repo:\n  path: __REPO__\nagent:\n${body}`;
+
+    it("defaults every step + the repo to DEFAULT_AGENT_CONFIG when no agent block is set anywhere", () => {
+      setup(cfg(JIRA_SRC, SHIP_BELT), { prompts: {} });
+      const { config } = loadConfig("demo");
+      expect(config.agent).toEqual(DEFAULT_AGENT_CONFIG); // claude --dangerously-skip-permissions
+      for (const step of config.belts[0]!.steps) expect(step.agent).toEqual(DEFAULT_AGENT_CONFIG);
+    });
+
+    it("resolves a repo-level command onto config.agent and every step (flags default to [])", () => {
+      setup(cfg(JIRA_SRC, SHIP_BELT, headWithAgent("  command: opencode\n")), { prompts: {} });
+      const { config } = loadConfig("demo");
+      // A new command drops the historical claude flags — flags are command-specific.
+      expect(config.agent).toEqual({ command: "opencode", flags: [] });
+      for (const step of config.belts[0]!.steps) expect(step.agent).toEqual({ command: "opencode", flags: [] });
+    });
+
+    it("keeps command=claude but lets flags be overridden at the repo level", () => {
+      setup(cfg(JIRA_SRC, SHIP_BELT, headWithAgent("  flags: [--verbose]\n")), { prompts: {} });
+      // command omitted ⇒ defaults to claude; flags come from the block verbatim.
+      expect(loadConfig("demo").config.agent).toEqual({ command: "claude", flags: ["--verbose"] });
+    });
+
+    it("resolves a belt-level agent over the repo (whole-unit, not merged)", () => {
+      const head = headWithAgent("  command: opencode\n  flags: [--sandbox]\n");
+      const belt = `  - name: ship
+    source: jira
+    label: agent
+    agent: { command: codex }
+    steps: [{ type: work, tab: w, pane: a }, { type: review, tab: r, pane: a }, { type: pr, tab: p, pane: a }]
+`;
+      setup(cfg(JIRA_SRC, belt, head), { prompts: {} });
+      const { config } = loadConfig("demo");
+      // The belt block replaces the repo's WHOLE agent — codex does NOT inherit --sandbox.
+      for (const step of config.belts[0]!.steps) expect(step.agent).toEqual({ command: "codex", flags: [] });
+      // The repo-level fallback (config.agent) still reflects the repo block.
+      expect(config.agent).toEqual({ command: "opencode", flags: ["--sandbox"] });
+    });
+
+    it("resolves a step-level agent over the belt and repo", () => {
+      const head = headWithAgent("  command: opencode\n");
+      const belt = `  - name: ship
+    source: jira
+    label: agent
+    agent: { command: codex }
+    steps:
+      - { type: work, tab: w, pane: a, agent: { command: pi, flags: [--fast] } }
+      - { type: review, tab: r, pane: a }
+      - { type: pr, tab: p, pane: a }
+`;
+      setup(cfg(JIRA_SRC, belt, head), { prompts: {} });
+      const steps = loadConfig("demo").config.belts[0]!.steps;
+      expect(steps.find((s) => s.name === "work")!.agent).toEqual({ command: "pi", flags: ["--fast"] }); // step wins
+      expect(steps.find((s) => s.name === "review")!.agent).toEqual({ command: "codex", flags: [] }); // belt wins
+      expect(steps.find((s) => s.name === "pr")!.agent).toEqual({ command: "codex", flags: [] }); // belt wins
+    });
+
+    it("rejects an unknown key in the agent block (strict)", () => {
+      setup(cfg(JIRA_SRC, SHIP_BELT, headWithAgent("  nope: true\n")), { prompts: {} });
+      expect(() => loadConfig("demo")).toThrow(/[Uu]nrecognized/);
+    });
+
+    it("rejects an empty command (min length)", () => {
+      setup(cfg(JIRA_SRC, SHIP_BELT, headWithAgent('  command: ""\n')), { prompts: {} });
       expect(() => loadConfig("demo")).toThrow();
     });
   });
