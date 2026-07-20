@@ -2,8 +2,10 @@ import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "
 import { dirname, join } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { Command } from "commander";
-import { configJsonSchema, configSchemaPath, evidenceKeyPrefix, globalDbPath, isManagedNode, loadConfig, managedNodePath, nodePathFile, writeConfigSchema, type WorkSourceConfig } from "../config.ts";
+import { configJsonSchema, configSchemaPath, evidenceKeyPrefix, globalDbPath, isManagedNode, loadConfig, managedNodePath, nodePathFile, repoConfigDir, writeConfigSchema, type WorkSourceConfig } from "../config.ts";
 import { descriptorFor } from "../sources/registry.ts";
+import { stepDescriptorFor } from "../steps/registry.ts";
+import { ejectPrompts, UnknownPromptStepError } from "../prompts-eject.ts";
 import { createEvidencePublisher, enumerateEvidenceFiles, resolveGithubUsername } from "../clients/evidence.ts";
 import { baseGroups, repoGroup, type DoctorGroup } from "../doctor.ts";
 import { openDb } from "../db/index.ts";
@@ -429,6 +431,58 @@ program
         return;
       }
       fail(`unknown auth action "${action}" — use: status`);
+    } catch (e) {
+      fail(e);
+    }
+  }));
+
+program
+  .command("prompts <action>")
+  .description(
+    "prompt pack: `eject` copies the shipped step prompts into the repo config folder (repos/<name>/prompts/) so you can edit them and point a step's `prompt_file` at the copy",
+  )
+  .option("--step <name>", "eject only this prompt (e.g. work/review/pr/evidence/resolver); default: the whole pack")
+  .option("--force", "overwrite prompts already ejected (default: skip existing files, preserving your edits)")
+  .action(cliAction("prompts", async (action: string, opts: { step?: string; force?: boolean }) => {
+    try {
+      const repo = requireRepo();
+      if (action !== "eject") fail(`unknown prompts action "${action}" — use: eject`);
+      const dir = repoConfigDir(repo);
+      // Eject works before `init` too, but a typo'd --repo would otherwise silently create a stray
+      // folder — so nudge (don't fail) when there's no config.yml for this repo yet.
+      if (!existsSync(join(dir, "config.yml"))) {
+        console.log(`note: no config.yml at ${dir} yet — run \`herdr-factory --repo ${repo} init\` first if this isn't the repo you meant.\n`);
+      }
+      let result;
+      try {
+        result = ejectPrompts({ repoConfigDir: dir, step: opts.step, force: opts.force });
+      } catch (e) {
+        if (e instanceof UnknownPromptStepError) fail(e.message);
+        throw e;
+      }
+      if (result.written.length === 0 && result.skipped.length === 0) {
+        console.log("no shipped prompts found to eject.");
+        return;
+      }
+      if (result.written.length > 0) {
+        console.log(`Ejected ${result.written.length} prompt${result.written.length === 1 ? "" : "s"} into ${result.destRoot}:`);
+        for (const f of result.written) console.log(`  ${f.configRel}`);
+      }
+      if (result.skipped.length > 0) {
+        console.log(`Skipped ${result.skipped.length} already-present file${result.skipped.length === 1 ? "" : "s"} (pass --force to overwrite):`);
+        for (const f of result.skipped) console.log(`  ${f.configRel}`);
+      }
+      // Wire hints for the shared, step-named prompts (the common case). Per-source variants and the
+      // resolver prompt still land in the folder above; they just aren't a one-line paste.
+      const wireable = result.written.filter((f) => !f.entry.source && stepDescriptorFor(f.entry.slug));
+      if (wireable.length > 0) {
+        console.log(`\nPoint a belt step at an ejected prompt (prompt_file_source defaults to \`config\`):`);
+        for (const f of wireable) console.log(`  - { type: ${f.entry.slug}, prompt_file: ${f.configRel} }`);
+        console.log(`For a work/review/pr/evidence step this AUGMENTS the shipped prompt; a \`custom\` step's prompt_file is its whole body.`);
+      }
+      if ([...result.written, ...result.skipped].some((f) => f.entry.slug === "resolver")) {
+        console.log(`\nresolver.md is the PR-watch resolver prompt — a reference copy; it isn't wired via a belt step's prompt_file.`);
+      }
     } catch (e) {
       fail(e);
     }
