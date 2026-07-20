@@ -161,10 +161,16 @@ image/video attachments are all handed to the agent as its spec.
 ### 4. Watch it work
 
 ```sh
-herdr-factory                        # the TUI: live dashboard · config editor · doctor
-herdr-factory --repo my-app status   # what's in flight, at a glance
-herdr-factory --repo my-app logs     # tail the dispatcher log
+herdr-factory                          # the TUI: live dashboard · config editor · doctor
+herdr-factory --repo my-app run --follow # run the factory in the foreground, streaming live progress
+herdr-factory --repo my-app status     # what's in flight, at a glance
+herdr-factory --repo my-app logs       # tail the dispatcher log
 ```
+
+`run --follow` is the quickest first taste: it ticks the repo in the foreground and streams the
+timeline (claims, step starts/finishes, PRs opened, merges) until you `Ctrl-C` — no background
+service required. Once you're happy, `herdr-factory start` installs the supervisor so the factory
+keeps running on its own.
 
 ## Markdown briefs — work without a ticket
 
@@ -783,6 +789,7 @@ readable errors.
 ```
 # inspect & operate a repo
 herdr-factory --repo <name> status | eligible | runs [--all] | timeline <KEY> | logs [n] | tick
+herdr-factory --repo <name> run [--follow]                          # run the factory in the FOREGROUND, streaming live progress
 herdr-factory --repo <name> claim <KEY> [--belt <name>]
 herdr-factory --repo <name> teardown <KEY> [--source <name>]
 herdr-factory --repo <name> resume <KEY> [--source <name>]          # un-park an `attention` run
@@ -810,6 +817,16 @@ The mutating/nudge commands (`tick`, `claim`, `teardown`, `resume`, `step-done`,
 back to executing directly against the DB when it isn't; reads (`status`, `eligible`, `runs`,
 `timeline`, `logs`) always go straight to the DB. `--source` disambiguates a key active in more
 than one source; `claim --belt` is required only when the repo has more than one belt.
+
+`run` is the **foreground first-run** path — the fastest way to see the factory work before you
+install the background supervisor. It reconciles the repo on its configured cadence (the same
+`reconcileRepo` the server ticks) **in-process** and streams the run timeline as it happens —
+claims, step starts/finishes, bounces, PRs opened, merges, attention parks. Plain `run` rides until
+the repo goes idle (local work implemented and PRs opened) then summarizes what's left and exits;
+`run --follow` never auto-exits — it tails until you `Ctrl-C` (like `tail -f`). It takes the
+per-repo tick lock, so it **cooperates** with a resident server if one is already up (a pass the
+server is mid-way through is simply skipped) while still streaming that server's own progress — so
+`run --follow` doubles as a live console onto a background factory.
 
 `auth status` reports each source's credential presence (env-var presence only, no network). Every
 source authenticates from the repo `env` — `JIRA_EMAIL` + `JIRA_API_TOKEN` for `jira`,
