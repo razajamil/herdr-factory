@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 import type { StepConfig } from "../config.ts";
 import type { BeltRuntime, Deps, SourceRuntime } from "./deps.ts";
 import type { Run, RunStep } from "../types.ts";
+import { renderWorkVars } from "./branch.ts";
 import { productActiveFor, type PromptStepContext, stripInactiveProductBlocks, validatePromptBody } from "../prompts/contract.ts";
 import { signalCommand } from "../signals/registry.ts";
 import { telemetrySpan } from "../telemetry/index.ts";
@@ -99,6 +100,63 @@ function commitConventionsBlock(deps: Deps): string {
   text = text.trim();
   if (!text) return "";
   return `\n\n**Commit-message conventions** (this repo's own — apply them to every commit message):\n\n${text}`;
+}
+
+// --- @@PR_OPTIONS@@ / @@PR_AUTOMATED_ROUND@@: the belt-level `pr:` behavior block ----------------
+// The belt's `pr:` policy is delivered as PROMPT instructions (not applied engine-side): the pr
+// agent already runs `gh pr create` and can pass `--draft`/`--title`/`--label`/`--reviewer`/
+// `--assignee` in one invocation, so the agent stays the single actor and everything it does is
+// visible in its pane — no second, invisible engine-side adoption step racing the agent's own create
+// (which would need its own gh calls, failure handling for missing labels/invalid reviewers, and
+// reconciliation with what the agent already did). Labels/reviewers/assignees ride the same path as
+// draft/title/automated_round for that reason. Both blocks are empty when the belt sets no `pr:`
+// block, so an absent block leaves the pr prompt byte-identical to before.
+
+/** A backtick-quoted, comma-joined list for prose: `["a","b"]` → `` `a`, `b` ``. */
+function quotedList(xs: readonly string[]): string {
+  return xs.map((x) => `\`${x}\``).join(", ");
+}
+
+/** Resolve @@PR_OPTIONS@@: the belt's PR opening policy (draft / title template / labels / reviewers
+ *  / assignees) as sub-bullets under the pr step's "open the PR" item, naming the `gh pr create`
+ *  flags to pass. The title reuses the `workspace_name` var renderer (branch.ts) so `{{work_id}}` &c.
+ *  interpolate. Empty string (leaving no trace) when the belt sets no `pr:` block or none of these
+ *  fields are set — that is what keeps an absent block byte-identical to before. */
+export function prOptionsBlock(belt: BeltRuntime, run: Run): string {
+  const pr = belt.pr;
+  if (!pr) return "";
+  const bullets: string[] = [];
+  if (pr.draft) bullets.push("**Open it as a draft PR** — pass `--draft` to `gh pr create`.");
+  if (pr.title) {
+    const title = renderWorkVars(pr.title, { key: run.ticketKey, type: run.issueType ?? "", summary: run.summary ?? "" });
+    bullets.push(`**Use this exact PR title** (do not paraphrase it): \`${title}\``);
+  }
+  if (pr.labels?.length) bullets.push(`**Apply these labels** (\`--label\`, creating any that don't exist yet): ${quotedList(pr.labels)}`);
+  if (pr.reviewers?.length) bullets.push(`**Request these reviewers** (\`--reviewer\`): ${quotedList(pr.reviewers)}`);
+  if (pr.assignees?.length) bullets.push(`**Assign the PR** (\`--assignee\`): ${quotedList(pr.assignees)}`);
+  if (!bullets.length) return "";
+  return "\n" + bullets.map((b) => `   - ${b}`).join("\n");
+}
+
+/** Resolve @@PR_AUTOMATED_ROUND@@: the pr prompt's "automated round" step (CI/bot polling), sized by
+ *  the belt's `pr.automated_round_minutes`. Unset ⇒ the ~10 min window baked before this block existed
+ *  (byte-identical); a positive N ⇒ a ~N min window; 0 ⇒ SKIP the round entirely — open the PR and
+ *  finish, letting the dispatcher's review watch take over. */
+export function prAutomatedRoundBlock(belt: BeltRuntime): string {
+  const mins = belt.pr?.automatedRoundMinutes;
+  if (mins === 0) {
+    return (
+      "2. **No automated round for this belt.** Don't poll CI or wait for bot comments here — as soon as the PR\n" +
+      "   is open, finish this step. The dispatcher watches the PR for CI and human review from here on."
+    );
+  }
+  const window = mins != null ? `~${mins} min` : "~10 min";
+  return (
+    `2. **Wait for the automated round (${window}):** poll CI (\`gh pr checks <num>\`) and bot review\n` +
+    "   comments; for each failure or bot thread, fix → commit → push → resolve, until everything is\n" +
+    "   green or the time elapses. Only automated checks/bots in this window — human reviewers are\n" +
+    "   watched by the dispatcher afterwards."
+  );
 }
 
 // --- belt step sequencing (belt.steps is the ordered source of truth) -------
@@ -475,6 +533,11 @@ async function renderStepPromptImpl(
   if (isActive("pull_request")) {
     const template = findPrTemplate(worktree);
     sub["@@PR_TEMPLATE@@"] = template ? prTemplateBlock(template) : "";
+    // The belt-level `pr:` behavior block (draft/title/labels/reviewers/assignees + the automated-
+    // round window). Both render empty / the ~10-min default when the belt sets no `pr:` block, so an
+    // absent block leaves this prompt byte-identical to before.
+    sub["@@PR_OPTIONS@@"] = prOptionsBlock(belt, run);
+    sub["@@PR_AUTOMATED_ROUND@@"] = prAutomatedRoundBlock(belt);
   }
   // exclusive_resource guard → the machine-global lock commands, injected only for a step that
   // declares one (evidence's capture mutex). The resource name comes from the guard, so it lives in

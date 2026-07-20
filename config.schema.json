@@ -481,6 +481,45 @@
               "additionalProperties": false
             }
           },
+          "pr": {
+            "type": "object",
+            "properties": {
+              "draft": {
+                "type": "boolean"
+              },
+              "title": {
+                "type": "string",
+                "minLength": 1
+              },
+              "labels": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              },
+              "reviewers": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              },
+              "assignees": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              },
+              "automated_round_minutes": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              }
+            },
+            "additionalProperties": false
+          },
           "steps": {
             "minItems": 1,
             "type": "array",

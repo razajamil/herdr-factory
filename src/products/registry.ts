@@ -66,9 +66,10 @@ export const PRODUCT_CAPABILITIES: readonly ProductCapability[] = [
   {
     product: "pull_request",
     // @@PR_NUMBER@@ is the resolver wake-prompt's (not a step-prompt token — kept out of the
-    // step-prompt catalog in contract.ts); @@PR_TEMPLATE@@ is the PR step's, carrying the target
-    // repo's own pull-request template so the PR follows the team's shape.
-    tokens: ["@@PR_NUMBER@@", "@@PR_TEMPLATE@@"],
+    // step-prompt catalog in contract.ts); @@PR_TEMPLATE@@ carries the target repo's own pull-request
+    // template so the PR follows the team's shape; @@PR_OPTIONS@@ + @@PR_AUTOMATED_ROUND@@ render the
+    // belt's `pr:` behavior block (draft/title/labels/reviewers/assignees + the automated-round window).
+    tokens: ["@@PR_NUMBER@@", "@@PR_TEMPLATE@@", "@@PR_OPTIONS@@", "@@PR_AUTOMATED_ROUND@@"],
     effectOnProduce: { to: "in_review" },
     adoption: { discover: ["by_branch", "by_number"], observedCompletion: ["MERGED"], perAttemptBranchUid: true },
     watch: {

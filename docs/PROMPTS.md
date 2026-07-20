@@ -115,10 +115,18 @@ step never carries this token:
 | Token | Meaning |
 | --- | --- |
 | `@@PR_TEMPLATE@@` | the target repo's own PR template — its `.github/PULL_REQUEST_TEMPLATE.md` (or the root / `docs/` variants, or the first file in a `.github/PULL_REQUEST_TEMPLATE/` directory), read from the worktree at render time and reproduced for the agent to fill faithfully. Empty when the repo ships no template — the base summary+testing-notes wording then applies unchanged. |
+| `@@PR_OPTIONS@@` | the belt's [`pr:` behavior block](../README.md#belt--1) opening policy — `draft`, `title` (a `{{work_id}}`/… template), `labels`, `reviewers`, `assignees` — rendered as the `gh pr create` flags to pass. Empty when the belt sets no `pr:` block (so an absent block leaves the pr prompt byte-identical to before). |
+| `@@PR_AUTOMATED_ROUND@@` | the pr step's automated-round (CI/bot polling) instructions, sized by the belt's `pr.automated_round_minutes` — the ~10 min default when unset, `~N min` when set, or a "skip the round, hand straight off" instruction when `0`. |
 
 Template discovery is **best-effort**: a missing or unreadable template drops the clause, it is
 never an error. The multi-template directory is v1-simple — the default/first `*.md` is used; there
 is no per-PR template selection.
+
+`@@PR_OPTIONS@@` and `@@PR_AUTOMATED_ROUND@@` render the belt-level **PR behavior block** as policy:
+`draft`, a `title` template, `labels`/`reviewers`/`assignees`, and the `automated_round_minutes`
+window are delivered as prompt instructions the agent applies via `gh` — the agent stays the actor,
+the config is the policy. An **absent** `pr:` block leaves both tokens at their pre-block defaults, so
+the rendered pr prompt is byte-identical to before.
 
 ### Product-scoped tokens — `evidence`
 

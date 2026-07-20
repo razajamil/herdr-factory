@@ -117,6 +117,16 @@ const PULL_REQUEST: readonly PromptTokenSpec[] = [
     scope: { kind: "product", product: "pull_request" },
     summary: "the target repo's own PR template (`.github/PULL_REQUEST_TEMPLATE.md` and the other standard locations), reproduced for the agent to fill faithfully; empty when the repo ships none",
   },
+  {
+    token: "@@PR_OPTIONS@@",
+    scope: { kind: "product", product: "pull_request" },
+    summary: "the belt's PR opening policy from its `pr:` block (draft / title template / labels / reviewers / assignees) as `gh pr create` instructions; empty when the belt sets no `pr:` block",
+  },
+  {
+    token: "@@PR_AUTOMATED_ROUND@@",
+    scope: { kind: "product", product: "pull_request" },
+    summary: "the pr step's automated-round (CI/bot polling) instructions, sized by the belt's `pr.automated_round_minutes` (default ~10 min; 0 = skip the round entirely)",
+  },
 ];
 
 // Capability-scoped tokens for the `evidence` product — substituted only when evidence is ACTIVE for

@@ -38,13 +38,23 @@ export function ticketVars(t: TicketVars): Record<string, string> {
 }
 
 /**
+ * Substitute `{{work_id}}` / `{{work_slug}}` / … in a free-form template using the same work-item
+ * vars a `workspace_name` interpolates (see {@link ticketVars}). Unknown `{{vars}}` render empty.
+ * This is the raw substitution ONLY — NO git-ref sanitisation (that's {@link renderWorkspaceName}),
+ * so it suits prose templates like a PR title where spaces and punctuation are wanted verbatim.
+ */
+export function renderWorkVars(template: string, t: TicketVars): string {
+  const vars = ticketVars(t);
+  return template.replace(/\{\{\s*(\w+)\s*\}\}/g, (_m, name: string) => vars[name] ?? "");
+}
+
+/**
  * Render a `workspace_name` template into a git-safe branch name. The worktree +
  * workspace derive from this branch (herdr assigns the workspace id). Unknown
  * `{{vars}}` render empty; the output is sanitised to a valid-ish ref.
  */
 export function renderWorkspaceName(template: string, t: TicketVars): string {
-  const vars = ticketVars(t);
-  const out = template.replace(/\{\{\s*(\w+)\s*\}\}/g, (_m, name: string) => vars[name] ?? "");
+  const out = renderWorkVars(template, t);
   const safe = out
     .replace(/[\x00-\x20~^:?*[\]\\]+/g, "-") // whitespace + git-illegal chars → dash
     .replace(/\.{2,}/g, ".") // collapse ".." (illegal in refs)

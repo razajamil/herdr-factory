@@ -227,6 +227,25 @@ const BeltStepSchema = z
  *  legal only on a `refCapabilities` step — enforced in superRefine). */
 type CapabilityRef = { consumes?: readonly string[]; produces?: readonly string[]; read_only?: boolean; bounce?: boolean };
 
+// The belt-level PR behavior block: how this belt's `pr` step opens the pull request, as POLICY
+// (config) rather than a forked prompt. All fields optional — an ABSENT block leaves the rendered pr
+// prompt byte-identical to before. `draft` opens the PR as a draft; `title` is a template using the
+// same `{{work_id}}` / `{{work_slug}}` / … vars as `workspace_name` (rendered verbatim, no git
+// sanitisation — see renderWorkVars); `labels`/`reviewers`/`assignees` are applied via `gh` at PR
+// creation; `automated_round_minutes` sets the CI/bot polling window the pr agent runs (0 = skip the
+// round entirely — open the PR and hand straight off to the dispatcher's review watch). Delivered as
+// prompt tokens/clauses so the agent stays the actor (see src/core/step.ts + src/prompts/pr.md).
+const PrBlockSchema = z
+  .object({
+    draft: z.boolean().optional(),
+    title: z.string().trim().min(1).optional(),
+    labels: z.array(z.string().trim().min(1)).optional(),
+    reviewers: z.array(z.string().trim().min(1)).optional(),
+    assignees: z.array(z.string().trim().min(1)).optional(),
+    automated_round_minutes: z.coerce.number().int().nonnegative().optional(),
+  })
+  .strict();
+
 // A per-belt branch-name template (the worktree + workspace derive from it). Must include
 // {{work_id}} so the branch is identifiable by ticket; a short unique suffix is appended
 // automatically (see branchName) so each claim — including a RE-claim of a previously-merged
@@ -269,6 +288,10 @@ const beltBase = {
   // Unset ⇒ the factory builds nothing; steps spawn their own panes as before.
   default_layout: z.string().trim().min(1).optional(),
   layout_matching: z.array(LayoutMatchRuleSchema).default([]),
+  // Optional belt-level PR behavior (draft / title template / labels / reviewers / assignees /
+  // automated-round window). Rendered into the pr step's prompt as policy; only meaningful on a belt
+  // that has a `pr` step (checked in superRefine). Absent ⇒ today's behavior, unchanged.
+  pr: PrBlockSchema.optional(),
 };
 
 // A belt is a (source + ordered steps) pairing. `.strict()` rejects typos AND the removed
@@ -502,6 +525,12 @@ export const RepoConfigSchema = z
         const d = stepDescriptorFor(s.type);
         return d ? !stepSkipped(d, s) : true;
       });
+      // A belt-level `pr:` block only does anything on a belt that opens a PR. Reject it on a belt
+      // with no pull_request-producing step (a `pr` step) so the policy can't silently no-op — the
+      // same "keep the composition honest" stance as the dataflow checks below.
+      if (b.pr && !kept.some((s) => stepDescriptorFor(s.type)?.produces.includes("pull_request"))) {
+        ctx.addIssue({ code: "custom", message: `belt "${b.name}" sets a \`pr:\` behavior block but has no step that opens a pull request — add a \`pr\` step or remove the block`, path: ["belt", i, "pr"] });
+      }
       const stepNames = new Set<string>();
       const paneTargets = new Map<string, string>(); // "tab\0pane" → first claiming step name
       b.steps.forEach((s, j) => {
@@ -672,6 +701,18 @@ export interface BeltConfig {
    *  (loadConfig always sets layoutMatching, defaulting to []; optional for terse test literals.) */
   defaultLayout?: string;
   layoutMatching?: LayoutMatchRule[];
+  /** Belt-level PR behavior policy, rendered into the `pr` step's prompt (draft / title template /
+   *  labels / reviewers / assignees / automated-round window). undefined ⇒ today's behavior; only set
+   *  on a belt with a `pr` step (enforced at parse). `title` is a `{{work_id}}`/… template. */
+  pr?: {
+    draft?: boolean;
+    title?: string;
+    labels?: string[];
+    reviewers?: string[];
+    assignees?: string[];
+    /** CI/bot polling window the pr agent runs after opening the PR, in minutes; 0 = skip it. */
+    automatedRoundMinutes?: number;
+  };
 }
 
 export interface Config {
@@ -1042,6 +1083,16 @@ export function loadConfig(repoName: string): Loaded {
       maxBounces: b.max_bounces,
       defaultLayout: b.default_layout,
       layoutMatching: b.layout_matching.map((r) => ({ worktreePattern: r.worktree_pattern, layout: r.layout })),
+      pr: b.pr
+        ? {
+            draft: b.pr.draft,
+            title: b.pr.title,
+            labels: b.pr.labels,
+            reviewers: b.pr.reviewers,
+            assignees: b.pr.assignees,
+            automatedRoundMinutes: b.pr.automated_round_minutes,
+          }
+        : undefined,
     };
   });
   // Stable sort: equal priorities keep config order (V8 Array.sort is stable on Node >=24).
