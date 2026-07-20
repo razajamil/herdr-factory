@@ -523,6 +523,153 @@ describe("loadConfig — work sources + belts", () => {
     expect(create!.tab).toBeUndefined(); // no layout → spawns its own pane
   });
 
+  // ── Config-declared capabilities for custom steps (build your own gates). ──
+  describe("custom-step capability opt-ins", () => {
+    // The acceptance belt: a bespoke read-only + bounce gate wired between work and pr.
+    const GATE_BELT = `  - name: ship
+    source: jira
+    label: agent
+    steps:
+      - { type: work, tab: work, pane: agent }
+      - { type: custom, name: security-review, read_only: true, bounce: true, tab: sec, pane: agent, prompt_file: sec.md }
+      - { type: pr, tab: pr, pane: agent }
+`;
+
+    it("a custom read_only + bounce step resolves to a bespoke review gate (read-only, bounces to work)", () => {
+      setup(cfg(JIRA_SRC, GATE_BELT), { prompts: { "sec.md": "Audit @@KEY@@; bounce with @@BOUNCE_CMD@@ if unsafe.\n" } });
+      const belt = loadConfig("demo").config.belts[0]!;
+      const gate = belt.steps.find((s) => s.name === "security-review")!;
+      expect(gate.type).toBe("custom");
+      expect(gate.readOnly).toBe(true); // enforced exactly like review/evidence (HEAD movement parks)
+      expect(gate.canBounceTo).toEqual(["work"]); // earliest earlier bounce_feedback consumer
+      expect(gate.opensPr).toBe(false);
+      expect(gate.gathersEvidence).toBe(false);
+      expect(gate.enginePrompt).toBeUndefined(); // custom: the prompt_file is the whole body
+      expect(gate.posture.readOnly).toBe(true); // posture stays consistent with the derived flag
+      expect(belt.watchPr).toBe(true); // the pr step still gives the belt its terminal PR watch
+    });
+
+    it("a custom `consumes: [commits]` step is a required consume satisfied by an upstream producer", () => {
+      const belt = `  - name: ship
+    source: jira
+    label: agent
+    steps:
+      - { type: work, tab: work, pane: agent }
+      - { type: custom, name: audit, consumes: [commits], read_only: true, tab: a, pane: agent, prompt_file: a.md }
+      - { type: pr, tab: pr, pane: agent }
+`;
+      setup(cfg(JIRA_SRC, belt), { prompts: { "a.md": "Audit the diff.@@WHEN:commits@@ Commits exist.@@END@@\n" } });
+      const audit = loadConfig("demo").config.belts[0]!.steps.find((s) => s.name === "audit")!;
+      expect(audit.consumes.some((c) => c.type === "commits" && c.required)).toBe(true);
+    });
+
+    it("rejects a custom `consumes: [commits]` step with nothing upstream producing commits", () => {
+      const belt = `  - name: gen
+    source: ideas
+    steps:
+      - { type: custom, name: audit, consumes: [commits], prompt_file: a.md }
+`;
+      setup(cfg(LM_SRC, belt), { prompts: { "a.md": "Audit.\n" } });
+      expect(() => loadConfig("demo")).toThrow(/requires "commits"/);
+    });
+
+    it("a custom `produces: [commits]` step is a code-writing station (produces commits; no PR/evidence; no auto-heartbeat)", () => {
+      const belt = `  - name: gen
+    source: ideas
+    steps:
+      - { type: custom, name: scaffold, produces: [commits], prompt_file: s.md }
+      - { type: custom, name: check, consumes: [commits], read_only: true, prompt_file: c.md }
+`;
+      setup(cfg(LM_SRC, belt), { prompts: { "s.md": "Scaffold.\n", "c.md": "Check.\n" } });
+      const steps = loadConfig("demo").config.belts[0]!.steps;
+      const scaffold = steps.find((s) => s.name === "scaffold")!;
+      expect(scaffold.produces).toContain("commits");
+      expect(scaffold.opensPr).toBe(false);
+      expect(scaffold.gathersEvidence).toBe(false);
+      expect(scaffold.heartbeat).toBe(false); // produces:[commits] is NOT the heartbeat opt-in
+      // the downstream consume is satisfied by the upstream producer (no dataflow error)
+      expect(steps.find((s) => s.name === "check")!.consumes.some((c) => c.type === "commits" && c.required)).toBe(true);
+    });
+
+    it("a custom `heartbeat: true` step also produces commits AND attaches the heartbeat guard", () => {
+      const belt = `  - name: gen
+    source: ideas
+    steps:
+      - { type: custom, name: build, heartbeat: true, prompt_file: b.md }
+`;
+      setup(cfg(LM_SRC, belt), { prompts: { "b.md": "Build.\n" } });
+      const build = loadConfig("demo").config.belts[0]!.steps[0]!;
+      expect(build.produces).toContain("commits");
+      expect(build.heartbeat).toBe(true);
+      expect(build.guards.some((g) => g.kind === "heartbeat")).toBe(true);
+    });
+
+    it("rejects a custom step that is read_only AND produces commits (contradictory)", () => {
+      const belt = `  - name: gen
+    source: ideas
+    steps:
+      - { type: custom, name: bad, read_only: true, produces: [commits], prompt_file: b.md }
+`;
+      setup(cfg(LM_SRC, belt), { prompts: { "b.md": "x\n" } });
+      expect(() => loadConfig("demo")).toThrow(/read-only and cannot produce commits/);
+    });
+
+    it("rejects a custom read_only step that also opts into heartbeat (heartbeat ⇒ commits)", () => {
+      const belt = `  - name: gen
+    source: ideas
+    steps:
+      - { type: custom, name: bad, read_only: true, heartbeat: true, prompt_file: b.md }
+`;
+      setup(cfg(LM_SRC, belt), { prompts: { "b.md": "x\n" } });
+      expect(() => loadConfig("demo")).toThrow(/read-only and cannot produce commits/);
+    });
+
+    it("rejects a custom `bounce: true` step with no earlier bounce_feedback consumer", () => {
+      const belt = `  - name: gen
+    source: ideas
+    steps:
+      - { type: custom, name: gate, bounce: true, prompt_file: g.md }
+`;
+      setup(cfg(LM_SRC, belt), { prompts: { "g.md": "x\n" } });
+      expect(() => loadConfig("demo")).toThrow(/declares a bounce but no earlier step consumes bounce_feedback/);
+    });
+
+    it("a custom `bounce: true` step bounces to an earlier custom step (custom always consumes bounce_feedback)", () => {
+      const belt = `  - name: gen
+    source: ideas
+    steps:
+      - { type: custom, name: draft, prompt_file: d.md }
+      - { type: custom, name: gate, bounce: true, prompt_file: g.md }
+`;
+      setup(cfg(LM_SRC, belt), { prompts: { "d.md": "Draft.\n", "g.md": "Gate.\n" } });
+      const gate = loadConfig("demo").config.belts[0]!.steps.find((s) => s.name === "gate")!;
+      expect(gate.canBounceTo).toEqual(["draft"]);
+    });
+
+    it("rejects capability opt-ins on a non-custom step (its capabilities are fixed by the primitive)", () => {
+      const belt = `  - name: ship
+    source: jira
+    label: agent
+    steps:
+      - { type: work, tab: work, pane: agent, read_only: true }
+      - { type: review, tab: review, pane: agent }
+      - { type: pr, tab: pr, pane: agent }
+`;
+      setup(cfg(JIRA_SRC, belt), { prompts: {} });
+      expect(() => loadConfig("demo")).toThrow(/capability opt-ins are only for/);
+    });
+
+    it("rejects a `produces: [pull_request]` opt-in at parse time (allow-list is commits only)", () => {
+      const belt = `  - name: gen
+    source: ideas
+    steps:
+      - { type: custom, name: opener, produces: [pull_request], prompt_file: o.md }
+`;
+      setup(cfg(LM_SRC, belt), { prompts: { "o.md": "x\n" } });
+      expect(() => loadConfig("demo")).toThrow();
+    });
+  });
+
   it("defaults a step's name to its type when omitted", () => {
     setup(cfg(JIRA_SRC, SHIP_BELT), { prompts: {} });
     const names = loadConfig("demo").config.belts[0]!.steps.map((s) => s.name);

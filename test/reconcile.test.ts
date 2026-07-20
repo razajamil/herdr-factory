@@ -722,6 +722,41 @@ describe("@@PR_TEMPLATE@@ + @@COMMIT_CONVENTIONS@@ (end-to-end render of the shi
   });
 });
 
+describe("custom gate scaffold (read-only + bounce declarations render per StepConfig)", () => {
+  const renderGate = async (gate: StepConfig, key: string) => {
+    const { deps, store, worktree, shipBelt } = build();
+    shipBelt.steps = [stepCfg("fix"), gate, stepCfg("pr")];
+    const run = seed(store, worktree, key, "running", gate.name);
+    await renderStepPrompt(deps, run, shipBelt, deps.resolveSource("jira")!, gate, null);
+    return readFileSync(join(worktree, MEMORY_DIR, `prompt-${gate.name}.md`), "utf8");
+  };
+  // A custom gate has no engine base prompt, so the engine injects its read-only notice + bounce
+  // section from the resolved StepConfig — the same fields config.ts derives from the ref opt-ins.
+  const gateCfg = (opts: Partial<StepConfig>) =>
+    stepCfg("gate", { type: "custom", enginePrompt: undefined, tab: undefined, pane: undefined, heartbeat: false, opensPr: false, ...opts });
+
+  it("read_only + bounce ⇒ a read-only notice AND a rendered bounce command, with no dangling tokens", async () => {
+    const body = await renderGate(gateCfg({ readOnly: true, canBounceTo: ["fix"] }), "K-GATE");
+    expect(body).toMatch(/read-only step/i); // the injected read-only posture notice
+    expect(body).toContain("Sending the work back for rework"); // the bounce scaffold section
+    expect(body).toContain("bounce"); // the rendered bounce command targeting the earlier step
+    expect(body).not.toMatch(/@@[A-Z_]+@@/); // every token substituted, nothing left dangling
+  });
+
+  it("read_only WITHOUT bounce ⇒ the read-only notice, no bounce section", async () => {
+    const body = await renderGate(gateCfg({ readOnly: true, canBounceTo: [] }), "K-GATE2");
+    expect(body).toMatch(/read-only step/i);
+    expect(body).not.toContain("Sending the work back for rework");
+    expect(body).toMatch(/record what's wrong in your handoff note/); // the no-bounce phrasing
+  });
+
+  it("a plain custom step (no read_only, no bounce) gets neither the read-only notice nor a bounce section", async () => {
+    const body = await renderGate(gateCfg({ readOnly: false, canBounceTo: [] }), "K-GATE3");
+    expect(body).not.toMatch(/read-only step/i);
+    expect(body).not.toContain("Sending the work back for rework");
+  });
+});
+
 describe("reconcile — Phase B source poll interval", () => {
   it("polls a source every tick when its interval equals the tick interval (the default)", async () => {
     const { deps, setNow } = build();

@@ -356,6 +356,25 @@ ends when the **last** step signals `step-done`. Per step you can set `budget_se
 that the shipped primitives use applies — mix `custom` steps with `work`/`review`/`pr` freely, the
 config-load dataflow check keeps the composition honest.
 
+**Build your own gates.** A `custom` step ref can declare capabilities from a small allow-list, so
+you can stand up a bespoke review-like gate ("security review", "docs check", "QA script") or a
+code-writing station without forking the engine:
+
+| Declaration | Effect |
+|---|---|
+| `consumes: [commits]` | Place the step after a code-writing step and receive its context (a **required** input — a step earlier in the belt must produce commits). |
+| `produces: [commits]` | A code-writing custom station (makes `heartbeat` meaningful). |
+| `read_only: true` | A gate that never edits or commits — **enforced** exactly like `review`/`evidence` (if the branch HEAD moves, the run parks). Mutually exclusive with `produces: [commits]`. |
+| `bounce: true` | The step may send the work back to the earliest earlier step that accepts rework (counts toward `max_bounces`). |
+
+So `[work, { type: custom, name: security-review, read_only: true, bounce: true, prompt_file: … }, pr]`
+behaves like a bespoke review station: read-only enforced, its bounce counted and capped, and the
+bounce/ask-human wiring rendered into its prompt. Producing a `pull_request` or `evidence` from a
+custom step stays out of scope (those drag heavy engine machinery — use the `pr`/`evidence`
+primitives). Every declaration is checked at config-load: a `bounce: true` with no earlier step to
+bounce to, a `consumes: [commits]` with nothing upstream producing them, or `read_only` +
+`produces: [commits]` are all rejected with a clear error.
+
 ### Multiple belts
 
 A repo runs **as many belts as you like, all ticking in parallel** — several belts on the same
@@ -632,6 +651,11 @@ steps:
 
 `prompt_file_source` is optional — it defaults to `config` (the repo's config folder, where custom-step
 prompts usually live), so you only set it to pin a prompt to `repo` (read from the target checkout).
+
+A `custom` step ref may also declare capabilities — `consumes: [commits]`, `produces: [commits]`,
+`read_only: true`, `bounce: true` — to build your own gates and code-writing stations (see
+[`custom` steps](#custom-steps--your-own-stations)). These four are legal only on a `custom` step
+(a shipped primitive's capabilities are fixed) and are validated by the same config-load dataflow check.
 
 The belt's lifecycle is **derived** from its steps: a `pr` step (which produces a pull request) gives
 it the terminal PR watch + the `in_review` write-back; an `evidence`/`review` step gives it a bounce
