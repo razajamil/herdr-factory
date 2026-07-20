@@ -598,12 +598,17 @@ CREATE TABLE transition_outbox(          -- source status write-backs as persist
   id INTEGER PRIMARY KEY AUTOINCREMENT, run_id INTEGER NOT NULL REFERENCES runs(id),
   repo TEXT NOT NULL, work_source TEXT NOT NULL, ticket_key TEXT NOT NULL,
   to_state TEXT NOT NULL CHECK (to_state IN ('todo','in_development','in_review','merged','aborted','done')),
+  to_status TEXT NOT NULL DEFAULT '',    -- belt-effect SOURCE-NATIVE status key ('' = canonical mapping
+                                         -- for to_state). to_state stays the canonical ANCHOR (its
+                                         -- CHECK untouched — WorkState vocab is unchanged); the source
+                                         -- delivers to_status when set (v27). See §7 effects.
   attempts INTEGER NOT NULL DEFAULT 0, next_attempt_at INTEGER NOT NULL,  -- exponential backoff
   last_error TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
   delivered_at INTEGER,                  -- set once the source confirms (or reports a no-op)
   stale_at INTEGER,                      -- delivery found the item GONE; stamped lock-free (v14)
   stale_handled_at INTEGER,              -- the run-locked stale policy consumed it (v14)
-  UNIQUE(run_id, to_state));             -- enqueue is idempotent across retried ticks
+  UNIQUE(run_id, to_state, to_status));  -- enqueue idempotent across ticks; a custom status and a
+                                         -- canonical transition at the same anchor are distinct (v27)
 
 CREATE TABLE evidence_uploads(           -- evidence publishes as persisted INTENTS (v16) — the
   id INTEGER PRIMARY KEY AUTOINCREMENT,  -- upload analog of transition_outbox (durable, retried).
@@ -744,6 +749,21 @@ PR opens, terminal at teardown) are **enqueued as outbox intents and attempted i
 the healthy path is unchanged (status moves the same tick), but a failure is retried with
 exponential backoff (60s doubling, 1h cap) until the source confirms, instead of the old
 logged-then-dropped "deferred".
+
+**Effects — configurable task progression.** Those three transitions are the engine *defaults*; a
+belt's optional `effects` block declares more (see README). Every source transition — default or
+belt-configured — routes through one `fireEffect(trigger, defaultTo?)` seam: it looks up the belt's
+effect for the trigger (entering a step / producing a product / a teardown outcome), else the engine
+default, and enqueues it on the outbox. An effect may target a **source-native custom status**
+(`to_status`) beyond the six canonical `WorkState`s — the engine's vocabulary stays canonical and
+the *source* maps the extra name (jira `status.<key>`, github_issues `state_labels.<key>`) onto its
+backend, so `WorkState` and the outbox CHECK are untouched. Effects are **forward-only/monotonic**:
+each carries a rank (its canonical anchor's rank, minus ½ for a custom status, which sits just before
+its anchor stage), and `fireEffect` refuses one whose rank is below the run's highest already-enqueued
+rank — so a bounce re-entry or forward re-advance can never walk the source backward (the outbox's
+re-open-on-enqueue would otherwise re-deliver an earlier transition). Internal-ledger sources
+(`local_markdown`, `sentry`) keep the canonical states only in v1; a custom-status effect on them is
+rejected at config-load.
 
 ### The pipeline (work_to_pull_request)
 

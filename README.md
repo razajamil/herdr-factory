@@ -538,7 +538,10 @@ caps the repo total but no single source can monopolize it), and a type block:
   record lives in Jira. By default the factory never writes a terminal status — merged/closed is left
   to Jira's GitHub integration. Set `status.done` to opt in: a merged PR then moves the ticket to that
   status at teardown (after the merge, before the worktree is recycled); a closed/abandoned run still
-  leaves the ticket untouched. Ticket description, comments, and image/video attachments are
+  leaves the ticket untouched. The `status` map also accepts **extra named entries**
+  (`status.<key>: <Jira status name>`, e.g. `qa: QA Review`) that a belt's
+  [`effects`](#effects--configurable-task-progression) can target by key — how you add columns like
+  a QA lane to the ticket's progression. Ticket description, comments, and image/video attachments are
   materialized into the worktree for the agents. Authentication is **API token only** — `JIRA_EMAIL` +
   `JIRA_API_TOKEN` (both required) in the repo's `env` (the Agile board API needs Basic auth, so there
   is no OAuth).
@@ -557,7 +560,9 @@ caps the repo total but no single source can monopolize it), and a type block:
   which acts as the trigger — set per **belt**, see [`belt`](#belt--1)), oldest first; the status of
   record stays on GitHub, projected as labels. Fields (all optional): `repo` (`owner/name`; default
   = the repo PRs are opened against), `state_labels` (`in_development`/`in_review`/`aborted`,
-  defaults `herdr:in-development` / `herdr:in-review` / `herdr:aborted`; created on demand),
+  defaults `herdr:in-development` / `herdr:in-review` / `herdr:aborted`; created on demand — plus
+  **extra named entries** `state_labels.<key>: <label>` that a belt's
+  [`effects`](#effects--configurable-task-progression) can target, e.g. `qa: herdr:qa`),
   `close_on` (`merged`/`done`/`aborted`, defaults `true`/`true`/`false`), `type_labels` (issue label
   → work type; GitHub's native issue type wins when present) + `default_type` (default `Feature`),
   `max_pages` (pages of 100 per poll, default 1). Lifecycle: claiming swaps in the in-development
@@ -611,7 +616,53 @@ caps are configurable — see [`branch`](#branch-optional) (defaults: fix/chore/
 ≤20, `{{work_full_slug}}` ≤50). A short unique suffix is always appended, so
 re-claiming a previously-merged item gets a fresh branch and PR. Optional `default_layout` +
 `layout_matching` pick which `layouts` entry (below) the factory builds into this belt's worktrees —
-see [Layouts](#layouts).
+see [Layouts](#layouts). Optional `effects` — configurable task progression onto source statuses
+(see [Effects](#effects--configurable-task-progression)).
+
+#### Effects — configurable task progression
+
+By default the factory moves the source item at three points: claim → `in_development`, PR opened →
+`in_review`, and (opt-in) merge → your terminal status. A belt's optional **`effects`** list widens
+that to **your** progression: map a **trigger** — entering a step, producing a product, or tearing
+down with an outcome — to the status the item should move to. Omit the block and the defaults are
+unchanged.
+
+```yaml
+work_sources:
+  - type: jira
+    jira:
+      base_url: https://your-org.atlassian.net
+      project: APP
+      board: 254
+      status:
+        # the canonical mapping (todo/in_development/review) plus EXTRA named statuses a belt
+        # effect can target by key:
+        qa: QA Review
+        done: Done
+
+belt:
+  - name: tickets-to-prs
+    source: jira
+    label: agent
+    effects:
+      - { on: produce, product: evidence, to: qa, anchor: in_review } # evidence passed → "QA Review"
+      - { on: teardown, outcome: merged, to: done } #                     merged → "Done"
+    steps: [{ type: work }, { type: evidence, tab: work, pane: evidence }, { type: review }, { type: pr }]
+```
+
+- **`on`** — `enter` (a `step:` you name — the first step is claim time), `produce` (a `product:` —
+  `evidence` or `pull_request`), or `teardown` (an `outcome:` — `merged`/`closed`/`abandoned`/`timeout`/`completed`).
+- **`to`** — either a **canonical state** (`todo`/`in_development`/`in_review`/`merged`/`done`/`aborted`,
+  works on any source) or a **source-native status key** you added to the source's map (a jira
+  `status.<key>`, a github_issues `state_labels.<key>`). A custom `to` needs an **`anchor`** — the
+  canonical state whose lifecycle position it sits just before — which fixes its ordering.
+- Effects are **forward-only**: one that would move the item backward (e.g. a re-run re-entering an
+  earlier step) is a no-op, and every effect rides the same durable, retry-safe status outbox as the
+  built-in transitions — never fire-and-forget. A trigger maps to exactly one status.
+- **Internal-ledger sources** (`local_markdown`, `sentry`) keep the canonical states only in v1;
+  a belt effect targeting a *custom* status on them is rejected at config-load with a clear error
+  (custom states there would need a database migration). Effects targeting canonical states work on
+  every source.
 
 Optional **`branch`** — a per-belt override of the repo-wide [`branch`](#branch-optional) taxonomy
 (prefix map + slug caps); each field resolves belt over repo over the defaults.

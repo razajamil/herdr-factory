@@ -39,6 +39,8 @@ work_sources:
         # done: Done   # OPT-IN: uncomment to move the ticket here when the PR merges (after the merge,
         #              # before the worktree is recycled). Omit to leave terminal closure to Jira's
         #              # GitHub integration; a closed/abandoned run never touches the ticket either way.
+        qa: QA Review # EXTRA named status a belt effect can target by key (see belt `effects` below).
+        #              # Any extra `status.<key>: <Jira status name>` entry adds a column to the flow.
 
   - type: local_markdown
     name: ideas
@@ -105,6 +107,13 @@ belt:
     #   labels: [needs-review]                          #   applied via `gh` at creation (created on demand)
     #   reviewers: [octocat]                            #   requested reviewers  ·  assignees: [me]
     #   automated_round_minutes: 10                     #   CI/bot polling window the pr step runs; 0 = skip the round entirely
+    # ── effects: OPTIONAL configurable task progression onto source statuses. Omit for the defaults
+    # (claim → in_development, PR opened → in_review, merge → your terminal). `on`: enter <step> /
+    # produce <product> / teardown <outcome>. `to`: a canonical state OR a source-native status key
+    # (a `status.<key>` above / a github `state_labels.<key>`); a custom `to` needs an `anchor` (the
+    # canonical state it sits just before). Forward-only + routed through the durable status outbox.
+    effects:
+      - { on: produce, product: evidence, to: qa, anchor: in_review } # evidence passed → move to "QA Review"
     steps:
       - { type: work, tab: work, pane: agent }
       - { type: evidence, tab: evidence, pane: agent } # opt-in; drop tab/pane (or the whole entry) to SKIP evidence
