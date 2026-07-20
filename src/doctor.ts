@@ -59,7 +59,7 @@ function ago(at: number): string {
  *  read from that status file when present (what the SERVICE actually ran — the env var is captured
  *  at install time and may not be exported in this shell), falling back to the ambient env. On a box
  *  that has never updated (no status file) it validates the `main` upstream exists, as before. */
-async function updateCheck(): Promise<DoctorCheck> {
+export async function updateCheck(): Promise<DoctorCheck> {
   const name = "auto-update";
   const status = readUpdateStatus();
   const channel = status?.channel ?? updateChannel();

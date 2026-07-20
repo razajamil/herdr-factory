@@ -16,6 +16,7 @@ import { hoverable, text } from "./render.ts";
 import { listConfiguredRepos } from "../config-paths.ts";
 import { fetchEligible, fetchHealth, fetchStatus, fetchTimeline, postClaim, postTeardown, postTick, serverPort, type ActiveRun, type EligibleItem, type RepoStatus } from "./api.ts";
 import { foldEligible, withoutClaimed } from "./eligible-cache.ts";
+import { updateWarning } from "../watchers/updater.ts";
 import { BORDER, theme } from "./theme.ts";
 import type { ChooseFn, ConfirmFn, PromptFn, ShowInfoFn, TabView } from "./types.ts";
 import { formatWorkTable, type WorkTableRow } from "./work-table.ts";
@@ -193,8 +194,11 @@ export function createDashboard(renderer: CliRenderer, actions: { confirm: Confi
   ): void {
     serverUp = true;
     statusBelts.clear();
-    banner.content = `● server up · v${health.version} · uptime ${fmtDuration(health.uptimeSec)}`;
-    banner.fg = theme.status.good;
+    // A warn-worthy last auto-update (failed / dirty-skip / behind its channel target) rides on the
+    // banner in amber — the same signal the Doctor tab paints, surfaced on the main view too.
+    const updateNote = updateWarning();
+    banner.content = `● server up · v${health.version} · uptime ${fmtDuration(health.uptimeSec)}${updateNote ? ` · ⚠ ${updateNote}` : ""}`;
+    banner.fg = updateNote ? theme.status.warn : theme.status.good;
     const specs: LineSpec[] = [];
     for (const { name, st, el } of data) {
       if (st) statusBelts.set(name, st.belts);

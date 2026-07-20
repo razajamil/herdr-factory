@@ -75,13 +75,30 @@ export interface UpdateStatus {
 
 /** Read the last recorded update attempt (or null if none / malformed — treated as "no attempt"). */
 export function readUpdateStatus(): UpdateStatus | null {
+  return readUpdateStatusAt(updateStatusPath());
+}
+function readUpdateStatusAt(path: string): UpdateStatus | null {
   try {
-    const o = JSON.parse(readFileSync(updateStatusPath(), "utf8")) as Partial<UpdateStatus>;
+    const o = JSON.parse(readFileSync(path, "utf8")) as Partial<UpdateStatus>;
     if (typeof o.at === "number" && typeof o.outcome === "string") return o as UpdateStatus;
     return null;
   } catch {
     return null;
   }
+}
+
+/** A short amber note for a warn-worthy last update — the box failed to update, skipped a reset over
+ *  a dirty checkout, is behind its channel target, or updated but a post-step (deps/Node) failed —
+ *  or null when the last attempt is clean or unrecorded. Shared by the `doctor` check and the TUI
+ *  dashboard banner so both agree on when the update state wants attention. */
+export function updateWarning(status: UpdateStatus | null = readUpdateStatus()): string | null {
+  if (!status) return null;
+  const target = status.targetRef ?? (status.channel === "stable" ? "the latest tag" : "upstream");
+  if (status.outcome === "failed") return `auto-update failed (${status.channel}): ${status.reason ?? "unknown"}`;
+  if (status.dirtySkip) return `auto-update skipped (${status.channel}): checkout has uncommitted changes`;
+  if (status.behind) return `${status.channel} channel behind ${target}`;
+  if (status.warning) return `updated (${status.channel}) but ${status.warning}`;
+  return null;
 }
 
 /** Persist the attempt outcome. Best-effort — a write failure must never break the tick. */
@@ -267,7 +284,7 @@ export async function runUpdate(log: Log, opts: RunUpdateOpts): Promise<UpdateRe
   // Dirty-checkout guard: a hand-patched box must survive the tick. Skip the reset, record the skip
   // (so doctor shows the reason + that we're behind the target), and notify once (throttled).
   if (await isDirty(cwd)) {
-    const prev = readUpdateStatus();
+    const prev = readUpdateStatusAt(statusPath);
     const notified = prev?.dirtySkip && prev.notifiedAt && Date.now() - prev.notifiedAt < DIRTY_RENOTIFY_MS;
     const reason = `dirty checkout — reset to ${target.ref} skipped (uncommitted local changes)`;
     log("warn", `self-update: ${reason}`);
