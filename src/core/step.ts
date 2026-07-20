@@ -3,11 +3,12 @@ import { isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { StepConfig } from "../config.ts";
 import type { BeltRuntime, Deps, SourceRuntime } from "./deps.ts";
-import type { AgentConfig, Run, RunStep } from "../types.ts";
+import type { AgentConfig, Run, RunStep, SourceType } from "../types.ts";
 import { DEFAULT_AGENT_CONFIG } from "../types.ts";
 import { renderWorkVars } from "./branch.ts";
 import { productActiveFor, type PromptStepContext, stripInactiveProductBlocks, validatePromptBody } from "../prompts/contract.ts";
 import { signalCommand } from "../signals/registry.ts";
+import { REPO_PACK_SUBDIR, resolvePromptFile } from "../prompt-packs.ts";
 import { telemetrySpan } from "../telemetry/index.ts";
 
 // The prompt contract (token catalog, dataflow gating, user-prompt validation) lives in one leaf
@@ -407,10 +408,16 @@ function scaffold(
  *  from `config` (the repo's config folder) or `repo` (the run's worktree). For an engine-prompted
  *  step the user prompt AUGMENTS the base by default, or REPLACES it (`promptMode: "replace"` — the
  *  file owns the body); for a custom step (no base) it IS the whole body.
+ *
  *  The user prompt is validated against the prompt contract for THIS step (`ctx`) — a `config`-sourced
  *  prompt was already checked at config-load, so this is the load-time check's mirror plus the only
- *  check a `repo`-sourced prompt (read from the worktree here) gets. */
-function stepBody(deps: Deps, run: Run, step: StepConfig, ctx: PromptStepContext): string {
+ *  check a `repo`-sourced prompt (read from the worktree here) gets.
+ *
+ *  The engine base itself runs through the prompt-pack chain (src/prompt-packs.ts): a repo-checkout
+ *  pack (`<worktree>/.herdr/prompts/`) — reachable only here, at render — OVERRIDES `enginePrompt`
+ *  (which config-load already resolved as the config-folder pack ?? shipped). So a base is resolved
+ *  repo-checkout ▸ config-folder ▸ shipped, and the per-step `promptFile` augments whichever wins. */
+function stepBody(deps: Deps, run: Run, step: StepConfig, ctx: PromptStepContext, sourceType: SourceType): string {
   let userPrompt = "";
   if (step.promptFile) {
     if (step.promptFileSource === "repo" && !run.worktreePath) {
@@ -432,12 +439,20 @@ function stepBody(deps: Deps, run: Run, step: StepConfig, ctx: PromptStepContext
   }
   if (step.enginePrompt === undefined) return userPrompt; // custom: the user prompt is the body
   // `replace`: the user prompt OWNS the body — the shipped base is dropped (config-load guarantees a
-  // prompt_file is set, so this is a deliberate takeover, not an accidental empty body).
+  // prompt_file is set, so this is a deliberate takeover, not an accidental empty body). In replace
+  // mode the base is discarded, so the pack chain below is deliberately skipped.
   if (step.promptMode === "replace" && userPrompt.trim()) return userPrompt;
-  // augment (default): the engine base, augmented by the optional user prompt.
+  // augment (default): a repo-checkout prompt pack (highest-precedence layer, worktree-only) overrides
+  // the base; else the load-resolved `enginePrompt` (config-folder pack ?? shipped) stands — then the
+  // optional user prompt augments whichever base wins.
+  let base = step.enginePrompt;
+  if (step.basePromptSlug && run.worktreePath) {
+    const override = resolvePromptFile([join(run.worktreePath, REPO_PACK_SUBDIR)], sourceType, step.basePromptSlug, step.basePromptPerSourceOverride ?? true);
+    if (override) base = override.body;
+  }
   return userPrompt.trim()
-    ? `${step.enginePrompt.trimEnd()}\n\n## Additional repo-specific instructions for this step\n\n${userPrompt.trim()}\n`
-    : step.enginePrompt;
+    ? `${base.trimEnd()}\n\n## Additional repo-specific instructions for this step\n\n${userPrompt.trim()}\n`
+    : base;
 }
 
 /** Render a step's prompt (its assembled body + tokens + guidance + handover scaffold) and write it
@@ -558,7 +573,7 @@ async function renderStepPromptImpl(
   // The ctx here is exactly what stepBody validates the user prompt against and what
   // availablePromptTokens keys on, so validation matches this render 1:1.
   const ctx: PromptStepContext = { isActive, guardKinds: new Set(step.guards.map((g) => g.kind)) };
-  let out = stripInactiveProductBlocks(stepBody(deps, run, step, ctx), isActive);
+  let out = stripInactiveProductBlocks(stepBody(deps, run, step, ctx, src.type), isActive);
   for (const [token, value] of Object.entries(sub)) out = out.replaceAll(token, () => value);
   if (deps.config.guidance) out += `\n\n## Repo-specific guidance\n\n${deps.config.guidance}\n`;
   out += scaffold(belt, step, prior, stepDoneCmd, askHumanCmd, bounceCmd, bounceTarget);

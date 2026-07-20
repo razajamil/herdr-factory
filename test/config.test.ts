@@ -1,7 +1,7 @@
 import { describe, it, expect, afterEach } from "vitest";
 import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir, homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parse as parseYaml } from "yaml";
 import { loadConfig, assertMainCheckout, expandHome, configJsonSchema, evidenceKeyPrefix, RepoConfigSchema } from "../src/config.ts";
@@ -57,7 +57,10 @@ function setup(yml: string, opts?: { guidance?: string; prompts?: Record<string,
   mkdirSync(repoDir, { recursive: true });
   writeFileSync(join(repoDir, "config.yml"), yml.replaceAll("__REPO__", repoPath));
   if (opts?.guidance) writeFileSync(join(repoDir, "guidelines-prompt.md"), opts.guidance);
-  for (const [name, body] of Object.entries(opts?.prompts ?? {})) writeFileSync(join(repoDir, name), body);
+  for (const [name, body] of Object.entries(opts?.prompts ?? {})) {
+    mkdirSync(dirname(join(repoDir, name)), { recursive: true }); // support nested paths (e.g. a prompt pack)
+    writeFileSync(join(repoDir, name), body);
+  }
   // Jira auth (email + token) is strictly per-repo, in repos/<name>/env.
   writeFileSync(join(repoDir, "env"), "JIRA_EMAIL=me@x.com\nJIRA_API_TOKEN=tok\n");
   process.env.HERDR_FACTORY_CONFIG_DIR = join(base, "cfg");
@@ -491,6 +494,21 @@ describe("loadConfig — work sources + belts", () => {
     const work = loadConfig("demo").config.belts[0]!.steps.find((s) => s.name === "work")!;
     expect(work.enginePrompt).toContain("Jira ticket");
     expect(work.enginePrompt).toContain("ticket.json");
+  });
+
+  it("a config-folder prompt pack (prompts/<slug>.md) overrides the shipped engine base at load", () => {
+    // A shared override replaces the shipped review base; a per-source-typed override wins for jira.
+    setup(cfg(JIRA_SRC, SHIP_BELT), {
+      prompts: { "prompts/review.md": "PACKED review base", "prompts/jira/work.md": "PACKED jira work base" },
+    });
+    const steps = loadConfig("demo").config.belts[0]!.steps;
+    const review = steps.find((s) => s.name === "review")!;
+    const work = steps.find((s) => s.name === "work")!;
+    expect(review.enginePrompt).toBe("PACKED review base"); // config pack beats shipped
+    expect(review.enginePrompt).not.toContain("fresh-eyes"); // the shipped review base is gone
+    expect(work.enginePrompt).toBe("PACKED jira work base"); // typed pack beats the shipped jira/work.md
+    // pr has no pack file → still the shipped base
+    expect(steps.find((s) => s.name === "pr")!.enginePrompt).toContain("push");
   });
 
   it("resolves a custom belt's user-defined steps (prompt_file body, budget, heartbeat, no PR)", () => {

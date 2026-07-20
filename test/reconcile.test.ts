@@ -896,6 +896,22 @@ describe("reconcile pipeline (work_to_pull_request belt)", () => {
     expect(prompt).toContain("Finishing this step (required)"); // the handover scaffold still wraps it
   });
 
+  it("a repo-checkout prompt pack (.herdr/prompts/<slug>.md) overrides the base at render time", async () => {
+    const { deps, state, worktree, shipBelt } = build();
+    // load-resolved base (config pack ?? shipped) that would apply with no repo pack…
+    shipBelt.steps[0]!.enginePrompt = "SHIPPED fix base @@WORK_DOC@@";
+    shipBelt.steps[0]!.basePromptSlug = "work";
+    shipBelt.steps[0]!.basePromptPerSourceOverride = true;
+    // …but a repo-checkout pack in the worktree wins (highest-precedence layer, reachable only here).
+    mkdirSync(join(worktree, ".herdr/prompts"), { recursive: true });
+    writeFileSync(join(worktree, ".herdr/prompts/work.md"), "REPO PACK fix base @@WORK_DOC@@");
+    state.eligible = [ticket("K-PACK")];
+    await reconcileRepo(deps);
+    const prompt = readFileSync(join(worktree, ".memory/herdr-factory/prompt-fix.md"), "utf8");
+    expect(prompt).toContain("REPO PACK fix base .memory/herdr-factory/ticket.json"); // pack body + token substitution
+    expect(prompt).not.toContain("SHIPPED fix base");
+  });
+
   it("a re-claimed ticket gets a fresh unique branch (so a prior merged PR isn't matched)", async () => {
     const { deps, store, state } = build();
     state.eligible = [ticket("K-RC")];

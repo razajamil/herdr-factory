@@ -1,6 +1,5 @@
 import { chmodSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join, sep } from "node:path";
-import { fileURLToPath } from "node:url";
 import { parse as parseYaml } from "yaml";
 import { z } from "zod";
 import type { AgentConfig, EffectSpec, GuardSpec, InputSpec, ProductType, SourceType, StepPosture } from "./types.ts";
@@ -11,6 +10,7 @@ import { SOURCE_DESCRIPTORS, descriptorFor } from "./sources/registry.ts";
 import { HEARTBEAT_GUARD, STEP_DESCRIPTORS, stepDescriptorFor, type StepDescriptor } from "./steps/registry.ts";
 import { productCapabilityFor } from "./products/registry.ts";
 import { SOURCE_PRODUCTS, productActiveFor, validatePromptBody } from "./prompts/contract.ts";
+import { CONFIG_PACK_SUBDIR, SHIPPED_PROMPTS_DIR, resolvePromptFile } from "./prompt-packs.ts";
 import { configDir, listConfiguredRepos, repoConfigDir, serverInfoPath, stateRoot } from "./config-paths.ts";
 
 // SOURCE_PRODUCTS + the dataflow-gating helpers live in the leaf prompt-contract module (so the
@@ -803,7 +803,9 @@ export interface StepConfig {
   type: string; // the registered step primitive this step is (descriptor name)
   tab?: string;
   pane?: string;
-  enginePrompt?: string; // shipped base body from basePrompt.slug; undefined when the descriptor has none (custom)
+  enginePrompt?: string; // engine base resolved at LOAD (config-folder pack ?? shipped); undefined for custom
+  basePromptSlug?: string; // the base's slug — lets render layer a repo-checkout pack on top; undefined for custom
+  basePromptPerSourceOverride?: boolean; // whether a per-sourceType pack variant is honored for this base
   promptFile?: string; // user prompt path as written in config (optional augment, or whole body for custom)
   promptFileSource?: "config" | "repo"; // present iff promptFile is
   promptMode?: "augment" | "replace"; // how promptFile relates to enginePrompt: augment (append, default) | replace (own the body). Inert without a promptFile / for a custom step.
@@ -1168,13 +1170,14 @@ export function loadConfig(repoName: string): Loaded {
   }));
   const sourceTypeByName = new Map(sources.map((s) => [s.name, s.type]));
 
-  // The engine's built-in prompt for a (sourceType, step): prompts/<type>/<step>.md if present,
-  // else the shared prompts/<step>.md. Used for work_to_pull_request steps (the engine owns those).
-  const shippedPrompt = (sourceType: SourceType, step: string): string => {
-    const typed = fileURLToPath(new URL(`prompts/${sourceType}/${step}.md`, import.meta.url));
-    const shared = fileURLToPath(new URL(`prompts/${step}.md`, import.meta.url));
-    return readFileSync(existsSync(typed) ? typed : shared, "utf8");
-  };
+  // The engine base prompt for a (sourceType, slug), resolved through the load-time reach of the
+  // prompt-pack chain (src/prompt-packs.ts): the repo's config-folder pack (repos/<name>/prompts/)
+  // overrides the shipped prompts/<type>/<slug>.md (else the shared prompts/<slug>.md). The
+  // repo-checkout layer lives in a run's worktree and is layered on at RENDER time (step.ts), so it
+  // isn't reachable here. Shipped is the always-present fallback, so this never returns undefined.
+  const configPackDir = join(repoDir, CONFIG_PACK_SUBDIR);
+  const basePrompt = (sourceType: SourceType, slug: string, perSourceOverride: boolean): string =>
+    resolvePromptFile([configPackDir, SHIPPED_PROMPTS_DIR], sourceType, slug, perSourceOverride)!.body;
   // Resolve a belt-relative file (prompt_file / match) to an absolute path, asserting it exists.
   const resolveFile = (belt: string, what: string, p: string): string => {
     const abs = isAbsolute(p) ? p : join(repoDir, p);
@@ -1220,7 +1223,11 @@ export function loadConfig(repoName: string): Loaded {
       type: ref.type,
       tab: ref.tab,
       pane: ref.pane,
-      enginePrompt: d.basePrompt ? shippedPrompt(sourceType, d.basePrompt.slug) : undefined,
+      enginePrompt: d.basePrompt ? basePrompt(sourceType, d.basePrompt.slug, d.basePrompt.perSourceOverride) : undefined,
+      // The base's slug + per-source flag so the render step can layer a repo-checkout pack override
+      // on top of `enginePrompt` (the config/shipped resolution). Undefined for a `custom` step.
+      basePromptSlug: d.basePrompt?.slug,
+      basePromptPerSourceOverride: d.basePrompt?.perSourceOverride,
       promptFile: ref.prompt_file,
       // Kept present iff there's a prompt_file — the `config`/`augment` defaults are inert without one.
       promptFileSource: ref.prompt_file ? ref.prompt_file_source : undefined,

@@ -1,18 +1,16 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { fileURLToPath } from "node:url";
 import type { Deps } from "./deps.ts";
 import type { Run, SourceType } from "../types.ts";
 import { MEMORY_DIR } from "./step.ts";
 import { productCapabilityFor } from "../products/registry.ts";
+import { SHIPPED_PROMPTS_DIR, packLayers, resolvePromptFile } from "../prompt-packs.ts";
 
-/** Render the resolver prompt from the library — prompts/<sourceType>/<slug>.md if present, else the
- *  shared prompts/<slug>.md (source-overridable, mirroring the belt-step base prompts) — substituting
- *  only the tokens the pull_request watch capability declares. */
-function renderResolverPrompt(slug: string, sourceType: SourceType | undefined, tokens: readonly string[], values: Record<string, string>): string {
-  const typed = sourceType ? fileURLToPath(new URL(`../prompts/${sourceType}/${slug}.md`, import.meta.url)) : "";
-  const shared = fileURLToPath(new URL(`../prompts/${slug}.md`, import.meta.url));
-  let body = readFileSync(typed && existsSync(typed) ? typed : shared, "utf8");
+/** Render the resolver prompt through the prompt-pack chain (repo-checkout ▸ config-folder ▸ shipped
+ *  — src/prompt-packs.ts, mirroring the belt-step base prompts, so a user pack can override the
+ *  resolver too) — substituting only the tokens the pull_request watch capability declares. */
+function renderResolverPrompt(dirs: string[], slug: string, sourceType: SourceType | undefined, tokens: readonly string[], values: Record<string, string>): string {
+  let body = resolvePromptFile(dirs, sourceType ?? "", slug, sourceType !== undefined)!.body;
   for (const t of tokens) body = body.replaceAll(t, () => values[t] ?? "");
   return body;
 }
@@ -32,7 +30,8 @@ export async function wakeResolver(deps: Deps, run: Run, prNumber: number): Prom
 
   const { wakePrompt } = productCapabilityFor("pull_request").watch!.resolver;
   const sourceType = wakePrompt.perSourceOverride ? deps.resolveSource(run.workSource)?.type : undefined;
-  const body = renderResolverPrompt(wakePrompt.slug, sourceType, wakePrompt.tokens, {
+  const dirs = [...packLayers(worktree, deps.config.paths.repoDir), SHIPPED_PROMPTS_DIR];
+  const body = renderResolverPrompt(dirs, wakePrompt.slug, sourceType, wakePrompt.tokens, {
     "@@KEY@@": run.ticketKey,
     "@@PR_NUMBER@@": String(prNumber),
   });

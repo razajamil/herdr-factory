@@ -97,7 +97,7 @@ describe("wakeResolver — the PR-watch resolver uses the pr step's (else repo's
       store: { updateRun: () => {} },
       resolveBelt: () => belt,
       resolveSource: () => undefined,
-      config: { agent: repoAgent },
+      config: { agent: repoAgent, paths: { repoDir: tmpdir() } },
       log: () => {},
     } as unknown as Deps;
     return { deps, captured };
