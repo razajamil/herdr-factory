@@ -1,8 +1,16 @@
 import { describe, it, expect } from "vitest";
-import { branchName, prefixForType, renderWorkspaceName, renderWorkVars, slugify } from "../src/core/branch.ts";
+import {
+  type BranchTaxonomy,
+  DEFAULT_BRANCH_TAXONOMY,
+  branchName,
+  prefixForType,
+  renderWorkspaceName,
+  renderWorkVars,
+  slugify,
+} from "../src/core/branch.ts";
 
 describe("prefixForType", () => {
-  it("maps issue types to prefixes (substring)", () => {
+  it("maps issue types to prefixes with the default taxonomy (substring)", () => {
     expect(prefixForType("Bug")).toBe("fix");
     expect(prefixForType("Dev bug")).toBe("fix");
     expect(prefixForType("Defect")).toBe("fix");
@@ -11,6 +19,14 @@ describe("prefixForType", () => {
     expect(prefixForType("Task")).toBe("chore");
     expect(prefixForType("Story")).toBe("feature");
     expect(prefixForType("New Feature")).toBe("feature");
+  });
+
+  it("uses a resolved taxonomy when one is given (case-insensitive substring, first key wins)", () => {
+    const tax: BranchTaxonomy = { prefixes: { story: "feat", epic: "feat" }, default: "chore", slugMax: 20, fullSlugMax: 50 };
+    expect(prefixForType("Story", tax)).toBe("feat"); // mapped
+    expect(prefixForType("STORY", tax)).toBe("feat"); // case-insensitive
+    expect(prefixForType("Tech Story", tax)).toBe("feat"); // substring
+    expect(prefixForType("Bug", tax)).toBe("chore"); // unmapped → configured default
   });
 });
 
@@ -30,6 +46,28 @@ describe("branchName", () => {
   it("appends a per-run uid suffix when given — same ticket, different uid → distinct branch", () => {
     expect(branchName("RWR-9", "Chore", "upgrade eslint", undefined, "a1b2c3")).toBe("chore/RWR-9-upgrade-eslint-a1b2c3");
     expect(branchName("RWR-9", "Chore", "upgrade eslint", undefined, "deadbe")).toBe("chore/RWR-9-upgrade-eslint-deadbe");
+  });
+
+  it("passing the default taxonomy explicitly is byte-identical to passing none (today's names, pinned)", () => {
+    // The "no branch: block ⇒ identical branch names to today" guarantee, at the function level.
+    for (const [key, type, summary] of [
+      ["RWR-1234", "Dev bug", "Balance sheet date range is showing incorrect!!"],
+      ["RWR-9", "Chore", "upgrade eslint"],
+      ["RWR-1", "Story", "!!!"],
+    ] as const) {
+      expect(branchName(key, type, summary, undefined, undefined, DEFAULT_BRANCH_TAXONOMY)).toBe(branchName(key, type, summary));
+    }
+  });
+
+  it("honors a resolved taxonomy: a story→feat mapping yields feat/… and slug caps apply", () => {
+    const tax: BranchTaxonomy = { prefixes: { story: "feat" }, default: "chore", slugMax: 6, fullSlugMax: 12 };
+    // {{semantic_work_prefix}} comes from the map; {{work_slug}} is capped at slugMax.
+    expect(branchName("RWR-5", "Story", "add a thing", undefined, undefined, tax)).toBe("feat/RWR-5-add-a-thing");
+    expect(
+      renderWorkspaceName("{{semantic_work_prefix}}/{{work_id}}-{{work_slug}}", { key: "RWR-5", type: "Story", summary: "add a shiny thing" }, tax),
+    ).toBe("feat/RWR-5-add-a"); // slugify("add a shiny thing", 6) = "add-a" (cut lands on the dash → trimmed)
+    // An unmapped type falls to the configured default prefix.
+    expect(branchName("RWR-6", "Bug", "boom", undefined, undefined, tax)).toBe("chore/RWR-6-boom");
   });
 });
 

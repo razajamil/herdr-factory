@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parse as parseYaml } from "yaml";
 import { loadConfig, assertMainCheckout, expandHome, configJsonSchema, evidenceKeyPrefix, RepoConfigSchema } from "../src/config.ts";
+import { DEFAULT_BRANCH_TAXONOMY, branchName } from "../src/core/branch.ts";
 import type { JiraSourceCfg } from "../src/clients/jira-source.ts";
 import type { SentrySourceCfg } from "../src/clients/sentry-source.ts";
 import type { GithubIssuesSourceCfg } from "../src/clients/github-issues-source.ts";
@@ -1299,6 +1300,73 @@ describe("loadConfig — work sources + belts", () => {
       { prompts: {} },
     );
     expect(() => loadConfig("demo")).toThrow(/work_id/);
+  });
+
+  describe("branch: taxonomy block", () => {
+    // A repo-level branch block goes in the config `head` (before work_sources/belt).
+    const headWithBranch = (body: string) => `repo:\n  path: __REPO__\nbranch:\n${body}`;
+
+    it("resolves a repo-level prefix map + slug caps onto BeltConfig.branch (default key split out)", () => {
+      const head = headWithBranch("  prefixes: { story: feat, default: chore }\n  slug_max: 30\n  full_slug_max: 80\n");
+      setup(cfg(JIRA_SRC, SHIP_BELT, head), { prompts: {} });
+      const branch = loadConfig("demo").config.belts[0]!.branch!;
+      expect(branch.prefixes).toEqual({ story: "feat" }); // `default` split out of the map
+      expect(branch.default).toBe("chore");
+      expect(branch.slugMax).toBe(30);
+      expect(branch.fullSlugMax).toBe(80);
+    });
+
+    it("defaults to the historical taxonomy when no branch block is set anywhere", () => {
+      setup(cfg(JIRA_SRC, SHIP_BELT), { prompts: {} });
+      expect(loadConfig("demo").config.belts[0]!.branch).toEqual(DEFAULT_BRANCH_TAXONOMY);
+    });
+
+    it("an omitted `default` key falls back to the built-in default prefix", () => {
+      const head = headWithBranch("  prefixes: { story: feat }\n");
+      setup(cfg(JIRA_SRC, SHIP_BELT, head), { prompts: {} });
+      const branch = loadConfig("demo").config.belts[0]!.branch!;
+      expect(branch.prefixes).toEqual({ story: "feat" });
+      expect(branch.default).toBe("feature"); // built-in fallback
+    });
+
+    it("resolves field-by-field: a belt's prefixes REPLACE the repo's; each slug cap overrides independently", () => {
+      const head = headWithBranch("  prefixes: { story: feat }\n  slug_max: 30\n  full_slug_max: 80\n");
+      const belt = `  - name: ship
+    source: jira
+    label: agent
+    branch:
+      prefixes: { bug: hotfix }
+      slug_max: 10
+    steps: [{ type: work, tab: w, pane: a }, { type: review, tab: r, pane: a }, { type: pr, tab: p, pane: a }]
+`;
+      setup(cfg(JIRA_SRC, belt, head), { prompts: {} });
+      const branch = loadConfig("demo").config.belts[0]!.branch!;
+      expect(branch.prefixes).toEqual({ bug: "hotfix" }); // belt map fully replaces the repo's
+      expect(branch.default).toBe("feature"); // belt map has no `default` → built-in
+      expect(branch.slugMax).toBe(10); // belt override
+      expect(branch.fullSlugMax).toBe(80); // repo value survives (field-level resolution)
+    });
+
+    it("acceptance: a repo `story → feat` mapping yields feat/… branch names; unmapped types use the default", () => {
+      const head = headWithBranch("  prefixes: { story: feat, default: chore }\n");
+      setup(cfg(JIRA_SRC, SHIP_BELT, head), { prompts: {} });
+      const belt = loadConfig("demo").config.belts[0]!;
+      // Wire the resolved taxonomy through branchName exactly as reconcile.claimImpl does.
+      expect(branchName("RWR-5", "Story", "add a thing", belt.workspaceName, undefined, belt.branch)).toBe("feat/RWR-5-add-a-thing");
+      expect(branchName("RWR-6", "Bug", "boom", belt.workspaceName, undefined, belt.branch)).toBe("chore/RWR-6-boom");
+    });
+
+    it("rejects a non-positive slug cap", () => {
+      const head = headWithBranch("  slug_max: 0\n");
+      setup(cfg(JIRA_SRC, SHIP_BELT, head), { prompts: {} });
+      expect(() => loadConfig("demo")).toThrow();
+    });
+
+    it("rejects an unknown key in the branch block (strict)", () => {
+      const head = headWithBranch("  nope: true\n");
+      setup(cfg(JIRA_SRC, SHIP_BELT, head), { prompts: {} });
+      expect(() => loadConfig("demo")).toThrow();
+    });
   });
 });
 
