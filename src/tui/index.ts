@@ -3,7 +3,7 @@
 // section within the active tab; arrows navigate inside the focused section; Esc pops to the top
 // level (the tab bar). Runs on Node >= 26 with --experimental-ffi (see bin/herdr-factory-tui).
 // Imperative opentui core API — no JSX.
-import { BoxRenderable, InputRenderable, ScrollBoxRenderable, StyledText, bold, createCliRenderer, fg, type CliRenderer, type Renderable, type TextChunk } from "@opentui/core";
+import { BoxRenderable, InputRenderable, ScrollBoxRenderable, StyledText, TextareaRenderable, bold, createCliRenderer, fg, type CliRenderer, type Renderable, type TextChunk } from "@opentui/core";
 import type { KeyEvent } from "@opentui/core";
 import { BORDER, theme } from "./theme.ts";
 import { SELECTION, hoverable, input as makeInput, text } from "./render.ts";
@@ -183,13 +183,14 @@ export function createApp(renderer: CliRenderer): { currentTab: () => number; at
     | { kind: "confirm"; resolve: (v: boolean) => void }
     | { kind: "choose"; options: { label: string; value: string }[]; index: number; resolve: (v: string | null) => void }
     | { kind: "prompt"; input: InputRenderable; prev: Renderable | null; resolve: (v: string | null) => void }
+    | { kind: "edit"; area: TextareaRenderable; prev: Renderable | null; resolve: (v: string | null) => void }
     | { kind: "info"; id: number };
   let modal: ModalState | null = null;
   let nextInfoId = 1;
 
   function renderModalBody(): void {
-    // A prompt owns its own body (a live InputRenderable) — don't tear it down on re-render.
-    if (modal?.kind === "prompt") return;
+    // A prompt / edit modal owns its own body (a live Input / Textarea) — don't tear it down on re-render.
+    if (modal?.kind === "prompt" || modal?.kind === "edit") return;
     for (const c of [...modalBody.getChildren()]) {
       modalBody.remove(c.id);
       c.destroy();
@@ -295,9 +296,41 @@ export function createApp(renderer: CliRenderer): { currentTab: () => number; at
       input.focus();
     });
   }
+  /** A multiline text editor over a whole file's contents (e.g. guidelines-prompt.md). ^S resolves
+   *  the edited text; Esc cancels (null). Like `prompt`, it focuses a live editor and lets typed keys
+   *  fall through — the keypress handler only intercepts ^S/Esc for an edit modal. */
+  function editText(title: string, initial: string, hint = "^S save · Esc cancel"): Promise<string | null> {
+    return new Promise((resolve) => {
+      for (const c of [...modalBody.getChildren()]) {
+        modalBody.remove(c.id);
+        c.destroy();
+      }
+      modalTitle.content = title;
+      const area = new TextareaRenderable(renderer, {
+        initialValue: initial,
+        width: 76,
+        height: 16,
+        wrapMode: "word",
+        backgroundColor: theme.input.bg,
+        focusedBackgroundColor: theme.input.focusBg,
+        textColor: theme.input.fg,
+        focusedTextColor: theme.input.focusFg,
+        ...SELECTION,
+      });
+      modalBody.add(area);
+      modalBody.add(text(renderer, { content: hint, fg: theme.text.tertiary, height: 1, wrapMode: "none" }));
+      const prev = renderer.currentFocusedRenderable ?? null;
+      modal = { kind: "edit", area, prev, resolve };
+      card.visible = true;
+      infoCard.visible = false;
+      overlay.visible = true;
+      area.focus();
+    });
+  }
   function closeModal(): void {
-    // A prompt focused a live input; restore focus to wherever it was so shell navigation keeps working.
-    if (modal?.kind === "prompt") modal.prev?.focus?.();
+    // A prompt / edit modal focused a live editor; restore focus to wherever it was so shell
+    // navigation keeps working.
+    if (modal?.kind === "prompt" || modal?.kind === "edit") modal.prev?.focus?.();
     overlay.visible = false;
     modal = null;
   }
@@ -307,7 +340,7 @@ export function createApp(renderer: CliRenderer): { currentTab: () => number; at
     if (!m) return;
     if (m.kind === "confirm") { closeModal(); m.resolve(false); }
     else if (m.kind === "choose") { closeModal(); m.resolve(null); }
-    else if (m.kind === "prompt") { closeModal(); m.resolve(null); }
+    else if (m.kind === "prompt" || m.kind === "edit") { closeModal(); m.resolve(null); }
     else closeModal();
   }
   // Click the dimmed backdrop (not the card) to dismiss — a familiar modal gesture.
@@ -318,7 +351,7 @@ export function createApp(renderer: CliRenderer): { currentTab: () => number; at
     createDashboard(renderer, { confirm, choose, showInfo, prompt }),
     createLazyView(renderer, 5, async () => {
       const { createConfigEditor } = await import("./config-editor.ts");
-      return createConfigEditor(renderer, confirm);
+      return createConfigEditor(renderer, { confirm, choose, prompt, editText });
     }),
     createLazyView(renderer, 1, async () => {
       const { createDoctor } = await import("./doctor.ts");
@@ -415,6 +448,11 @@ export function createApp(renderer: CliRenderer): { currentTab: () => number; at
         if (key.name === "return" || key.name === "enter") { const m = modal; const v = m.input.value.trim(); closeModal(); m.resolve(v || null); }
         else if (key.name === "escape") { const m = modal; closeModal(); m.resolve(null); }
         else return; // typing → don't preventDefault, so the focused input captures the key
+      } else if (modal.kind === "edit") {
+        // ^S saves the buffer, Esc cancels; everything else (incl. Enter=newline) is the textarea's.
+        if (key.ctrl && key.name === "s") { const m = modal; const v = m.area.plainText; closeModal(); m.resolve(v); }
+        else if (key.name === "escape") { const m = modal; closeModal(); m.resolve(null); }
+        else return; // fall through to the focused textarea
       } else {
         // info (scrollable, read-only)
         if (key.name === "up") infoScroll.scrollTop = Math.max(0, infoScroll.scrollTop - 1);

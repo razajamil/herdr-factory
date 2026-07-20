@@ -11,20 +11,22 @@
 // (↑↓ move within the focused panel, Esc → top). Structural edits mutate the Document surgically so
 // comments + the schema modeline are preserved; save validates the whole config against
 // RepoConfigSchema before writing.
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { basename, dirname, join } from "node:path";
 import { BoxRenderable, InputRenderable, ScrollBoxRenderable, SelectRenderable, StyledText, TextRenderable, bold, fg, type CliRenderer } from "@opentui/core";
 import type { KeyEvent, Renderable } from "@opentui/core";
 import { hoverable, input as makeInput, text } from "./render.ts";
 import { parseDocument, type Document } from "yaml";
 import { RepoConfigSchema, listConfiguredRepos, loadEnvMap, repoConfigDir, saveEnvValues } from "../config.ts";
 import { SOURCE_DESCRIPTORS } from "../sources/registry.ts";
+import { initRepo } from "../init.ts";
+import type { SourceType } from "../types.ts";
 import { postReload } from "./api.ts";
 import { applyBeltChangesForRepo } from "../belt-apply.ts";
 import { diffBelts } from "../core/belt-admin.ts";
-import { buildDescriptors, type FieldDesc } from "./config-fields.ts";
+import { buildDescriptors, type FieldCtx, type FieldDesc } from "./config-fields.ts";
 import { BORDER, theme } from "./theme.ts";
-import type { ConfirmFn, TabView } from "./types.ts";
+import type { EditorModals, TabView } from "./types.ts";
 
 const LABEL_WIDTH = 28;
 const IND = (n?: number) => "  ".repeat(n ?? 0);
@@ -467,8 +469,13 @@ function createFieldPanel(
   };
 }
 
-export function createConfigEditor(renderer: CliRenderer, confirm: ConfirmFn): TabView {
-  const repos = listConfiguredRepos();
+export function createConfigEditor(renderer: CliRenderer, modals: EditorModals): TabView {
+  // The repo list is mutable — the "+ new repo" wizard scaffolds a repo and refreshes it in place.
+  let repos = listConfiguredRepos();
+  // A sentinel row that always heads the repo list (even with zero repos) so a fresh install has an
+  // obvious way in; selecting it opens the add-repo wizard rather than loading a repo.
+  const NEW_REPO = "+ new repo…";
+  const repoOptions = () => [{ name: NEW_REPO, description: "" }, ...repos.map((r) => ({ name: r, description: "" }))];
 
   const root = new BoxRenderable(renderer, { flexDirection: "row", width: "100%", height: "100%", backgroundColor: theme.bg });
 
@@ -487,7 +494,7 @@ export function createConfigEditor(renderer: CliRenderer, confirm: ConfirmFn): T
   const repoSelect = new SelectRenderable(renderer, {
     flexGrow: 1,
     width: "100%",
-    options: repos.length ? repos.map((r) => ({ name: r, description: "" })) : [{ name: "(none configured)", description: "" }],
+    options: repoOptions(),
     showDescription: false,
     itemSpacing: 0, // one screen row per option, so a click's row = (y − list top)
     backgroundColor: theme.bg,
@@ -600,11 +607,23 @@ export function createConfigEditor(renderer: CliRenderer, confirm: ConfirmFn): T
     focusSection: (n) => focusSection(n),
   };
 
+  // What the field builder needs beyond the draft: the modal helpers, the loaded repo's config dir
+  // (so the referenced-file assist can resolve + check `config`-sourced prompt_file/match), and the
+  // IO callbacks the editor owns (write a stub, open the guidelines buffer). Rebuilt per render so
+  // `repoDir` always tracks the currently loaded repo.
+  const fieldCtx = (): FieldCtx => ({
+    confirm: modals.confirm,
+    choose: modals.choose,
+    repoDir: loadedRepo ? repoConfigDir(loadedRepo) : null,
+    writeStub,
+    editGuidelines,
+  });
+
   panels = [
-    createFieldPanel(2, sectionTitle(2, "config"), () => [...secretDescriptors(), ...buildDescriptors(draft!, rebuildAll, confirm, expandedNodes, "general")], summaryGeneral, ctx),
-    createFieldPanel(3, sectionTitle(3, "work sources"), () => buildDescriptors(draft!, rebuildAll, confirm, expandedNodes, "work_sources"), summarySources, ctx),
-    createFieldPanel(4, sectionTitle(4, "layouts"), () => buildDescriptors(draft!, rebuildAll, confirm, expandedNodes, "layouts"), summaryLayouts, ctx),
-    createFieldPanel(5, sectionTitle(5, "belts"), () => buildDescriptors(draft!, rebuildAll, confirm, expandedNodes, "belt"), summaryBelts, ctx),
+    createFieldPanel(2, sectionTitle(2, "config"), () => [...secretDescriptors(), ...buildDescriptors(draft!, rebuildAll, fieldCtx(), expandedNodes, "general")], summaryGeneral, ctx),
+    createFieldPanel(3, sectionTitle(3, "work sources"), () => buildDescriptors(draft!, rebuildAll, fieldCtx(), expandedNodes, "work_sources"), summarySources, ctx),
+    createFieldPanel(4, sectionTitle(4, "layouts"), () => buildDescriptors(draft!, rebuildAll, fieldCtx(), expandedNodes, "layouts"), summaryLayouts, ctx),
+    createFieldPanel(5, sectionTitle(5, "belts"), () => buildDescriptors(draft!, rebuildAll, fieldCtx(), expandedNodes, "belt"), summaryBelts, ctx),
   ];
   for (const p of panels) rightCol.add(p.outer);
   rightCol.add(status);
@@ -761,20 +780,88 @@ export function createConfigEditor(renderer: CliRenderer, confirm: ConfirmFn): T
       });
   }
 
-  function openRepo(): void {
-    const opt = repoSelect.getSelectedOption();
-    if (opt && opt.name !== "(none configured)") {
-      loadRepo(opt.name);
-      if (draft) focusSection(2); // jump straight into the fields after opening a valid repo
+  // ── referenced-file assist + guidelines buffer (IO the field builder delegates back here) ──────
+  /** Write a prompt_file / match stub the field builder offered, then rebuild so the "+ create" row
+   *  clears. The referenced value is already in the draft, so the config still needs a ^S save. */
+  function writeStub(absPath: string, content: string): void {
+    mkdirSync(dirname(absPath), { recursive: true });
+    writeFileSync(absPath, content);
+    rebuildAll(); // markUnsaved (the config referencing the file is still unsaved)
+    setStatus(`✓ created ${basename(absPath)} — ^S to save the config`, theme.status.good);
+  }
+  /** Open guidelines-prompt.md (the optional per-repo file appended to every step prompt) in the
+   *  shell's multiline text modal; write it back on save. It's a sibling file, not config.yml, so
+   *  it saves immediately (independent of ^S) and needs no schema validation. */
+  function editGuidelines(): void {
+    if (!loadedRepo) return;
+    const repoName = loadedRepo;
+    const path = join(repoConfigDir(repoName), "guidelines-prompt.md");
+    const initial = existsSync(path) ? readFileSync(path, "utf8") : "";
+    void modals.editText("guidelines-prompt.md — appended to every step prompt of every belt", initial, "^S save · Esc cancel").then((next) => {
+      if (next == null || loadedRepo !== repoName) return; // cancelled, or navigated away
+      writeFileSync(path, next);
+      configPanel().render(); // flip the create→edit label
+      setStatus("✓ guidelines-prompt.md saved", theme.status.good);
+    });
+  }
+
+  // ── the "+ new repo" wizard ────────────────────────────────────────────────────────────────────
+  // Sources the wizard can scaffold — registry-driven so a new source type appears automatically.
+  const sourceChoices = SOURCE_DESCRIPTORS.map((sd) => ({ label: sd.type, value: sd.type }));
+  /** Reload the repo list from disk and, when given a name, select + open it. */
+  function refreshRepos(select?: string): void {
+    repos = listConfiguredRepos();
+    repoSelect.options = repoOptions();
+    if (!select) return;
+    const idx = repoOptions().findIndex((o) => o.name === select);
+    if (idx >= 0) repoSelect.setSelectedIndex(idx);
+    loadRepo(select);
+    if (draft) focusSection(2);
+  }
+  /** Minimal name → path → source wizard, then share the `init` scaffold to write config.yml (+ an
+   *  env scaffold for credentialed sources) and open it in the editor for the details. */
+  async function newRepoWizard(): Promise<void> {
+    const name = (await modals.prompt("New repo — config name (the folder you pass to --repo)", "my-app"))?.trim();
+    if (!name) return; // cancelled / empty
+    if (!/^[A-Za-z0-9._-]+$/.test(name)) {
+      setStatus(`✗ invalid repo name "${name}" — use letters, digits, dot, dash, underscore`, theme.status.bad);
+      return;
+    }
+    if (listConfiguredRepos().includes(name)) {
+      setStatus(`✗ a repo named "${name}" already exists`, theme.status.bad);
+      return;
+    }
+    const path = (await modals.prompt(`New repo "${name}" — path to the repo's MAIN checkout`, `~/dev/${name}`))?.trim();
+    if (!path) return;
+    const source = await modals.choose("New repo — work source", sourceChoices);
+    if (!source) return;
+    try {
+      const res = await initRepo({ repoName: name, path, source: source as SourceType });
+      refreshRepos(res.repoName);
+      const cred = res.secretKeys.length ? ` · add ${res.secretKeys.join(" + ")} in secrets` : "";
+      setStatus(`✓ created "${res.repoName}" (${res.source}) — edit the placeholders${cred}, then ^S to save`, theme.status.good);
+    } catch (e) {
+      setStatus(`✗ ${e instanceof Error ? e.message : String(e)}`, theme.status.bad);
     }
   }
+
+  function openRepo(): void {
+    const opt = repoSelect.getSelectedOption();
+    if (!opt) return;
+    if (opt.name === NEW_REPO) {
+      void newRepoWizard();
+      return;
+    }
+    loadRepo(opt.name);
+    if (draft) focusSection(2); // jump straight into the fields after opening a valid repo
+  }
   repoSelect.on("itemSelected", openRepo);
-  // Click a repo to select + open it (Select has no native mouse handling): map the click row to an
-  // option index off the list's top. `itemSpacing: 0` keeps that one row per option.
-  const repoRowAt = (y: number) => Math.max(0, Math.min(repos.length - 1, Math.floor(y - repoSelect.y)));
+  // Click a row to select + open it (Select has no native mouse handling): map the click row to an
+  // option index off the list's top. `itemSpacing: 0` keeps that one row per option. The list always
+  // has ≥1 row (the "+ new repo" sentinel), so no empty-list guard is needed.
+  const repoRowAt = (y: number) => Math.max(0, Math.min(repoOptions().length - 1, Math.floor(y - repoSelect.y)));
   repoSelect.onMouseDown = (e) => {
     focusSection(1);
-    if (repos.length === 0) return;
     repoSelect.setSelectedIndex(repoRowAt(e.y));
     openRepo();
   };
@@ -782,7 +869,7 @@ export function createConfigEditor(renderer: CliRenderer, confirm: ConfirmFn): T
   // equivalent is to move its own selection highlight to the row under the cursor. Doesn't load a repo
   // (that's still a click) and doesn't steal focus — just tracks the pointer.
   repoSelect.onMouseMove = (e) => {
-    if (repos.length > 0) repoSelect.setSelectedIndex(repoRowAt(e.y));
+    repoSelect.setSelectedIndex(repoRowAt(e.y));
   };
 
   return {
@@ -794,7 +881,12 @@ export function createConfigEditor(renderer: CliRenderer, confirm: ConfirmFn): T
     },
     activate() {
       const first = repos[0];
-      if (!loadedRepo && first) loadRepo(first);
+      // Open the first configured repo (index 1 — index 0 is the "+ new repo" sentinel) so the
+      // highlighted row matches what the editor is showing.
+      if (!loadedRepo && first) {
+        repoSelect.setSelectedIndex(1);
+        loadRepo(first);
+      }
     },
     deactivate() {
       /* no timers to stop */

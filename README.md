@@ -1034,7 +1034,16 @@ cursor.
   panels are an accordion — collapsed by default, and jumping to one (number keys `2`/`3`/`4`/`5`, a
   click, or `↵` from the repo list) expands it and collapses the others, so only one is open at a
   time. It edits the YAML surgically (comments and the schema modeline preserved), validates against
-  the engine schema, `^S` saves, `[`/`]` reorder list entries. Credentials appear as masked,
+  the engine schema, `^S` saves, `[`/`]` reorder list entries. The repo list always heads with
+  **`+ new repo…`**: it prompts for a name, checkout path, and source type, then scaffolds
+  `repos/<name>/{config.yml, env}` (sharing [`init`](#2-point-it-at-a-repo-and-a-project)'s scaffold —
+  the same annotated placeholders) and opens it for editing, so a zero-repo install bootstraps its
+  first repo entirely in the TUI. Adding a belt offers a **pipeline preset** — *ticket → PR*
+  (work → review → pr, with the pickup `label` seeded for a label-driven source) or a *custom
+  pipeline* — and `+ add step` defaults to `work`. When a step's `config`-sourced `prompt_file` or a
+  belt's `match` names a file that doesn't exist yet, the editor offers to **create it with a
+  commented stub** so the save it just set up can't fail on a missing reference; the optional
+  `guidelines-prompt.md` is editable inline as a multiline buffer. Credentials appear as masked,
   replace-only `secrets (env)` fields —
   declared per source type (`JIRA_EMAIL`/`JIRA_API_TOKEN` for jira, `GITHUB_TOKEN` for
   github_issues, `SENTRY_AUTH_TOKEN` for sentry) — written separately to the `env` file (`chmod 600`).

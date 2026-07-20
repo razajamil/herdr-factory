@@ -9,13 +9,29 @@
 //
 // Structural edits (add/remove, type switch) mutate the Document surgically — setIn/addIn/deleteIn
 // (+ createNode for new nodes) preserve comments on untouched nodes — then call `rebuild`.
+import { existsSync } from "node:fs";
+import { basename, isAbsolute, join } from "node:path";
 import type { Document } from "yaml";
 import { SOURCE_DESCRIPTORS, descriptorFor } from "../sources/registry.ts";
 import { STEP_DESCRIPTORS } from "../steps/registry.ts";
 import type { SourceType } from "../types.ts";
-import type { ConfirmFn } from "./types.ts";
+import type { ChooseFn, ConfirmFn } from "./types.ts";
 
 export type Path = (string | number)[];
+
+/** Shell wiring the field builder needs beyond the draft: modal helpers plus the loaded repo's
+ *  config folder (for the referenced-file assist) and the IO callbacks the editor owns. */
+export interface FieldCtx {
+  confirm: ConfirmFn;
+  choose: ChooseFn;
+  /** The loaded repo's config folder — lets the referenced-file assist resolve a `config`-sourced
+   *  prompt_file / match and check whether it exists yet. Absent (tests, no repo) ⇒ no assist. */
+  repoDir?: string | null;
+  /** Write a referenced-file stub to an absolute path, then rebuild. IO is owned by the editor. */
+  writeStub?: (absPath: string, content: string) => void;
+  /** Open the guidelines-prompt.md multiline editor (owned by the editor — it holds the modal). */
+  editGuidelines?: () => void;
+}
 
 /** Which slice of a repo config a `buildDescriptors` call emits — one per numbered config panel.
  *  `general` = the singleton blocks (repo, limits, evidence); `work_sources`, `layouts`, and `belt`
@@ -59,10 +75,10 @@ const evidenceNode = (publisher: string, keyPrefix?: unknown, githubUsername?: u
   ...(keyPrefix != null ? { key_prefix: keyPrefix } : {}),
   ...(githubUsername != null ? { github_username: githubUsername } : {}),
 });
-// A newly-added step defaults to the generic `custom` primitive (its prompt_file is the whole body);
-// the `type` field is editable to any registered primitive. A brand-new belt starts with one valid
-// `work` step (work needs no prompt_file), which the user extends.
-const defaultStep = (name: string) => ({ type: "custom", name, prompt_file: "", prompt_file_source: "config" });
+// A newly-added step defaults to the `work` primitive (implements + commits; needs no prompt_file),
+// the most common building block — the `type` field is editable to any registered primitive. A
+// brand-new belt likewise starts with one valid `work` step, which the user extends.
+const defaultStep = (name: string) => ({ type: "work", name });
 
 // Per-step budgets moved onto the step primitives (clean break), so the four *_budget_seconds limits
 // are gone from the schema and this list.
@@ -87,7 +103,7 @@ function uniqueName(base: string, existing: string[]): string {
   return `${base}${n}`;
 }
 
-export function buildDescriptors(draft: Document, rebuild: () => void, confirm: ConfirmFn, expanded: WeakSet<object>, section: ConfigSection): FieldDesc[] {
+export function buildDescriptors(draft: Document, rebuild: () => void, ctx: FieldCtx, expanded: WeakSet<object>, section: ConfigSection): FieldDesc[] {
   const cfg = (draft.toJS() ?? {}) as Record<string, any>;
   const d: FieldDesc[] = [];
   const node = (path: Path) => draft.getIn(path) as object; // stable yaml node — the collapse key
@@ -112,6 +128,38 @@ export function buildDescriptors(draft: Document, rebuild: () => void, confirm: 
     if (draft.getIn(arrayPath) == null) draft.setIn(arrayPath, draft.createNode([item]));
     else draft.addIn(arrayPath, draft.createNode(item));
   };
+
+  // ── Referenced-file assist ──────────────────────────────────────────────────────────────────
+  // A `config`-sourced prompt_file / match names a file the loader existence-checks at save. When it
+  // doesn't exist yet, offer an action row that drops a commented stub in place, so the save the TUI
+  // itself set up never fails on a missing file. Only viable when the editor wired repoDir + writeStub
+  // (a repo is loaded); resolved relative to the repo's config folder, matching loadConfig's resolveFile.
+  const configFileMissing = (rel: string): boolean => {
+    if (!ctx.repoDir || !ctx.writeStub || !rel.trim()) return false;
+    const abs = isAbsolute(rel) ? rel : join(ctx.repoDir, rel);
+    return !existsSync(abs);
+  };
+  const createStubAction = (rel: string, content: string, indent: number): FieldDesc => ({
+    kind: "action",
+    label: `+ create ${rel} (stub)`,
+    indent,
+    run: () => ctx.writeStub!(isAbsolute(rel) ? rel : join(ctx.repoDir!, rel), content),
+  });
+  // Stubs carry NO `@@TOKEN@@`/`@@WHEN@@` markers of their own — a prompt stub is contract-validated at
+  // load, so a literal token would (rightly) be rejected; the token reference is left to docs/PROMPTS.md.
+  const promptStub = (rel: string, wholeBody: boolean): string =>
+    `<!-- ${basename(rel)} — herdr-factory prompt file.\n` +
+    (wholeBody
+      ? `     This is the ENTIRE body of this custom step; the engine adds only a handover scaffold.\n`
+      : `     This text is appended to the engine's built-in prompt for this step.\n`) +
+    `     Prompt-token reference and the product-gated clause syntax: see docs/PROMPTS.md.\n` +
+    `     Replace this comment with your guidance. -->\n`;
+  const matchStub = (rel: string): string =>
+    `// ${basename(rel)} — herdr-factory belt match predicate.\n` +
+    `// Return true to claim a work item onto this belt (first matching belt by priority wins).\n` +
+    `// ctx = { item, source: { name, type } }; item carries labels + source-native routing fields.\n` +
+    `// See the README "Multiple belts" section.\n` +
+    `export default (ctx) => true;\n`;
 
   // Source names are needed by both the work_sources section (dedup on add) and the belt section
   // (the `source` ref choices + which pickup label a belt shows), so compute them regardless.
@@ -173,7 +221,15 @@ export function buildDescriptors(draft: Document, rebuild: () => void, confirm: 
       // Shared across every publisher (uniform key layout).
       d.push({ kind: "text", label: "github_username", path: ["evidence", "github_username"], placeholder: "(optional; default = gh login)", indent: 1 });
       d.push({ kind: "text", label: "key_prefix", path: ["evidence", "key_prefix"], placeholder: "(optional; after herdr-factory/<user>/)", indent: 1 });
-      d.push({ kind: "action", label: "‹ remove evidence config ›", indent: 1, run: () => { void confirm("Remove the evidence publish config?").then((ok) => { if (ok) { draft.deleteIn(["evidence"]); rebuild(); } }); } });
+      d.push({ kind: "action", label: "‹ remove evidence config ›", indent: 1, run: () => { void ctx.confirm("Remove the evidence publish config?").then((ok) => { if (ok) { draft.deleteIn(["evidence"]); rebuild(); } }); } });
+    }
+
+    // guidelines-prompt.md — an optional sibling file (NOT part of config.yml) appended to every step
+    // prompt of every belt. Surfaced here as an editable multiline buffer via the editor's text modal.
+    if (ctx.editGuidelines) {
+      d.push({ kind: "header", label: "guidelines (optional — appended to every step prompt)", level: 1 });
+      const exists = ctx.repoDir ? existsSync(join(ctx.repoDir, "guidelines-prompt.md")) : false;
+      d.push({ kind: "action", label: exists ? "‹ edit guidelines-prompt.md ›" : "+ create & edit guidelines-prompt.md", indent: 1, run: ctx.editGuidelines });
     }
     return d;
   }
@@ -235,7 +291,7 @@ export function buildDescriptors(draft: Document, rebuild: () => void, confirm: 
           d.push({ kind: "text", label: f.label, path: full, placeholder: f.placeholder, numeric: f.numeric, indent: 1 });
         }
       }
-      d.push({ kind: "action", label: "‹ remove source ›", indent: 1, run: () => { void confirm(`Remove work source "${sourceNames[i]}"?`).then((ok) => { if (ok) { draft.deleteIn(["work_sources", i]); rebuild(); } }); } });
+      d.push({ kind: "action", label: "‹ remove source ›", indent: 1, run: () => { void ctx.confirm(`Remove work source "${sourceNames[i]}"?`).then((ok) => { if (ok) { draft.deleteIn(["work_sources", i]); rebuild(); } }); } });
     });
     d.push({
       kind: "action",
@@ -300,13 +356,13 @@ export function buildDescriptors(draft: Document, rebuild: () => void, confirm: 
           const splitCur = p?.split == null ? "(unset)" : String(p.split);
           d.push({ kind: "enum", label: "split", value: splitCur, choices: ["(unset)", ...SPLIT_CHOICES], indent: 3, apply: (next) => { if (next === "(unset)") draft.deleteIn([...base, "split"]); else draft.setIn([...base, "split"], next); rebuild(); } });
           d.push({ kind: "text", label: "size", path: [...base, "size"], placeholder: '"40%", a 0<n<1 fraction, or cells', clearable: true, indent: 3 });
-          d.push({ kind: "action", label: "‹ remove pane ›", indent: 3, run: () => { void confirm(`Remove pane "${paneTitles[k]}"?`).then((ok) => { if (ok) { draft.deleteIn(base); rebuild(); } }); } });
+          d.push({ kind: "action", label: "‹ remove pane ›", indent: 3, run: () => { void ctx.confirm(`Remove pane "${paneTitles[k]}"?`).then((ok) => { if (ok) { draft.deleteIn(base); rebuild(); } }); } });
         });
         d.push({ kind: "action", label: "+ add pane", indent: 2, run: () => { draft.addIn(["layouts", i, "tabs", j, "panes"], draft.createNode({ title: uniqueName("pane", paneTitles), command: "" })); open(["layouts", i, "tabs", j, "panes", panes.length]); rebuild(); } });
-        d.push({ kind: "action", label: "‹ remove tab ›", indent: 2, run: () => { void confirm(`Remove tab "${tabTitles[j]}"?`).then((ok) => { if (ok) { draft.deleteIn(["layouts", i, "tabs", j]); rebuild(); } }); } });
+        d.push({ kind: "action", label: "‹ remove tab ›", indent: 2, run: () => { void ctx.confirm(`Remove tab "${tabTitles[j]}"?`).then((ok) => { if (ok) { draft.deleteIn(["layouts", i, "tabs", j]); rebuild(); } }); } });
       });
       d.push({ kind: "action", label: "+ add tab", indent: 1, run: () => { draft.addIn(["layouts", i, "tabs"], draft.createNode({ title: uniqueName("tab", tabTitles), panes: [{ title: "agent", command: "claude" }] })); open(["layouts", i, "tabs", tabs.length]); rebuild(); } });
-      d.push({ kind: "action", label: "‹ remove layout ›", indent: 1, run: () => { void confirm(`Remove layout "${layoutIds[i]}"?`).then((ok) => { if (ok) { draft.deleteIn(["layouts", i]); rebuild(); } }); } });
+      d.push({ kind: "action", label: "‹ remove layout ›", indent: 1, run: () => { void ctx.confirm(`Remove layout "${layoutIds[i]}"?`).then((ok) => { if (ok) { draft.deleteIn(["layouts", i]); rebuild(); } }); } });
     });
     d.push({
       kind: "action",
@@ -346,6 +402,9 @@ export function buildDescriptors(draft: Document, rebuild: () => void, confirm: 
     if (pickup) d.push({ kind: "text", label: "label", path: ["belt", i, "label"], placeholder: `${pickup.noun} — required (no default)`, indent: 1 });
     d.push({ kind: "text", label: "workspace_name", path: ["belt", i, "workspace_name"], placeholder: "{{work_id}}-{{work_slug}}", clearable: true, indent: 1 });
     d.push({ kind: "text", label: "match", path: ["belt", i, "match"], placeholder: "match.ts (optional)", clearable: true, indent: 1 });
+    // Referenced-file assist: a `match` predicate is existence-checked on save; offer to stub it.
+    const matchRel = b?.match ? String(b.match) : "";
+    if (matchRel && configFileMissing(matchRel)) d.push(createStubAction(matchRel, matchStub(matchRel), 1));
 
     // Layout selection — which `layouts:` entry (section 4) the factory builds into this belt's
     // worktrees. default_layout is the fallback; a layout_matching rule picks a different one per
@@ -358,7 +417,7 @@ export function buildDescriptors(draft: Document, rebuild: () => void, confirm: 
       if (!isOpen(["belt", i, "layout_matching", k])) return;
       d.push({ kind: "text", label: "worktree_pattern", path: ["belt", i, "layout_matching", k, "worktree_pattern"], placeholder: "hotfix/*", indent: 2 });
       d.push({ kind: "enum", label: "layout", value: String(r?.layout ?? (layoutIds[0] ?? "")), choices: layoutIds.length ? layoutIds : [""], indent: 2, apply: (next) => { draft.setIn(["belt", i, "layout_matching", k, "layout"], next); rebuild(); } });
-      d.push({ kind: "action", label: "‹ remove rule ›", indent: 2, run: () => { void confirm("Remove this layout_matching rule?").then((ok) => { if (ok) { draft.deleteIn(["belt", i, "layout_matching", k]); rebuild(); } }); } });
+      d.push({ kind: "action", label: "‹ remove rule ›", indent: 2, run: () => { void ctx.confirm("Remove this layout_matching rule?").then((ok) => { if (ok) { draft.deleteIn(["belt", i, "layout_matching", k]); rebuild(); } }); } });
     });
     d.push({ kind: "action", label: "+ add layout_matching rule", indent: 1, run: () => { addToArray(["belt", i, "layout_matching"], { worktree_pattern: "", layout: layoutIds[0] ?? "" }); open(["belt", i, "layout_matching", rules.length]); rebuild(); } });
 
@@ -377,24 +436,49 @@ export function buildDescriptors(draft: Document, rebuild: () => void, confirm: 
       d.push({ kind: "text", label: "pane", path: ["belt", i, "steps", j, "pane"], placeholder: layoutHint, clearable: true, indent: 2 });
       d.push({ kind: "text", label: "prompt_file", path: ["belt", i, "steps", j, "prompt_file"], placeholder: stType === "custom" ? "prompts/step.md (required)" : "(optional augment)", clearable: true, indent: 2 });
       d.push(optionalSource(["belt", i, "steps", j, "prompt_file_source"], st?.prompt_file_source, draft, rebuild, 2));
+      // Referenced-file assist: a `config`-sourced prompt_file is existence-checked on save. Offer to
+      // stub it (a `repo`-sourced one lives in the target checkout, so it can't be created from here).
+      const pfRel = st?.prompt_file ? String(st.prompt_file) : "";
+      const pfSource = st?.prompt_file_source == null ? "config" : String(st.prompt_file_source);
+      if (pfRel && pfSource === "config" && configFileMissing(pfRel)) d.push(createStubAction(pfRel, promptStub(pfRel, stType === "custom"), 2));
       d.push({ kind: "text", label: "budget_seconds", path: ["belt", i, "steps", j, "budget_seconds"], placeholder: "(optional; default per type)", numeric: true, clearable: true, indent: 2 });
       d.push({ kind: "bool", label: "heartbeat", value: st?.heartbeat === true, indent: 2, apply: (next) => { draft.setIn(["belt", i, "steps", j, "heartbeat"], next); rebuild(); } });
-      d.push({ kind: "action", label: "‹ remove step ›", indent: 2, run: () => { void confirm(`Remove step "${stepNames[j]}"?`).then((ok) => { if (ok) { draft.deleteIn(["belt", i, "steps", j]); rebuild(); } }); } });
+      d.push({ kind: "action", label: "‹ remove step ›", indent: 2, run: () => { void ctx.confirm(`Remove step "${stepNames[j]}"?`).then((ok) => { if (ok) { draft.deleteIn(["belt", i, "steps", j]); rebuild(); } }); } });
     });
     d.push({ kind: "action", label: "+ add step", indent: 1, run: () => { draft.addIn(["belt", i, "steps"], draft.createNode(defaultStep(uniqueName("step", stepNames)))); open(["belt", i, "steps", steps.length]); rebuild(); } });
     // On save the delete is guarded (refused if the belt has work in progress) and, when it goes
     // through, the belt's finished-run rows are purged + any leftover worktrees cleaned (its event
     // timeline is kept). The confirm just removes it from the draft; save does the cleanup.
-    d.push({ kind: "action", label: "‹ remove belt ›", indent: 1, run: () => { void confirm(`Remove belt "${beltNames[i]}"? On save its finished-run data is purged (blocked if work is in progress).`).then((ok) => { if (ok) { draft.deleteIn(["belt", i]); rebuild(); } }); } });
+    d.push({ kind: "action", label: "‹ remove belt ›", indent: 1, run: () => { void ctx.confirm(`Remove belt "${beltNames[i]}"? On save its finished-run data is purged (blocked if work is in progress).`).then((ok) => { if (ok) { draft.deleteIn(["belt", i]); rebuild(); } }); } });
   });
   d.push({
     kind: "action",
     label: "+ add belt",
     indent: 0,
     run: () => {
-      draft.addIn(["belt"], draft.createNode({ name: uniqueName("belt", beltNames), source: sourceNames[0] ?? "", priority: 100, steps: [{ type: "work", name: "work" }] }));
-      open(["belt", belts.length]);
-      rebuild();
+      const source = sourceNames[0] ?? "";
+      const name = uniqueName("belt", beltNames);
+      const addBelt = (preset: "ticket_pr" | "custom") => {
+        if (preset === "ticket_pr") {
+          // The ticket → PR pipeline: work → review → pr. A label-driven source (jira/github_issues)
+          // needs a pickup label (required, no default), so seed the conventional `agent` — the preset
+          // then validates as-is. A label-less source (local_markdown/sentry) must NOT carry a label.
+          const pickup = SOURCE_DESCRIPTORS.find((x) => x.type === sourceTypeByName.get(source))?.pickupLabel;
+          const belt: Record<string, unknown> = { name, source };
+          if (pickup) belt.label = "agent";
+          belt.steps = [{ type: "work" }, { type: "review" }, { type: "pr" }];
+          draft.addIn(["belt"], draft.createNode(belt));
+        } else {
+          // A custom pipeline: one valid `work` step the user extends (the historical add-belt seed).
+          draft.addIn(["belt"], draft.createNode({ name, source, priority: 100, steps: [{ type: "work", name: "work" }] }));
+        }
+        open(["belt", belts.length]);
+        rebuild();
+      };
+      void ctx.choose("New belt — pipeline preset", [
+        { label: "ticket → PR pipeline (work → review → pr)", value: "ticket_pr" },
+        { label: "custom pipeline…", value: "custom" },
+      ]).then((preset) => { if (preset === "ticket_pr" || preset === "custom") addBelt(preset); });
     },
   });
 

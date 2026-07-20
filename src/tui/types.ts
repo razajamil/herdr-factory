@@ -10,6 +10,18 @@ export interface InfoModalHandle {
 export type ShowInfoFn = (title: string, lines: string[]) => InfoModalHandle;
 /** A single-line text prompt. Resolves null when cancelled (Esc). */
 export type PromptFn = (title: string, placeholder?: string) => Promise<string | null>;
+/** A multi-line text editor (a modal text area over a whole file's contents). Resolves the edited
+ *  text on save (^S), or null when cancelled (Esc). */
+export type EditFn = (title: string, initial: string, hint?: string) => Promise<string | null>;
+
+/** The shell-provided modal helpers the config editor drives (the add-repo wizard, belt-preset
+ *  picker, referenced-file confirmations, and the guidelines-prompt.md buffer). */
+export interface EditorModals {
+  confirm: ConfirmFn;
+  choose: ChooseFn;
+  prompt: PromptFn;
+  editText: EditFn;
+}
 
 /** A top-level tab (lazygit-style navigation). The shell (index.ts) shows one view at a time and
  *  owns a three-level focus hierarchy: top level (the tab bar) → a numbered section → editing a
