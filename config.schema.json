@@ -600,6 +600,14 @@
                     "config"
                   ]
                 },
+                "prompt_mode": {
+                  "default": "augment",
+                  "type": "string",
+                  "enum": [
+                    "augment",
+                    "replace"
+                  ]
+                },
                 "consumes": {
                   "type": "array",
                   "items": {

@@ -243,11 +243,19 @@ const LayoutMatchRuleSchema = z
 // (repos/<name>/); `repo` = relative to the target repo checkout, read from the run's WORKTREE at
 // render time (so the prompt can live version-controlled in the codebase).
 const PromptSourceSchema = z.enum(["repo", "config"]);
+// How a `prompt_file` relates to an engine-prompted step's shipped base. `augment` (the default)
+// appends the file BELOW the base as extra repo-specific instructions; `replace` makes the file
+// OWN the step body outright — the shipped prose is dropped, though the engine still wraps the body
+// with the handover scaffold, repo guidelines, and token substitution (so a replacement prompt can
+// still use @@…@@ tokens). Only meaningful for an engine-prompted step (work/evidence/review/pr)
+// WITH a prompt_file: a `custom` step's prompt_file is already the whole body, and `replace` with no
+// prompt_file has nothing to replace with — both are rejected at load (see superRefine).
+const PromptModeSchema = z.enum(["augment", "replace"]);
 // `prompt_file_source` defaults to `config` (the repo's config folder — where custom-step prompts
 // live, and the location existence-checked at load), so a step that sets a `prompt_file` no longer
 // has to repeat it. Set `repo` to read the prompt from the run's worktree (the target checkout) at
 // render time instead. The default is inert on a step with no `prompt_file` (dropped at resolve).
-const promptFileFields = { prompt_file: z.string().optional(), prompt_file_source: PromptSourceSchema.default("config") };
+const promptFileFields = { prompt_file: z.string().optional(), prompt_file_source: PromptSourceSchema.default("config"), prompt_mode: PromptModeSchema.default("augment") };
 
 // Belt steps are references to registered step primitives (src/steps/registry.ts) — see
 // BeltStepSchema below. There is no belt_type / agents map (clean break): a belt is one ordered
@@ -263,7 +271,8 @@ const StepNameSchema = z
 // A belt step: a reference to a registered step primitive by `type` (work/evidence/review/pr/custom
 // today). `name` defaults to `type` and must be unique within the belt (step names key run_steps
 // rows, pane labels, prompt files). `prompt_file` is the WHOLE body for a `custom` step (required)
-// and an OPTIONAL augment for an engine-prompted one; `prompt_file_source` says where to read it.
+// and an OPTIONAL augment for an engine-prompted one; `prompt_file_source` says where to read it,
+// and `prompt_mode: replace` makes the file OWN an engine-prompted step's body instead of augmenting.
 // Optional per-step budget (else the descriptor default, else limits.step_budget_seconds) and
 // commit-stall heartbeat (a `custom` step opts in; work/pr already have one).
 
@@ -728,6 +737,15 @@ export const RepoConfigSchema = z
             }
           }
         }
+        // `prompt_mode: replace` only makes sense for an engine-prompted step WITH a prompt_file to
+        // replace its shipped base — reject the two degenerate cases with a clear message.
+        if (s.prompt_mode === "replace") {
+          if (!s.prompt_file) {
+            ctx.addIssue({ code: "custom", message: `belt "${b.name}" step "${name}" sets prompt_mode: replace but has no prompt_file — there is nothing to replace the built-in prompt with`, path: ["belt", i, "steps", j, "prompt_file"] });
+          } else if (!d.basePrompt) {
+            ctx.addIssue({ code: "custom", message: `belt "${b.name}" step "${name}" (type ${s.type}) has no built-in prompt to replace — its prompt_file is already the whole body; drop prompt_mode`, path: ["belt", i, "steps", j, "prompt_mode"] });
+          }
+        }
         // A read-only step must never produce commits — the two are contradictory (a gate that
         // commits isn't a gate). Fires for a custom `read_only` + `produces: [commits]`/`heartbeat`,
         // and for a stray `heartbeat` on the read-only descriptors (evidence/review).
@@ -775,7 +793,8 @@ export interface WorkSourceConfig {
 /** One resolved belt step: a registered primitive (`type`) resolved against a belt step ref. The
  *  body is assembled at RENDER time (step.ts): the `enginePrompt` base (from the descriptor's
  *  basePrompt slug; undefined for a `custom` step) PLUS, if `promptFile` is set, the user prompt —
- *  augmenting the base, or being the whole body when there is no base. The legacy flags
+ *  augmenting the base (`promptMode` "augment"), REPLACING it ("replace"), or being the whole body
+ *  when there is no base (custom). The legacy flags
  *  (`heartbeat`/`opensPr`/`gathersEvidence`/`canBounceTo`/`readOnly`) are DERIVED from the
  *  declaration below so the reconciler keeps driving off them; the declaration fields
  *  (`consumes`/`produces`/`guards`/`effects`/`posture`) drive the new machinery. */
@@ -787,6 +806,7 @@ export interface StepConfig {
   enginePrompt?: string; // shipped base body from basePrompt.slug; undefined when the descriptor has none (custom)
   promptFile?: string; // user prompt path as written in config (optional augment, or whole body for custom)
   promptFileSource?: "config" | "repo"; // present iff promptFile is
+  promptMode?: "augment" | "replace"; // how promptFile relates to enginePrompt: augment (append, default) | replace (own the body). Inert without a promptFile / for a custom step.
   budgetSeconds: number;
   heartbeat: boolean; // commit-HEAD stall heartbeat applies to this step (derived: has a heartbeat guard)
   opensPr: boolean; // derived: produces includes pull_request
@@ -1173,7 +1193,7 @@ export function loadConfig(repoName: string): Loaded {
   const resolveStep = (
     beltName: string,
     sourceType: SourceType,
-    ref: { type: string; name?: string; tab?: string; pane?: string; prompt_file?: string; prompt_file_source?: "config" | "repo"; budget_seconds?: number; heartbeat: boolean; agent?: ParsedAgentBlock } & CapabilityRef,
+    ref: { type: string; name?: string; tab?: string; pane?: string; prompt_file?: string; prompt_file_source?: "config" | "repo"; prompt_mode?: "augment" | "replace"; budget_seconds?: number; heartbeat: boolean; agent?: ParsedAgentBlock } & CapabilityRef,
     kept: { type: string; name?: string }[],
     index: number,
     beltAgent: ParsedAgentBlock | undefined,
@@ -1202,8 +1222,9 @@ export function loadConfig(repoName: string): Loaded {
       pane: ref.pane,
       enginePrompt: d.basePrompt ? shippedPrompt(sourceType, d.basePrompt.slug) : undefined,
       promptFile: ref.prompt_file,
-      // Kept present iff there's a prompt_file — the `config` default is inert without one.
+      // Kept present iff there's a prompt_file — the `config`/`augment` defaults are inert without one.
       promptFileSource: ref.prompt_file ? ref.prompt_file_source : undefined,
+      promptMode: ref.prompt_file ? ref.prompt_mode : undefined,
       budgetSeconds: ref.budget_seconds ?? d.defaultBudgetSeconds ?? parsed.limits.step_budget_seconds,
       heartbeat: guards.some((g) => g.kind === "heartbeat"),
       opensPr: produces.includes("pull_request"),

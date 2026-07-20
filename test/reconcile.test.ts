@@ -879,6 +879,23 @@ describe("reconcile pipeline (work_to_pull_request belt)", () => {
     expect(prompt).toContain("Study .memory/herdr-factory/ticket.json (Jira ticket (JSON)).");
   });
 
+  it("prompt_mode: replace drops the shipped base — the user prompt_file owns the body (scaffold + tokens still wrap it)", async () => {
+    const { deps, state, worktree, shipBelt } = build();
+    shipBelt.steps[0]!.enginePrompt = "SHIPPED BASE PROSE";
+    // The file lives in the run's worktree (repo-sourced), read at render time.
+    writeFileSync(join(worktree, "own-work.md"), "MY OWN WORK BODY for @@KEY@@\n");
+    shipBelt.steps[0]!.promptFile = "own-work.md";
+    shipBelt.steps[0]!.promptFileSource = "repo";
+    shipBelt.steps[0]!.promptMode = "replace";
+    state.eligible = [ticket("K-REPL")];
+    await reconcileRepo(deps);
+    const prompt = readFileSync(join(worktree, ".memory/herdr-factory/prompt-fix.md"), "utf8");
+    expect(prompt).toContain("MY OWN WORK BODY for K-REPL"); // the file body, tokens substituted
+    expect(prompt).not.toContain("SHIPPED BASE PROSE"); // the shipped base is dropped
+    expect(prompt).not.toContain("Additional repo-specific instructions"); // not the augment framing
+    expect(prompt).toContain("Finishing this step (required)"); // the handover scaffold still wraps it
+  });
+
   it("a re-claimed ticket gets a fresh unique branch (so a prior merged PR isn't matched)", async () => {
     const { deps, store, state } = build();
     state.eligible = [ticket("K-RC")];

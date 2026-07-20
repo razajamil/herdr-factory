@@ -764,6 +764,41 @@ describe("loadConfig — work sources + belts", () => {
     const work = loadConfig("demo").config.belts[0]!.steps[0]!;
     expect(work.promptFile).toBeUndefined();
     expect(work.promptFileSource).toBeUndefined(); // present iff there's a prompt_file
+    expect(work.promptMode).toBeUndefined(); // ditto — `augment` default is inert without a prompt_file
+  });
+
+  it("resolves prompt_mode: replace on an engine-prompted step with a prompt_file", () => {
+    setup(
+      cfg(JIRA_SRC, `  - name: ship
+    source: jira
+    label: agent
+    steps:
+      - { type: work,   tab: work,   pane: agent, prompt_file: work.md, prompt_mode: replace }
+      - { type: review, tab: review, pane: agent }
+      - { type: pr,     tab: pr,     pane: agent }
+`),
+      { prompts: { "work.md": "OWN THE WHOLE WORK BODY\n" } },
+    );
+    const work = loadConfig("demo").config.belts[0]!.steps[0]!;
+    expect(work.promptFile).toBe("work.md");
+    expect(work.promptMode).toBe("replace");
+    expect(work.enginePrompt).toBeDefined(); // the base is still carried; step.ts drops it at render
+  });
+
+  it("defaults prompt_mode to `augment` when a step sets a prompt_file without one", () => {
+    setup(
+      cfg(JIRA_SRC, `  - name: ship
+    source: jira
+    label: agent
+    steps:
+      - { type: work,   tab: work,   pane: agent, prompt_file: work.md }
+      - { type: review, tab: review, pane: agent }
+      - { type: pr,     tab: pr,     pane: agent }
+`),
+      { prompts: { "work.md": "extra instructions\n" } },
+    );
+    const work = loadConfig("demo").config.belts[0]!.steps[0]!;
+    expect(work.promptMode).toBe("augment");
   });
 
   // ── Prompt-contract validation of a config-sourced prompt_file (see docs/PROMPTS.md). ──
@@ -1105,6 +1140,33 @@ describe("loadConfig — work sources + belts", () => {
       { prompts: {} },
     );
     expect(() => loadConfig("demo")).toThrow(/needs a prompt_file/);
+  });
+
+  it("rejects prompt_mode: replace with no prompt_file (nothing to replace with)", () => {
+    setup(
+      cfg(JIRA_SRC, `  - name: ship
+    source: jira
+    label: agent
+    steps:
+      - { type: work,   tab: work,   pane: agent, prompt_mode: replace }
+      - { type: review, tab: review, pane: agent }
+      - { type: pr,     tab: pr,     pane: agent }
+`),
+      { prompts: {} },
+    );
+    expect(() => loadConfig("demo")).toThrow(/prompt_mode: replace but has no prompt_file/);
+  });
+
+  it("rejects prompt_mode: replace on a custom step (no built-in prompt to replace)", () => {
+    setup(
+      cfg(LM_SRC, `  - name: gen
+    source: ideas
+    steps:
+      - { type: custom, name: research, prompt_file: research.md, prompt_mode: replace }
+`),
+      { prompts: { "research.md": "the whole body\n" } },
+    );
+    expect(() => loadConfig("demo")).toThrow(/has no built-in prompt to replace/);
   });
 
   it("rejects a belt whose required dataflow is unsatisfied (review with no upstream commits)", () => {

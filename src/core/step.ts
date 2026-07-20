@@ -404,8 +404,9 @@ function scaffold(
 
 /** Assemble a step's prompt body at render time (before tokens/scaffold): the engine base
  *  (work_to_pull_request steps) plus, if the step configures a `promptFile`, the user prompt read
- *  from `config` (the repo's config folder) or `repo` (the run's worktree). For a w2pr step the
- *  user prompt AUGMENTS the engine base; for a custom step (no base) it IS the whole body.
+ *  from `config` (the repo's config folder) or `repo` (the run's worktree). For an engine-prompted
+ *  step the user prompt AUGMENTS the base by default, or REPLACES it (`promptMode: "replace"` — the
+ *  file owns the body); for a custom step (no base) it IS the whole body.
  *  The user prompt is validated against the prompt contract for THIS step (`ctx`) — a `config`-sourced
  *  prompt was already checked at config-load, so this is the load-time check's mirror plus the only
  *  check a `repo`-sourced prompt (read from the worktree here) gets. */
@@ -430,7 +431,10 @@ function stepBody(deps: Deps, run: Run, step: StepConfig, ctx: PromptStepContext
     }
   }
   if (step.enginePrompt === undefined) return userPrompt; // custom: the user prompt is the body
-  // work_to_pull_request: the engine base, augmented by the optional user prompt.
+  // `replace`: the user prompt OWNS the body — the shipped base is dropped (config-load guarantees a
+  // prompt_file is set, so this is a deliberate takeover, not an accidental empty body).
+  if (step.promptMode === "replace" && userPrompt.trim()) return userPrompt;
+  // augment (default): the engine base, augmented by the optional user prompt.
   return userPrompt.trim()
     ? `${step.enginePrompt.trimEnd()}\n\n## Additional repo-specific instructions for this step\n\n${userPrompt.trim()}\n`
     : step.enginePrompt;
