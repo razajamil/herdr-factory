@@ -894,6 +894,14 @@ validation rules — is documented in [`docs/PROMPTS.md`](docs/PROMPTS.md).
 folder (checked at load); set it to `repo` = the target repo's checkout, read from the run's
 **worktree at render time**, so prompts can live version-controlled next to the code.
 
+**Ejecting the shipped pack.** The engine's built-in prompts live inside the package, so to start
+from them, `herdr-factory --repo <name> prompts eject` copies the whole shipped pack into the repo's
+config folder at `repos/<name>/prompts/` (the `config` root above). It's copy-only — it never edits
+`config.yml` — and prints the `prompt_file:` lines to paste onto a belt step. Re-ejecting skips files
+that already exist (so it never clobbers your edits) unless you pass `--force`; `--step <name>` ejects
+just one prompt (`work`/`review`/`pr`/`evidence`/`resolver`, with its per-source variants). Point a
+step's `prompt_file` at a copy to augment that step's shipped prompt with your edits.
+
 Around the body the engine always adds: a handover scaffold (which belt and step this is, the
 full step sequence, the prior step's handoff note and pane/session pointer for on-demand
 questions, the ask-human protocol, the bounce protocol where applicable, and the finish protocol —
@@ -972,6 +980,7 @@ herdr-factory capture-lock acquire|release <resource> [owner]       # machine-gl
 
 # scaffold a repo config from inside the repo (name defaults to --repo, else the checkout dir)
 herdr-factory [--repo <name>] init [--source jira|github_issues|local_markdown|sentry] [--path <dir>] [--force]
+herdr-factory --repo <name> prompts eject [--step <name>] [--force]  # copy the shipped prompt pack into repos/<name>/prompts/ to edit
 
 # the machine-wide server + supervisor (no --repo)
 herdr-factory serve | ensure-up [--restart] | restart | reload | update | provision-node
