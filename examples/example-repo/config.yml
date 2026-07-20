@@ -182,4 +182,17 @@ layouts:
 #   slug_max: 20                                # cap for {{work_slug}}
 #   full_slug_max: 50                           # cap for {{work_full_slug}}
 
+# ── agent: the harness a factory-SPAWNED pane launches — the binary + its flags. OPTIONAL and
+# repo-wide (override per belt with a belt-level `agent:` block, or per step with `agent:` on a step
+# ref). OMIT it and spawned panes launch `claude --dangerously-skip-permissions`, unchanged — this is
+# how you change the agent CLI or its permission posture WITHOUT editing the checkout (see the
+# README's Security note). Resolution is whole-block, most-specific-wins (step over belt over repo):
+# because flags are command-specific, `command` defaults to `claude` and `flags` to EMPTY once you set
+# a block — list what you want. `command` must be a herdr-recognized agent (claude/opencode/codex/pi/…
+# — whatever `herdr integration install` supports) so herdr detects its idle/working state. Panes YOUR
+# layout provides are unaffected (set the agent there via the pane's `command:`).
+# agent:
+#   command: opencode                           # the spawned pane's executable (default: claude)
+#   flags: [--some-flag]                        # its flags (default: none once an `agent:` block is set)
+
 # guidelines-prompt.md in this folder (if present) is appended to EVERY step prompt of EVERY belt.

@@ -311,7 +311,11 @@ reverse-engineered during the bash prototype.
     O(active runs) subprocess spawns); `paneAlive`/`paneState` accept `{fresh:true}` to bypass
     the memo, and `agentStart` invalidates it.
   - `agentStart({workspaceId, cwd, argv}) → paneId` where
-    **`argv = ["claude", ...flags, prompt]`** (first token is the executable)
+    **`argv = [command, ...flags, prompt]`** (first token is the executable — the configured
+    `agent.command`, default `claude`; the `herdr agent start <name>` kind is derived from
+    argv[0]'s basename via `agentKindForArgv`, so a non-claude harness is detected). The harness is
+    the resolved [`agent:` config](../README.md#agent-optional) (step over belt over repo over
+    the default `claude --dangerously-skip-permissions`), threaded through `StepConfig.agent`.
   - `paneByLabel(ws, tabLabel, paneLabel)`, `paneAlive(pane)` (any agent present),
     `paneRun(pane, cmd)`, `agentSend(pane, text)`, `paneSendKeys(pane, "Enter")`,
     `agentRename(pane, "<step>:KEY")`, `notify(title, body)`

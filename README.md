@@ -56,7 +56,7 @@ is on PATH; otherwise link it later with `herdr plugin link <checkout>`).
 | Tool                         | Used for                                                                                         |
 | ---------------------------- | ------------------------------------------------------------------------------------------------ |
 | [`herdr`](https://herdr.dev) | worktrees, workspaces, panes, and agent lifecycle — the factory floor                            |
-| your agent's CLI             | the workers — `claude`, `opencode`, `pi`, `codex`, … (factory-spawned panes default to `claude`) |
+| your agent's CLI             | the workers — `claude`, `opencode`, `pi`, `codex`, … (factory-spawned panes default to `claude`; [configurable](#agent-optional)) |
 | `gh` (authenticated)         | PR discovery, CI/review polling                                                                  |
 | `git`                        | branch cleanup, heartbeats                                                                       |
 
@@ -755,6 +755,39 @@ A work **type** is matched against each `prefixes` key **case-insensitively by s
 fallback is `feature`. A belt's `prefixes` map **fully replaces** the repo's (it's not merged), while
 each slug cap overrides independently; unset fields fall back to the repo block, then the defaults.
 
+### `agent` (optional)
+
+The **agent harness** the factory launches in the panes it spawns itself — the binary and its
+flags. Repo-wide, **overridable per belt and per step**:
+
+```yaml
+agent:
+  command: opencode # the executable the spawned pane runs (default: claude)
+  flags: [--some-flag] # its flags (default: none once you set an `agent:` block)
+
+belt:
+  - name: ship
+    source: jira
+    label: agent
+    agent: { command: codex } # this belt's spawned panes run codex instead
+    steps:
+      - { type: work } # spawns codex (inherits the belt)
+      - { type: pr, agent: { command: claude, flags: [--dangerously-skip-permissions] } } # per-step override
+```
+
+The spawned pane's command line is `<command> <flags…> <prompt>`, so `command` is a herdr-recognized
+agent (`claude`, `opencode`, `codex`, `pi`, … — whatever `herdr integration install` supports, so
+herdr can detect its idle/working state) and the flags are whatever that agent takes. The PR-watch
+resolver reuses the `pr` step's harness (else the repo's).
+
+Resolution is **whole-block, most-specific-wins** — step over belt over repo — **not** field-merged:
+because flags are command-specific, a belt that switches `command` to `opencode` must not inherit the
+repo's claude `--dangerously-skip-permissions`. So once you write an `agent:` block, `command` defaults
+to `claude` and `flags` defaults to **empty** — list the flags you want. **Omit `agent:` everywhere and
+nothing changes**: spawned panes launch `claude --dangerously-skip-permissions`, exactly as before (see
+the [security note](#security-note)). Panes **your** [layout](#layouts) provides are unaffected — the
+step drives whatever that pane already runs, so set the agent there in the layout's `command:`.
+
 ### Layouts
 
 A **layout** is a herdr tab/pane arrangement the factory builds into a worktree the moment it's
@@ -1004,10 +1037,14 @@ resolves the same vendored Node the engine uses, so there's nothing to set up.
 
 ## Security note
 
-Factory-spawned workers launch with `--dangerously-skip-permissions` (hardcoded as `CLAUDE_FLAGS`
-in `src/core/step.ts`) so the loop runs unattended. Each worker is confined to its own throwaway
-worktree, but can run commands, push branches, and open PRs without prompting. Agents in
-_your_-layout panes are whatever you launched them as. To tighten, change `CLAUDE_FLAGS`.
+Factory-spawned workers launch with **`claude --dangerously-skip-permissions`** by default, so the
+loop runs unattended. Each worker is confined to its own throwaway worktree, but can run commands,
+push branches, and open PRs **without prompting**. Agents in _your_-layout panes are whatever you
+launched them as. The harness **and** this permission posture are config, not code: set an
+[`agent:` block](#agent-optional) — repo-wide, per belt, or per step — to change the command or the
+flags (e.g. drop `--dangerously-skip-permissions`, or switch to a different agent CLI) **without
+touching the checkout** (which the auto-updater hard-resets anyway). Omit it and the default above is
+unchanged.
 
 ## Platform
 
