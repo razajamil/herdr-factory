@@ -16,7 +16,8 @@ import { SentryClient } from "../src/clients/sentry.ts";
 import { SentrySource, type SentrySourceCfg } from "../src/clients/sentry-source.ts";
 import { bearsHerdrMarker, HERDR_MARKER, type WorkSource } from "../src/core/deps.ts";
 import { instrumentObject } from "../src/telemetry/index.ts";
-import type { WorkState } from "../src/types.ts";
+import { descriptorFor } from "../src/sources/registry.ts";
+import type { SourceType, WorkState } from "../src/types.ts";
 import { makeFakeGithub, makeSource } from "./helpers/github-fake.ts";
 
 const ALL_STATES: WorkState[] = ["todo", "in_development", "in_review", "merged", "aborted", "done"];
@@ -309,13 +310,24 @@ const HARNESSES: Harness[] = [
 
 // --- the charter, as tests ----------------------------------------------------------------------
 
-describe.each(HARNESSES)("WorkSource contract: $name", ({ make }) => {
+describe.each(HARNESSES)("WorkSource contract: $name", ({ make, name }) => {
   it("spec is sane: statusOfRecord/replyChannel set, mappedStates non-empty and canonical", () => {
     const { src } = make();
     expect(["external", "internal"]).toContain(src.spec.statusOfRecord);
     expect(["comments", "file"]).toContain(src.spec.replyChannel);
     expect(src.spec.mappedStates.length).toBeGreaterThan(0);
     for (const s of src.spec.mappedStates) expect(ALL_STATES).toContain(s);
+  });
+
+  it("INV-13: custom-status support is a declared boolean; internal-ledger sources support NONE", () => {
+    const { src } = make();
+    const desc = descriptorFor(name as SourceType);
+    expect(typeof desc.supportsCustomStatuses).toBe("boolean");
+    expect(typeof desc.customStatusKeys).toBe("function");
+    // An internal-ledger source keeps the canonical states only in v1 (a custom state would need a
+    // work_items CHECK migration) — so it declares no custom-status support, and config-load rejects
+    // any belt effect targeting a custom status on it.
+    if (src.spec.statusOfRecord === "internal") expect(desc.supportsCustomStatuses).toBe(false);
   });
 
   it("listEligible returns [] when the backend has nothing", async () => {
