@@ -206,7 +206,8 @@
                 "type": "object",
                 "properties": {
                   "folder": {
-                    "type": "string"
+                    "type": "string",
+                    "minLength": 1
                   }
                 },
                 "required": [
@@ -510,6 +511,7 @@
                   "type": "string"
                 },
                 "prompt_file_source": {
+                  "default": "config",
                   "type": "string",
                   "enum": [
                     "repo",

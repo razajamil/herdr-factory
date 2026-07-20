@@ -144,6 +144,46 @@ describe("loadConfig — work sources + belts", () => {
     expect(() => loadConfig("demo")).toThrow(/[Uu]nrecognized|auth/);
   });
 
+  // Onboarding friction: the fields a new user hits first must fail with an actionable directive, not
+  // zod's opaque "expected string, received undefined" (or a bare "Invalid input" from a union).
+  describe("required-field errors are actionable", () => {
+    it("names what to put in `repo.path`", () => {
+      setup(cfg(JIRA_SRC, SHIP_BELT, "repo: {}\n"));
+      expect(() => loadConfig("demo")).toThrow(/repo\.path.*checkout/s);
+    });
+    it("directs you to add a `repo` section when it's missing entirely", () => {
+      setup(`work_sources:\n${JIRA_SRC}belt:\n${SHIP_BELT}`);
+      expect(() => loadConfig("demo")).toThrow(/`repo` section/);
+    });
+    it("directs you to add a work source when `work_sources` is missing", () => {
+      setup(`repo:\n  path: __REPO__\nbelt:\n${SHIP_BELT}`);
+      expect(() => loadConfig("demo")).toThrow(/work_sources.*pull work from/s);
+    });
+    it("directs you to add a belt when `belt` is missing", () => {
+      setup(`repo:\n  path: __REPO__\nwork_sources:\n${JIRA_SRC}`);
+      expect(() => loadConfig("demo")).toThrow(/belt.*steps.*pipeline/s);
+    });
+    it("names the Agile board id for a missing jira.board (not a bare union error)", () => {
+      setup(cfg(`  - type: jira\n    jira: { base_url: https://x.atlassian.net, project: RWR }\n`, SHIP_BELT));
+      expect(() => loadConfig("demo")).toThrow(/jira\.board.*Agile board id/s);
+    });
+    it("names the Atlassian site for a missing jira.base_url", () => {
+      setup(cfg(`  - type: jira\n    jira: { project: RWR, board: 254 }\n`, SHIP_BELT));
+      expect(() => loadConfig("demo")).toThrow(/base_url.*Atlassian site/s);
+    });
+    it("names the folder for a missing local_markdown.folder", () => {
+      setup(
+        cfg(`  - type: local_markdown\n    name: ideas\n    local_markdown: {}\n`, `  - name: gen\n    source: ideas\n    steps: [{ type: custom, name: r, prompt_file: r.md }]\n`),
+        { prompts: { "r.md": "x\n" } },
+      );
+      expect(() => loadConfig("demo")).toThrow(/local_markdown\.folder.*task briefs/s);
+    });
+    it("names the org for a missing sentry.organization", () => {
+      setup(cfg(`  - type: sentry\n    sentry: { projects: [backend] }\n`, `  - name: err\n    source: sentry\n    steps: [{ type: work }, { type: review }, { type: pr }]\n`));
+      expect(() => loadConfig("demo")).toThrow(/sentry\.organization.*org slug/s);
+    });
+  });
+
   it("maps a github_issues source with defaults (labels, close_on, type map) and camelCase resolution", () => {
     setup(
       cfg(
@@ -487,6 +527,27 @@ describe("loadConfig — work sources + belts", () => {
     setup(cfg(JIRA_SRC, SHIP_BELT), { prompts: {} });
     const names = loadConfig("demo").config.belts[0]!.steps.map((s) => s.name);
     expect(names).toEqual(["work", "review", "pr"]); // names default to the step `type`
+  });
+
+  it("defaults prompt_file_source to `config` when a step sets a prompt_file without one (onboarding friction)", () => {
+    setup(
+      cfg(LM_SRC, `  - name: work_generation
+    source: ideas
+    steps:
+      - { type: custom, name: research, prompt_file: research.md }
+`),
+      { prompts: { "research.md": "Do the research\n" } },
+    );
+    const research = loadConfig("demo").config.belts[0]!.steps[0]!;
+    expect(research.promptFile).toBe("research.md");
+    expect(research.promptFileSource).toBe("config"); // defaulted — no longer has to be spelled out
+  });
+
+  it("leaves promptFileSource undefined on a step with no prompt_file (the `config` default is inert)", () => {
+    setup(cfg(JIRA_SRC, SHIP_BELT), { prompts: {} });
+    const work = loadConfig("demo").config.belts[0]!.steps[0]!;
+    expect(work.promptFile).toBeUndefined();
+    expect(work.promptFileSource).toBeUndefined(); // present iff there's a prompt_file
   });
 
   it("loads a belt's match file path (existence verified, fn loaded later in buildDeps)", () => {

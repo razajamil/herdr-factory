@@ -164,11 +164,11 @@ const LayoutMatchRuleSchema = z
 // (repos/<name>/); `repo` = relative to the target repo checkout, read from the run's WORKTREE at
 // render time (so the prompt can live version-controlled in the codebase).
 const PromptSourceSchema = z.enum(["repo", "config"]);
-const promptFileFields = { prompt_file: z.string().optional(), prompt_file_source: PromptSourceSchema.optional() };
-const promptSourceRefine = [
-  (a: { prompt_file?: string; prompt_file_source?: "repo" | "config" }) => !a.prompt_file || a.prompt_file_source != null,
-  { message: "prompt_file_source is required when prompt_file is set", path: ["prompt_file_source"] as string[] },
-] as const;
+// `prompt_file_source` defaults to `config` (the repo's config folder — where custom-step prompts
+// live, and the location existence-checked at load), so a step that sets a `prompt_file` no longer
+// has to repeat it. Set `repo` to read the prompt from the run's worktree (the target checkout) at
+// render time instead. The default is inert on a step with no `prompt_file` (dropped at resolve).
+const promptFileFields = { prompt_file: z.string().optional(), prompt_file_source: PromptSourceSchema.default("config") };
 
 // Belt steps are references to registered step primitives (src/steps/registry.ts) — see
 // BeltStepSchema below. There is no belt_type / agents map (clean break): a belt is one ordered
@@ -198,8 +198,7 @@ const BeltStepSchema = z
     heartbeat: z.boolean().default(false),
   })
   .strict()
-  .refine(bothOrNeither, layoutRefine)
-  .refine(...promptSourceRefine);
+  .refine(bothOrNeither, layoutRefine);
 
 // A per-belt branch-name template (the worktree + workspace derive from it). Must include
 // {{work_id}} so the branch is identifiable by ticket; a short unique suffix is appended
@@ -289,11 +288,17 @@ function resolveBounceTargets(kept: { type: string; name?: string }[], index: nu
 
 export const RepoConfigSchema = z
   .object({
-    repo: z.object({
-      path: z.string(),
-      base_ref: z.string().default("origin/main"),
-      github: z.string().optional(),
-    }),
+    repo: z.object(
+      {
+        // Required-field errors are worded as directives (they read correctly whether the field is
+        // missing or the wrong type) — the raw zod "expected string, received undefined" is opaque to
+        // someone hand-writing their first config.
+        path: z.string({ error: "set `repo.path` to your project's MAIN (non-linked) checkout — the clone worktrees fork from" }),
+        base_ref: z.string().default("origin/main"),
+        github: z.string().optional(),
+      },
+      { error: "add a `repo` section pointing at your project's main checkout (at least `repo.path`)" },
+    ),
     limits: z
       .object({
         // Cap on concurrently WORKED workspaces (one worktree per run). A slot is held by a run
@@ -352,10 +357,14 @@ export const RepoConfigSchema = z
       .prefault({}),
     // Backends this repo can pull work from (≥1). Each just names a type + its backend block;
     // the pipeline/agents live on a belt now.
-    work_sources: z.array(WorkSourceSchema).min(1, "work_sources must list at least one source"),
+    work_sources: z
+      .array(WorkSourceSchema, { error: "add a `work_sources` list — at least one source to pull work from (jira, github_issues, local_markdown, or sentry)" })
+      .min(1, "work_sources must list at least one source (jira, github_issues, local_markdown, or sentry)"),
     // Belts (≥1): each pairs a source with an ordered pipeline. At claim time belts are walked in
     // priority order and the first whose `match` accepts an item claims it (first match wins).
-    belt: z.array(BeltSchema).min(1, "belt must list at least one belt"),
+    belt: z
+      .array(BeltSchema, { error: "add a `belt` list — at least one belt pairing a source with an ordered `steps` pipeline" })
+      .min(1, "belt must list at least one belt (a source paired with an ordered `steps` pipeline)"),
     // Named herdr tab/pane arrangements this repo's belts build into a worktree on claim (referenced
     // by a belt's default_layout / layout_matching). Empty ⇒ the factory builds nothing.
     layouts: z.array(LayoutSchema).default([]),
@@ -899,7 +908,8 @@ export function loadConfig(repoName: string): Loaded {
       pane: ref.pane,
       enginePrompt: d.basePrompt ? shippedPrompt(sourceType, d.basePrompt.slug) : undefined,
       promptFile: ref.prompt_file,
-      promptFileSource: ref.prompt_file_source,
+      // Kept present iff there's a prompt_file — the `config` default is inert without one.
+      promptFileSource: ref.prompt_file ? ref.prompt_file_source : undefined,
       budgetSeconds: ref.budget_seconds ?? d.defaultBudgetSeconds ?? parsed.limits.step_budget_seconds,
       heartbeat: guards.some((g) => g.kind === "heartbeat"),
       opensPr: produces.includes("pull_request"),

@@ -10,11 +10,15 @@ import { commonSourceFields } from "../common.ts";
 // OAuth token, so there is no OAuth here. The pickup label is per-belt (belt.label), not on the source.
 const JiraBlockSchema = z
   .object({
-    base_url: z.url().transform((s) => s.replace(/\/+$/, "")),
-    project: z.string().trim().min(1),
+    // Required-field errors are worded as directives so they read whether the field is missing or
+    // wrong-typed (the raw zod / bare-union messages give a first-time user nothing to act on).
+    base_url: z.url({ error: "set `jira.base_url` to your Atlassian site, e.g. https://your-org.atlassian.net" }).transform((s) => s.replace(/\/+$/, "")),
+    project: z.string({ error: "set `jira.project` to your Jira project key, e.g. PROJ" }).trim().min(1, "`jira.project` cannot be empty"),
     // The Agile board id to pull work from (REQUIRED). Accepts the numeric id or its string form; the
     // board scopes pickup to its own filter, and the status + label JQL narrows within it.
-    board: z.union([z.string().trim().min(1), z.number().int().positive()]).transform((v) => String(v).trim()),
+    board: z
+      .union([z.string().trim().min(1), z.number().int().positive()], { error: "set `jira.board` to the Agile board id pickup pulls from, e.g. 254" })
+      .transform((v) => String(v).trim()),
     status: z
       .object({
         todo: z.string().default("To Do"),

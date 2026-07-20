@@ -21,7 +21,7 @@ const SentryBlockSchema = z
       .refine((u) => /^https?:\/\//i.test(u), "base_url must be an http(s) URL")
       .optional(),
     // The organization slug (or numeric id) the issues live in.
-    organization: z.string().trim().min(1),
+    organization: z.string({ error: "set `sentry.organization` to your Sentry org slug (or numeric id)" }).trim().min(1, "`sentry.organization` cannot be empty"),
     // Project slugs to poll; [] (default) = every project the token can see (project=-1).
     projects: z.array(z.string().trim().min(1)).default([]),
     // Environment names to filter on; [] (default) = all environments. A list (not a scalar) so the

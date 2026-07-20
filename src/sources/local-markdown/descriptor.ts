@@ -12,7 +12,7 @@ export interface LocalMarkdownSourceCfg {
 // A folder of *.md files, each one work item. Lifecycle is tracked internally in the work_items
 // table (herdr-factory owns the status of record here).
 const LocalMarkdownBlockSchema = z.object({
-  folder: z.string(),
+  folder: z.string({ error: "set `local_markdown.folder` to a directory of *.md task briefs (~ and $HOME expand)" }).trim().min(1, "`local_markdown.folder` cannot be empty"),
 });
 
 export const localMarkdownDescriptor: SourceDescriptor<LocalMarkdownSourceCfg> = {
