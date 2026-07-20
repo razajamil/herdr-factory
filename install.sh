@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # herdr-factory installer — bootstraps a bare machine with ZERO pre-installed runtime:
 #
-#   curl -fsSL <public-url>/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/razajamil/herdr-factory/main/install.sh | sh
 #
 # POSIX sh — runs under dash (Debian/Ubuntu /bin/sh), busybox ash (Alpine) and bash (macOS), so
 # `| sh` works on every supported target. What it does (idempotent — safe to re-run to repair/upgrade):
@@ -26,14 +26,14 @@
 # libstdc++), and the launcher shims need bash — the installer verifies the Node it downloaded can
 # start and, if not, tells you exactly which package to add.
 #
-# Uninstall:  curl -fsSL <public-url>/install.sh | sh -s -- --uninstall
+# Uninstall:  curl -fsSL https://raw.githubusercontent.com/razajamil/herdr-factory/main/install.sh | sh -s -- --uninstall
 set -eu
 
 # ── Configuration (override via env) ──────────────────────────────────────────────────────────
 STATE_ROOT="${HERDR_FACTORY_STATE_ROOT:-$HOME/.local/state/herdr-factory}"
 APP_DIR="${HERDR_APP_DIR:-$HOME/.local/share/herdr-factory}"
 BIN_DIR="${HERDR_BIN_DIR:-$HOME/.local/bin}"
-REPO_URL="${HERDR_REPO_URL:-git@razajamil_git:razajamil/herdr-factory.git}"
+REPO_URL="${HERDR_REPO_URL:-https://github.com/razajamil/herdr-factory.git}"
 BRANCH="${HERDR_BRANCH:-main}"
 PNPM_VERSION="${HERDR_PNPM_VERSION:-11}"
 DEPLOY_KEY="${HERDR_DEPLOY_KEY:-}"   # literal key content OR a path to a key file (optional)
