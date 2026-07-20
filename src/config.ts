@@ -2,8 +2,19 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync
 import { dirname, isAbsolute, join, sep } from "node:path";
 import { parse as parseYaml } from "yaml";
 import { z } from "zod";
-import type { AgentConfig, EffectSpec, GuardSpec, InputSpec, ProductType, SourceType, StepPosture } from "./types.ts";
-import { DEFAULT_AGENT_CONFIG } from "./types.ts";
+import {
+  DEFAULT_AGENT_CONFIG,
+  EFFECT_PRODUCE_PRODUCTS,
+  type AgentConfig,
+  type BeltEffect,
+  type EffectSpec,
+  type GuardSpec,
+  type InputSpec,
+  type ProductType,
+  type SourceType,
+  type StepPosture,
+  type WorkState,
+} from "./types.ts";
 import { type BranchTaxonomy, DEFAULT_BRANCH_TAXONOMY } from "./core/branch.ts";
 import { expandHome } from "./paths.ts";
 import { SOURCE_DESCRIPTORS, descriptorFor } from "./sources/registry.ts";
@@ -411,6 +422,46 @@ function resolveAgent(repo: ParsedAgentBlock | undefined, belt: ParsedAgentBlock
   return { command: block.command ?? DEFAULT_AGENT_CONFIG.command, flags: block.flags ?? [] };
 }
 
+// The canonical WorkState vocabulary + run outcomes, as config enums for the belt-effects block.
+// These stay the engine's fixed spine; a belt effect's `to` names one of these (a canonical target)
+// OR a source-native custom status key resolved at the source layer (see BeltEffect / INV-13).
+const WORK_STATES = ["todo", "in_development", "in_review", "merged", "aborted", "done"] as const;
+const OUTCOMES = ["merged", "closed", "abandoned", "timeout", "completed"] as const;
+
+// Optional per-belt `effects:` block — configurable task progression onto source statuses. Each
+// entry maps a TRIGGER (entering a step / producing a product / tearing down with an outcome) to a
+// target status `to`. `to` is either a canonical WorkState (works on any source) or a source-native
+// custom status key (a widened jira `status.<key>` / github `state_labels.<key>` entry); a custom
+// `to` requires an `anchor` (a canonical WorkState) that fixes its monotonicity rank — the custom
+// status sits just before that anchor stage. A belt with no `effects` behaves as the engine
+// defaults. Cross-field validity (trigger targets exist, `to`/`anchor` coherence, source declares a
+// custom status, no duplicate triggers) is enforced in superRefine, which knows the belt's steps +
+// its source.
+const BeltEffectSchema = z
+  .discriminatedUnion("on", [
+    z.object({ on: z.literal("enter"), step: z.string().trim().min(1) }).strict().extend({
+      to: z.string().trim().min(1),
+      anchor: z.enum(WORK_STATES).optional(),
+    }),
+    z.object({ on: z.literal("produce"), product: z.enum(EFFECT_PRODUCE_PRODUCTS) }).strict().extend({
+      to: z.string().trim().min(1),
+      anchor: z.enum(WORK_STATES).optional(),
+    }),
+    z.object({ on: z.literal("teardown"), outcome: z.enum(OUTCOMES) }).strict().extend({
+      to: z.string().trim().min(1),
+      anchor: z.enum(WORK_STATES).optional(),
+    }),
+  ]);
+
+/** Resolve a belt effect's `to`/`anchor` into a canonical anchor WorkState + optional source-native
+ *  status key. Returns null when `to` is a custom key with no anchor (a config error surfaced in
+ *  superRefine — this is only reached after validation, so callers can assume non-null). */
+function resolveEffectTarget(to: string, anchor?: WorkState): { to: WorkState; status?: string } | null {
+  if ((WORK_STATES as readonly string[]).includes(to)) return { to: to as WorkState }; // canonical
+  if (!anchor) return null; // custom status needs an explicit anchor
+  return { to: anchor, status: to };
+}
+
 // Fields every belt shares. `source` references a work_source by name (validated below). `match`
 // is an OPTIONAL path to a `.ts` module (default export = predicate); when omitted the belt
 // accepts anything from its source. Lower `priority` = matched first (first matching belt claims).
@@ -453,6 +504,8 @@ const beltBase = {
   // launches). Resolved as a whole unit belt over repo over DEFAULT_AGENT_CONFIG — see resolveAgent.
   // A step ref may override it further. Absent everywhere ⇒ today's claude harness, unchanged.
   agent: AgentBlockSchema.optional(),
+  // Optional configurable task progression (see BeltEffectSchema). Empty ⇒ engine defaults only.
+  effects: z.array(BeltEffectSchema).default([]),
 };
 
 // A belt is a (source + ordered steps) pairing. `.strict()` rejects typos AND the removed
@@ -770,6 +823,49 @@ export const RepoConfigSchema = z
         }
         for (const p of stepProduces(d, s)) available.add(p);
       });
+
+      // Belt effects (configurable task progression). Validate each against the belt's steps + its
+      // source. A custom (non-canonical) `to` needs an anchor and a source that declares it; an
+      // internal-ledger source rejects custom statuses entirely (canonical-only in v1).
+      if (b.effects.length) {
+        const producedByStep = new Set<ProductType>();
+        for (const s of kept) for (const p of stepProduces(stepDescriptorFor(s.type)!, s)) producedByStep.add(p);
+        const desc = sourceType ? descriptorFor(sourceType) : undefined;
+        // Resolve the source's declared custom-status keys once (only when needed).
+        const parsedSource = cfg.work_sources.find((s) => (s.name ?? s.type) === b.source);
+        const declaredCustom = new Set<string>(desc && parsedSource ? desc.customStatusKeys(desc.resolveConfig(parsedSource as Record<string, unknown>)) : []);
+        const seenTriggers = new Set<string>();
+        b.effects.forEach((e, k) => {
+          const at = (field?: string) => (field ? ["belt", i, "effects", k, field] : ["belt", i, "effects", k]);
+          // 1) The trigger's target must exist in the belt.
+          if (e.on === "enter" && !stepNames.has(e.step)) {
+            ctx.addIssue({ code: "custom", message: `belt "${b.name}" effect on entering step "${e.step}" — no such step in the belt (steps: ${[...stepNames].join(", ")})`, path: at("step") });
+          }
+          if (e.on === "produce" && !producedByStep.has(e.product as ProductType)) {
+            ctx.addIssue({ code: "custom", message: `belt "${b.name}" effect on producing "${e.product}" — no step in the belt produces it`, path: at("product") });
+          }
+          // 2) One target per trigger (a trigger fires exactly one transition).
+          const triggerKey = e.on === "enter" ? `enter\0${e.step}` : e.on === "produce" ? `produce\0${e.product}` : `teardown\0${e.outcome}`;
+          if (seenTriggers.has(triggerKey)) {
+            ctx.addIssue({ code: "custom", message: `belt "${b.name}" has two effects on the same trigger (${triggerKey.replace("\0", " ")}) — a trigger maps to exactly one status`, path: at() });
+          }
+          seenTriggers.add(triggerKey);
+          // 3) Resolve `to`/`anchor`. Canonical works everywhere; a custom key needs an anchor + a
+          //    source that maps it.
+          const target = resolveEffectTarget(e.to, e.anchor);
+          if (!target) {
+            ctx.addIssue({ code: "custom", message: `belt "${b.name}" effect target "${e.to}" is not a canonical state (${WORK_STATES.join(", ")}); as a custom source status it needs an \`anchor\` (a canonical WorkState fixing its lifecycle rank)`, path: at("to") });
+            return;
+          }
+          if (target.status && desc) {
+            if (!desc.supportsCustomStatuses) {
+              ctx.addIssue({ code: "custom", message: `belt "${b.name}" effect targets custom status "${target.status}" but source "${b.source}" (${sourceType}) is internal-ledger — it supports canonical states only (a custom state needs a work_items CHECK migration, out of scope for v1). Target a canonical state (${WORK_STATES.join(", ")}).`, path: at("to") });
+            } else if (!declaredCustom.has(target.status)) {
+              ctx.addIssue({ code: "custom", message: `belt "${b.name}" effect targets custom status "${target.status}" but source "${b.source}" declares no such status (declared: ${[...declaredCustom].join(", ") || "none"}) — add it under the source's ${sourceType === "jira" ? "`status`" : "`state_labels`"} map, or target a canonical state`, path: at("to") });
+            }
+          }
+        });
+      }
     });
   });
 
@@ -906,6 +1002,11 @@ export interface BeltConfig {
     /** CI/bot polling window the pr agent runs after opening the PR, in minutes; 0 = skip it. */
     automatedRoundMinutes?: number;
   };
+  /** Configurable task progression: source transitions this belt fires at trigger points (entering a
+   *  step, producing a product, tearing down), beyond the engine defaults. Empty ⇒ defaults only.
+   *  Each carries a canonical anchor `to` + optional source-native `status` (see BeltEffect).
+   *  (loadConfig always sets it, defaulting to []; optional for terse test literals — like layoutMatching.) */
+  effects?: BeltEffect[];
 }
 
 export interface Config {
@@ -1301,6 +1402,16 @@ export function loadConfig(repoName: string): Loaded {
             automatedRoundMinutes: b.pr.automated_round_minutes,
           }
         : undefined,
+      effects: b.effects.map((e): BeltEffect => {
+        const target = resolveEffectTarget(e.to, e.anchor)!; // validated in superRefine → non-null
+        const trigger =
+          e.on === "enter"
+            ? ({ on: "enter", step: e.step } as const)
+            : e.on === "produce"
+              ? ({ on: "produce", product: e.product as ProductType } as const)
+              : ({ on: "teardown", outcome: e.outcome } as const);
+        return { trigger, to: target.to, status: target.status };
+      }),
     };
   });
   // Stable sort: equal priorities keep config order (V8 Array.sort is stable on Node >=24).

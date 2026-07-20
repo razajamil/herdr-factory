@@ -163,7 +163,10 @@
                         "minLength": 1
                       }
                     },
-                    "additionalProperties": false
+                    "additionalProperties": {
+                      "type": "string",
+                      "minLength": 1
+                    }
                   }
                 },
                 "required": [
@@ -270,7 +273,10 @@
                         "minLength": 1
                       }
                     },
-                    "additionalProperties": false
+                    "additionalProperties": {
+                      "type": "string",
+                      "minLength": 1
+                    }
                   },
                   "close_on": {
                     "default": {},
@@ -562,6 +568,125 @@
               }
             },
             "additionalProperties": false
+          },
+          "effects": {
+            "default": [],
+            "type": "array",
+            "items": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "properties": {
+                    "on": {
+                      "type": "string",
+                      "const": "enter"
+                    },
+                    "step": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "to": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "anchor": {
+                      "type": "string",
+                      "enum": [
+                        "todo",
+                        "in_development",
+                        "in_review",
+                        "merged",
+                        "aborted",
+                        "done"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "on",
+                    "step",
+                    "to"
+                  ],
+                  "additionalProperties": false
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "on": {
+                      "type": "string",
+                      "const": "produce"
+                    },
+                    "product": {
+                      "type": "string",
+                      "enum": [
+                        "evidence",
+                        "pull_request"
+                      ]
+                    },
+                    "to": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "anchor": {
+                      "type": "string",
+                      "enum": [
+                        "todo",
+                        "in_development",
+                        "in_review",
+                        "merged",
+                        "aborted",
+                        "done"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "on",
+                    "product",
+                    "to"
+                  ],
+                  "additionalProperties": false
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "on": {
+                      "type": "string",
+                      "const": "teardown"
+                    },
+                    "outcome": {
+                      "type": "string",
+                      "enum": [
+                        "merged",
+                        "closed",
+                        "abandoned",
+                        "timeout",
+                        "completed"
+                      ]
+                    },
+                    "to": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "anchor": {
+                      "type": "string",
+                      "enum": [
+                        "todo",
+                        "in_development",
+                        "in_review",
+                        "merged",
+                        "aborted",
+                        "done"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "on",
+                    "outcome",
+                    "to"
+                  ],
+                  "additionalProperties": false
+                }
+              ]
+            }
           },
           "steps": {
             "minItems": 1,

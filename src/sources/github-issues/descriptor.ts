@@ -80,6 +80,7 @@ export const githubIssuesDescriptor: SourceDescriptor<ResolvedBlock> = {
       maxPages: b.max_pages,
     };
   },
+  supportsCustomStatuses: true,
   customStatusKeys(cfg) {
     return Object.keys(cfg.stateLabelsExtra);
   },

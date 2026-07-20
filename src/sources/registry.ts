@@ -75,11 +75,15 @@ export interface SourceDescriptor<TCfg = unknown> {
   /** Construct the live client (build-deps wraps it in instrumentObject). MAY throw on an
    *  unbuildable config (e.g. no repo resolvable) — startup should fail loudly, not at claim time. */
   create(ctx: SourceBuildCtx<TCfg>): WorkSource;
+  /** Whether this source type can map belt-effect CUSTOM statuses onto its backend (INV-13): true
+   *  for external sources (jira statuses, github_issues labels), false for internal-ledger sources
+   *  (local_markdown / sentry — a custom state would need a work_items CHECK migration, out of scope
+   *  for v1). Config-load rejects a belt effect with a custom status on a `false` source. */
+  readonly supportsCustomStatuses: boolean;
   /** The EXTRA (beyond-canonical) source-native status keys a configured source declares, so a belt
-   *  effect can target them (INV-13): the jira `status.<key>` extras, the github_issues
-   *  `state_labels.<key>` extras. Empty for internal-ledger sources (local_markdown / sentry) —
-   *  which makes config-load reject any belt effect targeting a custom status on them (a work_items
-   *  CHECK migration is out of scope for v1). Given the RESOLVED camelCase cfg; local-only, no network. */
+   *  effect can target them: the jira `status.<key>` extras, the github_issues `state_labels.<key>`
+   *  extras. Empty when the source declares none (and always for internal-ledger). Given the RESOLVED
+   *  camelCase cfg; local-only, no network. */
   customStatusKeys(cfg: TCfg): readonly string[];
   readonly secrets: readonly SecretSpec[];
   readonly tui: { defaultBlock(): Record<string, unknown>; fields: readonly TuiFieldSpec[] };

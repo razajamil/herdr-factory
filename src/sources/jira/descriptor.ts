@@ -77,6 +77,7 @@ export const jiraDescriptor: SourceDescriptor<JiraSourceCfg> = {
       statusExtra: jiraStatusExtra(s.status as Record<string, unknown>),
     };
   },
+  supportsCustomStatuses: true,
   customStatusKeys(cfg) {
     return Object.keys(cfg.statusExtra);
   },
