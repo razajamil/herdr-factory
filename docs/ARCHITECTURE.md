@@ -205,6 +205,8 @@ herdr-factory/
     prompts/{work,evidence,review,pr}.md + prompts/resolver.md   step-primitive prompts (work.md
                           source-neutral) + the PR-watch resolver (tokenized + source-overridable, rendered by core/watch.ts)
     prompts/jira/work.md + prompts/github_issues/{work,pr}.md   per-source-type overrides
+    prompt-packs.ts          the repo-level prompt-resolution chain (repo-checkout ▸ config-folder ▸ shipped);
+                          import-free leaf shared by config.ts (load) · core/step.ts (render) · core/watch.ts (resolver)
     steps/registry.ts + steps/<name>/descriptor.ts   the STEP_DESCRIPTORS registry (work/evidence/review/pr/custom)
     products/registry.ts · signals/registry.ts       PRODUCT_CAPABILITIES + SIGNAL_DESCRIPTORS registries
   examples/example-repo/{config.yml, guidelines-prompt.md, match-bugs.ts, prompts/…}
@@ -213,7 +215,7 @@ herdr-factory/
 
 Code/config/state live OUTSIDE any repo: the managed code checkout at
 `~/.local/share/herdr-factory/` (install.sh + auto-update own it);
-`~/.config/herdr-factory/{config.schema.json, repos/<name>/{config.yml, env, guidelines-prompt.md}}`;
+`~/.config/herdr-factory/{config.schema.json, repos/<name>/{config.yml, env, guidelines-prompt.md, prompts/}}`;
 `~/.local/state/herdr-factory/{herdr-factory.db, runtime/<node>/, node-path, server.json, logs/, <repo>/logs/}`.
 
 ---
@@ -970,7 +972,7 @@ step (`spawnStep`):
    clock); set `run.focus_pending` so the worktree view can follow the active step (§7,
    *Focus follows the active step* — applied later, never stealing focus from another worktree).
 2. **Prompt** — the step body is resolved by the step's descriptor: a step with a `basePrompt`
-   (`work`/`evidence`/`review`/`pr`) uses that engine-shipped prompt, optionally **augmented** by the
+   (`work`/`evidence`/`review`/`pr`) uses that engine base prompt, optionally **augmented** by the
    step ref's `prompt_file` — or **replaced** by it when the ref sets `prompt_mode: replace` (the
    file owns the body, the shipped prose is dropped; only valid on a `basePrompt` step *with* a
    `prompt_file`, enforced at load); a `custom` step (no `basePrompt`) body *is* its (required)
@@ -978,7 +980,15 @@ step (`spawnStep`):
    Each `prompt_file` carries a `prompt_file_source` —
    `config` (the repo's config folder, read + existence-checked at load) or `repo` (the target
    repo checkout, read from the run's **worktree at render time**, so prompts can live
-   version-controlled next to the code). The built-in is resolved **per source type**:
+   version-controlled next to the code). The base itself resolves through the **prompt-pack chain**
+   (`src/prompt-packs.ts`), highest precedence first: a repo-checkout pack
+   (`<worktree>/.herdr/prompts/`, render-time) ▸ a config-folder pack (`repos/<name>/prompts/`,
+   load-time) ▸ the engine-shipped `src/prompts/` (always present). The first file found *replaces*
+   the shipped base — as opposed to `prompt_file`, which *augments* whichever base wins — and within
+   any layer the per-source variant beats the shared one. The repo-checkout layer lives in the
+   per-run worktree (absent at config-load), so config-load bakes layers 2–3 into `enginePrompt` and
+   the render step (`stepBody`) layers the worktree pack on top; the PR resolver
+   (`core/watch.ts`) runs the same chain. The built-in is resolved **per source type**:
    `src/prompts/<type>/<step>.md` if present, else the shared `src/prompts/<step>.md`. The
    shared `work.md` is source-NEUTRAL (`@@WORK_DOC@@`-based, with the rework + ask-human
    guidance); `jira` and `github_issues` override `work` with source-flavored versions, and

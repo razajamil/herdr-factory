@@ -489,7 +489,10 @@ Everything repo-specific lives in `~/.config/herdr-factory/repos/<name>/`:
   `gh` CLI's token); `SENTRY_AUTH_TOKEN` for a `sentry` source; `local_markdown` needs none.
   Strictly per-repo; there is no global secrets file.
 - `guidelines-prompt.md` _(optional)_ — appended to every step prompt of every belt.
-- Any `match` predicates and `config`-sourced prompt files referenced by `config.yml`.
+- `prompts/` _(optional)_ — `config`-sourced `prompt_file`s referenced by `config.yml`, **and** a
+  [prompt pack](#prompts): a file named for a primitive's slug (`work.md`, `review.md`, …) here
+  overrides that step's shipped base prompt.
+- Any `match` predicates referenced by `config.yml`.
 
 The server discovers every folder under `repos/` that contains a `config.yml`; onboarding a repo
 is pure data (`herdr-factory reload` picks it up without a restart).
@@ -892,7 +895,7 @@ setup required.
 
 ### Prompts
 
-A step's body is the engine's built-in prompt for its primitive (per source type under
+A step's body is the engine's built-in **base prompt** for its primitive (per source type under
 `src/prompts/`), optionally augmented by your `prompt_file` — or **replaced** by it
 (`prompt_mode: replace`, so your file owns the body and the shipped prose is dropped) — or, for a
 `custom` step, your `prompt_file` alone. The `prompt_file` is the factory's public authoring
@@ -901,6 +904,24 @@ syntax, and the validation rules — is documented in [`docs/PROMPTS.md`](docs/P
 `prompt_file_source` says where it's read from and **defaults to `config`** = the repo's config
 folder (checked at load); set it to `repo` = the target repo's checkout, read from the run's
 **worktree at render time**, so prompts can live version-controlled next to the code.
+
+**User-overridable prompt packs — the base-prompt resolution chain.** `prompt_file` _augments_ the
+shipped base; a **prompt pack** _replaces_ it. Drop a file named for the primitive's slug
+(`work.md`, `review.md`, `pr.md`, `evidence.md`, or the PR `resolver.md`) into a pack directory and
+the engine uses it as the base instead of its shipped one. Packs resolve highest-precedence first:
+
+1. **repo checkout** — `<repo>/.herdr/prompts/` — version-controlled next to the code; read from the
+   run's worktree at render time (so a branch can carry its own prompts).
+2. **config folder** — `repos/<name>/prompts/` — the same folder your `custom`-step prompt files
+   live in; resolved at config-load.
+3. **engine shipped** — `src/prompts/` — the built-in default; always present, so the chain always
+   resolves.
+
+The first file found wins and replaces the shipped base; within any layer a per-source variant
+(`<pack>/<source_type>/<slug>.md`, e.g. `.herdr/prompts/jira/work.md`) beats the shared
+`<pack>/<slug>.md`, mirroring the shipped library's own `prompts/<type>/<slug>.md` layout. A step's
+`prompt_file` still augments whichever base wins, so you can override the pack **and** append
+per-step instructions. It's convention-based — there's nothing to configure; just add the files.
 
 **Ejecting the shipped pack.** The engine's built-in prompts live inside the package, so to start
 from them, `herdr-factory --repo <name> prompts eject` copies the whole shipped pack into the repo's
