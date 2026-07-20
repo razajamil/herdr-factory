@@ -4,7 +4,7 @@ import { createInterface } from "node:readline/promises";
 import { Command } from "commander";
 import { configJsonSchema, configSchemaPath, evidenceKeyPrefix, globalDbPath, isManagedNode, loadConfig, managedNodePath, nodePathFile, writeConfigSchema, type WorkSourceConfig } from "../config.ts";
 import { descriptorFor } from "../sources/registry.ts";
-import { classifyS3Error, enumerateEvidenceFiles, evidenceUrls, resolveGithubUsername, uploadEvidence } from "../clients/evidence.ts";
+import { createEvidencePublisher, enumerateEvidenceFiles, resolveGithubUsername } from "../clients/evidence.ts";
 import { baseGroups, repoGroup, type DoctorGroup } from "../doctor.ts";
 import { openDb } from "../db/index.ts";
 import { Store } from "../db/store.ts";
@@ -586,7 +586,7 @@ program
 
 program
   .command("evidence-upload <key>")
-  .description("publish this run's captured evidence to S3 + print the CloudFront URLs (reads the repo's `evidence:` config; uses the ambient AWS credential chain; retries in the background if creds are down)")
+  .description("publish this run's captured evidence via the configured `evidence.publisher` (s3 | local | command) + print the public URLs; retries in the background if delivery is deferred")
   .option("--source <name>", "the work source the run belongs to (passed by the agent)")
   .action(cliAction("evidence-upload", async (key: string, opts: { source?: string }) => {
     try {
@@ -594,52 +594,62 @@ program
       const deps = await buildDeps(repo);
       const ev = deps.config.evidence;
       if (!ev) {
-        console.log("evidence-upload: no `evidence:` block configured for this repo — skipping upload (no URLs produced)");
+        console.log("evidence-upload: no `evidence:` block configured for this repo — skipping publish (no URLs produced)");
         return;
       }
       const activeRun = resolveActiveRun(deps, key, opts.source);
       if (!activeRun?.worktreePath) {
-        console.log(`${key}: no active run with a worktree — nothing to upload`);
+        console.log(`${key}: no active run with a worktree — nothing to publish`);
         return;
       }
       const dir = join(activeRun.worktreePath, MEMORY_DIR, "evidence");
       const files = enumerateEvidenceFiles(dir);
       if (files.length === 0) {
-        console.log("evidence-upload: no files in the evidence dir — nothing to upload");
+        console.log("evidence-upload: no files in the evidence dir — nothing to publish");
         return;
       }
-      // Key layout: herdr-factory / <github_username> / <key_prefix> / <ticketKey> / <runId>-<timestamp>.
-      // The per-user folder namespaces operators in a shared bucket; username = the evidence config
-      // override, else the gh-authenticated login (best-effort — omitted if gh can't resolve it). The
-      // run id + timestamp mean a re-capture (e.g. after a bounce) never overwrites an earlier upload.
+      // Key layout (uniform across publishers): herdr-factory / <github_username> / <key_prefix> /
+      // <ticketKey> / <runId>-<timestamp>. The per-user folder namespaces operators in a shared backend;
+      // username = the config override, else the gh-authenticated login (best-effort). The run id +
+      // timestamp mean a re-capture (e.g. after a bounce) never overwrites an earlier publish.
       const stamp = new Date().toISOString().replace(/[:.]/g, "-");
       const githubUsername = await resolveGithubUsername(ev, () => deps.github.currentLogin());
       if (!githubUsername) {
-        console.log("evidence-upload: could not resolve github_username (set evidence.github_username or authenticate gh) — uploading under herdr-factory/ with no per-user folder");
+        console.log("evidence-upload: could not resolve github_username (set evidence.github_username or authenticate gh) — publishing under herdr-factory/ with no per-user folder");
       }
       const prefix = evidenceKeyPrefix({ githubUsername, keyPrefix: ev.keyPrefix, ticketKey: activeRun.ticketKey, runId: activeRun.id, stamp });
+      const publisher = createEvidencePublisher(ev, { currentLogin: () => deps.github.currentLogin() });
 
-      // Enqueue the upload as a durable outbox intent (persisting `prefix` so retry URLs stay stable),
-      // then ALWAYS print the deterministic URLs — the handoff/PR get correct links regardless of whether
-      // the byte upload lands now. The engine's Phase 0 flush retries until S3 accepts it.
+      // Enqueue the publish as a durable outbox intent (persisting `prefix` so retry URLs stay stable),
+      // then print the deterministic URLs UP FRONT so the handoff/PR get correct links regardless of
+      // whether delivery lands now. The `command` publisher can't pre-compute URLs (they come from its
+      // stdout) — its links print only after a successful publish below.
       const job = deps.store.enqueueEvidenceUpload({ runId: activeRun.id, repo, ticketKey: activeRun.ticketKey, keyPrefix: prefix, evidenceDir: dir });
-      console.log("public URLs (use these in your handoff even if the upload is deferred — they resolve once the bytes land):");
-      for (const url of evidenceUrls(ev.cloudfrontDomain, prefix, files)) console.log(url);
+      const predicted = publisher.predictUrls(prefix, files);
+      if (predicted) {
+        console.log("public URLs (use these in your handoff even if delivery is deferred — they resolve once the bytes land):");
+        for (const url of predicted) console.log(url);
+      }
 
-      // Inline fast path: upload now (succeeds when creds are valid). On failure DON'T hard-fail — the
-      // outbox owns retry from here, so the agent proceeds with the URLs above.
+      // Inline fast path: publish now (the common success case). On failure DON'T hard-fail — the outbox
+      // owns retry from here, so the agent proceeds (with the URLs above, for s3/local).
       try {
-        await uploadEvidence({ evidence: ev, dir, prefix });
+        const { urls } = await publisher.publish({ dir, prefix });
         deps.store.markEvidenceDelivered(job.id);
-        console.log(`uploaded ${files.length} evidence file(s) to s3://${ev.bucket}/${prefix}/`);
+        if (!predicted) {
+          console.log("public URLs (use these in your handoff):");
+          for (const url of urls) console.log(url);
+        }
+        console.log(`published ${files.length} evidence file(s) via ${ev.publisher}`);
       } catch (e) {
-        const c = classifyS3Error(e);
+        const c = publisher.classifyError(e);
         if (c.kind === "permanent") {
           deps.store.markEvidencePermanentFailed(job.id, c.reason);
-          console.log(`evidence-upload: upload FAILED (config error) — ${c.reason}. Run \`herdr-factory --repo ${repo} doctor --deep\`. The URLs above will not resolve until this is fixed.`);
+          console.log(`evidence-upload: publish FAILED (config error) — ${c.reason}. Run \`herdr-factory --repo ${repo} doctor --deep\`.${predicted ? " The URLs above will not resolve until this is fixed." : ""}`);
         } else {
           deps.store.recordEvidenceAttempt(job.id, c.reason, c.kind);
-          console.log(`evidence-upload: upload deferred — ${c.reason}. The engine will retry automatically; the URLs above resolve once it lands.`);
+          const tail = predicted ? "the URLs above resolve once it lands." : "URLs will appear in the server logs once it lands (a `command` publisher can't pre-compute links).";
+          console.log(`evidence-upload: publish deferred — ${c.reason}. The engine will retry automatically; ${tail}`);
         }
       }
     } catch (e) {

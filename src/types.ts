@@ -240,9 +240,10 @@ export interface TransitionIntent {
   staleHandledAt: number | null;
 }
 
-/** One capture's pending S3 media upload — the durable evidence-upload outbox row (see migration v16).
- *  URLs are published to the handoff/PR immediately (deterministic from `keyPrefix` + filenames); the
- *  bytes are retried until S3 accepts them or a permanent config error stops it. */
+/** One capture's pending media publish — the durable evidence-upload outbox row (see migration v16),
+ *  publisher-agnostic (s3 | local | command). URLs are published to the handoff/PR immediately
+ *  (deterministic from `keyPrefix` + filenames for s3/local; from the command's stdout for `command`);
+ *  the bytes are retried until the backend accepts them or a permanent config error stops it. */
 export interface EvidenceUpload {
   id: number;
   runId: number;
@@ -253,7 +254,7 @@ export interface EvidenceUpload {
   attempts: number;
   nextAttemptAt: number; // also the enqueue lease (CLI inline attempt vs Phase 0 flush)
   lastError: string | null;
-  errorKind: "auth" | "transient" | "permanent" | null; // classifyS3Error kind of the last failure
+  errorKind: "auth" | "transient" | "permanent" | null; // the publisher's classified kind of the last failure (auth: S3 only)
   notifiedAt: number | null; // SSO/permanent notify throttle (per row, never the run)
   permanentFailedAt: number | null; // non-retryable config error / dir-gone; stop retrying
   abandonedAt: number | null; // superseded by a re-capture, or dropped at teardown

@@ -1257,6 +1257,8 @@ describe("loadConfig — work sources + belts", () => {
       { prompts: {} },
     );
     const ev = loadConfig("demo").config.evidence!;
+    expect(ev.publisher).toBe("s3"); // default discriminant — a block with no `publisher:` key is s3
+    if (ev.publisher !== "s3") throw new Error("expected s3 publisher");
     expect(ev.bucket).toBe("my-bucket");
     expect(ev.cloudfrontDomain).toBe("d1.cloudfront.net"); // scheme + trailing slash stripped
     expect(ev.keyPrefix).toBe("sub"); // leading/trailing slashes trimmed

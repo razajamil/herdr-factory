@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import * as Effect from "effect/Effect";
-import { classifyS3Error, probeEvidenceCreds, uploadEvidence } from "../clients/evidence.ts";
+import { createEvidencePublisher } from "../clients/evidence.ts";
 import { runEffect } from "../runtime/effect.ts";
 import { HerdrUnreachableError, type BeltRuntime, type Deps, type SourceRuntime } from "./deps.ts";
 import type { StepConfig } from "../config.ts";
@@ -203,37 +203,38 @@ export async function flushTransitionOutbox(deps: Deps): Promise<void> {
 export async function flushEvidenceUploads(deps: Deps): Promise<void> {
   const repo = deps.config.repoName;
   const ev = deps.config.evidence;
-  // Auto-resume on AWS-creds recovery: if an upload is stuck on expired creds, cheaply probe once (a
-  // HeadBucket, gated so the happy path never probes). The moment creds are live again, make every
-  // auth-stuck row due now so THIS pass uploads it — no human "retry" gesture, no waiting out the
-  // backoff. Mirrors the source-auth path's retryTransitionsForSource. A probe error is treated as
-  // still-down (conservative: don't reset on an ambiguous probe), so recovery just lands a tick later.
-  if (ev && deps.store.authStuckEvidenceUpload(repo)) {
-    const probe = await probeEvidenceCreds(ev).catch(() => ({ auth: true, reason: "probe failed" }));
+  const publisher = ev ? createEvidencePublisher(ev, { currentLogin: () => deps.github.currentLogin() }) : undefined;
+  // Auto-resume on creds recovery (S3 only — `local`/`command` have no `auth` kind, so no row is ever
+  // auth-stuck and this branch is skipped). If an upload is stuck on expired creds, cheaply probe once
+  // (gated so the happy path never probes). The moment creds are live again, make every auth-stuck row
+  // due now so THIS pass uploads it — no human "retry" gesture, no waiting out the backoff. Mirrors the
+  // source-auth path's retryTransitionsForSource. A probe error is treated as still-down (conservative).
+  if (publisher?.probeLiveness && deps.store.authStuckEvidenceUpload(repo)) {
+    const probe = await publisher.probeLiveness().catch(() => ({ auth: true, reason: "probe failed" }));
     if (!probe.auth) {
       const requeued = deps.store.retryEvidenceUploadsForRepo(repo);
-      if (requeued > 0) deps.log("info", `evidence upload: AWS creds recovered — re-queued ${requeued} stuck upload(s) for immediate retry`);
+      if (requeued > 0) deps.log("info", `evidence publish: creds recovered — re-queued ${requeued} stuck upload(s) for immediate retry`);
     }
   }
   for (const job of deps.store.dueEvidenceUploads(repo)) {
-    if (!ev) {
+    if (!ev || !publisher) {
       deps.store.markEvidencePermanentFailed(job.id, "evidence config removed");
       continue;
     }
     // Best-effort drop policy: the bytes live in the worktree, which teardown removes. If the dir is
-    // gone the upload can never land — stop retrying (this also covers the manual-teardown race).
+    // gone the publish can never land — stop retrying (this also covers the manual-teardown race).
     if (!existsSync(job.evidenceDir)) {
-      deps.store.markEvidencePermanentFailed(job.id, "evidence dir gone (torn down before upload)");
-      deps.log("warn", `${job.ticketKey}: evidence upload dropped — worktree removed before the upload landed`);
+      deps.store.markEvidencePermanentFailed(job.id, "evidence dir gone (torn down before publish)");
+      deps.log("warn", `${job.ticketKey}: evidence publish dropped — worktree removed before it landed`);
       continue;
     }
     try {
-      const { files } = await uploadEvidence({ evidence: ev, dir: job.evidenceDir, prefix: job.keyPrefix });
+      const { files } = await publisher.publish({ dir: job.evidenceDir, prefix: job.keyPrefix });
       deps.store.markEvidenceDelivered(job.id);
-      deps.store.recordEvent({ runId: job.runId, repo, ticketKey: job.ticketKey, type: "evidence_uploaded", detail: { files: files.length, prefix: job.keyPrefix, attempts: job.attempts } });
-      deps.log("info", `${job.ticketKey}: evidence uploaded (${files.length} file(s)) after ${job.attempts} retr${job.attempts === 1 ? "y" : "ies"}`);
+      deps.store.recordEvent({ runId: job.runId, repo, ticketKey: job.ticketKey, type: "evidence_uploaded", detail: { files: files.length, prefix: job.keyPrefix, attempts: job.attempts, publisher: ev.publisher } });
+      deps.log("info", `${job.ticketKey}: evidence published (${files.length} file(s)) after ${job.attempts} retr${job.attempts === 1 ? "y" : "ies"}`);
     } catch (e) {
-      const c = classifyS3Error(e);
+      const c = publisher.classifyError(e);
       // Notify on the FIRST failure, then throttle re-notifies by attentionRenotifySeconds (a null
       // notifiedAt means never-notified — must always fire, not be read as "notified at epoch 0").
       const notifyDue = job.notifiedAt == null || deps.now() - job.notifiedAt >= deps.config.limits.attentionRenotifySeconds;
@@ -241,14 +242,15 @@ export async function flushEvidenceUploads(deps: Deps): Promise<void> {
         deps.store.markEvidencePermanentFailed(job.id, c.reason);
         deps.store.recordEvent({ runId: job.runId, repo, ticketKey: job.ticketKey, type: "evidence_upload_failed", detail: { reason: c.reason } });
         if (notifyDue) {
-          await deps.herdr.notify(`herdr-factory: ${job.ticketKey} evidence upload failed`, `Evidence upload can't proceed: ${c.reason}. Run \`herdr-factory --repo ${repo} doctor --deep\`; the published URLs won't resolve until it's fixed.`).catch(() => {});
+          await deps.herdr.notify(`herdr-factory: ${job.ticketKey} evidence publish failed`, `Evidence publish can't proceed: ${c.reason}. Run \`herdr-factory --repo ${repo} doctor --deep\`; the published URLs won't resolve until it's fixed.`).catch(() => {});
           deps.store.markEvidenceNotified(job.id);
         }
       } else {
         const updated = deps.store.recordEvidenceAttempt(job.id, c.reason, c.kind);
-        deps.log("warn", `${job.ticketKey}: evidence upload deferred (attempt ${updated?.attempts}): ${c.reason}`);
+        deps.log("warn", `${job.ticketKey}: evidence publish deferred (attempt ${updated?.attempts}): ${c.reason}`);
         if (c.kind === "auth" && notifyDue) {
-          await deps.herdr.notify(`herdr-factory: AWS SSO expired`, `Evidence upload for ${job.ticketKey} is blocked on AWS creds — run \`aws sso login${ev.profile ? ` --profile ${ev.profile}` : ""}\`. It uploads automatically on the next tick.`).catch(() => {});
+          const profile = ev.publisher === "s3" ? ev.profile : undefined;
+          await deps.herdr.notify(`herdr-factory: AWS SSO expired`, `Evidence publish for ${job.ticketKey} is blocked on AWS creds — run \`aws sso login${profile ? ` --profile ${profile}` : ""}\`. It uploads automatically on the next tick.`).catch(() => {});
           deps.store.markEvidenceNotified(job.id);
         }
       }

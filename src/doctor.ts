@@ -5,9 +5,7 @@
 // separate group behind `--repo`.
 import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
-import { fromNodeProviderChain } from "@aws-sdk/credential-providers";
-import { classifyS3Error } from "./clients/evidence.ts";
+import { createEvidencePublisher } from "./clients/evidence.ts";
 import { run } from "./clients/exec.ts";
 import { assertMainCheckout, globalDbPath, isManagedNode } from "./config.ts";
 import { descriptorFor } from "./sources/registry.ts";
@@ -164,27 +162,26 @@ export async function repoGroup(repo: string, deep = false): Promise<DoctorGroup
       }
     }
     const ev = d.config.evidence;
-    // Default: report it's configured (local). Deep: PutObject write-probe (network + a tiny S3 write).
-    // Uploads land under herdr-factory/<github_username>/<key_prefix>/… ; show that base.
+    // Default: report it's configured (local, no network). Deep: a per-publisher active round-trip
+    // (S3 PutObject write-probe · local static-serve round-trip · command dry-run) — see each
+    // publisher's deepProbe. Uploads land under herdr-factory/<github_username>/<key_prefix>/… .
     if (!ev) {
       checks.push({ name: "evidence", ok: true, detail: "not configured (optional)" });
     } else if (deep) {
-      // Resolve the real per-user folder (override, else gh login) so the probe writes where uploads do.
-      const username = ev.githubUsername ?? (await d.github.currentLogin()) ?? undefined;
-      checks.push(await attempt(`evidence bucket (s3://${ev.bucket})`, () => probeEvidenceBucket(ev, username)));
+      const publisher = createEvidencePublisher(ev, { currentLogin: () => d.github.currentLogin() });
+      checks.push(await attempt(`evidence publisher (${ev.publisher})`, () => publisher.deepProbe()));
     } else {
-      // Shallow = no network, so show the override or a <gh-login> placeholder rather than resolving it.
-      const folder = ["herdr-factory", ev.githubUsername ?? "<gh-login>", ev.keyPrefix].filter(Boolean).join("/");
-      checks.push({ name: "evidence", ok: true, detail: `configured: s3://${ev.bucket}/${folder}/ (${ev.region}) — --deep to write-probe` });
+      checks.push({ name: "evidence", ok: true, detail: `${describeEvidence(ev)} — --deep to probe` });
     }
     // Evidence-upload outbox health (local, no network): pending uploads still retrying. An auth-class
-    // stuck upload almost always means the AWS SSO session expired — the actionable fix.
+    // stuck upload almost always means the AWS SSO session expired — the actionable fix (S3 only).
     if (ev) {
       const pending = d.store.pendingEvidenceUploads(repo);
+      const profile = ev.publisher === "s3" ? ev.profile : undefined;
       if (pending.length === 0) {
         checks.push({ name: "evidence uploads", ok: true, detail: "none pending" });
       } else if (pending.some((u) => u.errorKind === "auth")) {
-        checks.push({ name: "evidence uploads", ok: false, detail: `${pending.length} stuck — AWS SSO/creds expired; run \`aws sso login${ev.profile ? ` --profile ${ev.profile}` : ""}\`` });
+        checks.push({ name: "evidence uploads", ok: false, detail: `${pending.length} stuck — AWS SSO/creds expired; run \`aws sso login${profile ? ` --profile ${profile}` : ""}\`` });
       } else {
         checks.push({ name: "evidence uploads", ok: true, detail: `${pending.length} pending — retrying (last: ${pending[pending.length - 1]!.lastError ?? "not yet attempted"})` });
       }
@@ -193,38 +190,16 @@ export async function repoGroup(repo: string, deep = false): Promise<DoctorGroup
   return { title: `repo ${repo}`, checks };
 }
 
-/** Verify the evidence upload can actually reach AND write the bucket: PUT a 0-byte probe object at
- *  the real upload base `herdr-factory/<github_username>/<key_prefix>/.herdr-doctor` (a fixed key,
- *  overwritten each run so nothing accumulates) using the SAME ambient credential chain the real
- *  upload uses. This exercises the exact s3:PutObject permission at the exact prefix uploads land in
- *  — not just reachability. Returns a success detail or throws a concise, actionable reason.
- *  NOTE: this writes one tiny object to the bucket (by design). */
-async function probeEvidenceBucket(ev: NonNullable<Deps["config"]["evidence"]>, username?: string): Promise<string> {
-  // Silence the SDK's own console warnings (ambient-credential-source notes, body-length hints) so
-  // they don't leak into the doctor output — the check reports the outcome itself.
-  const silent = { debug() {}, info() {}, warn() {}, error() {} };
-  const s3 = new S3Client({
-    region: ev.region,
-    maxAttempts: 1, // a doctor should fail fast, not retry a broken config for ~20s
-    logger: silent,
-    ...(ev.profile ? { credentials: fromNodeProviderChain({ profile: ev.profile, logger: silent }) } : {}),
-  });
-  const key = ["herdr-factory", username, ev.keyPrefix, ".herdr-doctor"].filter(Boolean).join("/");
-  try {
-    // A short known-length body (avoids the SDK's "stream of unknown length" PutObject warning).
-    await s3.send(new PutObjectCommand({ Bucket: ev.bucket, Key: key, Body: "herdr-factory doctor probe\n", ContentType: "text/plain" }), {
-      abortSignal: AbortSignal.timeout(8000),
-    });
-    return `writable — wrote s3://${ev.bucket}/${key} (${ev.region})`;
-  } catch (e) {
-    throw new Error(explainS3Error(e));
-  } finally {
-    s3.destroy();
+/** Shallow (no-network) one-line summary of where evidence publishes, per publisher. Shows the
+ *  gh-login placeholder rather than resolving it (that would be a network call). */
+function describeEvidence(ev: NonNullable<Deps["config"]["evidence"]>): string {
+  const folder = ["herdr-factory", ev.githubUsername ?? "<gh-login>", ev.keyPrefix].filter(Boolean).join("/");
+  switch (ev.publisher) {
+    case "s3":
+      return `configured: s3 → s3://${ev.bucket}/${folder}/ (${ev.region})`;
+    case "local":
+      return `configured: local → served at ${ev.publicBaseUrl ?? "http://127.0.0.1:<port>"}/evidence/${folder}/`;
+    case "command":
+      return `configured: command → \`${ev.command.join(" ")}\` (uploads + prints URLs)`;
   }
-}
-
-/** Map an AWS SDK error to a short, actionable doctor reason. Delegates to the shared classifier so the
- *  S3 taxonomy lives in exactly one place (src/clients/evidence.ts). */
-function explainS3Error(e: unknown): string {
-  return classifyS3Error(e).reason;
 }

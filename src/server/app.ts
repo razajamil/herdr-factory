@@ -3,8 +3,12 @@
 // injected here via `ServerContext`; this module is pure request → response wiring. Request bodies,
 // params and query strings are validated by the route schemas before a handler runs; validation
 // failures and thrown errors are normalised to `{ error }` (the shape server/client.ts expects).
+import { createReadStream, statSync } from "node:fs";
+import { join } from "node:path";
+import { Readable } from "node:stream";
 import { OpenAPIHono } from "@hono/zod-openapi";
 import { swaggerUI } from "@hono/swagger-ui";
+import { lookup as mimeLookup } from "mime-types";
 import * as Effect from "effect/Effect";
 import { VERSION } from "../version.ts";
 import { withExtractedTelemetryContext } from "../telemetry/index.ts";
@@ -12,7 +16,8 @@ import { annotateCurrentSpan, recordHttpServerDurationEffect, withHttpServerSpan
 import { runEffect } from "../runtime/effect.ts";
 import { claimTicket, reconcileRepo, reconcileRun, resumeRun, teardownTicket, withRunLockWaiting, withTickLock } from "../core/reconcile.ts";
 import { applySignal } from "../core/signals.ts";
-import { probeEvidenceCreds } from "../clients/evidence.ts";
+import { createEvidencePublisher } from "../clients/evidence.ts";
+import { evidenceServeDir } from "../config-paths.ts";
 import { getAuthFailure } from "../auth/gate.ts";
 import { resolveActiveRun, resolveBeltName } from "../resolve.ts";
 import type { Deps } from "../core/deps.ts";
@@ -82,13 +87,18 @@ async function evidenceSsoStatus(rt: RepoRuntime, refresh = false): Promise<{ st
   const cfg = rt.deps.config;
   const ev = cfg.evidence;
   if (!ev) return { state: "na" };
+  // Only S3 carries a creds/SSO light — `local`/`command` have no auth, so no upload is ever
+  // auth-stuck and the probe is absent. Report `ok` (nothing to be "down" about).
+  const publisher = createEvidencePublisher(ev, { currentLogin: () => rt.deps.github.currentLogin() });
+  if (!publisher.probeLiveness) return { state: "ok" };
+  const profile = ev.publisher === "s3" ? ev.profile : undefined;
   if (rt.deps.store.authStuckEvidenceUpload(cfg.repoName)) {
-    return { state: "down", detail: `an evidence upload is stuck on expired AWS creds — run \`aws sso login${ev.profile ? ` --profile ${ev.profile}` : ""}\`` };
+    return { state: "down", detail: `an evidence upload is stuck on expired AWS creds — run \`aws sso login${profile ? ` --profile ${profile}` : ""}\`` };
   }
   const now = rt.deps.now();
   let cached = ssoProbeCache.get(cfg.repoName);
   if (refresh || !cached || now - cached.at >= SSO_PROBE_TTL_SECONDS) {
-    const probe = await probeEvidenceCreds(ev).catch(() => ({ auth: false, reason: "probe failed" }));
+    const probe = await publisher.probeLiveness().catch(() => ({ auth: false, reason: "probe failed" }));
     cached = { at: now, auth: probe.auth, reason: probe.reason };
     ssoProbeCache.set(cfg.repoName, cached);
   }
@@ -123,6 +133,42 @@ async function sourceAuthStatus(rt: RepoRuntime, sourceName: string, refresh = f
   }
   if (cached.state === "unauthenticated") return { state: "down", detail: cached.detail, account };
   return { state: cached.state === "not_applicable" ? "na" : "ok", account };
+}
+
+/** Serve a file the `local` evidence publisher copied under `evidenceServeDir()`. `reqPath` is the raw
+ *  (still URL-encoded) request path `/evidence/<encoded segments>`. Each segment is decoded and rejected
+ *  if it is empty, `.`/`..`, or contains a path separator or null byte after decoding — so no request can
+ *  escape the serve root (evidence prefixes never contain those). Read-only; 404 for anything missing. */
+function serveEvidenceFile(reqPath: string): Response {
+  const notFound = () => new Response("not found", { status: 404 });
+  let segments: string[];
+  try {
+    segments = reqPath.slice("/evidence/".length).split("/").map(decodeURIComponent);
+  } catch {
+    return new Response("bad request", { status: 400 });
+  }
+  if (segments.length === 0 || segments.some((s) => s === "" || s === "." || s === ".." || s.includes("/") || s.includes("\\") || s.includes("\0"))) {
+    return notFound();
+  }
+  const abs = join(evidenceServeDir(), ...segments);
+  let size: number;
+  try {
+    const st = statSync(abs);
+    if (!st.isFile()) return notFound();
+    size = st.size;
+  } catch {
+    return notFound();
+  }
+  // Immutable per prefix (run id + timestamp), so cache aggressively. ContentType is load-bearing:
+  // without it a browser/reviewer downloads screenshots/video instead of viewing them inline.
+  const web = Readable.toWeb(createReadStream(abs)) as unknown as ReadableStream;
+  return new Response(web, {
+    headers: {
+      "Content-Type": mimeLookup(abs) || "application/octet-stream",
+      "Content-Length": String(size),
+      "Cache-Control": "public, max-age=31536000, immutable",
+    },
+  });
 }
 
 /** The structured status payload exposed for API clients. Quick mode omits auth/AWS probes and live
@@ -411,6 +457,13 @@ export function createApp(ctx: ServerContext): OpenAPIHono {
     if (!rt) return c.json({ error: notConfigured(repo) }, 404);
     return c.json({ timeline: rt.deps.store.timeline(repo, key) }, 200);
   });
+
+  // --- `local` evidence publisher static serve ----------------------------
+  // Serve the captures the `local` publisher copied under evidenceServeDir() at `/evidence/<prefix>/<file>`
+  // (the "prefix + filename" URL shape). Global across repos (keys carry a unique run id). Read-only;
+  // path-traversal-guarded per segment (no `.`/`..`/separator/null after decode — evidence prefixes
+  // never contain those). 404 for anything missing, so the route is harmless when no local publisher runs.
+  app.get("/evidence/*", (c) => serveEvidenceFile(c.req.path));
 
   // --- OpenAPI document + Swagger UI --------------------------------------
   app.doc("/doc", { openapi: "3.0.0", info: { title: "herdr-factory", version: VERSION } });

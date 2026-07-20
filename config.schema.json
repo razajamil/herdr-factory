@@ -766,39 +766,117 @@
       }
     },
     "evidence": {
-      "type": "object",
-      "properties": {
-        "bucket": {
-          "type": "string",
-          "minLength": 1
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "publisher": {
+              "default": "s3",
+              "type": "string",
+              "const": "s3"
+            },
+            "bucket": {
+              "type": "string",
+              "minLength": 1
+            },
+            "region": {
+              "type": "string",
+              "minLength": 1
+            },
+            "cloudfront_domain": {
+              "type": "string",
+              "minLength": 1
+            },
+            "key_prefix": {
+              "default": "",
+              "type": "string"
+            },
+            "profile": {
+              "type": "string",
+              "minLength": 1
+            },
+            "github_username": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "required": [
+            "bucket",
+            "region",
+            "cloudfront_domain"
+          ],
+          "additionalProperties": false
         },
-        "region": {
-          "type": "string",
-          "minLength": 1
+        {
+          "type": "object",
+          "properties": {
+            "publisher": {
+              "type": "string",
+              "const": "local"
+            },
+            "public_base_url": {
+              "type": "string",
+              "minLength": 1
+            },
+            "key_prefix": {
+              "default": "",
+              "type": "string"
+            },
+            "github_username": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "required": [
+            "publisher"
+          ],
+          "additionalProperties": false
         },
-        "cloudfront_domain": {
-          "type": "string",
-          "minLength": 1
-        },
-        "key_prefix": {
-          "default": "",
-          "type": "string"
-        },
-        "profile": {
-          "type": "string",
-          "minLength": 1
-        },
-        "github_username": {
-          "type": "string",
-          "minLength": 1
+        {
+          "type": "object",
+          "properties": {
+            "publisher": {
+              "type": "string",
+              "const": "command"
+            },
+            "command": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "minLength": 1
+                },
+                {
+                  "minItems": 1,
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                }
+              ]
+            },
+            "timeout_seconds": {
+              "default": 300,
+              "type": "integer",
+              "exclusiveMinimum": 0,
+              "maximum": 9007199254740991
+            },
+            "key_prefix": {
+              "default": "",
+              "type": "string"
+            },
+            "github_username": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "required": [
+            "publisher",
+            "command"
+          ],
+          "additionalProperties": false
         }
-      },
-      "required": [
-        "bucket",
-        "region",
-        "cloudfront_domain"
-      ],
-      "additionalProperties": false
+      ]
     },
     "conventions": {
       "type": "object",

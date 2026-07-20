@@ -28,3 +28,11 @@ export function listConfiguredRepos(): string[] {
 export function serverInfoPath(): string {
   return join(stateRoot(), "server.json");
 }
+
+/** Root the `local` evidence publisher copies captures into and the resident server serves at
+ *  `/evidence/<key>/…`. Global (not per-repo): keys carry a globally-unique run id, so repos never
+ *  collide, and one HTTP server serves every repo. Files persist past teardown — a merged PR links
+ *  to them — so this dir grows; operators can prune old subtrees. */
+export function evidenceServeDir(): string {
+  return join(stateRoot(), "evidence");
+}
