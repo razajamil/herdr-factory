@@ -10,7 +10,8 @@
 //   - `local`   — copy captures into the dir the resident server serves (config-paths.evidenceServeDir);
 //                 URLs point at the server. Zero cloud setup; rarely fails.
 //   - `command` — run a user executable with (captureDir, keyPrefix); it uploads + prints public URLs.
-import { cpSync, createReadStream, mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { cpSync, createReadStream, mkdirSync, mkdtempSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join, sep } from "node:path";
 import { HeadBucketCommand, PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
 import { Upload } from "@aws-sdk/lib-storage";
@@ -367,8 +368,7 @@ class CommandPublisher implements EvidencePublisher {
   /** Dry-run: publish a single throwaway probe file from a temp dir at a probe prefix and confirm the
    *  command exits 0 and prints ≥1 URL. Uses the real publish path (so a broken command is caught). */
   async deepProbe(): Promise<string> {
-    const tmp = join(evidenceServeDir(), ".herdr-doctor-command", `${process.pid}`);
-    mkdirSync(tmp, { recursive: true });
+    const tmp = mkdtempSync(join(tmpdir(), "hf-evidence-cmd-"));
     writeFileSync(join(tmp, "probe.txt"), "herdr-factory doctor probe\n");
     try {
       const { urls } = await this.publish({ dir: tmp, prefix: "herdr-factory/.herdr-doctor" });
