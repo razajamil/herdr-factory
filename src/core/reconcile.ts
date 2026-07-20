@@ -1964,6 +1964,35 @@ export async function resumeRun(deps: Deps, run: Run): Promise<{ ok: boolean; ph
  * So: remove → verify the workspace is gone, else close it directly → clear the checkout
  * dir → prune the stale git registration → delete the branch (now safely not "checked out").
  */
+/**
+ * herdr-first, verify-and-fall-back removal of a run's worktree + local branch (§9). Extracted
+ * from teardown so belt deletion can reap a LEAKED worktree with the identical sequence — this is
+ * the one place the §9 remove→verify→close→rmrf→prune→branch-delete order lives. Pure herdr/git/fs
+ * cleanup: it touches neither the DB nor the work source (teardown owns the run-state + write-back).
+ */
+export async function removeRunWorktree(deps: Deps, run: Run): Promise<void> {
+  if (run.workspaceId) {
+    await deps.herdr.worktreeRemove(run.workspaceId);
+    if (await deps.herdr.workspaceExists(run.workspaceId)) {
+      deps.log("warn", `${run.ticketKey}: worktree remove left workspace ${run.workspaceId} — closing it directly`);
+      await deps.herdr.workspaceClose(run.workspaceId);
+    }
+  }
+  // The checkout dir can survive a partial remove. It's always a linked worktree under
+  // herdr's worktrees dir, never the main checkout — guard anyway, then prune the now-stale
+  // git registration so a re-claim of the same ticket starts clean.
+  if (run.worktreePath && run.worktreePath !== deps.config.repo.path) {
+    await deps.rmrf(run.worktreePath).catch(() => {});
+  }
+  await deps.git.worktreePrune(deps.config.repo.path).catch(() => {});
+  if (run.branch) {
+    // branchDelete force-removes any worktree still on the branch (an abandoned-while-running run
+    // whose agent kept the dir busy) and retries; only warn if the branch STILL can't be deleted.
+    const deleted = await deps.git.branchDelete(deps.config.repo.path, run.branch);
+    if (!deleted) deps.log("warn", `${run.ticketKey}: branch ${run.branch} could not be deleted (still present after force-prune) — remove it manually`);
+  }
+}
+
 async function teardown(deps: Deps, run: Run, outcome: Outcome, src: SourceRuntime | undefined): Promise<void> {
   return telemetrySpan(
     "reconcile.teardown",
@@ -1991,26 +2020,7 @@ async function teardownImpl(deps: Deps, run: Run, outcome: Outcome, src: SourceR
     await requestTransition(deps, run, src, outcomeToWorkState(outcome));
   }
 
-  if (run.workspaceId) {
-    await deps.herdr.worktreeRemove(run.workspaceId);
-    if (await deps.herdr.workspaceExists(run.workspaceId)) {
-      deps.log("warn", `${run.ticketKey}: worktree remove left workspace ${run.workspaceId} — closing it directly`);
-      await deps.herdr.workspaceClose(run.workspaceId);
-    }
-  }
-  // The checkout dir can survive a partial remove. It's always a linked worktree under
-  // herdr's worktrees dir, never the main checkout — guard anyway, then prune the now-stale
-  // git registration so a re-claim of the same ticket starts clean.
-  if (run.worktreePath && run.worktreePath !== deps.config.repo.path) {
-    await deps.rmrf(run.worktreePath).catch(() => {});
-  }
-  await deps.git.worktreePrune(deps.config.repo.path).catch(() => {});
-  if (run.branch) {
-    // branchDelete force-removes any worktree still on the branch (an abandoned-while-running run
-    // whose agent kept the dir busy) and retries; only warn if the branch STILL can't be deleted.
-    const deleted = await deps.git.branchDelete(deps.config.repo.path, run.branch);
-    if (!deleted) deps.log("warn", `${run.ticketKey}: branch ${run.branch} could not be deleted at teardown (still present after force-prune) — remove it manually`);
-  }
+  await removeRunWorktree(deps, run);
 
   // Best-effort drop of any still-pending evidence upload: the worktree (and its evidence dir) is gone,
   // so the bytes can't be uploaded anymore. Log the loss so it's visible rather than silent.

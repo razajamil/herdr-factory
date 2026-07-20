@@ -346,7 +346,10 @@ export function buildDescriptors(draft: Document, rebuild: () => void, confirm: 
       d.push({ kind: "action", label: "‹ remove step ›", indent: 2, run: () => { void confirm(`Remove step "${stepNames[j]}"?`).then((ok) => { if (ok) { draft.deleteIn(["belt", i, "steps", j]); rebuild(); } }); } });
     });
     d.push({ kind: "action", label: "+ add step", indent: 1, run: () => { draft.addIn(["belt", i, "steps"], draft.createNode(defaultStep(uniqueName("step", stepNames)))); open(["belt", i, "steps", steps.length]); rebuild(); } });
-    d.push({ kind: "action", label: "‹ remove belt ›", indent: 1, run: () => { void confirm(`Remove belt "${beltNames[i]}"?`).then((ok) => { if (ok) { draft.deleteIn(["belt", i]); rebuild(); } }); } });
+    // On save the delete is guarded (refused if the belt has work in progress) and, when it goes
+    // through, the belt's finished-run rows are purged + any leftover worktrees cleaned (its event
+    // timeline is kept). The confirm just removes it from the draft; save does the cleanup.
+    d.push({ kind: "action", label: "‹ remove belt ›", indent: 1, run: () => { void confirm(`Remove belt "${beltNames[i]}"? On save its finished-run data is purged (blocked if work is in progress).`).then((ok) => { if (ok) { draft.deleteIn(["belt", i]); rebuild(); } }); } });
   });
   d.push({
     kind: "action",

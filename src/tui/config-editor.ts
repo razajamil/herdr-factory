@@ -20,6 +20,8 @@ import { parseDocument, type Document } from "yaml";
 import { RepoConfigSchema, listConfiguredRepos, loadEnvMap, repoConfigDir, saveEnvValues } from "../config.ts";
 import { SOURCE_DESCRIPTORS } from "../sources/registry.ts";
 import { postReload } from "./api.ts";
+import { applyBeltChangesForRepo } from "../belt-apply.ts";
+import { diffBelts } from "../core/belt-admin.ts";
 import { buildDescriptors, type FieldDesc } from "./config-fields.ts";
 import { BORDER, theme } from "./theme.ts";
 import type { ConfirmFn, TabView } from "./types.ts";
@@ -698,21 +700,65 @@ export function createConfigEditor(renderer: CliRenderer, confirm: ConfirmFn): T
       setStatus(`✗ ${parsed.error.issues.length} validation error(s) — not saved`, theme.status.bad);
       return;
     }
+    // Belt rename/delete cleanup: diff the on-disk config (as loaded) against the draft. A rename
+    // migrates its runs to the new name; a delete purges the belt's data (guarded — blocked if it
+    // still has work). Both need the DB/worktree side handled atomically with the reload, so they
+    // route through applyBeltChangesForRepo instead of the plain reload nudge.
+    const beltsOf = (yamlText: string): Record<string, unknown>[] => {
+      const b = (parseDocument(yamlText).toJS() as { belt?: unknown } | null)?.belt;
+      return Array.isArray(b) ? (b as Record<string, unknown>[]) : [];
+    };
+    const { renames, deletes } = diffBelts(beltsOf(loadedText), beltsOf(draft.toString()));
+
+    const prevText = loadedText;
+    const cfgPath = join(repoConfigDir(loadedRepo), "config.yml");
     const text = draft.toString();
-    writeFileSync(join(repoConfigDir(loadedRepo), "config.yml"), text);
+    writeFileSync(cfgPath, text);
     loadedText = text;
     setStatus("✓ saved", theme.status.good);
-    void postReload().then((outcome) => {
-      if (!loadedRepo || !outcome.reached) return;
-      const failed = outcome.failures.find((f) => f.name === loadedRepo) ?? outcome.failures[0];
-      if (failed) {
-        // The save was schema-valid but the server could NOT load the repo (e.g. a source whose
-        // client can't be constructed) — the repo is NOT ticking; "reloaded" would be a lie.
-        setStatus(`✗ saved, but repo "${failed.name}" failed to load: ${failed.error}`, theme.status.bad);
-      } else {
-        setStatus("✓ saved · server reloaded", theme.status.good);
-      }
-    });
+
+    if (renames.length === 0 && deletes.length === 0) {
+      void postReload().then((outcome) => {
+        if (!loadedRepo || !outcome.reached) return;
+        const failed = outcome.failures.find((f) => f.name === loadedRepo) ?? outcome.failures[0];
+        if (failed) {
+          // The save was schema-valid but the server could NOT load the repo (e.g. a source whose
+          // client can't be constructed) — the repo is NOT ticking; "reloaded" would be a lie.
+          setStatus(`✗ saved, but repo "${failed.name}" failed to load: ${failed.error}`, theme.status.bad);
+        } else {
+          setStatus("✓ saved · server reloaded", theme.status.good);
+        }
+      });
+      return;
+    }
+
+    const repoName = loadedRepo;
+    void applyBeltChangesForRepo(repoName, { renames, deletes })
+      .then((res) => {
+        if (loadedRepo !== repoName) return; // the user navigated away while it ran
+        if (res.blocked.length > 0) {
+          // The delete guard refused: REVERT the file so on-disk config matches the belts still
+          // running, but KEEP the draft (the user's edits survive in memory) so they can tear the
+          // work down and re-save.
+          writeFileSync(cfgPath, prevText);
+          loadedText = prevText;
+          const detail = res.blocked.map((b) => `"${b.belt}" (${b.activeRuns} in progress)`).join(", ");
+          setStatus(`✗ not saved — belt ${detail} still has work; tear it down or let it finish first`, theme.status.bad);
+          return;
+        }
+        if (res.failures.length > 0) {
+          setStatus(`✗ saved, but reload failed: ${res.failures[0]!.error}`, theme.status.bad);
+          return;
+        }
+        const parts: string[] = [];
+        if (res.runsMoved) parts.push(`${res.runsMoved} run(s) migrated`);
+        if (res.runsPurged) parts.push(`${res.runsPurged} run(s) purged`);
+        if (res.worktreesCleaned) parts.push(`${res.worktreesCleaned} worktree(s) cleaned`);
+        setStatus(`✓ saved${parts.length ? ` · ${parts.join(" · ")}` : " · belts updated"} · server reloaded`, theme.status.good);
+      })
+      .catch((e: unknown) => {
+        setStatus(`✗ belt cleanup failed: ${e instanceof Error ? e.message : String(e)}`, theme.status.bad);
+      });
   }
 
   function openRepo(): void {

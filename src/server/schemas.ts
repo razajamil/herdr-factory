@@ -63,6 +63,19 @@ const CaptureAttemptResponse = z
   .object({ ok: z.boolean(), attempts: z.number().optional(), escalated: z.boolean().optional(), message: z.string().optional() })
   .openapi("CaptureAttempt");
 const ResumeResponse = z.object({ ok: z.boolean(), phase: z.string().optional(), message: z.string().optional() }).openapi("Resume");
+// Belt rename/delete cleanup. `ok` is false when a delete was blocked by in-flight work (`blocked`)
+// or the repo failed to reload (`failures`); the caller (TUI) then reverts the config file. Counts
+// report what was applied when it succeeded.
+const BeltApplyResponse = z
+  .object({
+    ok: z.boolean(),
+    runsMoved: z.number(),
+    runsPurged: z.number(),
+    worktreesCleaned: z.number(),
+    blocked: z.array(z.object({ belt: z.string(), activeRuns: z.number() })),
+    failures: z.array(z.object({ name: z.string(), error: z.string() })),
+  })
+  .openapi("BeltApply");
 
 const RunSchema = z
   .object({
@@ -177,6 +190,14 @@ export const CaptureAttemptBody = z.object({ key: z.string(), step: z.string(), 
 export const ClaimBody = z.object({ key: z.string(), belt: z.string().optional() }).openapi("ClaimBody");
 export const TeardownBody = z.object({ key: z.string(), source: z.string().optional() }).openapi("TeardownBody");
 export const ResumeBody = z.object({ key: z.string(), source: z.string().optional() }).openapi("ResumeBody");
+// Belt-set change to apply against a config whose file the caller has ALREADY written: migrate the
+// renamed belts' runs, purge the deleted belts (guarded). Computed by the caller's old→new belt diff.
+export const BeltApplyBody = z
+  .object({
+    renames: z.array(z.object({ from: z.string(), to: z.string() })).default([]),
+    deletes: z.array(z.string()).default([]),
+  })
+  .openapi("BeltApplyBody");
 
 const jsonBody = <T extends z.ZodType>(schema: T) => ({
   body: { required: true, content: { "application/json": { schema } } },
@@ -299,6 +320,18 @@ export const teardownRoute = createRoute({
   request: { params: RepoParam, ...jsonBody(TeardownBody) },
   responses: {
     200: { description: "Torn down", content: { "application/json": { schema: OkResponse } } },
+    ...repoErrors,
+  },
+});
+
+export const beltApplyRoute = createRoute({
+  method: "post",
+  path: "/repos/{repo}/belt-apply",
+  tags: ["repo"],
+  summary: "Apply belt renames/deletes: migrate renamed belts' runs, purge deleted belts (guarded)",
+  request: { params: RepoParam, ...jsonBody(BeltApplyBody) },
+  responses: {
+    200: { description: "Applied (or blocked/failed — see the body)", content: { "application/json": { schema: BeltApplyResponse } } },
     ...repoErrors,
   },
 });

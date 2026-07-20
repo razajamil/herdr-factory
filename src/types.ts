@@ -75,6 +75,8 @@ export type EventType =
   | "merged"
   | "closed"
   | "torn_down"
+  | "belt_reassigned" // a belt was renamed; the run's belt name was migrated old → new
+  | "belt_deleted" // a belt with no in-flight work was deleted; its run rows were purged (events kept)
   | "attention"
   | "resumed"
   | "error";

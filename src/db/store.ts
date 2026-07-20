@@ -395,6 +395,66 @@ export class Store {
     return row ? toRun(row) : undefined;
   }
 
+  /** Active (in-flight) runs on a belt — the belt-delete guard's input. "In progress" here is any
+   *  run with ended_at IS NULL, INCLUDING parked attention/waiting_for_human runs (they still hold
+   *  a worktree and are mid-flight), not just the working ones countOccupying counts. */
+  activeRunsForBelt(repo: string, belt: string): Run[] {
+    const rows = this.db
+      .prepare(`${RUN_SELECT} WHERE r.repo = ? AND r.belt = ? AND r.ended_at IS NULL ORDER BY r.id`)
+      .all(repo, belt) as unknown as RunRow[];
+    return rows.map(toRun);
+  }
+
+  /** Ended runs on a belt that still show a herdr workspace / checkout dir — the defensive
+   *  worktree-cleanup input at belt deletion. Teardown normally reaps these at run end, so a hit
+   *  here is a leak (a teardown that partially failed); belt deletion clears it as a backstop. */
+  endedRunsForBelt(repo: string, belt: string): Run[] {
+    const rows = this.db
+      .prepare(
+        `${RUN_SELECT} WHERE r.repo = ? AND r.belt = ? AND r.ended_at IS NOT NULL
+         AND (r.workspace_id IS NOT NULL OR r.worktree_path IS NOT NULL) ORDER BY r.id`,
+      )
+      .all(repo, belt) as unknown as RunRow[];
+    return rows.map(toRun);
+  }
+
+  /** Move every run (active AND historical) from one belt name to another — the belt-rename
+   *  migration. runs.belt is otherwise written only at createRun; this is its one later mutation.
+   *  Returns how many rows moved (0 ⇒ already migrated / no such belt — idempotent). The caller
+   *  runs this under the repo tick lock and reloads Deps atomically after, so no reconcile pass
+   *  ever sees a run whose new belt name isn't yet configured. */
+  reassignBelt(repo: string, from: string, to: string): number {
+    const info = this.db
+      .prepare("UPDATE runs SET belt = ?, updated_at = ? WHERE repo = ? AND belt = ?")
+      .run(to, this.now(), repo, from);
+    const moved = Number(info.changes);
+    telemetryEvent("store.belt.reassign", { repo, "belt.from": from, "belt.to": to, "runs.moved": moved });
+    return moved;
+  }
+
+  /** Purge a belt's run rows and every run-referencing child row, KEEPING the events timeline.
+   *  events.run_id is REFERENCES runs(id) and foreign_keys is ON, so the audit rows are DETACHED
+   *  (run_id → NULL, exempt from the FK) rather than deleted — their repo/ticket_key/ts/type/detail
+   *  survive for audit. Every other child table's rows ARE deleted (some carry the FK; run_steps
+   *  doesn't but is cleaned anyway) so no orphaned outbox intent lingers to retry against a deleted
+   *  run. Caller MUST have verified the belt has no active runs. Returns the run count purged. */
+  purgeBeltRuns(repo: string, belt: string): number {
+    return tx(this.db, () => {
+      const ids = (this.db.prepare("SELECT id FROM runs WHERE repo = ? AND belt = ?").all(repo, belt) as { id: number }[]).map((r) => r.id);
+      if (ids.length === 0) return 0;
+      const ph = ids.map(() => "?").join(",");
+      // Detach (keep) the timeline; the FK on events(run_id) permits NULL, so the rows survive.
+      this.db.prepare(`UPDATE events SET run_id = NULL WHERE run_id IN (${ph})`).run(...ids);
+      // Delete every run-scoped child row. Table names are a fixed internal list (never user input).
+      for (const table of ["run_steps", "run_products", "guard_counters", "transition_outbox", "evidence_uploads", "human_questions", "pending_signals"]) {
+        this.db.prepare(`DELETE FROM ${table} WHERE run_id IN (${ph})`).run(...ids);
+      }
+      this.db.prepare(`DELETE FROM runs WHERE id IN (${ph})`).run(...ids);
+      telemetryEvent("store.belt.purge", { repo, belt, "runs.purged": ids.length });
+      return ids.length;
+    });
+  }
+
   createRun(input: {
     repo: string;
     workSource: string;

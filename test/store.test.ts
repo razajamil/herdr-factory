@@ -30,6 +30,45 @@ describe("Store — guard_counters (generalized capped-guard storage)", () => {
   });
 });
 
+describe("Store — belt admin (rename migration + delete purge)", () => {
+  it("activeRunsForBelt counts only non-ended runs; reassignBelt moves active + ended", () => {
+    const { store } = makeStore();
+    const a = store.createRun({ repo: "r", workSource: "jira", belt: "old", ticketKey: "K-1" });
+    const e = store.createRun({ repo: "r", workSource: "jira", belt: "old", ticketKey: "K-2" });
+    store.endRun(e.id, "merged");
+    expect(store.activeRunsForBelt("r", "old")).toHaveLength(1); // only the active one
+
+    expect(store.reassignBelt("r", "old", "new")).toBe(2); // BOTH move (active + historical)
+    expect(store.getRun(a.id)!.belt).toBe("new");
+    expect(store.getRun(e.id)!.belt).toBe("new");
+    expect(store.reassignBelt("r", "old", "new")).toBe(0); // idempotent
+  });
+
+  it("purgeBeltRuns deletes runs + child rows but KEEPS events (detached, run_id → NULL)", () => {
+    const { store, db } = makeStore();
+    const run = store.createRun({ repo: "r", workSource: "jira", belt: "ship", ticketKey: "K-1" });
+    store.upsertRunStep(run.id, "work", { paneId: "p" });
+    store.bumpGuardCounter(run.id, "work", "bounce_cap");
+    store.updateRun(run.id, { prNumber: 7 }); // creates a run_products row
+    store.enqueueTransition({ runId: run.id, repo: "r", workSource: "jira", ticketKey: "K-1", toState: "in_development" });
+    store.createHumanQuestion({ runId: run.id, repo: "r", workSource: "jira", ticketKey: "K-1", question: "?" });
+    store.recordEvent({ runId: run.id, repo: "r", ticketKey: "K-1", type: "claimed" });
+    store.endRun(run.id, "merged");
+
+    const purged = store.purgeBeltRuns("r", "ship");
+    expect(purged).toBe(1);
+    expect(store.getRun(run.id)).toBeUndefined();
+    const childCount = (t: string) => (db.prepare(`SELECT COUNT(*) AS n FROM ${t} WHERE run_id = ?`).get(run.id) as { n: number }).n;
+    for (const t of ["run_steps", "run_products", "guard_counters", "transition_outbox", "human_questions", "pending_signals"]) {
+      expect(childCount(t)).toBe(0);
+    }
+    // events survive, detached from the deleted run
+    const evs = db.prepare("SELECT run_id, type FROM events WHERE repo = ? AND ticket_key = ?").all("r", "K-1") as { run_id: number | null; type: string }[];
+    expect(evs.map((e) => e.type)).toContain("claimed");
+    expect(evs.every((e) => e.run_id === null)).toBe(true);
+  });
+});
+
 describe("Store", () => {
   it("creates a run in claiming and counts it active", () => {
     const { store } = makeStore();

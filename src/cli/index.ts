@@ -693,9 +693,12 @@ program
   .description("hot-reload config: the running server re-reads every repo's config + re-discovers repos (no restart)")
   .action(cliAction("reload", async () => {
     try {
-      const data = await serverFetch("POST", "/reload");
-      const repos = (data as { repos?: string[] }).repos ?? [];
+      const data = await serverFetch("POST", "/reload") as { repos?: string[]; failures?: { name: string; error: string }[] };
+      const repos = data.repos ?? [];
       console.log(`reloaded — serving: ${repos.join(", ") || "(no repos)"}`);
+      // A repo can fail to reload — e.g. the belt-removal guard refusing to drop a belt that still
+      // has work in progress (it keeps running the old config). Surface it; it isn't a clean reload.
+      for (const f of data.failures ?? []) console.log(`  ⚠ ${f.name}: ${f.error}`);
     } catch (e) {
       if (e instanceof NoServerError) {
         console.log("no server running — config is read fresh on the next `serve` start (try `herdr-factory start`)");

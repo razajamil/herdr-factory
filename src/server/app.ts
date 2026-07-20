@@ -17,6 +17,7 @@ import { getAuthFailure } from "../auth/gate.ts";
 import { resolveActiveRun, resolveBeltName } from "../resolve.ts";
 import type { Deps } from "../core/deps.ts";
 import {
+  beltApplyRoute,
   bounceRoute,
   captureAttemptRoute,
   claimRoute,
@@ -33,6 +34,7 @@ import {
   tickRoute,
   timelineRoute,
 } from "./schemas.ts";
+import type { BeltChanges, BeltChangesResult } from "../core/belt-admin.ts";
 import { runHandler } from "./effect.ts";
 
 /** A repo the resident server is currently serving: its injected Deps + tick-loop bookkeeping. */
@@ -57,6 +59,9 @@ export interface HealthInfo {
 export interface ServerContext {
   health(): HealthInfo;
   reload(): Promise<{ repos: string[]; failures: { name: string; error: string }[] }>;
+  /** Apply a belt-set change (rename/delete cleanup) for one repo whose config file the caller has
+   *  already written — atomically under the repo tick lock, then reload that repo's Deps. */
+  applyBeltChanges(repo: string, changes: BeltChanges): Promise<BeltChangesResult & { ok: boolean; failures: { name: string; error: string }[] }>;
   requestShutdown(why: string): void;
   getRepo(name: string): RepoRuntime | undefined;
   knownRepos(): string[];
@@ -360,6 +365,14 @@ export function createApp(ctx: ServerContext): OpenAPIHono {
     if (!rt) return c.json({ error: notConfigured(repo) }, 404);
     await teardownTicket(rt.deps, key, source);
     return c.json({ ok: true }, 200);
+  });
+
+  app.openapi(beltApplyRoute, async (c) => {
+    const { repo } = c.req.valid("param");
+    const changes = c.req.valid("json");
+    const rt = ctx.getRepo(repo);
+    if (!rt) return c.json({ error: notConfigured(repo) }, 404);
+    return c.json(await ctx.applyBeltChanges(repo, changes), 200);
   });
 
   app.openapi(statusRoute, async (c) => {

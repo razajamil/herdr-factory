@@ -659,8 +659,10 @@ pile of runs waiting on humans must not starve the belt of new claims. History i
 **event types:** `claimed · transition · worktree_created · step_spawned · step_done ·
 layout_wait_retry · bounced · signal_queued · signal_rejected ·
 capture_attempt · evidence_uploaded · evidence_upload_failed · stale · human_question · human_reply ·
-focus_applied · pr_opened · resolver_woken · merged · closed · torn_down · attention · resumed · error`
-(plus legacy `worker_*` / `review_*` kept for old-run history).
+focus_applied · pr_opened · resolver_woken · merged · closed · torn_down · belt_reassigned ·
+belt_deleted · attention · resumed · error`
+(plus legacy `worker_*` / `review_*` kept for old-run history). `belt_reassigned` / `belt_deleted`
+are repo-scoped (run-id-less) audit events from the belt rename/delete admin (§9).
 
 ---
 
@@ -1087,6 +1089,45 @@ write-back keeps retrying on later ticks *after the run has ended* (this, plus t
 claim guard on pending write-backs, is what stops a torn-down item whose status never moved
 from being claimed again).
 
+The herdr-first, verify-and-fall-back worktree removal (steps 1–5) is factored into an exported
+`removeRunWorktree(deps, run)` so it lives in exactly one place — teardown calls it, and so does
+belt **deletion** (below) to reap a leaked worktree.
+
+### Belt rename / delete cleanup (`core/belt-admin.ts`)
+
+A belt's identity is its `name`, recorded on each run (`runs.belt`, written once at claim). Editing
+that name — or removing the belt — would otherwise orphan its in-flight runs (their belt no longer
+resolves → parked `belt_missing`). The admin makes both edits clean:
+
+- **rename** → `reassignBelt(repo, from, to)` migrates **every** run (active *and* historical) onto
+  the new name. runs.belt's only mutation after claim.
+- **delete** → **guarded**: refused (`BeltHasActiveRunsError`) while the belt has any non-ended run
+  (including parked `attention`/`waiting_for_human` — they hold a worktree). Once idle,
+  `removeRunWorktree` reaps any leaked worktree for its ended runs, then `purgeBeltRuns` deletes the
+  belt's run rows and every run-referencing child row (`run_steps` / `run_products` /
+  `guard_counters` / `transition_outbox` / `evidence_uploads` / `human_questions` /
+  `pending_signals` — so no orphaned outbox intent survives to retry). The **events timeline is
+  kept**: with `PRAGMA foreign_keys = ON`, `events.run_id` (which `REFERENCES runs(id)`) is
+  **detached to NULL** rather than deleted, so the audit rows survive the runs' deletion.
+
+`applyBeltChanges(deps, {renames, deletes})` is **guard-first, all-or-nothing**: if any deleted belt
+is busy it applies nothing and returns the blockers, so a rename never migrates runs a caller is
+about to revert. It's driven two ways:
+
+- **TUI save** — the config editor diffs the old→new belt set (`diffBelts`; a rename is inferred
+  only when exactly one belt name disappears and one appears with an identical body, else it's a
+  safe delete+add). It writes `config.yml`, then routes the change through `POST
+  /repos/:repo/belt-apply`, which runs `applyBeltChanges` + the Deps reload **atomically under the
+  repo tick lock** (so no reconcile pass sees a run whose renamed belt isn't yet in the swapped-in
+  config) — falling back to an in-process apply when no server is up (`viaServerOrLocal`). A blocked
+  delete comes back → the editor **reverts the file** (keeping the in-memory draft) with a clear
+  message.
+- **Hot reload** (`loadRepos`, a hand-edit + `herdr-factory reload`) diffs each repo's old→new belt
+  set: a removed belt with in-flight work **refuses that repo's reload** (the old config keeps
+  running); an idle removed belt is purged. A **cold** server start has no prior config to diff
+  against → lenient (a belt already gone at boot just parks its orphaned runs reactively — the
+  machine-wide daemon must never refuse to boot).
+
 ---
 
 ## 10. Config
@@ -1145,7 +1186,9 @@ from being claimed again).
     - `belt` — **required, ≥1** (`.strict()` members — unknown keys, including the removed
       `belt_type` / `agents`, are parse errors). Common fields:
       - `name` (unique) · `source` (must reference a `work_sources` name) · `priority` (optional,
-        default `100`; **lower = matched first**; ties keep config order — stable sort).
+        default `100`; **lower = matched first**; ties keep config order — stable sort). The `name`
+        is the belt's identity (recorded on each run); renaming or removing it is cleaned up by the
+        belt admin (§9) — a rename migrates the runs, a delete is guarded + purges.
       - `label` — the belt's pickup label, threaded into `listEligible`/`transition`/`health`.
         **Required** (no default) for a belt on a label-driven source (`descriptor.pickupLabel` set:
         jira, github_issues); **forbidden** for one without (local_markdown). Two belts sharing the
@@ -1407,7 +1450,16 @@ Hard-won from the bash prototype — encode as types/tests/asserts:
   then if the workspace still exists `herdr workspace close`, then `rmrf <worktreePath>` +
   `git worktree prune` + `git branch -D <branch>` (in that order — branch delete last, after
   the worktree is deregistered). `worktree remove` can exit 0 yet leak the workspace+dir, so
-  the fallbacks are active, not defensive-only.
+  the fallbacks are active, not defensive-only. This sequence lives once in
+  `removeRunWorktree` (teardown + belt deletion share it).
+- **Belt rename/delete is clean, not orphaning** (§9). A rename migrates every run (active +
+  historical) onto the new belt name; a delete is refused while the belt has in-flight work and
+  otherwise purges the belt's run rows + child rows while **keeping the events timeline** (detach
+  `events.run_id` to NULL — never delete an event row, and never delete `runs` while a child row
+  still `REFERENCES` it under `foreign_keys = ON`). The apply is **guard-first, all-or-nothing** and
+  runs atomically under the repo tick lock with the Deps reload, so no reconcile pass observes a run
+  whose renamed belt isn't yet configured. A hot reload enforces the same delete guard; a cold start
+  stays lenient (never refuse to boot).
 - Jira transition match is **case-insensitive** on `.to.name`; no-op if already
   in target.
 - **Work-source parity:** `WorkSource.transition` returns a `TransitionResult` — `noop` for an

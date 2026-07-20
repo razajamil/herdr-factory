@@ -578,6 +578,17 @@ re-claiming a previously-merged item gets a fresh branch and PR. Optional `defau
 `layout_matching` pick which `layouts` entry (below) the factory builds into this belt's worktrees —
 see [Layouts](#layouts).
 
+**Renaming or deleting a belt** cleans up after itself. A belt's `name` is its identity (each run
+records the belt it's on), so the TUI config editor handles the two edits specially on save:
+**renaming** a belt migrates all of its runs — in-flight and historical — onto the new name (so
+nothing is orphaned and the dashboard/timeline stay coherent); **deleting** a belt is **refused
+while it has work in progress** (an error tells you which runs, and the save is reverted so nothing
+is lost), and once it's idle the delete purges the belt's run records and cleans up any leftover
+worktrees — its event timeline is kept for audit. Editing `config.yml` by hand and running
+`herdr-factory reload` enforces the same delete guard (a reload that would drop a belt with live
+work is refused, leaving the old config running); rename **via the TUI** to migrate a busy belt's
+runs.
+
 **`steps` (≥ 1)** — the ordered pipeline. Each step references a shipped primitive by `type`:
 
 ```yaml

@@ -95,4 +95,31 @@ describe("dashboard server payloads", () => {
     // The inactive belt's source is never polled, so its items never reach the dashboard.
     expect(pausedEligible).not.toHaveBeenCalled();
   });
+
+  it("belt-apply route validates the body and delegates to ctx.applyBeltChanges", async () => {
+    const applyBeltChanges = vi.fn(async () => ({ ok: true, runsMoved: 3, runsPurged: 1, worktreesCleaned: 0, blocked: [], failures: [] }));
+    const context = {
+      getRepo: (name: string) => (name === "demo" ? ({} as RepoRuntime) : undefined),
+      knownRepos: () => ["demo"],
+      applyBeltChanges,
+    } as unknown as ServerContext;
+    const app = createApp(context);
+
+    const res = await app.request("/repos/demo/belt-apply", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ renames: [{ from: "old", to: "new" }], deletes: ["gone"] }),
+    });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ ok: true, runsMoved: 3, runsPurged: 1, worktreesCleaned: 0, blocked: [], failures: [] });
+    expect(applyBeltChanges).toHaveBeenCalledWith("demo", { renames: [{ from: "old", to: "new" }], deletes: ["gone"] });
+
+    // unknown repo → 404, never touches the ctx method
+    const missing = await app.request("/repos/nope/belt-apply", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ renames: [], deletes: [] }),
+    });
+    expect(missing.status).toBe(404);
+  });
 });
