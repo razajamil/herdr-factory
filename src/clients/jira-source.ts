@@ -40,6 +40,10 @@ export interface JiraSourceCfg {
    *  PR is merged and before the worktree is torn down); when undefined, the terminal stays unmapped
    *  (Jira-silent, no network) exactly as before. `aborted` is never mapped regardless. */
   statusDone?: string;
+  /** EXTRA named statuses (`status.<key>: <Jira status name>`) beyond the canonical mapping, that a
+   *  belt effect can target by key (INV-13). A `statusOverride` reaching `transition` is one of these
+   *  keys (validated at config-load); we resolve it to the Jira status name here. */
+  statusExtra: Record<string, string>;
 }
 
 function bodyText(node: unknown): string {
@@ -147,8 +151,11 @@ export class JiraSource implements WorkSource {
     }
   }
 
-  async transition(key: string, to: WorkState): Promise<TransitionResult> {
-    const status = this.statusFor(to);
+  async transition(key: string, to: WorkState, _pickupLabel?: string, _ctx?: unknown, statusOverride?: string): Promise<TransitionResult> {
+    // A belt effect's custom status wins over the canonical mapping for `to` — the engine still
+    // ranks/records `to`, but Jira moves to the effect's named status. The override key was
+    // validated against statusExtra at config-load, so an unknown one here is a bug, not user error.
+    const status = statusOverride ? this.cfg.statusExtra[statusOverride] : this.statusFor(to);
     if (!status) return { kind: "noop" }; // unmapped → no-op, and crucially NO network call (teardown parity)
     const moved = await this.jira.transition(key, status);
     return moved ? { kind: "applied" } : { kind: "noop" };

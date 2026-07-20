@@ -27,6 +27,7 @@ export const localMarkdownDescriptor: SourceDescriptor<LocalMarkdownSourceCfg> =
   create(ctx) {
     return new LocalMarkdownSource(ctx.cfg.folder, ctx.store, ctx.repoName, ctx.sourceName, ctx.log);
   },
+  customStatusKeys: () => [], // internal-ledger: canonical states only (custom would need a work_items CHECK migration)
   secrets: [],
   tui: {
     defaultBlock: () => ({ folder: "" }),

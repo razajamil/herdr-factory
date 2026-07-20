@@ -515,6 +515,52 @@ const MIGRATIONS: { version: number; sql: string }[] = [
     // release baseline, don't reopen on release alone".
     sql: `ALTER TABLE work_items ADD COLUMN last_release TEXT;`,
   },
+  {
+    version: 27,
+    // transition_outbox gains `to_status`: the SOURCE-NATIVE status key a belt-configured effect
+    // delivers (a widened jira `status.<key>` / github `state_labels.<key>` entry), '' for a plain
+    // canonical transition. `to_state` STAYS the canonical anchor (its CHECK is untouched — the
+    // engine's WorkState vocabulary is unchanged), giving the intent its monotonicity rank; the
+    // source resolves the native status from `to_status` when it's set, else maps `to_state`. The
+    // uniqueness key widens from (run_id, to_state) to (run_id, to_state, to_status) so a custom
+    // status (e.g. QA, anchored at in_review) and a later canonical in_review coexist as distinct
+    // intents. SQLite can't ALTER a UNIQUE constraint, so the table is rebuilt (copy → drop →
+    // rename), preserving every in-flight intent (expand-only; the whole version is one transaction).
+    // `to_status` NOT NULL DEFAULT '' backfills existing rows and keeps NULLs out of the unique key
+    // (SQLite treats NULLs as distinct, which would break canonical enqueue idempotence).
+    sql: `
+      CREATE TABLE transition_outbox_v27 (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        run_id INTEGER NOT NULL REFERENCES runs(id),
+        repo TEXT NOT NULL,
+        work_source TEXT NOT NULL,
+        ticket_key TEXT NOT NULL,
+        to_state TEXT NOT NULL
+          CHECK (to_state IN ('todo','in_development','in_review','merged','aborted','done')),
+        to_status TEXT NOT NULL DEFAULT '',
+        attempts INTEGER NOT NULL DEFAULT 0,
+        next_attempt_at INTEGER NOT NULL,
+        last_error TEXT,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        delivered_at INTEGER,
+        stale_at INTEGER,
+        stale_handled_at INTEGER,
+        UNIQUE(run_id, to_state, to_status)
+      );
+      INSERT INTO transition_outbox_v27
+        (id, run_id, repo, work_source, ticket_key, to_state, to_status, attempts, next_attempt_at,
+         last_error, created_at, updated_at, delivered_at, stale_at, stale_handled_at)
+        SELECT id, run_id, repo, work_source, ticket_key, to_state, '', attempts, next_attempt_at,
+               last_error, created_at, updated_at, delivered_at, stale_at, stale_handled_at
+          FROM transition_outbox;
+      DROP TABLE transition_outbox;
+      ALTER TABLE transition_outbox_v27 RENAME TO transition_outbox;
+      CREATE INDEX idx_transition_outbox_pending ON transition_outbox(repo, next_attempt_at) WHERE delivered_at IS NULL;
+      CREATE INDEX idx_transition_outbox_key ON transition_outbox(repo, work_source, ticket_key) WHERE delivered_at IS NULL;
+      CREATE INDEX idx_transition_outbox_stale ON transition_outbox(run_id) WHERE stale_at IS NOT NULL AND stale_handled_at IS NULL;
+    `,
+  },
 ];
 
 /** Apply pending migrations in a transaction. Idempotent. */

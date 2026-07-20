@@ -12,6 +12,7 @@ const CFG: JiraSourceCfg = {
   statusTodo: "To Do",
   statusInDev: "In development",
   statusReview: "Ready for Code Review",
+  statusExtra: {},
 };
 // The belt's pickup label — a per-belt arg to listEligible now, not source config.
 const LABEL = "agent";

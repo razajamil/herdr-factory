@@ -157,6 +157,7 @@ interface TransitionIntentRow {
   work_source: string;
   ticket_key: string;
   to_state: string;
+  to_status: string;
   attempts: number;
   next_attempt_at: number;
   last_error: string | null;
@@ -813,6 +814,7 @@ export class Store {
       workSource: r.work_source,
       ticketKey: r.ticket_key,
       toState: r.to_state as WorkState,
+      toStatus: r.to_status,
       attempts: r.attempts,
       nextAttemptAt: r.next_attempt_at,
       lastError: r.last_error,
@@ -829,25 +831,44 @@ export class Store {
     return row ? this.toTransitionIntent(row) : undefined;
   }
 
-  /** Record the INTENT to move a work item to `toState`. Idempotent per (run, state): re-enqueueing
-   *  a delivered intent re-opens it for delivery (the transition itself is idempotent at the
-   *  source), re-enqueueing a pending one just makes it due now. */
-  enqueueTransition(input: { runId: number; repo: string; workSource: string; ticketKey: string; toState: WorkState }): TransitionIntent {
+  /** Record the INTENT to move a work item to `toState` (with an optional source-native `toStatus`
+   *  key from a belt effect; '' = canonical mapping). Idempotent per (run, state, status):
+   *  re-enqueueing a delivered intent re-opens it for delivery (the transition itself is idempotent
+   *  at the source), re-enqueueing a pending one just makes it due now. A custom status and a
+   *  canonical transition at the same anchor are DISTINCT intents (they differ in `toStatus`). */
+  enqueueTransition(input: {
+    runId: number;
+    repo: string;
+    workSource: string;
+    ticketKey: string;
+    toState: WorkState;
+    toStatus?: string;
+  }): TransitionIntent {
     const t = this.now();
+    const toStatus = input.toStatus ?? "";
     this.db
       .prepare(
-        `INSERT INTO transition_outbox (run_id, repo, work_source, ticket_key, to_state, attempts, next_attempt_at, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?)
-         ON CONFLICT(run_id, to_state) DO UPDATE SET next_attempt_at = excluded.next_attempt_at, delivered_at = NULL,
+        `INSERT INTO transition_outbox (run_id, repo, work_source, ticket_key, to_state, to_status, attempts, next_attempt_at, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
+         ON CONFLICT(run_id, to_state, to_status) DO UPDATE SET next_attempt_at = excluded.next_attempt_at, delivered_at = NULL,
            stale_at = NULL, stale_handled_at = NULL, updated_at = excluded.updated_at`,
       )
-      .run(input.runId, input.repo, input.workSource, input.ticketKey, input.toState, t, t, t);
+      .run(input.runId, input.repo, input.workSource, input.ticketKey, input.toState, toStatus, t, t, t);
     const row = this.db
-      .prepare("SELECT * FROM transition_outbox WHERE run_id = ? AND to_state = ?")
-      .get(input.runId, input.toState) as TransitionIntentRow | undefined;
+      .prepare("SELECT * FROM transition_outbox WHERE run_id = ? AND to_state = ? AND to_status = ?")
+      .get(input.runId, input.toState, toStatus) as TransitionIntentRow | undefined;
     if (!row) throw new Error("enqueueTransition: row vanished after upsert");
-    telemetryEvent("store.transition.enqueue", { repo: input.repo, "run.id": input.runId, "work.key": input.ticketKey, "work.state": input.toState });
+    telemetryEvent("store.transition.enqueue", { repo: input.repo, "run.id": input.runId, "work.key": input.ticketKey, "work.state": input.toState, "work.status": toStatus || undefined });
     return this.toTransitionIntent(row);
+  }
+
+  /** Every transition target ENQUEUED for a run (delivered or pending), for effect monotonicity:
+   *  the reconciler ranks these to refuse an effect that would walk the source backward. */
+  transitionTargetsForRun(runId: number): { toState: WorkState; toStatus: string }[] {
+    const rows = this.db
+      .prepare("SELECT to_state, to_status FROM transition_outbox WHERE run_id = ?")
+      .all(runId) as { to_state: string; to_status: string }[];
+    return rows.map((r) => ({ toState: r.to_state as WorkState, toStatus: r.to_status }));
   }
 
   /** Undelivered intents due for a delivery attempt, ordered (run, id) so a run's transitions

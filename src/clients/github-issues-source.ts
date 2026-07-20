@@ -38,6 +38,10 @@ import { classifyGone, GithubIssuesClient, labelNames, type GhComment, type GhIs
 export interface GithubIssuesSourceCfg {
   repo: string; // "owner/name" the issues live in
   stateLabels: { inDevelopment: string; inReview: string; aborted: string };
+  /** EXTRA named state labels (`state_labels.<key>: <label>`) beyond the canonical three, that a
+   *  belt effect can target by key (INV-13). A `statusOverride` reaching `transition` is one of
+   *  these keys (validated at config-load); it swaps in the label like an in-flight state change. */
+  stateLabelsExtra: Record<string, string>;
   closeOn: { merged: boolean; done: boolean; aborted: boolean };
   typeLabels: Record<string, string>; // issue label (lowercased) -> Ticket.type
   defaultType: string;
@@ -144,7 +148,13 @@ export class GithubIssuesSource implements WorkSource {
   }
 
   private allStateLabels(): string[] {
-    return [this.cfg.stateLabels.inDevelopment, this.cfg.stateLabels.inReview, this.cfg.stateLabels.aborted];
+    return [this.cfg.stateLabels.inDevelopment, this.cfg.stateLabels.inReview, this.cfg.stateLabels.aborted, ...Object.values(this.cfg.stateLabelsExtra)];
+  }
+
+  /** The in-flight state labels (an item wearing one is mid-run): the canonical dev/review markers
+   *  plus every belt-effect custom label. Gates listEligible (belt-and-braces over run dedup). */
+  private inFlightStateLabels(): string[] {
+    return [this.cfg.stateLabels.inDevelopment, this.cfg.stateLabels.inReview, ...Object.values(this.cfg.stateLabelsExtra)];
   }
 
   /** Ticket.type: GitHub's native issue type when present, else the first type_labels hit over
@@ -186,7 +196,7 @@ export class GithubIssuesSource implements WorkSource {
     // GitHub label names are case-insensitively unique and the API returns the repo's CANONICAL
     // casing — every membership check here (and in transition) must fold case, or a config that
     // spells "herdr" against a repo label "Herdr" silently breaks the guards.
-    const inFlight = new Set([this.cfg.stateLabels.inDevelopment, this.cfg.stateLabels.inReview].map((l) => l.toLowerCase()));
+    const inFlight = new Set(this.inFlightStateLabels().map((l) => l.toLowerCase()));
     for (let page = 1; page <= this.cfg.maxPages; page++) {
       const batch = await this.gh.listOpenIssuesByLabel(pickupLabel, page);
       let kept = 0;
@@ -228,8 +238,10 @@ export class GithubIssuesSource implements WorkSource {
     this.ensuredLabels.add(name);
   }
 
-  async transition(key: string, to: WorkState, pickupLabel?: string): Promise<TransitionResult> {
-    if (!this.spec.mappedStates.includes(to)) return { kind: "noop" }; // unmapped (todo) → ZERO network (INV-3)
+  async transition(key: string, to: WorkState, pickupLabel?: string, _ctx?: unknown, statusOverride?: string): Promise<TransitionResult> {
+    // A canonical `to` that isn't mapped costs ZERO network (INV-3); a belt-effect custom status
+    // (statusOverride) is always a real, validated label swap, so it bypasses the mapped-state gate.
+    if (!statusOverride && !this.spec.mappedStates.includes(to)) return { kind: "noop" };
     const n = Number(key);
     try {
       // Idempotent GET → diff → apply. The GET is also the stale probe: 301/410/404 end here.
@@ -241,6 +253,24 @@ export class GithubIssuesSource implements WorkSource {
       const has = (label: string) => have.has(label.toLowerCase());
       const want = this.stateLabelFor(to);
       let applied = false;
+
+      if (statusOverride) {
+        // A belt-effect custom status: a mid-flight state-label swap (like in_development/in_review),
+        // but it never consumes the trigger and never closes the issue. Validated at config-load, so
+        // the label exists in stateLabelsExtra. A closed issue here is a human cancel (no PR yet at a
+        // pre-PR custom status → no Fixes-#n auto-close to race) → stale/park.
+        if (issue.state === "closed") return { kind: "stale", detail: `issue #${n} was closed (${issue.state_reason ?? "no reason"}) before ${statusOverride}` };
+        const wantCustom = this.cfg.stateLabelsExtra[statusOverride]!;
+        await this.ensureLabel(wantCustom);
+        if (!has(wantCustom)) {
+          await this.gh.addLabels(n, [wantCustom]);
+          applied = true;
+        }
+        for (const l of this.allStateLabels()) {
+          if (l.toLowerCase() !== wantCustom.toLowerCase() && has(l)) applied = (await this.gh.removeLabel(n, l)) || applied;
+        }
+        return { kind: applied ? "applied" : "noop" };
+      }
 
       if (to === "in_development" || to === "in_review") {
         if (issue.state === "closed") {

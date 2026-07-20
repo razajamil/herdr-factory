@@ -68,6 +68,7 @@ export interface FakeGithub {
 export const DEFAULT_CFG: GithubIssuesSourceCfg = {
   repo: "acme/tracker",
   stateLabels: { inDevelopment: "herdr:in-development", inReview: "herdr:in-review", aborted: "herdr:aborted" },
+  stateLabelsExtra: {},
   closeOn: { merged: true, done: true, aborted: false },
   typeLabels: { bug: "Bug", defect: "Bug", chore: "Chore", task: "Chore", enhancement: "Feature" },
   defaultType: "Feature",

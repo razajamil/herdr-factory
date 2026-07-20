@@ -47,6 +47,33 @@ export function outcomeToWorkState(outcome: Outcome): "merged" | "aborted" | "do
   }
 }
 
+/** Rank of a canonical WorkState in the forward lifecycle order — the basis for effect MONOTONICITY
+ *  (an effect never walks the source backward). The three terminals share the top rank (a run has at
+ *  most one). A belt effect targeting a custom SOURCE-NATIVE status sits just BEFORE its declared
+ *  anchor stage: `workStateRank(anchor) - 0.5` (see `effectRank`) — so a QA column anchored at
+ *  `in_review` ranks between `in_development` (1) and `in_review` (2). */
+export function workStateRank(s: WorkState): number {
+  switch (s) {
+    case "todo":
+      return 0;
+    case "in_development":
+      return 1;
+    case "in_review":
+      return 2;
+    case "merged":
+    case "done":
+    case "aborted":
+      return 3;
+  }
+}
+
+/** The monotonicity rank of a transition target: its canonical anchor's rank, minus 0.5 when it
+ *  carries a custom source-native status (that status precedes the anchor stage). Computed both for
+ *  a belt effect and for an already-enqueued outbox row (`{ to: toState, status: toStatus||undefined }`). */
+export function effectRank(target: { to: WorkState; status?: string }): number {
+  return workStateRank(target.to) - (target.status ? 0.5 : 0);
+}
+
 export type EventType =
   | "claimed"
   | "transition"
@@ -227,6 +254,11 @@ export interface TransitionIntent {
   workSource: string;
   ticketKey: string;
   toState: WorkState;
+  /** The source-native status key delivered for this intent (a belt-effect custom status); `""`
+   *  for a plain canonical transition (deliver the source's mapping for `toState`). Part of the
+   *  outbox uniqueness key `(run, toState, toStatus)` so a custom status and a canonical transition
+   *  at the same anchor coexist. */
+  toStatus: string;
   attempts: number;
   nextAttemptAt: number;
   lastError: string | null;
@@ -477,6 +509,33 @@ export interface EffectSpec {
   trigger: EffectTrigger;
   to: WorkState;
 }
+
+/** A BELT-CONFIGURED effect (the optional per-belt `effects:` block). It exposes the same three
+ *  declared trigger families as the engine defaults — entering a step, producing a product, tearing
+ *  down with an outcome — to config, so task progression onto source statuses becomes the user's.
+ *  A belt with no effects behaves exactly as the engine defaults. Fired FORWARD-ONLY through the
+ *  transition outbox (never fire-and-forget), like every other transition. */
+export type BeltEffectTrigger =
+  | { on: "enter"; step: string } // entering a named belt step (the first step's is belt_start)
+  | { on: "produce"; product: ProductType } // a step produces a durable product (evidence | pull_request)
+  | { on: "teardown"; outcome: Outcome }; // teardown reaches an outcome
+
+/** A resolved belt effect. `to` is the canonical ANCHOR: the outbox `to_state` (CHECK-safe) and the
+ *  monotonicity rank base. `status` is an OPTIONAL source-native status key — a widened jira
+ *  `status.<key>` / github_issues `state_labels.<key>` entry — delivered instead of the canonical
+ *  mapping for `to`. undefined `status` ⇒ a plain canonical transition to `to` (works on every
+ *  source); a custom `status` is rejected at config-load for internal-ledger sources
+ *  (local_markdown / sentry — those would need a work_items CHECK migration, out of scope for v1). */
+export interface BeltEffect {
+  trigger: BeltEffectTrigger;
+  to: WorkState;
+  status?: string;
+}
+
+/** The products a belt effect may fire on producing — the durable ones with a single, well-defined
+ *  produce point in the pipeline. (handoff/commits are produced continuously/by every step, so they
+ *  are not effect triggers.) */
+export const EFFECT_PRODUCE_PRODUCTS = ["evidence", "pull_request"] as const;
 
 /** Posture flags a step declares (and the engine enforces). */
 export interface StepPosture {

@@ -22,7 +22,10 @@ const GithubIssuesBlockSchema = z.object({
       in_review: z.string().trim().min(1).default("herdr:in-review"),
       aborted: z.string().trim().min(1).default("herdr:aborted"),
     })
-    .strict()
+    // EXTRA named state labels (`state_labels.<key>: <label>`) a belt `effects:` block can target
+    // (e.g. `qa: herdr:qa`). catchall (not strict) so those pass while a mistyped KNOWN key is still
+    // caught by its own schema; a belt effect referencing an undeclared key is rejected at load.
+    .catchall(z.string().trim().min(1))
     .prefault({}),
   close_on: z
     .object({
@@ -57,6 +60,11 @@ export const githubIssuesDescriptor: SourceDescriptor<ResolvedBlock> = {
     .strict(),
   resolveConfig(parsed) {
     const b = (parsed as unknown as GithubIssuesParsed).github_issues;
+    const knownStateLabels = new Set(["in_development", "in_review", "aborted"]);
+    const stateLabelsExtra: Record<string, string> = {};
+    for (const [k, v] of Object.entries(b.state_labels as Record<string, unknown>)) {
+      if (!knownStateLabels.has(k) && typeof v === "string" && v.trim()) stateLabelsExtra[k] = v;
+    }
     return {
       repo: b.repo,
       stateLabels: {
@@ -64,12 +72,16 @@ export const githubIssuesDescriptor: SourceDescriptor<ResolvedBlock> = {
         inReview: b.state_labels.in_review,
         aborted: b.state_labels.aborted,
       },
+      stateLabelsExtra,
       closeOn: b.close_on,
       // Case-insensitive matching happens at lookup; normalize the keys once here.
       typeLabels: Object.fromEntries(Object.entries(b.type_labels).map(([k, v]) => [k.toLowerCase(), v])),
       defaultType: b.default_type,
       maxPages: b.max_pages,
     };
+  },
+  customStatusKeys(cfg) {
+    return Object.keys(cfg.stateLabelsExtra);
   },
   create(ctx) {
     const repo = ctx.cfg.repo ?? ctx.ghRepo;

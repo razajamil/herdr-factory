@@ -175,6 +175,12 @@ export function bearsHerdrMarker(body: string): boolean {
  *        deployment constraint, not something implementations can fix.
  * INV-11 describe MAY accept alternate identifiers but MUST return the canonical key — the engine
  *        re-checks active-run dedup against the RETURNED key before claiming.
+ * INV-13 CUSTOM STATUSES map at the SOURCE LAYER. A belt effect may target a source-native status
+ *        (`transition`'s `statusOverride`) beyond the canonical WorkState set — the engine's
+ *        vocabulary stays the six canonical states; the source maps the extra NAME to its backend
+ *        status. A source declares which extra keys it supports via SourceDescriptor.customStatusKeys
+ *        (empty ⇒ internal-ledger sources reject custom effects at config-load); every override
+ *        reaching transition() was validated against that set at load, so it costs no network to reject.
  */
 export interface WorkSource {
   /** Declarative capabilities/ownership. Cheap, constant, side-effect free. */
@@ -205,8 +211,14 @@ export interface WorkSource {
    *  github_issues consumes the trigger label on in_development). Undefined when the belt is gone
    *  or the source has no label concept. `ctx` carries optional run-scoped facts for a terminal
    *  write-back (the merged PR number/URL — see TransitionContext); a source that doesn't need it
-   *  ignores the parameter, and every impl MUST behave correctly when it is absent. */
-  transition(key: string, to: WorkState, pickupLabel?: string, ctx?: TransitionContext): Promise<TransitionResult>;
+   *  ignores the parameter, and every impl MUST behave correctly when it is absent.
+   *  `statusOverride` (INV-13) is a belt effect's SOURCE-NATIVE status key — a widened jira
+   *  `status.<key>` / github_issues `state_labels.<key>` entry — to move to INSTEAD of the canonical
+   *  mapping for `to` (`to` stays the anchor the engine ranks/records; only the delivered backend
+   *  status differs). It is always one this source declared (validated at config-load), so it never
+   *  needs a network read to reject; a source with no custom-status support (internal-ledger) never
+   *  receives one (rejected at load) and MUST behave identically to the no-override path if it ever does. */
+  transition(key: string, to: WorkState, pickupLabel?: string, ctx?: TransitionContext, statusOverride?: string): Promise<TransitionResult>;
   /** Write the item's work doc (+ any media) into `memDir` for the fix agent. INV-4. */
   materialize(key: string, memDir: string, log: Logger): Promise<void>;
   /** Describe what materialize wrote (drives @@WORK_DOC@@/@@WORK_DOC_KIND@@). Local-fs-only (may

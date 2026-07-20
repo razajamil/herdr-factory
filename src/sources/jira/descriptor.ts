@@ -29,7 +29,11 @@ const JiraBlockSchema = z
         // terminal closure is owned by Jira's GitHub integration unless you opt in here.
         done: z.string().trim().min(1).optional(),
       })
-      .strict() // a typo'd status key would silently fall back to the default name (wrong JQL) — reject it
+      // EXTRA named statuses (`status.<key>: <Jira status name>`) a belt `effects:` block can target
+      // (e.g. `qa: QA Review`). catchall (not strict) so those pass validation while a mistyped
+      // KNOWN key is still caught by its own schema; a belt effect referencing an undeclared key is
+      // rejected at config-load, so a typo can't silently no-op at runtime.
+      .catchall(z.string().trim().min(1))
       .prefault({}),
   })
   .strict(); // reject unknown jira keys loudly, not silently strip them
@@ -39,6 +43,21 @@ interface JiraParsed {
   type: "jira";
   name?: string;
   jira: z.infer<typeof JiraBlockSchema>;
+}
+
+// The canonical-mapping keys of the jira `status` map (todo/in_development/in_review + the opt-in
+// terminal). Everything else in the map is a belt-effect EXTRA (statusExtra) keyed by its own name.
+const JIRA_KNOWN_STATUS_KEYS = new Set(["todo", "in_development", "review", "done"]);
+
+/** Pull the extra `status.<key>` entries (beyond the known canonical-mapping keys) into a name→Jira
+ *  status map a belt effect can target. Skips a `done` (its own field) and never emits empty values. */
+function jiraStatusExtra(status: Record<string, unknown>): Record<string, string> {
+  const extra: Record<string, string> = {};
+  for (const [k, v] of Object.entries(status)) {
+    if (JIRA_KNOWN_STATUS_KEYS.has(k)) continue;
+    if (typeof v === "string" && v.trim()) extra[k] = v;
+  }
+  return extra;
 }
 
 export const jiraDescriptor: SourceDescriptor<JiraSourceCfg> = {
@@ -55,7 +74,11 @@ export const jiraDescriptor: SourceDescriptor<JiraSourceCfg> = {
       statusInDev: s.status.in_development,
       statusReview: s.status.review,
       statusDone: s.status.done, // undefined ⇒ terminal stays unmapped (Jira-silent on merge)
+      statusExtra: jiraStatusExtra(s.status as Record<string, unknown>),
     };
+  },
+  customStatusKeys(cfg) {
+    return Object.keys(cfg.statusExtra);
   },
   create(ctx) {
     return new JiraSource(ctx.cfg, new JiraApiTokenAuth(ctx.cfg.baseUrl, ctx.env.JIRA_EMAIL ?? "", ctx.env.JIRA_API_TOKEN ?? ""));
