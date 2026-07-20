@@ -699,7 +699,7 @@ program
 
 program
   .command("update")
-  .description("pull the latest code (hard reset to upstream) and restart the server onto it")
+  .description("pull the latest code (hard reset to the channel target: upstream on main, newest release tag on stable) and restart onto it")
   .action(cliAction("update", async () => {
     try {
       const res = await selfUpdate(consoleLog);

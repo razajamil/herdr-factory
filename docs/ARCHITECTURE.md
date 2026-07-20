@@ -1289,7 +1289,7 @@ herdr-factory --repo <name> runs [--all] | timeline <KEY> | logs [n]   # read th
 herdr-factory serve                       # the resident daemon: tick every repo + Hono API (+ /doc, /ui)
 herdr-factory ensure-up [--restart]       # supervisor one-shot: auto-update + (re)start serve if down/wedged/outdated
 herdr-factory restart                     # graceful restart of the running server (pick up new code)
-herdr-factory update                      # pull latest (hard reset to upstream) + restart onto it
+herdr-factory update                      # pull latest (hard reset to the channel target) + restart onto it
 herdr-factory reload                      # hot-reload config + re-discover repos (no restart)
 herdr-factory provision-node              # (re)download the pinned vendored Node runtime
 herdr-factory schema [--stdout]           # write the config.yml JSON Schema for editors
