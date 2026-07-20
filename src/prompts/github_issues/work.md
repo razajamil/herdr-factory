@@ -27,7 +27,7 @@ commit it — you do NOT open the PR yourself.
 5. Verify: run the repo's lint, type-check, and the unit tests for the affected area.
    Fix everything they report.
 6. **Commit** your work to the branch — code only, and commit incrementally as you go
-   (this keeps the dispatcher's progress heartbeat alive).
+   (this keeps the dispatcher's progress heartbeat alive).@@COMMIT_CONVENTIONS@@
 
 Do NOT open a PR, do NOT comment on the issue, and do NOT change its labels or state (the
 dispatcher owns all of that).

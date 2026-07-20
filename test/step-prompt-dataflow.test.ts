@@ -1,7 +1,9 @@
-import { readFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { describe, expect, it } from "vitest";
-import { productActiveFor, stripInactiveProductBlocks } from "../src/core/step.ts";
+import { afterEach, describe, expect, it } from "vitest";
+import { findPrTemplate, productActiveFor, stripInactiveProductBlocks } from "../src/core/step.ts";
 import type { ProductType } from "../src/types.ts";
 
 // The render-time half of design §8: an OPTIONAL consume unsatisfied by the belt is DROPPED — no
@@ -49,6 +51,13 @@ describe("productActiveFor — belt dataflow gating", () => {
     expect(productActiveFor(steps, PR, "github_issues")("close_reference")).toBe(true);
     expect(productActiveFor(steps, PR, "jira")("close_reference")).toBe(false);
   });
+
+  it("pull_request is ACTIVE only for the step that produces the PR (the pr step) — this gates @@PR_TEMPLATE@@", () => {
+    const steps = [WORK, REVIEW, PR];
+    expect(productActiveFor(steps, PR, "jira")("pull_request")).toBe(true);
+    expect(productActiveFor(steps, WORK, "jira")("pull_request")).toBe(false);
+    expect(productActiveFor(steps, REVIEW, "jira")("pull_request")).toBe(false);
+  });
 });
 
 describe("stripInactiveProductBlocks — @@WHEN:product@@ … @@END@@", () => {
@@ -66,6 +75,80 @@ describe("stripInactiveProductBlocks — @@WHEN:product@@ … @@END@@", () => {
   it("returns a body with no blocks unchanged", () => {
     expect(stripInactiveProductBlocks("plain @@KEY@@ body", () => false)).toBe("plain @@KEY@@ body");
   });
+});
+
+describe("findPrTemplate — the target repo's own PR template (@@PR_TEMPLATE@@)", () => {
+  const tmps: string[] = [];
+  const wt = () => {
+    const d = mkdtempSync(join(tmpdir(), "prtpl-"));
+    tmps.push(d);
+    return d;
+  };
+  const write = (dir: string, rel: string, body: string) => {
+    const p = join(dir, rel);
+    mkdirSync(join(p, ".."), { recursive: true });
+    writeFileSync(p, body);
+  };
+  afterEach(() => {
+    for (const t of tmps) rmSync(t, { recursive: true, force: true });
+    tmps.length = 0;
+  });
+
+  it("returns null when the repo ships no template", () => {
+    expect(findPrTemplate(wt())).toBeNull();
+  });
+
+  it("finds the canonical .github/PULL_REQUEST_TEMPLATE.md", () => {
+    const dir = wt();
+    write(dir, ".github/PULL_REQUEST_TEMPLATE.md", "## Summary\n<!-- what -->\n");
+    expect(findPrTemplate(dir)).toContain("## Summary");
+  });
+
+  it("finds the lowercase and root/docs spellings GitHub also honours", () => {
+    const root = wt();
+    write(root, "pull_request_template.md", "ROOT TEMPLATE");
+    expect(findPrTemplate(root)).toBe("ROOT TEMPLATE");
+    const docs = wt();
+    write(docs, "docs/PULL_REQUEST_TEMPLATE.md", "DOCS TEMPLATE");
+    expect(findPrTemplate(docs)).toBe("DOCS TEMPLATE");
+  });
+
+  it("prefers .github/ over the root over docs/ (discovery precedence)", () => {
+    const dir = wt();
+    write(dir, ".github/PULL_REQUEST_TEMPLATE.md", "GITHUB WINS");
+    write(dir, "PULL_REQUEST_TEMPLATE.md", "root");
+    write(dir, "docs/PULL_REQUEST_TEMPLATE.md", "docs");
+    expect(findPrTemplate(dir)).toBe("GITHUB WINS");
+  });
+
+  it("picks the default/first *.md from a .github/PULL_REQUEST_TEMPLATE/ directory (v1: no selection)", () => {
+    const dir = wt();
+    write(dir, ".github/PULL_REQUEST_TEMPLATE/bug.md", "BUG");
+    write(dir, ".github/PULL_REQUEST_TEMPLATE/aardvark.md", "FIRST");
+    expect(findPrTemplate(dir)).toBe("FIRST"); // alphabetical
+  });
+
+  it("ignores an empty/whitespace-only template file", () => {
+    const dir = wt();
+    write(dir, ".github/PULL_REQUEST_TEMPLATE.md", "   \n\n");
+    expect(findPrTemplate(dir)).toBeNull();
+  });
+});
+
+describe("shipped pr prompts gate @@PR_TEMPLATE@@ behind pull_request", () => {
+  for (const rel of ["pr.md", "github_issues/pr.md"]) {
+    it(`${rel}: a belt with no pr step (pull_request inactive) drops @@PR_TEMPLATE@@ with no leftover markers`, () => {
+      const dropped = stripInactiveProductBlocks(prompt(rel), () => false);
+      expect(dropped).not.toContain("@@PR_TEMPLATE@@");
+      expect(dropped).not.toMatch(/@@WHEN:|@@END@@/);
+    });
+
+    it(`${rel}: the pr step (pull_request active) retains @@PR_TEMPLATE@@ and strips the markers cleanly`, () => {
+      const kept = stripInactiveProductBlocks(prompt(rel), (p) => p === "pull_request");
+      expect(kept).toContain("@@PR_TEMPLATE@@");
+      expect(kept).not.toMatch(/@@WHEN:|@@END@@/); // evidence clause dropped, pull_request markers removed
+    });
+  }
 });
 
 describe("shipped consumer prompts gate every evidence reference", () => {

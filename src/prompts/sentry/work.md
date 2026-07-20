@@ -26,7 +26,7 @@ Sentry and commit the fix — you do NOT open the PR yourself.
 6. Verify: run the repo's lint, type-check, and the unit tests for the affected area. Fix everything
    they report.
 7. **Commit** your work to the branch — code only, and commit incrementally as you go (this keeps
-   the dispatcher's progress heartbeat alive).
+   the dispatcher's progress heartbeat alive).@@COMMIT_CONVENTIONS@@
 
 Do NOT open a PR, and do NOT resolve or change the Sentry issue (the dispatcher owns lifecycle).
 

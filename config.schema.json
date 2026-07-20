@@ -677,6 +677,16 @@
         "cloudfront_domain"
       ],
       "additionalProperties": false
+    },
+    "conventions": {
+      "type": "object",
+      "properties": {
+        "commits": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "additionalProperties": false
     }
   },
   "required": [

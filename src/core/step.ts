@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { StepConfig } from "../config.ts";
@@ -16,6 +16,90 @@ export { productActiveFor, stripInactiveProductBlocks } from "../prompts/contrac
 export const CLAUDE_FLAGS = ["--dangerously-skip-permissions"];
 export const CLI_PATH = fileURLToPath(new URL("../../bin/herdr-factory", import.meta.url));
 export const MEMORY_DIR = ".memory/herdr-factory";
+
+// --- @@PR_TEMPLATE@@: the target repo's own pull-request template -----------
+// Standard single-file locations GitHub honours, in priority order. Both the canonical uppercase
+// name and the common lowercase spelling (GitHub matches case-insensitively) are tried at each base.
+const PR_TEMPLATE_FILES = [
+  ".github/PULL_REQUEST_TEMPLATE.md",
+  ".github/pull_request_template.md",
+  "PULL_REQUEST_TEMPLATE.md",
+  "pull_request_template.md",
+  "docs/PULL_REQUEST_TEMPLATE.md",
+  "docs/pull_request_template.md",
+];
+// The multi-template directory (v1: pick the default/first `*.md`, alphabetically — no selection UI).
+const PR_TEMPLATE_DIRS = [".github/PULL_REQUEST_TEMPLATE", "PULL_REQUEST_TEMPLATE", "docs/PULL_REQUEST_TEMPLATE"];
+
+/** Best-effort read of the target repo's own PR template from the run's worktree. Returns the
+ *  template text, or null when the repo ships none (or it can't be read). Never throws — a missing
+ *  or unreadable template just drops the @@PR_TEMPLATE@@ clause, it is never an error. */
+export function findPrTemplate(worktree: string): string | null {
+  for (const rel of PR_TEMPLATE_FILES) {
+    try {
+      const p = join(worktree, rel);
+      if (statSync(p).isFile()) {
+        const t = readFileSync(p, "utf8");
+        if (t.trim()) return t;
+      }
+    } catch {
+      /* missing/unreadable → try the next candidate */
+    }
+  }
+  for (const dir of PR_TEMPLATE_DIRS) {
+    try {
+      const abs = join(worktree, dir);
+      if (!statSync(abs).isDirectory()) continue;
+      for (const name of readdirSync(abs).filter((f) => f.toLowerCase().endsWith(".md")).sort()) {
+        const t = readFileSync(join(abs, name), "utf8");
+        if (t.trim()) return t; // v1: the default/first
+      }
+    } catch {
+      /* missing/unreadable → try the next base */
+    }
+  }
+  return null;
+}
+
+/** Fence `content` in a backtick block long enough to survive any backtick run inside it. */
+function fenced(content: string): string {
+  let longest = 0;
+  for (const m of content.matchAll(/`+/g)) longest = Math.max(longest, m[0].length);
+  const fence = "`".repeat(Math.max(3, longest + 1));
+  return `${fence}\n${content}\n${fence}`;
+}
+
+/** The @@PR_TEMPLATE@@ value when a template was found: a sub-bullet under the PR step's "open the
+ *  PR" item that tells the agent to fill the repo's own template faithfully, with the template
+ *  reproduced verbatim. Empty string ⇒ the base summary+testing-notes wording applies unchanged. */
+function prTemplateBlock(template: string): string {
+  return (
+    `\n   - **Fill the repo's own PR template.** This repository ships its own pull-request template ` +
+    `(reproduced below). Fill it out faithfully — keep every section and heading, and replace the ` +
+    `template's guidance/comments with real content for this change — instead of the generic ` +
+    `summary+testing-notes shape above. Still include the evidence URLs and any \`Closing reference:\` ` +
+    `line where the instructions here call for them. The template:\n\n${fenced(template.replace(/\s+$/, ""))}\n`
+  );
+}
+
+/** Resolve @@COMMIT_CONVENTIONS@@: the repo's `conventions.commits` — short free text, or a file
+ *  pointer (absolute, or relative to the repo's config folder) whose contents are used. Returns a
+ *  formatted block when set, or "" (leaving no trace) when the key is unset or resolves to nothing.
+ *  Best-effort: a value that looks like a path but isn't a readable file is used as literal text. */
+function commitConventionsBlock(deps: Deps): string {
+  const raw = deps.config.conventions?.commits?.trim();
+  if (!raw) return "";
+  let text = raw;
+  try {
+    const candidate = isAbsolute(raw) ? raw : join(deps.config.paths.repoDir, raw);
+    if (statSync(candidate).isFile()) text = readFileSync(candidate, "utf8");
+  } catch {
+    /* not a readable file → treat the value as literal free text */
+  }
+  text = text.trim();
+  if (!text) return "";
+  return `\n\n**Commit-message conventions** (this repo's own — apply them to every commit message):\n\n${text}`;
+}
 
 // --- belt step sequencing (belt.steps is the ordered source of truth) -------
 
@@ -358,6 +442,9 @@ async function renderStepPromptImpl(
     "@@PRIOR_PANE@@": prior?.paneId ?? "(none)",
     "@@PRIOR_SESSION@@": prior?.sessionId ?? "(none)",
     "@@STEP_DONE_CMD@@": stepDoneCmd,
+    // Universal but config-driven: renders the repo's commit-message conventions (from
+    // `conventions.commits`) when set, else "" — so an unset key leaves the work/pr prompts unchanged.
+    "@@COMMIT_CONVENTIONS@@": commitConventionsBlock(deps),
   };
   // Capability-scoped tokens + @@WHEN@@ clauses gate on ACTUAL belt dataflow, not just this step's
   // declaration: an OPTIONAL consume (evidence for review/pr) is ACTIVE only when an upstream step
@@ -368,6 +455,14 @@ async function renderStepPromptImpl(
     sub["@@EVIDENCE_DIR@@"] = `${MEMORY_DIR}/evidence`;
     sub["@@EVIDENCE_UPLOAD_CMD@@"] = evidenceUploadCmd;
     sub["@@CAPTURE_ATTEMPT_CMD@@"] = captureAttemptCmd;
+  }
+  // @@PR_TEMPLATE@@ is active only for a step that produces the pull request (the pr step). Read the
+  // target repo's own PR template from the worktree (best-effort — missing ⇒ ""), so the PR follows
+  // the team's template rather than the factory's baked default. An absent template collapses the
+  // @@WHEN:pull_request@@ clause to nothing, leaving today's summary+testing-notes wording unchanged.
+  if (isActive("pull_request")) {
+    const template = findPrTemplate(worktree);
+    sub["@@PR_TEMPLATE@@"] = template ? prTemplateBlock(template) : "";
   }
   // exclusive_resource guard → the machine-global lock commands, injected only for a step that
   // declares one (evidence's capture mutex). The resource name comes from the guard, so it lives in

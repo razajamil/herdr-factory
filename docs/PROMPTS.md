@@ -98,9 +98,27 @@ in a matching `@@WHEN:<product>@@` clause to reference it portably.
 | `@@BOUNCE_TARGET@@` | the step name a bounce returns to (empty when this step can't bounce) |
 | `@@BOUNCE_REASON_FILE@@` | path to write bounce findings to (empty when this step can't bounce) |
 | `@@CLI@@` | absolute path to the herdr-factory CLI binary |
+| `@@COMMIT_CONVENTIONS@@` | the repo's commit-message conventions (from `conventions.commits`); empty when that key is unset |
 
 The three `@@BOUNCE_*@@` tokens are universal but render **empty** on a step that cannot bounce
 (a step with no earlier `bounce_feedback` consumer), so they are always safe to reference.
+`@@COMMIT_CONVENTIONS@@` is likewise universal-but-empty: it renders the repo's
+[`conventions.commits`](../README.md#conventions-optional) value when set (short free text, or a
+file pointer resolved against the repo's config folder), and **nothing** when unset — so referencing
+it leaves a prompt byte-identical to today until a repo opts in.
+
+### Product-scoped tokens — `pull_request`
+
+Active only for a step that **produces** the pull request (the `pr` step), so a belt with no `pr`
+step never carries this token:
+
+| Token | Meaning |
+| --- | --- |
+| `@@PR_TEMPLATE@@` | the target repo's own PR template — its `.github/PULL_REQUEST_TEMPLATE.md` (or the root / `docs/` variants, or the first file in a `.github/PULL_REQUEST_TEMPLATE/` directory), read from the worktree at render time and reproduced for the agent to fill faithfully. Empty when the repo ships no template — the base summary+testing-notes wording then applies unchanged. |
+
+Template discovery is **best-effort**: a missing or unreadable template drops the clause, it is
+never an error. The multi-template directory is v1-simple — the default/first `*.md` is used; there
+is no per-PR template selection.
 
 ### Product-scoped tokens — `evidence`
 

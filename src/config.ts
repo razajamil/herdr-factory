@@ -364,6 +364,11 @@ export const RepoConfigSchema = z
     layouts: z.array(LayoutSchema).default([]),
     // Optional: where the evidence step publishes captured media (S3 + CloudFront). Repo-wide.
     evidence: EvidenceBlockSchema.optional(),
+    // Optional repo-wide conventions injected into agent prompts. `commits` is short free text OR a
+    // file pointer (absolute, or relative to the repo's config folder) whose contents are used — it
+    // surfaces as @@COMMIT_CONVENTIONS@@ in the work/pr prompts; unset ⇒ the token renders empty and
+    // leaves those prompts unchanged. (v1: the config key IS the convention — no commitlint auto-detect.)
+    conventions: z.object({ commits: z.string().trim().min(1).optional() }).strict().optional(),
   })
   .superRefine((cfg, ctx) => {
     // Work source names unique on the RESOLVED name (name ?? type), so two unnamed jira sources
@@ -626,6 +631,9 @@ export interface Config {
     profile?: string;
   };
   guidance?: string;
+  /** Repo-wide conventions injected into agent prompts. `commits` is free text or a file pointer
+   *  (resolved at render time in step.ts); surfaced as @@COMMIT_CONVENTIONS@@. */
+  conventions?: { commits?: string };
   paths: {
     configDir: string;
     repoDir: string;
@@ -1013,6 +1021,7 @@ export function loadConfig(repoName: string): Loaded {
         }
       : undefined,
     guidance,
+    conventions: parsed.conventions,
     paths: {
       configDir: cfgDir,
       repoDir,

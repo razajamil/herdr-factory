@@ -11,7 +11,7 @@ through its automated round. The earlier steps are done and their commits are on
      `Closing reference:` line — copy it into the PR description **verbatim, on its own line**
      (e.g. `Fixes #@@KEY@@`). This is what links the PR to the issue and closes it on merge.
      (Auto-close only fires for PRs merged into the default branch — the dispatcher closes the
-     issue as a backstop either way, so never close it yourself.)@@WHEN:evidence@@
+     issue as a backstop either way, so never close it yourself.)@@WHEN:pull_request@@@@PR_TEMPLATE@@@@END@@@@WHEN:evidence@@
    - **Evidence.** The prior handoff notes (start with `@@HANDOFF_IN@@`) carry the public URLs of the
      screenshots/video an earlier step published; you do **not** need to re-capture or re-upload.
      Embed them in the **PR description**: screenshots inline with `![screenshot](<url>)`, and any
@@ -20,7 +20,7 @@ through its automated round. The earlier steps are done and their commits are on
 2. **Wait for the automated round (~10 min):** poll CI (`gh pr checks <num>`) and bot review
    comments; for each failure or bot thread, fix → commit → push → resolve, until everything is
    green or the time elapses. Only automated checks/bots in this window — human reviewers are
-   watched by the dispatcher afterwards.
+   watched by the dispatcher afterwards.@@COMMIT_CONVENTIONS@@
 
 Do NOT change the issue's labels or state, and do NOT close or comment on the issue (the
 dispatcher owns all of that). Put the PR URL in your handoff note.

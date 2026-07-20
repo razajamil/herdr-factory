@@ -102,6 +102,21 @@ const UNIVERSAL: readonly PromptTokenSpec[] = [
   { token: "@@BOUNCE_TARGET@@", scope: { kind: "universal" }, summary: "the step name a bounce returns to (empty when this step can't bounce)" },
   { token: "@@BOUNCE_REASON_FILE@@", scope: { kind: "universal" }, summary: "path to write bounce findings to (empty when this step can't bounce)" },
   { token: "@@CLI@@", scope: { kind: "universal" }, summary: "absolute path to the herdr-factory CLI binary" },
+  { token: "@@COMMIT_CONVENTIONS@@", scope: { kind: "universal" }, summary: "the repo's commit-message conventions from `conventions.commits` (empty — and leaves no trace — when that key is unset)" },
+];
+
+// Capability-scoped tokens for the `pull_request` product — substituted only when pull_request is
+// ACTIVE for the step (the step produces the PR, i.e. the `pr` step). @@PR_TEMPLATE@@ carries the
+// target repo's OWN pull-request template (read from the worktree at render time), so the PR follows
+// the team's shape rather than the factory's baked default. Empty when the repo ships no template —
+// the base summary+testing-notes wording then applies unchanged. `@@PR_NUMBER@@` stays OUT of this
+// catalog on purpose (it belongs to the resolver wake-prompt — see the PROMPT_TOKENS note below).
+const PULL_REQUEST: readonly PromptTokenSpec[] = [
+  {
+    token: "@@PR_TEMPLATE@@",
+    scope: { kind: "product", product: "pull_request" },
+    summary: "the target repo's own PR template (`.github/PULL_REQUEST_TEMPLATE.md` and the other standard locations), reproduced for the agent to fill faithfully; empty when the repo ships none",
+  },
 ];
 
 // Capability-scoped tokens for the `evidence` product — substituted only when evidence is ACTIVE for
@@ -128,7 +143,7 @@ const CAPTURE_LOCK: readonly PromptTokenSpec[] = [
  *  into step prompts, so a `prompt_file` referencing them would reach the agent unrendered — the
  *  validator rejects them on purpose. This catalog is exactly the set step.ts substitutes into a
  *  belt step's prompt. */
-export const PROMPT_TOKENS: readonly PromptTokenSpec[] = [...UNIVERSAL, ...EVIDENCE, ...CAPTURE_LOCK];
+export const PROMPT_TOKENS: readonly PromptTokenSpec[] = [...UNIVERSAL, ...PULL_REQUEST, ...EVIDENCE, ...CAPTURE_LOCK];
 
 /** Every product name the engine knows (the closed ProductType set), for validating `@@WHEN:<x>@@`. */
 export const KNOWN_PRODUCTS: ReadonlySet<ProductType> = new Set(PRODUCT_CAPABILITIES.map((p) => p.product));

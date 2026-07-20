@@ -659,6 +659,24 @@ SSO, `~/.aws`, or the named `profile`) — never stored in config or handed to a
 land under `herdr-factory/<github_username>/<key_prefix>/<key>/<run>-<timestamp>/`.
 `doctor --deep` verifies the setup with a real S3 write probe.
 
+### `conventions` (optional)
+
+Repo-wide conventions injected into agent prompts. Today it carries one key:
+
+```yaml
+conventions:
+  commits: "Conventional Commits — feat/fix/chore(scope): summary" # short free text …
+  # commits: docs/commit-guide.md   # … or a file pointer (relative to this config folder, or absolute)
+```
+
+`conventions.commits` surfaces as `@@COMMIT_CONVENTIONS@@` in the **work** and **pr** prompts (see
+[Prompts](#prompts)): the value is either short free text or a path to a file whose contents are
+used (a path is resolved against the repo's config folder, or given absolutely). Omit the key and
+the token renders empty — the prompts are unchanged. Beyond the `pr` step reading the target repo's
+own `.github/PULL_REQUEST_TEMPLATE.md` automatically (as `@@PR_TEMPLATE@@`), this is how you steer
+the *commit* shape without editing a prompt file. (v1: the config key **is** the convention — there
+is no auto-detection of commitlint configs.)
+
 ### Layouts
 
 A **layout** is a herdr tab/pane arrangement the factory builds into a worktree the moment it's
@@ -741,14 +759,19 @@ substitution. Universal tokens (always injected):
 `@@KEY@@ @@REPO@@ @@BELT@@ @@STEPS@@ @@STEP@@ @@TYPE@@ @@SUMMARY@@ @@BRANCH@@ @@WORKTREE@@
 @@MEMORY_DIR@@ @@WORK_DOC@@ @@WORK_DOC_KIND@@ @@HANDOFF_IN@@ @@HANDOFF_OUT@@ @@PRIOR_PANE@@
 @@PRIOR_SESSION@@ @@STEP_DONE_CMD@@ @@ASK_HUMAN_CMD@@ @@BOUNCE_CMD@@ @@BOUNCE_TARGET@@
-@@BOUNCE_REASON_FILE@@ @@CLI@@`
+@@BOUNCE_REASON_FILE@@ @@CLI@@ @@COMMIT_CONVENTIONS@@`
+
+(`@@COMMIT_CONVENTIONS@@` renders your [`conventions.commits`](#conventions-optional) value when set
+and **nothing** when unset, so an unset key leaves the work/pr prompts byte-identical to before.)
 
 Plus **capability-scoped** tokens, injected only when the step declares the machinery they belong to:
 `@@EVIDENCE_DIR@@ @@EVIDENCE_UPLOAD_CMD@@ @@CAPTURE_ATTEMPT_CMD@@` appear only when an upstream step
 *produces* `evidence` (so in a work → review → pr belt the review/pr prompts carry no evidence tokens
-at all), and `@@CAPTURE_LOCK_ACQUIRE_CMD@@ @@CAPTURE_LOCK_RELEASE_CMD@@` appear only for a step that
+at all); `@@CAPTURE_LOCK_ACQUIRE_CMD@@ @@CAPTURE_LOCK_RELEASE_CMD@@` appear only for a step that
 declares an `exclusive_resource` guard (the evidence capture mutex), the lock name coming from the
-guard.
+guard; and `@@PR_TEMPLATE@@` appears only for a step that *produces* `pull_request` (the `pr` step),
+carrying the target repo's own PR template (read from the worktree at render time) so the PR follows
+the team's shape — empty when the repo ships none.
 
 Prompts also support **product-gated clauses** — `@@WHEN:<product>@@ … @@END@@` — kept only when that
 product is active for the step (produced by it or upstream), otherwise the whole clause (prose **and**

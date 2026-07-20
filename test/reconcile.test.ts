@@ -6,7 +6,7 @@ import { openDb } from "../src/db/index.ts";
 import { Store } from "../src/db/store.ts";
 import { applyPendingFocus, bounceStep, claimTicket, flushTransitionOutbox, reconcileRepo, reconcileRun, recordCaptureAttempt, requestHumanInput, resumeRun, withRunLock, withRunLockWaiting, withTickLock } from "../src/core/reconcile.ts";
 import { applySignal } from "../src/core/signals.ts";
-import { MEMORY_DIR } from "../src/core/step.ts";
+import { MEMORY_DIR, renderStepPrompt } from "../src/core/step.ts";
 import { HerdrUnreachableError, type BeltRuntime, type Deps, type GitApi, type GitHubApi, type HerdrApi, type SourceRuntime, type WorkSource } from "../src/core/deps.ts";
 import { SourceUnauthenticatedError } from "../src/auth/errors.ts";
 import { getAuthFailure, resetAuthGate } from "../src/auth/gate.ts";
@@ -657,6 +657,68 @@ describe("exclusive_resource guard (the capture mutex)", () => {
     const res = await bounceStep(deps, store.getRun(run.id)!, belt, src, "fix", "redo");
     expect(res.ok).toBe(true);
     expect(store.acquireLock("capture", "other", 1200)).toBe(true); // freed on bounce (backstop)
+  });
+});
+
+describe("@@PR_TEMPLATE@@ + @@COMMIT_CONVENTIONS@@ (end-to-end render of the shipped prompts)", () => {
+  const shippedPr = readFileSync(new URL("../src/prompts/pr.md", import.meta.url), "utf8");
+  const shippedWork = readFileSync(new URL("../src/prompts/work.md", import.meta.url), "utf8");
+
+  const renderStep = async (which: "pr" | "fix", o: { template?: string; commits?: string } = {}) => {
+    const { deps, store, worktree, shipBelt } = build();
+    // Render the ACTUAL shipped prompts (the harness otherwise stubs enginePrompt).
+    shipBelt.steps[0]!.enginePrompt = shippedWork;
+    shipBelt.steps[2]!.enginePrompt = shippedPr;
+    if (o.commits) deps.config.conventions = { commits: o.commits };
+    if (o.template) {
+      mkdirSync(join(worktree, ".github"), { recursive: true });
+      writeFileSync(join(worktree, ".github/PULL_REQUEST_TEMPLATE.md"), o.template);
+    }
+    const step = which === "pr" ? shipBelt.steps[2]! : shipBelt.steps[0]!;
+    const run = seed(store, worktree, "K-PT", "running", step.name);
+    await renderStepPrompt(deps, run, shipBelt, deps.resolveSource("jira")!, step, null);
+    return readFileSync(join(worktree, MEMORY_DIR, `prompt-${step.name}.md`), "utf8");
+  };
+
+  it("no template ⇒ the pr prompt keeps today's summary+testing-notes wording and injects nothing", async () => {
+    const body = await renderStep("pr");
+    expect(body).toContain("a clear\n   summary + testing notes)."); // base wording intact
+    expect(body).not.toContain("Fill the repo's own PR template");
+    expect(body).not.toMatch(/@@[A-Z_]+@@/); // no dangling tokens whatsoever
+  });
+
+  it("a template present ⇒ the pr prompt reproduces it and tells the agent to fill it faithfully", async () => {
+    const body = await renderStep("pr", { template: "## Summary\n\n## Testing\n- [ ] covered\n" });
+    expect(body).toContain("Fill the repo's own PR template");
+    expect(body).toContain("## Testing");
+    expect(body).toContain("- [ ] covered");
+    expect(body).not.toMatch(/@@[A-Z_]+@@/);
+  });
+
+  it("conventions.commits shows up in the work/pr prompts when set, and leaves no trace when unset", async () => {
+    const CONV = "Conventional Commits — feat/fix(scope): summary";
+    expect(await renderStep("fix")).not.toContain("Commit-message conventions");
+    expect(await renderStep("pr")).not.toContain("Commit-message conventions");
+    for (const which of ["fix", "pr"] as const) {
+      const body = await renderStep(which, { commits: CONV });
+      expect(body, which).toContain("Commit-message conventions");
+      expect(body, which).toContain(CONV);
+    }
+  });
+
+  it("a conventions.commits file pointer (relative to the config folder) is read for its contents", async () => {
+    const { deps, store, worktree, shipBelt } = build();
+    shipBelt.steps[0]!.enginePrompt = shippedWork;
+    const cfgDir = mkdtempSync(join(tmpdir(), "cfg-"));
+    tmps.push(cfgDir);
+    deps.config.paths.repoDir = cfgDir; // where a `config`-relative pointer resolves
+    writeFileSync(join(cfgDir, "commit-guide.md"), "Prefix every commit with the ticket key.");
+    deps.config.conventions = { commits: "commit-guide.md" };
+    const run = seed(store, worktree, "K-CV", "running", "fix");
+    await renderStepPrompt(deps, run, shipBelt, deps.resolveSource("jira")!, shipBelt.steps[0]!, null);
+    const body = readFileSync(join(worktree, MEMORY_DIR, "prompt-fix.md"), "utf8");
+    expect(body).toContain("Prefix every commit with the ticket key.");
+    expect(body).not.toContain("commit-guide.md"); // the pointer resolved to contents, not echoed
   });
 });
 
