@@ -722,6 +722,54 @@ describe("@@PR_TEMPLATE@@ + @@COMMIT_CONVENTIONS@@ (end-to-end render of the shi
   });
 });
 
+describe("belt-level pr: behavior block (end-to-end render of the shipped pr prompt)", () => {
+  const shippedPr = readFileSync(new URL("../src/prompts/pr.md", import.meta.url), "utf8");
+  // A verbatim copy of pr.md from BEFORE the pr: block existed — the byte-identity ground truth.
+  const legacyPr = readFileSync(new URL("./fixtures/pr-prompt.legacy.md", import.meta.url), "utf8");
+
+  const renderPr = async (pr: BeltRuntime["pr"]) => {
+    const { deps, store, worktree, shipBelt } = build();
+    shipBelt.steps[2]!.enginePrompt = shippedPr;
+    shipBelt.pr = pr;
+    const run = seed(store, worktree, "K-PR", "running", "pr");
+    await renderStepPrompt(deps, run, shipBelt, deps.resolveSource("jira")!, shipBelt.steps[2]!, null);
+    return readFileSync(join(worktree, MEMORY_DIR, "prompt-pr.md"), "utf8");
+  };
+
+  it("absent pr: block ⇒ the rendered pr prompt is byte-identical to the pre-block prompt", async () => {
+    // Render the current (tokenized) and the legacy (literal step 2) pr base in the SAME worktree, so
+    // only the prompt body differs — byte-equal ⇒ an absent pr: block changed nothing.
+    const { deps, store, worktree, shipBelt } = build();
+    const run = seed(store, worktree, "K-PR", "running", "pr");
+    shipBelt.steps[2]!.enginePrompt = shippedPr;
+    await renderStepPrompt(deps, run, shipBelt, deps.resolveSource("jira")!, shipBelt.steps[2]!, null);
+    const current = readFileSync(join(worktree, MEMORY_DIR, "prompt-pr.md"), "utf8");
+    shipBelt.steps[2]!.enginePrompt = legacyPr;
+    await renderStepPrompt(deps, run, shipBelt, deps.resolveSource("jira")!, shipBelt.steps[2]!, null);
+    const legacy = readFileSync(join(worktree, MEMORY_DIR, "prompt-pr.md"), "utf8");
+    expect(current).toBe(legacy);
+    expect(current).not.toMatch(/@@[A-Z_]+@@/); // and no dangling tokens
+  });
+
+  it("draft + title (templated) + labels + reviewers + assignees render as gh instructions", async () => {
+    const body = await renderPr({ draft: true, title: "[{{semantic_work_prefix}}] {{work_id}}", labels: ["needs-review"], reviewers: ["octocat"], assignees: ["me"] });
+    expect(body).toContain("--draft");
+    expect(body).toContain("[fix] K-PR"); // {{semantic_work_prefix}} of a Bug = fix; {{work_id}} = key
+    expect(body).toContain("`needs-review`");
+    expect(body).toContain("--reviewer");
+    expect(body).toContain("--assignee");
+    expect(body).not.toMatch(/@@[A-Z_]+@@/); // fully substituted
+  });
+
+  it("automated_round_minutes: 30 sizes the window; 0 removes the CI-wait step entirely", async () => {
+    expect(await renderPr({ automatedRoundMinutes: 30 })).toContain("(~30 min)");
+    const skip = await renderPr({ automatedRoundMinutes: 0 });
+    expect(skip).not.toContain("Wait for the automated round");
+    expect(skip).toContain("No automated round");
+    expect(skip).not.toMatch(/@@[A-Z_]+@@/);
+  });
+});
+
 describe("custom gate scaffold (read-only + bounce declarations render per StepConfig)", () => {
   const renderGate = async (gate: StepConfig, key: string) => {
     const { deps, store, worktree, shipBelt } = build();

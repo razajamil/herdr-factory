@@ -670,6 +670,73 @@ describe("loadConfig — work sources + belts", () => {
     });
   });
 
+  describe("belt-level pr: behavior block", () => {
+    const PR_BELT = `  - name: ship
+    source: jira
+    label: agent
+    pr:
+      draft: true
+      title: "[{{semantic_work_prefix}}] {{work_id}} {{work_slug}}"
+      labels: [needs-review, auto]
+      reviewers: [octocat]
+      assignees: [me]
+      automated_round_minutes: 20
+    steps:
+      - { type: work,   tab: work,   pane: agent }
+      - { type: review, tab: review, pane: agent }
+      - { type: pr,     tab: pr,     pane: agent }
+`;
+
+    it("parses + resolves onto BeltConfig.pr (camelCased) on a belt with a pr step", () => {
+      setup(cfg(JIRA_SRC, PR_BELT), { prompts: {} });
+      const pr = loadConfig("demo").config.belts[0]!.pr!;
+      expect(pr.draft).toBe(true);
+      expect(pr.title).toBe("[{{semantic_work_prefix}}] {{work_id}} {{work_slug}}");
+      expect(pr.labels).toEqual(["needs-review", "auto"]);
+      expect(pr.reviewers).toEqual(["octocat"]);
+      expect(pr.assignees).toEqual(["me"]);
+      expect(pr.automatedRoundMinutes).toBe(20);
+    });
+
+    it("is undefined when the belt sets no pr: block (default = today's behavior)", () => {
+      setup(cfg(JIRA_SRC, SHIP_BELT), { prompts: {} });
+      expect(loadConfig("demo").config.belts[0]!.pr).toBeUndefined();
+    });
+
+    it("accepts automated_round_minutes: 0 (skip the round)", () => {
+      const belt = `  - name: ship
+    source: jira
+    label: agent
+    pr: { automated_round_minutes: 0 }
+    steps: [{ type: work, tab: w, pane: a }, { type: review, tab: r, pane: a }, { type: pr, tab: p, pane: a }]
+`;
+      setup(cfg(JIRA_SRC, belt), { prompts: {} });
+      expect(loadConfig("demo").config.belts[0]!.pr!.automatedRoundMinutes).toBe(0);
+    });
+
+    it("rejects a pr: block on a belt with no pr step (it would silently no-op)", () => {
+      const belt = `  - name: gen
+    source: ideas
+    pr: { draft: true }
+    steps:
+      - { type: custom, name: research, prompt_file: r.md }
+`;
+      setup(cfg(LM_SRC, belt), { prompts: { "r.md": "Research.\n" } });
+      expect(() => loadConfig("demo")).toThrow(/sets a `pr:` behavior block but has no step that opens a pull request/);
+    });
+
+    it("rejects a negative automated_round_minutes at parse (schema)", () => {
+      const belt = `  - name: ship
+    source: jira
+    label: agent
+    pr: { automated_round_minutes: -5 }
+    steps: [{ type: work, tab: w, pane: a }, { type: review, tab: r, pane: a }, { type: pr, tab: p, pane: a }]
+`;
+      setup(cfg(JIRA_SRC, belt), { prompts: {} });
+      expect(() => loadConfig("demo")).toThrow();
+    });
+  });
+
   it("defaults a step's name to its type when omitted", () => {
     setup(cfg(JIRA_SRC, SHIP_BELT), { prompts: {} });
     const names = loadConfig("demo").config.belts[0]!.steps.map((s) => s.name);

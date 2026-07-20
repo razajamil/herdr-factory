@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { branchName, prefixForType, renderWorkspaceName, slugify } from "../src/core/branch.ts";
+import { branchName, prefixForType, renderWorkspaceName, renderWorkVars, slugify } from "../src/core/branch.ts";
 
 describe("prefixForType", () => {
   it("maps issue types to prefixes (substring)", () => {
@@ -62,5 +62,24 @@ describe("renderWorkspaceName", () => {
   it("sanitises spaces / illegal chars and tidies separators", () => {
     expect(renderWorkspaceName("wip/{{work_id}} draft?", t)).toBe("wip/RWR-17202-draft");
     expect(renderWorkspaceName("{{semantic_work_prefix}}//{{work_id}}", t)).toBe("fix/RWR-17202");
+  });
+});
+
+describe("renderWorkVars (PR-title-style templates — same vars, NO git sanitisation)", () => {
+  const t = { key: "RWR-17202", type: "Bug", summary: "[UI] Fix chargeable item list loading state" };
+
+  it("interpolates the work-item vars", () => {
+    expect(renderWorkVars("{{work_id}}: {{work_type}}", t)).toBe("RWR-17202: bug");
+    expect(renderWorkVars("[{{semantic_work_prefix}}] {{work_id}}", t)).toBe("[fix] RWR-17202");
+  });
+
+  it("keeps spaces and case verbatim (unlike renderWorkspaceName, which sanitises to a ref)", () => {
+    // A real title, not a branch: spaces stay spaces, case is preserved — no ref sanitisation.
+    expect(renderWorkVars("{{work_id}} Fix It Now", t)).toBe("RWR-17202 Fix It Now");
+    expect(renderWorkspaceName("{{work_id}} Fix It Now", t)).toBe("RWR-17202-Fix-It-Now");
+  });
+
+  it("tolerates whitespace in the braces and drops unknown vars", () => {
+    expect(renderWorkVars("{{ work_id }}{{nope}}!", t)).toBe("RWR-17202!");
   });
 });

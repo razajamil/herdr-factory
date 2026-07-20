@@ -3,7 +3,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
-import { findPrTemplate, productActiveFor, stripInactiveProductBlocks } from "../src/core/step.ts";
+import { findPrTemplate, prAutomatedRoundBlock, prOptionsBlock, productActiveFor, stripInactiveProductBlocks } from "../src/core/step.ts";
+import type { BeltRuntime } from "../src/core/deps.ts";
+import type { Run } from "../src/types.ts";
 import type { ProductType } from "../src/types.ts";
 
 // The render-time half of design §8: an OPTIONAL consume unsatisfied by the belt is DROPPED — no
@@ -11,6 +13,9 @@ import type { ProductType } from "../src/types.ts";
 // step at evidence that was never captured.
 
 const prompt = (rel: string) => readFileSync(fileURLToPath(new URL(`../src/prompts/${rel}`, import.meta.url)), "utf8");
+// Verbatim copies of pr.md / github_issues/pr.md as they were BEFORE the belt-level `pr:` block —
+// the trustworthy ground truth for the byte-identity check below.
+const legacyPrompt = (rel: string) => readFileSync(fileURLToPath(new URL(`./fixtures/${rel}`, import.meta.url)), "utf8");
 
 const step = (name: string, produces: ProductType[], consumes: ProductType[] = []) => ({
   name,
@@ -135,20 +140,88 @@ describe("findPrTemplate — the target repo's own PR template (@@PR_TEMPLATE@@)
   });
 });
 
-describe("shipped pr prompts gate @@PR_TEMPLATE@@ behind pull_request", () => {
+describe("shipped pr prompts gate @@PR_TEMPLATE@@ + the pr: behavior tokens behind pull_request", () => {
+  const PR_TOKENS = /@@PR_TEMPLATE@@|@@PR_OPTIONS@@|@@PR_AUTOMATED_ROUND@@/;
   for (const rel of ["pr.md", "github_issues/pr.md"]) {
-    it(`${rel}: a belt with no pr step (pull_request inactive) drops @@PR_TEMPLATE@@ with no leftover markers`, () => {
+    it(`${rel}: a belt with no pr step (pull_request inactive) drops every pr token with no leftover markers`, () => {
       const dropped = stripInactiveProductBlocks(prompt(rel), () => false);
-      expect(dropped).not.toContain("@@PR_TEMPLATE@@");
+      expect(dropped).not.toMatch(PR_TOKENS); // @@PR_TEMPLATE@@/@@PR_OPTIONS@@/@@PR_AUTOMATED_ROUND@@ all gone
       expect(dropped).not.toMatch(/@@WHEN:|@@END@@/);
     });
 
-    it(`${rel}: the pr step (pull_request active) retains @@PR_TEMPLATE@@ and strips the markers cleanly`, () => {
+    it(`${rel}: the pr step (pull_request active) retains all three pr tokens and strips the markers cleanly`, () => {
       const kept = stripInactiveProductBlocks(prompt(rel), (p) => p === "pull_request");
       expect(kept).toContain("@@PR_TEMPLATE@@");
+      expect(kept).toContain("@@PR_OPTIONS@@");
+      expect(kept).toContain("@@PR_AUTOMATED_ROUND@@");
       expect(kept).not.toMatch(/@@WHEN:|@@END@@/); // evidence clause dropped, pull_request markers removed
     });
   }
+});
+
+describe("belt-level pr: block — absent block renders byte-identical to before it existed", () => {
+  // Replicate the pr-step render for a default work→review→pr belt with NO `pr:` block: pull_request
+  // active, evidence inactive, no PR template, no commit conventions — strip the @@WHEN@@ clauses then
+  // substitute the pr tokens to their absent-block defaults. The current (tokenized) prompt must
+  // render identically to the legacy fixture (literal step 2, no @@PR_OPTIONS@@/@@PR_AUTOMATED_ROUND@@).
+  const noPrBelt = { pr: undefined } as unknown as BeltRuntime;
+  const run = { ticketKey: "K", issueType: "", summary: "" } as unknown as Run;
+  const renderDefault = (body: string) =>
+    stripInactiveProductBlocks(body, (p) => p === "pull_request")
+      .replaceAll("@@PR_OPTIONS@@", prOptionsBlock(noPrBelt, run))
+      .replaceAll("@@PR_AUTOMATED_ROUND@@", prAutomatedRoundBlock(noPrBelt))
+      .replaceAll("@@PR_TEMPLATE@@", "")
+      .replaceAll("@@COMMIT_CONVENTIONS@@", "");
+  for (const [cur, leg] of [
+    ["pr.md", "pr-prompt.legacy.md"],
+    ["github_issues/pr.md", "github-issues-pr-prompt.legacy.md"],
+  ] as const) {
+    it(`${cur}: identical to the pre-block prompt`, () => {
+      expect(renderDefault(prompt(cur))).toBe(renderDefault(legacyPrompt(leg)));
+    });
+  }
+
+  it("the unset automated-round default is exactly the historical ~10 min instruction", () => {
+    // Pin the default text against the legacy fixture's literal step-2 (no retyping-drift risk).
+    const legacy = legacyPrompt("pr-prompt.legacy.md");
+    const step2 = legacy.slice(legacy.indexOf("2. **Wait"), legacy.indexOf("afterwards.") + "afterwards.".length);
+    expect(prAutomatedRoundBlock(noPrBelt)).toBe(step2);
+  });
+});
+
+describe("belt-level pr: block — @@PR_OPTIONS@@ / @@PR_AUTOMATED_ROUND@@ render the policy", () => {
+  const run = { ticketKey: "RWR-9", issueType: "Bug", summary: "Fix the thing" } as unknown as Run;
+  const belt = (pr: BeltRuntime["pr"]) => ({ pr } as unknown as BeltRuntime);
+
+  it("draft / title (templated) / labels / reviewers / assignees each surface as gh instructions", () => {
+    const out = prOptionsBlock(
+      belt({ draft: true, title: "[{{semantic_work_prefix}}] {{work_id}} {{work_slug}}", labels: ["needs-review", "auto"], reviewers: ["octocat"], assignees: ["me"] }),
+      run,
+    );
+    expect(out).toContain("--draft");
+    expect(out).toContain("[fix] RWR-9 fix-the-thing"); // {{...}} interpolated via the workspace_name vars
+    expect(out).toContain("--label");
+    expect(out).toContain("`needs-review`, `auto`");
+    expect(out).toContain("--reviewer");
+    expect(out).toContain("`octocat`");
+    expect(out).toContain("--assignee");
+  });
+
+  it("an empty/absent pr block (or one with no fields set) renders nothing", () => {
+    expect(prOptionsBlock(belt(undefined), run)).toBe("");
+    expect(prOptionsBlock(belt({}), run)).toBe("");
+  });
+
+  it("automated_round_minutes: a positive N sets a ~N min window", () => {
+    expect(prAutomatedRoundBlock(belt({ automatedRoundMinutes: 30 }))).toContain("(~30 min)");
+  });
+
+  it("automated_round_minutes: 0 removes the CI-wait instructions entirely", () => {
+    const out = prAutomatedRoundBlock(belt({ automatedRoundMinutes: 0 }));
+    expect(out).not.toContain("Wait for the automated round");
+    expect(out).not.toContain("poll CI");
+    expect(out).toContain("No automated round");
+  });
 });
 
 describe("shipped consumer prompts gate every evidence reference", () => {
