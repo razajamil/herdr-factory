@@ -60,8 +60,10 @@ is on PATH; otherwise link it later with `herdr plugin link <checkout>`).
 | `gh` (authenticated)         | PR discovery, CI/review polling                                                                  |
 | `git`                        | branch cleanup, heartbeats                                                                       |
 
-Run `herdr-factory doctor` (or `doctor --deep`) any time — it checks everything above, plus the
-supervisor, server, database, and each repo's config, sources, and evidence bucket.
+The installer finishes by printing this checklist and running `herdr-factory doctor`, so you see
+what's still on you (herdr, an agent CLI, `gh auth`) right away. Run `herdr-factory doctor` (or
+`doctor --deep`) any time — it checks everything above, plus the supervisor, server, database, and
+each repo's config, sources, and evidence bucket.
 
 <details>
 <summary>Private repo / custom clone URL / uninstall</summary>

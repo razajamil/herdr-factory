@@ -247,6 +247,31 @@ install_service() {
   "$BIN_DIR/herdr-factory" install
 }
 
+# ── Epilogue: the you-provide checklist + a live doctor run ─────────────────────────────────────
+# install.sh bootstraps only what the factory itself needs (its Node runtime, pnpm, deps, shims,
+# plugin, service). The tools the factory *drives* are yours to install and authenticate — the same
+# ones you'd reach for by hand. Spell them out (with where to get each), mirroring the "you provide
+# (install + auth)" group in src/doctor.ts, so a fresh box knows exactly what's still on the operator.
+you_provide_checklist() {
+  echo ""
+  say "you provide these — install + authenticate them yourself:"
+  echo "  • herdr        worktrees · workspaces · panes · agent lifecycle   → https://herdr.dev"
+  echo "  • an agent CLI the workers: claude · opencode · pi · codex · …  (panes default to 'claude')"
+  echo "  • gh           PR discovery + CI/review polling — then run: gh auth login"
+  echo "  • git          branch cleanup + heartbeats (usually already present)"
+}
+
+# Run doctor so the operator sees, right now, what's ready (✓) vs still missing (✗) — the same
+# command the README says to run any time. Two guards: the bash shim can't run without bash (already
+# warned in install_shims), and doctor exits non-zero when any check fails — expected on a fresh box
+# that hasn't got herdr/gh/claude yet — so `|| true` keeps `set -e` from aborting at the finish line.
+run_doctor() {
+  [ -x "$BIN_DIR/herdr-factory" ] && command -v bash >/dev/null 2>&1 || return 0
+  echo ""
+  say "doctor — a health check of the setup (✓ ready · ✗ needs your attention):"
+  "$BIN_DIR/herdr-factory" doctor || true
+}
+
 # ── Uninstall (needs none of git/curl/tar — do NOT run require_tools here) ──────────────────────
 uninstall() {
   say "uninstalling herdr-factory"
@@ -277,6 +302,8 @@ main() {
   echo "  • TUI:  herdr-factory            (no args launches the TUI)"
   echo "  • The supervisor keeps the server up and auto-updates from $BRANCH."
   echo "  • Layouts: a repo's belts can build a herdr tab/pane layout into each new worktree (herdr plugin — see README)."
+  you_provide_checklist
+  run_doctor
 }
 
 main "$@"
