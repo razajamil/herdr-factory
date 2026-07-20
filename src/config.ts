@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 import { parse as parseYaml } from "yaml";
 import { z } from "zod";
 import type { EffectSpec, GuardSpec, InputSpec, ProductType, SourceType, StepPosture } from "./types.ts";
+import { type BranchTaxonomy, DEFAULT_BRANCH_TAXONOMY } from "./core/branch.ts";
 import { expandHome } from "./paths.ts";
 import { SOURCE_DESCRIPTORS, descriptorFor } from "./sources/registry.ts";
 import { HEARTBEAT_GUARD, STEP_DESCRIPTORS, stepDescriptorFor, type StepDescriptor } from "./steps/registry.ts";
@@ -249,14 +250,54 @@ const PrBlockSchema = z
 // A per-belt branch-name template (the worktree + workspace derive from it). Must include
 // {{work_id}} so the branch is identifiable by ticket; a short unique suffix is appended
 // automatically (see branchName) so each claim — including a RE-claim of a previously-merged
-// ticket — gets a distinct branch. Vars: {{work_id}} {{work_slug}} (<=20) {{work_full_slug}}
-// (<=50) {{work_type}} {{semantic_work_prefix}} (fix|chore|feature).
+// ticket — gets a distinct branch. Vars: {{work_id}} {{work_slug}} (<=slug_max) {{work_full_slug}}
+// (<=full_slug_max) {{work_type}} {{semantic_work_prefix}} (from the `branch:` taxonomy below).
 const WorkspaceNameSchema = z
   .string()
   .refine((s) => /\{\{\s*work_id\s*\}\}/.test(s), {
     message: "workspace_name must include {{work_id}} so each item gets a unique branch",
   })
   .optional();
+
+// The branch-naming taxonomy: how a work-item type maps to `{{semantic_work_prefix}}` and the length
+// caps for the slug vars. Repo-level, overridable per belt (see beltBase), each field resolved belt
+// over repo over the historical defaults (resolveBranchTaxonomy). ABSENT everywhere ⇒ the historical
+// fix|chore|feature taxonomy + 20/50 caps, so branch names are byte-identical to before.
+//   `prefixes` maps a work TYPE to a prefix; a type matches a key case-insensitively by SUBSTRING (so
+//     "Dev bug" → the "bug" rule, matching today's behavior), keys tried in declaration order. A
+//     reserved `default` key is the fallback for an unmatched type (omitted ⇒ "feature").
+//   `slug_max` / `full_slug_max` cap `{{work_slug}}` / `{{work_full_slug}}`.
+// A belt's block resolves field-by-field: its `prefixes` (if set) REPLACES the repo's whole map, and
+// each slug cap overrides independently — every field falling back to repo, then the default.
+const BranchBlockSchema = z
+  .object({
+    prefixes: z.record(z.string().trim().min(1), z.string().trim().min(1)).optional(),
+    slug_max: z.coerce.number().int().positive().optional(),
+    full_slug_max: z.coerce.number().int().positive().optional(),
+  })
+  .strict();
+type ParsedBranchBlock = z.infer<typeof BranchBlockSchema>;
+
+/** Resolve a belt's effective {@link BranchTaxonomy}: each field is belt ?? repo ?? built-in default.
+ *  A `prefixes` map fully REPLACES (not merges) at its level; the reserved `default` key is split out
+ *  as the fallback prefix (absent ⇒ the built-in "feature"). Lives alongside workspace_name so branch
+ *  naming is resolved in one place. */
+function resolveBranchTaxonomy(repo: ParsedBranchBlock | undefined, belt: ParsedBranchBlock | undefined): BranchTaxonomy {
+  const prefixesRaw = belt?.prefixes ?? repo?.prefixes;
+  let prefixes = DEFAULT_BRANCH_TAXONOMY.prefixes;
+  let defaultPrefix = DEFAULT_BRANCH_TAXONOMY.default;
+  if (prefixesRaw) {
+    const { default: d, ...rest } = prefixesRaw;
+    prefixes = rest;
+    defaultPrefix = d ?? DEFAULT_BRANCH_TAXONOMY.default;
+  }
+  return {
+    prefixes,
+    default: defaultPrefix,
+    slugMax: belt?.slug_max ?? repo?.slug_max ?? DEFAULT_BRANCH_TAXONOMY.slugMax,
+    fullSlugMax: belt?.full_slug_max ?? repo?.full_slug_max ?? DEFAULT_BRANCH_TAXONOMY.fullSlugMax,
+  };
+}
 
 // Fields every belt shares. `source` references a work_source by name (validated below). `match`
 // is an OPTIONAL path to a `.ts` module (default export = predicate); when omitted the belt
@@ -292,6 +333,10 @@ const beltBase = {
   // automated-round window). Rendered into the pr step's prompt as policy; only meaningful on a belt
   // that has a `pr` step (checked in superRefine). Absent ⇒ today's behavior, unchanged.
   pr: PrBlockSchema.optional(),
+  // Optional per-belt override of the repo-level `branch:` taxonomy (prefix map + slug caps). Each
+  // field resolves belt over repo over the historical defaults — see resolveBranchTaxonomy. Absent
+  // (both here and at repo level) ⇒ today's fix|chore|feature naming, unchanged.
+  branch: BranchBlockSchema.optional(),
 };
 
 // A belt is a (source + ordered steps) pairing. `.strict()` rejects typos AND the removed
@@ -451,6 +496,10 @@ export const RepoConfigSchema = z
     // surfaces as @@COMMIT_CONVENTIONS@@ in the work/pr prompts; unset ⇒ the token renders empty and
     // leaves those prompts unchanged. (v1: the config key IS the convention — no commitlint auto-detect.)
     conventions: z.object({ commits: z.string().trim().min(1).optional() }).strict().optional(),
+    // Optional repo-wide branch-naming taxonomy (prefix map + slug caps) feeding {{semantic_work_prefix}}
+    // and the slug vars. Overridable per belt (belt.branch); resolved belt over repo over the historical
+    // defaults. Absent ⇒ today's fix|chore|feature naming + 20/50 caps, unchanged.
+    branch: BranchBlockSchema.optional(),
   })
   .superRefine((cfg, ctx) => {
     // Work source names unique on the RESOLVED name (name ?? type), so two unnamed jira sources
@@ -686,6 +735,11 @@ export interface BeltConfig {
    *  in-flight runs still reconcile normally. Defaults to true at parse. */
   active: boolean;
   workspaceName?: string;
+  /** The resolved branch-naming taxonomy (prefix map + slug caps) feeding {{semantic_work_prefix}}
+   *  and the slug vars — belt over repo over the historical defaults (resolveBranchTaxonomy).
+   *  loadConfig always sets it; optional so terse test literals fall back to DEFAULT_BRANCH_TAXONOMY
+   *  via branchName's default param. */
+  branch?: BranchTaxonomy;
   matchFile?: string;
   /** The label this belt picks up work by, threaded into its source's listEligible/transition/
    *  health. Set for belts on a label-driven source (jira, github_issues); undefined for one whose
@@ -1076,6 +1130,7 @@ export function loadConfig(repoName: string): Loaded {
       priority: b.priority,
       active: b.active,
       workspaceName: b.workspace_name,
+      branch: resolveBranchTaxonomy(parsed.branch, b.branch),
       matchFile: b.match ? resolveFile(b.name, "match", b.match) : undefined,
       label: b.label,
       steps,

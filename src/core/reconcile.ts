@@ -601,7 +601,7 @@ async function claimImpl(deps: Deps, belt: BeltRuntime, src: SourceRuntime, tick
   const repo = deps.config.repoName;
   // The per-run uid makes the branch unique to THIS attempt, so a re-claimed ticket doesn't reuse a
   // branch name whose prior PR was already merged (which the pr step would otherwise treat as done).
-  const branch = branchName(ticket.key, ticket.type, ticket.summary, belt.workspaceName, deps.uid());
+  const branch = branchName(ticket.key, ticket.type, ticket.summary, belt.workspaceName, deps.uid(), belt.branch);
   let run: Run;
   try {
     run = deps.store.createRun({

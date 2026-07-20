@@ -128,7 +128,7 @@ export function prOptionsBlock(belt: BeltRuntime, run: Run): string {
   const bullets: string[] = [];
   if (pr.draft) bullets.push("**Open it as a draft PR** — pass `--draft` to `gh pr create`.");
   if (pr.title) {
-    const title = renderWorkVars(pr.title, { key: run.ticketKey, type: run.issueType ?? "", summary: run.summary ?? "" });
+    const title = renderWorkVars(pr.title, { key: run.ticketKey, type: run.issueType ?? "", summary: run.summary ?? "" }, belt.branch);
     bullets.push(`**Use this exact PR title** (do not paraphrase it): \`${title}\``);
   }
   if (pr.labels?.length) bullets.push(`**Apply these labels** (\`--label\`, creating any that don't exist yet): ${quotedList(pr.labels)}`);
