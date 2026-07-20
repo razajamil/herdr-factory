@@ -725,7 +725,9 @@ setup required.
 
 A step's body is the engine's built-in prompt for its primitive (per source type under
 `src/prompts/`), optionally augmented by your `prompt_file` — or, for a `custom` step, your
-`prompt_file` alone.
+`prompt_file` alone. The `prompt_file` is the factory's public authoring surface, and the full
+contract it writes against — every token, its scope, the `@@WHEN@@` clause syntax, and the
+validation rules — is documented in [`docs/PROMPTS.md`](docs/PROMPTS.md).
 `prompt_file_source` says where it's read from and **defaults to `config`** = the repo's config
 folder (checked at load); set it to `repo` = the target repo's checkout, read from the run's
 **worktree at render time**, so prompts can live version-controlled next to the code.
@@ -754,6 +756,11 @@ its tokens) is dropped. That's how the shipped `review`/`pr` prompts reference e
 pointing at evidence a shorter belt never captured. Base prompts never name neighbour steps by name —
 they reference prior/next work only through `@@HANDOFF_IN@@`/`@@HANDOFF_OUT@@` and the `@@STEPS@@`
 sequence, so a primitive reads correctly in any belt order.
+
+Your `prompt_file` is **validated against this contract** — a `config`-sourced one at config load
+(so `doctor`/`reload`/the TUI editor catch it before any run), a `repo`-sourced one at render time.
+A token that would reach the agent unrendered (unknown, or out of scope for the step) or a malformed
+`@@WHEN@@`/`@@END@@` clause is rejected with an error naming the belt, step, file, and problem.
 
 Everything a run reads and writes lives in `.memory/herdr-factory/` inside its worktree: the
 rendered prompts, handoff notes, the work doc (`ticket.json`, or `task.md`/`task/`), attachments,

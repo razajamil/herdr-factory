@@ -550,6 +550,68 @@ describe("loadConfig — work sources + belts", () => {
     expect(work.promptFileSource).toBeUndefined(); // present iff there's a prompt_file
   });
 
+  // ── Prompt-contract validation of a config-sourced prompt_file (see docs/PROMPTS.md). ──
+  describe("prompt_file contract validation at load", () => {
+    const CUSTOM_BELT = (prompt = "research.md") => `  - name: gen
+    source: ideas
+    steps:
+      - { type: custom, name: research, prompt_file: ${prompt} }
+`;
+    // A work step whose prompt_file augments the engine base, in a work→review→pr belt (no evidence).
+    const WORK_AUGMENT = `  - name: ship
+    source: jira
+    label: agent
+    steps:
+      - { type: work,   tab: work,   pane: agent, prompt_file: notes.md }
+      - { type: review, tab: review, pane: agent }
+      - { type: pr,     tab: pr,     pane: agent }
+`;
+
+    it("accepts a config-sourced prompt using only universal tokens", () => {
+      setup(cfg(LM_SRC, CUSTOM_BELT()), { prompts: { "research.md": "Work @@KEY@@ on @@BRANCH@@; write @@HANDOFF_OUT@@.\n" } });
+      expect(() => loadConfig("demo")).not.toThrow();
+    });
+
+    it("rejects an unknown token, naming the belt/step/file", () => {
+      setup(cfg(LM_SRC, CUSTOM_BELT()), { prompts: { "research.md": "Do @@NONSENSE@@.\n" } });
+      expect(() => loadConfig("demo")).toThrow(/prompt contract/);
+      expect(() => loadConfig("demo")).toThrow(/@@NONSENSE@@/);
+      expect(() => loadConfig("demo")).toThrow(/belt "gen" step "research"/);
+    });
+
+    it("rejects an evidence token in a belt where evidence is inactive (out of scope)", () => {
+      setup(cfg(LM_SRC, CUSTOM_BELT()), { prompts: { "research.md": "See @@EVIDENCE_DIR@@.\n" } });
+      expect(() => loadConfig("demo")).toThrow(/@@EVIDENCE_DIR@@/);
+    });
+
+    it("rejects a malformed @@WHEN@@ clause", () => {
+      setup(cfg(LM_SRC, CUSTOM_BELT()), { prompts: { "research.md": "@@WHEN@@ x @@END@@\n" } });
+      expect(() => loadConfig("demo")).toThrow(/malformed|prompt contract/);
+    });
+
+    it("validates a work step's augment against the engine base's belt dataflow", () => {
+      setup(cfg(JIRA_SRC, WORK_AUGMENT), { prompts: { "notes.md": "Extra: reconcile @@EVIDENCE_DIR@@.\n" } });
+      expect(() => loadConfig("demo")).toThrow(/@@EVIDENCE_DIR@@/); // no evidence step ⇒ token out of scope
+    });
+
+    it("accepts an evidence token wrapped in @@WHEN:evidence@@ even in a no-evidence belt (clause is dropped)", () => {
+      setup(cfg(LM_SRC, CUSTOM_BELT()), { prompts: { "research.md": "Impl.@@WHEN:evidence@@ See @@EVIDENCE_DIR@@.@@END@@\n" } });
+      expect(() => loadConfig("demo")).not.toThrow();
+    });
+
+    it("does NOT validate a repo-sourced prompt at load (read from the worktree at render time)", () => {
+      const belt = `  - name: gen
+    source: ideas
+    steps:
+      - { type: custom, name: research, prompt_file: research.md, prompt_file_source: repo }
+`;
+      // A repo-sourced prompt isn't read (or existence-checked) at load, so even a bogus token loads —
+      // it's validated when the step is dispatched from the worktree.
+      setup(cfg(LM_SRC, belt), { prompts: {} });
+      expect(() => loadConfig("demo")).not.toThrow();
+    });
+  });
+
   it("loads a belt's match file path (existence verified, fn loaded later in buildDeps)", () => {
     const { repoDir } = setup(
       cfg(JIRA_SRC, `  - name: ship
