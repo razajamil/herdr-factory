@@ -99,6 +99,12 @@ belt:
     default_layout: bug-dev # the layout (see `layouts:` below) the factory builds into every worktree this belt claims
     # layout_matching:                                  # optional: pick a different layout per branch — first glob that matches the branch wins
     #   - { worktree_pattern: "hotfix/*", layout: bug-dev }
+    # pr:                                               # OPTIONAL belt-level PR behavior — applied by the `pr` step when it opens the PR
+    #   draft: true                                     #   open as a draft PR
+    #   title: "[{{semantic_work_prefix}}] {{work_id}} {{work_slug}}" # same vars as workspace_name (rendered verbatim)
+    #   labels: [needs-review]                          #   applied via `gh` at creation (created on demand)
+    #   reviewers: [octocat]                            #   requested reviewers  ·  assignees: [me]
+    #   automated_round_minutes: 10                     #   CI/bot polling window the pr step runs; 0 = skip the round entirely
     steps:
       - { type: work, tab: work, pane: agent }
       - { type: evidence, tab: evidence, pane: agent } # opt-in; drop tab/pane (or the whole entry) to SKIP evidence

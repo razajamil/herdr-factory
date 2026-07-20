@@ -606,6 +606,30 @@ re-claiming a previously-merged item gets a fresh branch and PR. Optional `defau
 `layout_matching` pick which `layouts` entry (below) the factory builds into this belt's worktrees —
 see [Layouts](#layouts).
 
+Optional **`pr`** — belt-level **PR behavior**, applied by the `pr` step when it opens the PR (only
+valid on a belt that has a `pr` step — a stray block is rejected at load):
+
+```yaml
+belt:
+  - name: tickets-to-prs
+    source: jira
+    label: agent
+    pr:
+      draft: true # open as a draft PR
+      title: "[{{semantic_work_prefix}}] {{work_id}} {{work_slug}}" # same vars as workspace_name (rendered verbatim)
+      labels: [needs-review] # applied via `gh` at PR creation (created on demand)
+      reviewers: [octocat] # requested reviewers
+      assignees: [me] # PR assignees
+      automated_round_minutes: 10 # CI/bot polling window the pr step runs; 0 = skip the round entirely
+    steps: [{ type: work }, { type: review }, { type: pr }]
+```
+
+All fields optional. `title` is a template using the same vars as `workspace_name` (rendered
+verbatim — no branch sanitisation). `automated_round_minutes` sizes the CI/bot round the `pr` step
+runs after opening (default ~10 min; `0` opens the PR then hands straight to the dispatcher's review
+watch). It's delivered as **prompt policy** — the `pr` agent applies it with `gh pr create`, so the
+agent stays the single actor and an **absent block leaves the PR flow byte-identical** to before.
+
 **Renaming or deleting a belt** cleans up after itself. A belt's `name` is its identity (each run
 records the belt it's on), so the TUI config editor handles the two edits specially on save:
 **renaming** a belt migrates all of its runs — in-flight and historical — onto the new name (so
@@ -793,9 +817,12 @@ Plus **capability-scoped** tokens, injected only when the step declares the mach
 *produces* `evidence` (so in a work → review → pr belt the review/pr prompts carry no evidence tokens
 at all); `@@CAPTURE_LOCK_ACQUIRE_CMD@@ @@CAPTURE_LOCK_RELEASE_CMD@@` appear only for a step that
 declares an `exclusive_resource` guard (the evidence capture mutex), the lock name coming from the
-guard; and `@@PR_TEMPLATE@@` appears only for a step that *produces* `pull_request` (the `pr` step),
-carrying the target repo's own PR template (read from the worktree at render time) so the PR follows
-the team's shape — empty when the repo ships none.
+guard; and `@@PR_TEMPLATE@@ @@PR_OPTIONS@@ @@PR_AUTOMATED_ROUND@@` appear only for a step that
+*produces* `pull_request` (the `pr` step) — `@@PR_TEMPLATE@@` carries the target repo's own PR
+template (read from the worktree at render time) so the PR follows the team's shape (empty when the
+repo ships none), while `@@PR_OPTIONS@@` and `@@PR_AUTOMATED_ROUND@@` render the belt's
+[`pr:` behavior block](#belt--1) (draft/title/labels/reviewers/assignees and the automated-round
+window) — both at their pre-block defaults when the belt sets no `pr:`.
 
 Prompts also support **product-gated clauses** — `@@WHEN:<product>@@ … @@END@@` — kept only when that
 product is active for the step (produced by it or upstream), otherwise the whole clause (prose **and**
