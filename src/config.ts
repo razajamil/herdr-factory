@@ -3,7 +3,8 @@ import { dirname, isAbsolute, join, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parse as parseYaml } from "yaml";
 import { z } from "zod";
-import type { EffectSpec, GuardSpec, InputSpec, ProductType, SourceType, StepPosture } from "./types.ts";
+import type { AgentConfig, EffectSpec, GuardSpec, InputSpec, ProductType, SourceType, StepPosture } from "./types.ts";
+import { DEFAULT_AGENT_CONFIG } from "./types.ts";
 import { type BranchTaxonomy, DEFAULT_BRANCH_TAXONOMY } from "./core/branch.ts";
 import { expandHome } from "./paths.ts";
 import { SOURCE_DESCRIPTORS, descriptorFor } from "./sources/registry.ts";
@@ -211,6 +212,22 @@ const capabilityFields = {
   bounce: z.boolean().optional(),
 };
 const StepTypeSchema = z.enum(STEP_DESCRIPTORS.map((d) => d.name) as [string, ...string[]]);
+
+// The agent-harness block: which binary + flags a factory-SPAWNED pane launches. Repo-level,
+// overridable per belt AND per step ref. Threaded through StepConfig → the spawn argv (step.ts) and
+// the PR-watch resolver (watch.ts). Both fields optional; the WHOLE block resolves as a unit at the
+// nearest level that sets one (NOT field-by-field), because `flags` are command-specific — a belt
+// that switches `command` to opencode must not inherit the repo's claude `--dangerously-skip-
+// permissions`. ABSENT everywhere ⇒ the historical `claude --dangerously-skip-permissions`
+// (DEFAULT_AGENT_CONFIG), so a spawned pane's argv is byte-identical to before. See resolveAgent.
+const AgentBlockSchema = z
+  .object({
+    command: z.string().trim().min(1).optional(),
+    flags: z.array(z.string()).optional(),
+  })
+  .strict();
+type ParsedAgentBlock = z.infer<typeof AgentBlockSchema>;
+
 const BeltStepSchema = z
   .object({
     type: StepTypeSchema,
@@ -220,6 +237,10 @@ const BeltStepSchema = z
     ...capabilityFields,
     budget_seconds: z.coerce.number().int().positive().optional(),
     heartbeat: z.boolean().default(false),
+    // Per-step override of the agent harness this step's SPAWNED pane launches (a step targeting a
+    // layout pane drives whatever that pane runs, so this only bites a no-tab/pane step). Resolved
+    // step over belt over repo over DEFAULT_AGENT_CONFIG — see resolveAgent.
+    agent: AgentBlockSchema.optional(),
   })
   .strict()
   .refine(bothOrNeither, layoutRefine);
@@ -299,6 +320,17 @@ function resolveBranchTaxonomy(repo: ParsedBranchBlock | undefined, belt: Parsed
   };
 }
 
+/** Resolve the effective {@link AgentConfig} for a spawned pane: the NEAREST level that sets an
+ *  `agent:` block wins WHOLE (step over belt over repo) — within it, `command` defaults to
+ *  {@link DEFAULT_AGENT_CONFIG}'s `claude` and `flags` to `[]` (you own the flags once you name a
+ *  block, so opencode never inherits claude's). No block at any level ⇒ DEFAULT_AGENT_CONFIG, keeping
+ *  today's `claude --dangerously-skip-permissions` byte-identical. */
+function resolveAgent(repo: ParsedAgentBlock | undefined, belt: ParsedAgentBlock | undefined, step: ParsedAgentBlock | undefined): AgentConfig {
+  const block = step ?? belt ?? repo;
+  if (!block) return DEFAULT_AGENT_CONFIG;
+  return { command: block.command ?? DEFAULT_AGENT_CONFIG.command, flags: block.flags ?? [] };
+}
+
 // Fields every belt shares. `source` references a work_source by name (validated below). `match`
 // is an OPTIONAL path to a `.ts` module (default export = predicate); when omitted the belt
 // accepts anything from its source. Lower `priority` = matched first (first matching belt claims).
@@ -337,6 +369,10 @@ const beltBase = {
   // field resolves belt over repo over the historical defaults — see resolveBranchTaxonomy. Absent
   // (both here and at repo level) ⇒ today's fix|chore|feature naming, unchanged.
   branch: BranchBlockSchema.optional(),
+  // Optional per-belt override of the repo-level `agent:` harness (command + flags a SPAWNED pane
+  // launches). Resolved as a whole unit belt over repo over DEFAULT_AGENT_CONFIG — see resolveAgent.
+  // A step ref may override it further. Absent everywhere ⇒ today's claude harness, unchanged.
+  agent: AgentBlockSchema.optional(),
 };
 
 // A belt is a (source + ordered steps) pairing. `.strict()` rejects typos AND the removed
@@ -500,6 +536,12 @@ export const RepoConfigSchema = z
     // and the slug vars. Overridable per belt (belt.branch); resolved belt over repo over the historical
     // defaults. Absent ⇒ today's fix|chore|feature naming + 20/50 caps, unchanged.
     branch: BranchBlockSchema.optional(),
+    // Optional repo-wide agent harness for factory-SPAWNED panes: `command` (the binary) + `flags`.
+    // Overridable per belt and per step (belt.agent / step.agent); resolved step over belt over repo
+    // over DEFAULT_AGENT_CONFIG. Absent everywhere ⇒ today's `claude --dangerously-skip-permissions`,
+    // so a spawned pane's argv is byte-identical to before. (Panes YOUR layout provides are unaffected
+    // — the step drives whatever that pane already runs.)
+    agent: AgentBlockSchema.optional(),
   })
   .superRefine((cfg, ctx) => {
     // Work source names unique on the RESOLVED name (name ?? type), so two unnamed jira sources
@@ -686,6 +728,10 @@ export interface StepConfig {
   guards: GuardSpec[]; // resolved watchdogs that actually attach to this step
   effects: EffectSpec[]; // declared source-lifecycle transitions
   posture: StepPosture; // read_only / requiresLayout flags
+  /** The agent harness a SPAWNED pane for this step launches (command + flags), resolved step over
+   *  belt over repo over DEFAULT_AGENT_CONFIG. loadConfig always sets it; optional so terse test
+   *  literals fall back to DEFAULT_AGENT_CONFIG at the spawn site (step.ts). */
+  agent?: AgentConfig;
 }
 
 /** A pane's normalized extent along its split axis: a percentage of the parent, or a fixed cell
@@ -801,6 +847,11 @@ export interface Config {
   /** Repo-wide conventions injected into agent prompts. `commits` is free text or a file pointer
    *  (resolved at render time in step.ts); surfaced as @@COMMIT_CONVENTIONS@@. */
   conventions?: { commits?: string };
+  /** The repo-level agent harness (command + flags a SPAWNED pane launches), resolved repo over
+   *  DEFAULT_AGENT_CONFIG. Per-belt/per-step overrides live on each StepConfig.agent; this is the
+   *  fallback the PR-watch resolver uses when it can't resolve a belt's pr step (watch.ts). Always
+   *  set by loadConfig (DEFAULT_AGENT_CONFIG when no `agent:` block). */
+  agent: AgentConfig;
   paths: {
     configDir: string;
     repoDir: string;
@@ -1052,9 +1103,10 @@ export function loadConfig(repoName: string): Loaded {
   const resolveStep = (
     beltName: string,
     sourceType: SourceType,
-    ref: { type: string; name?: string; tab?: string; pane?: string; prompt_file?: string; prompt_file_source?: "config" | "repo"; budget_seconds?: number; heartbeat: boolean } & CapabilityRef,
+    ref: { type: string; name?: string; tab?: string; pane?: string; prompt_file?: string; prompt_file_source?: "config" | "repo"; budget_seconds?: number; heartbeat: boolean; agent?: ParsedAgentBlock } & CapabilityRef,
     kept: { type: string; name?: string }[],
     index: number,
+    beltAgent: ParsedAgentBlock | undefined,
   ): StepConfig => {
     const d = stepDescriptorFor(ref.type)!; // existence guaranteed by the schema step-type enum
     const name = ref.name ?? ref.type;
@@ -1094,6 +1146,9 @@ export function loadConfig(repoName: string): Loaded {
       guards,
       effects: [...d.effects],
       posture,
+      // The harness a SPAWNED pane for this step launches — step over belt over repo over the
+      // default. Inert for a step that targets a layout pane (it drives that pane's own agent).
+      agent: resolveAgent(parsed.agent, beltAgent, ref.agent),
     };
   };
 
@@ -1101,7 +1156,7 @@ export function loadConfig(repoName: string): Loaded {
     const sourceType = sourceTypeByName.get(b.source)!; // existence guaranteed by superRefine
     // Apply the evidence-opt-in skip (a requiresLayout step with no tab/pane), then resolve each.
     const kept = b.steps.filter((s) => !stepSkipped(stepDescriptorFor(s.type)!, s));
-    const steps: StepConfig[] = kept.map((ref, i) => resolveStep(b.name, sourceType, ref, kept, i));
+    const steps: StepConfig[] = kept.map((ref, i) => resolveStep(b.name, sourceType, ref, kept, i, b.agent));
     // Validate each `config`-sourced user prompt's tokens + @@WHEN@@ clauses against the contract for
     // its step (existence was already asserted in resolveStep). A `repo`-sourced prompt is read from
     // the worktree at render time, so it's validated there instead. productActiveFor is the same
@@ -1203,6 +1258,9 @@ export function loadConfig(repoName: string): Loaded {
       : undefined,
     guidance,
     conventions: parsed.conventions,
+    // Repo-level resolved harness (repo over the default). Per-belt/per-step overrides live on each
+    // StepConfig.agent; this is the resolver's fallback (watch.ts) when no belt pr step resolves.
+    agent: resolveAgent(parsed.agent, undefined, undefined),
     paths: {
       configDir: cfgDir,
       repoDir,

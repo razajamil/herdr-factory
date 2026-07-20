@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Deps } from "./deps.ts";
 import type { Run, SourceType } from "../types.ts";
-import { CLAUDE_FLAGS, MEMORY_DIR } from "./step.ts";
+import { MEMORY_DIR } from "./step.ts";
 import { productCapabilityFor } from "../products/registry.ts";
 
 /** Render the resolver prompt from the library — prompts/<sourceType>/<slug>.md if present, else the
@@ -48,10 +48,14 @@ export async function wakeResolver(deps: Deps, run: Run, prNumber: number): Prom
     return true;
   }
 
+  // The resolver runs in the SAME worktree as the pr step; give it the pr step's configured harness
+  // (else the repo-level default) so a factory that spawns opencode/codex workers resolves review
+  // rounds with the same agent. Byte-identical to before when no `agent:` block is set.
+  const agent = deps.resolveBelt(run.belt)?.steps.find((s) => s.opensPr)?.agent ?? deps.config.agent;
   const pane = await deps.herdr.agentStart({
     workspaceId: run.workspaceId,
     cwd: worktree,
-    argv: ["claude", ...CLAUDE_FLAGS, instruction],
+    argv: [agent.command, ...agent.flags, instruction],
   });
   if (!pane) {
     deps.log("warn", `${run.ticketKey}: resolver agentStart returned no pane for PR #${prNumber}`);

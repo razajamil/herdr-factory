@@ -1,6 +1,16 @@
+import { basename } from "node:path";
 import { run, runJson } from "./exec.ts";
 import { HerdrUnreachableError, type LivenessOpts } from "../core/deps.ts";
 import type { Agent, FocusedPane, WorkspaceInfo, WorktreeResult } from "../types.ts";
+
+/** The herdr agent KIND (`herdr agent start <name>`) for a spawn argv. herdr uses it to pick the
+ *  integration that detects idle/working for the pane, so it must name the real harness — we derive
+ *  it from the executable (argv[0]'s basename), which is the configured `agent.command`. A full path
+ *  (`/opt/homebrew/bin/claude`) still yields `claude`; an empty/absent argv falls back to `claude`.
+ *  Byte-identical to the old hardcoded "claude" whenever argv[0] is `claude`. */
+export function agentKindForArgv(argv: readonly string[]): string {
+  return (argv[0] ? basename(argv[0]) : "") || "claude";
+}
 
 interface RawAgent {
   pane_id: string;
@@ -179,14 +189,16 @@ export class HerdrClient {
     return pane?.pane_id ?? null;
   }
 
-  /** Start a claude agent; argv[0] is the executable (e.g. "claude"). Echoes its pane id. */
+  /** Start an agent; argv[0] is the executable (e.g. "claude", "opencode"). The herdr agent kind
+   *  is derived from argv[0] (agentKindForArgv) so a configured non-claude harness is detected
+   *  correctly. Echoes its pane id. */
   async agentStart(opts: {
     workspaceId: string;
     cwd: string;
     argv: string[];
     env?: Record<string, string>;
   }): Promise<string | null> {
-    const args = ["agent", "start", "claude", "--workspace", opts.workspaceId, "--cwd", opts.cwd, "--no-focus"];
+    const args = ["agent", "start", agentKindForArgv(opts.argv), "--workspace", opts.workspaceId, "--cwd", opts.cwd, "--no-focus"];
     for (const [k, v] of Object.entries(opts.env ?? {})) args.push("--env", `${k}=${v}`);
     args.push("--", ...opts.argv);
     const j = await runJson<AgentStartResp>(this.bin, args, { allowFail: true }).catch(

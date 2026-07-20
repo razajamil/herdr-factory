@@ -3,7 +3,8 @@ import { isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { StepConfig } from "../config.ts";
 import type { BeltRuntime, Deps, SourceRuntime } from "./deps.ts";
-import type { Run, RunStep } from "../types.ts";
+import type { AgentConfig, Run, RunStep } from "../types.ts";
+import { DEFAULT_AGENT_CONFIG } from "../types.ts";
 import { renderWorkVars } from "./branch.ts";
 import { productActiveFor, type PromptStepContext, stripInactiveProductBlocks, validatePromptBody } from "../prompts/contract.ts";
 import { signalCommand } from "../signals/registry.ts";
@@ -14,7 +15,6 @@ import { telemetrySpan } from "../telemetry/index.ts";
 // these two were historically step.ts's surface (and tests import them from it).
 export { productActiveFor, stripInactiveProductBlocks } from "../prompts/contract.ts";
 
-export const CLAUDE_FLAGS = ["--dangerously-skip-permissions"];
 export const CLI_PATH = fileURLToPath(new URL("../../bin/herdr-factory", import.meta.url));
 export const MEMORY_DIR = ".memory/herdr-factory";
 
@@ -214,7 +214,7 @@ export type DispatchResult = { status: "ready"; paneId: string } | { status: "wa
  */
 export async function dispatchToLayout(
   deps: Deps,
-  opts: { workspaceId: string; worktree: string; tab?: string; pane?: string; prompt: string; paneName: string; ticketKey: string; knownPaneId?: string },
+  opts: { workspaceId: string; worktree: string; tab?: string; pane?: string; prompt: string; paneName: string; ticketKey: string; knownPaneId?: string; agent: AgentConfig },
 ): Promise<DispatchResult> {
   return telemetrySpan(
     "step.dispatch",
@@ -232,7 +232,7 @@ export async function dispatchToLayout(
 
 async function dispatchToLayoutImpl(
   deps: Deps,
-  opts: { workspaceId: string; worktree: string; tab?: string; pane?: string; prompt: string; paneName: string; ticketKey: string; knownPaneId?: string },
+  opts: { workspaceId: string; worktree: string; tab?: string; pane?: string; prompt: string; paneName: string; ticketKey: string; knownPaneId?: string; agent: AgentConfig },
 ): Promise<DispatchResult> {
   if (opts.tab && opts.pane) {
     // Resolve this step's pane, in order (see the dispatchToLayout doc):
@@ -289,10 +289,13 @@ async function dispatchToLayoutImpl(
     deps.log("info", `${opts.ticketKey}: re-dispatched to reused dedicated pane ${opts.knownPaneId}`);
     return { status: "ready", paneId: opts.knownPaneId };
   }
+  // The configured harness for this spawned pane: [command, ...flags, prompt]. argv[0] is the
+  // executable (agentStart's documented invariant; herdr's agent kind is derived from it). Defaults
+  // to claude --dangerously-skip-permissions when no `agent:` block is set (byte-identical to before).
   const target = await deps.herdr.agentStart({
     workspaceId: opts.workspaceId,
     cwd: opts.worktree,
-    argv: ["claude", ...CLAUDE_FLAGS, opts.prompt],
+    argv: [opts.agent.command, ...opts.agent.flags, opts.prompt],
     env: { HERDR_FACTORY_TICKET: opts.ticketKey },
   });
   if (!target) throw new Error(`${opts.ticketKey}: failed to spawn dedicated agent (no tab/pane configured)`);
@@ -635,6 +638,9 @@ async function spawnStepImpl(
     paneName: `${stepName}:${run.ticketKey}`,
     ticketKey: run.ticketKey,
     knownPaneId,
+    // Resolved step over belt over repo over the default (config.ts); the ?? guards terse test
+    // literals that build a StepConfig without an `agent`. Only used on the dedicated-spawn path.
+    agent: step.agent ?? DEFAULT_AGENT_CONFIG,
   });
   if (result.status === "waiting") return result; // still waiting on the user's layout pane
 

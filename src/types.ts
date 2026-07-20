@@ -483,6 +483,21 @@ export interface StepPosture {
   requiresLayout?: boolean; // materialize only when a layout tab/pane targets it (evidence opt-in)
 }
 
+/** The agent harness a factory-SPAWNED pane launches (the `agent:` config block, resolved
+ *  step ?? belt ?? repo ?? {@link DEFAULT_AGENT_CONFIG} in src/config.ts). `command` is the
+ *  executable and `flags` its flags; the spawned argv is `[command, ...flags, prompt]` — so
+ *  `command` is argv[0], the documented `agentStart` invariant (see clients/herdr.ts). Only panes
+ *  the factory spawns itself use this; a step targeting a layout pane drives whatever that pane
+ *  already runs. */
+export interface AgentConfig {
+  command: string;
+  flags: string[];
+}
+
+/** The historical hardcoded harness: `claude --dangerously-skip-permissions`. Used when NO
+ *  `agent:` block is set at any level, so a spawned pane's argv stays byte-identical to before. */
+export const DEFAULT_AGENT_CONFIG: AgentConfig = { command: "claude", flags: ["--dangerously-skip-permissions"] };
+
 /** Where an agent→dispatcher signal is scoped — drives its route mounting, lock discipline, and
  *  which outbox (if any) it feeds. */
 export type SignalScope = "run" | "machine" | "product-outbox";

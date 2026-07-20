@@ -13,7 +13,7 @@ import { getAuthFailure, resetAuthGate } from "../src/auth/gate.ts";
 import type { Config, StepConfig } from "../src/config.ts";
 import { LAYOUT_WAIT_GUARD } from "../src/steps/guards.ts";
 import type { FocusedPane, HumanAskInput, HumanPollInput, HumanReply, JiraMatchItem, LocalMarkdownMatchItem, Phase, PrInfo, PrSnapshot, ReviewSig, Ticket, WorkState } from "../src/types.ts";
-import { StaleItemError } from "../src/types.ts";
+import { DEFAULT_AGENT_CONFIG, StaleItemError } from "../src/types.ts";
 
 const tmps: string[] = [];
 afterEach(() => {
@@ -240,6 +240,7 @@ function build(opts: { multi?: boolean } = {}) {
     belts,
     layouts: [],
     guidance: undefined,
+    agent: DEFAULT_AGENT_CONFIG,
     paths: { configDir: "/c", repoDir: "/c/repos/demo", stateRoot: "/s", stateDir: "/s/demo", dbPath: "/s/db", logsDir: join(worktree, "logs") },
   };
   const deps: Deps = {
