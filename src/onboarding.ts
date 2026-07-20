@@ -39,7 +39,7 @@ export function afterDoctorHint(opts: { repo?: string; deep: boolean; failed: bo
     return "Next: point it at a repo — run `herdr-factory init` from inside your project checkout, then `herdr-factory --repo <name> doctor --deep`.";
   }
   if (!opts.deep) {
-    return `Next: verify the live setup — \`herdr-factory --repo ${opts.repo} doctor --deep\` (gh auth · work-source health · evidence bucket).`;
+    return `Next: verify the live setup — \`herdr-factory --repo ${opts.repo} doctor --deep\` (gh auth · work-source health · evidence publisher).`;
   }
   return `Next: take your first run — \`herdr-factory --repo ${opts.repo} run --follow\`.`;
 }

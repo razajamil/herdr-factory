@@ -156,17 +156,35 @@ layouts:
         panes:
           - { title: agent, command: claude }
 
-# ── evidence: where the evidence step publishes captured screenshots/video (S3 + CloudFront). ──
+# ── evidence: where the evidence step publishes captured screenshots/video. ──
 # OPTIONAL — omit it and the evidence step still captures + assesses (and can bounce), it just
-# publishes nothing. Non-secret infra pointers ONLY: AWS credentials come from the ambient AWS CLI
+# publishes nothing. The backend is a SEAM selected by `publisher` (default `s3`; a block with no
+# `publisher:` key is `s3`, unchanged). Every publisher lays evidence under the same key layout
+# `herdr-factory/<github_username>/<key_prefix>/<key>/<run>-<timestamp>/` and builds "prefix +
+# filename" URLs. `key_prefix` + `github_username` (default = the gh login) are shared by all three.
+#
+# s3 — S3 + CloudFront. Non-secret infra pointers ONLY: AWS credentials come from the ambient AWS
 # credential chain (~/.aws / AWS_* env / the named `profile`), never stored here or handed to an
 # agent. bucket + region + cloudfront_domain are required together.
 # evidence:
 #   bucket: my-evidence-bucket
 #   region: us-east-1
 #   cloudfront_domain: d123abc.cloudfront.net   # bare host (or a full URL); builds https asset URLs
-#   key_prefix: herdr-factory                   # optional S3 key prefix
+#   key_prefix: herdr-factory                   # optional key prefix
 #   profile: my-aws-profile                     # optional AWS CLI named profile
+#
+# local — zero cloud setup: copy captures into a dir the resident server serves at /evidence/<key>/…;
+# URLs point at that server (it must be running to resolve them). Same-machine/tailnet reviewers.
+# evidence:
+#   publisher: local
+#   public_base_url: http://my-box.tailnet.ts.net:8765   # optional; default http://127.0.0.1:<port>
+#
+# command — bring-your-own backend: the executable is run with (captureDir, keyPrefix) and must
+# upload the bytes + print one public URL per file to stdout. Non-zero exit / timeout is retried.
+# evidence:
+#   publisher: command
+#   command: ./publish-evidence.sh              # a bare path, or an argv array [tool, --flag, …]
+#   timeout_seconds: 300                         # optional; default 300
 
 # ── branch: how a work-item type maps to {{semantic_work_prefix}}, and the length caps for the slug
 # vars. OPTIONAL and repo-wide (override per belt with a belt-level `branch:` block — each field

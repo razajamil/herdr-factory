@@ -315,7 +315,8 @@ review }, { type: pr }]` — the engine ships each primitive's prompt:
 - **evidence** _(opt-in)_ — derives a test plan from the work item's acceptance criteria, then films
   the running app to prove each one. It follows the repo's own skills/runbooks for the dev-server
   workflow **and** the login/test account so it exercises the flow as the right persona, drives
-  `playwright-cli` for before/after screenshots and video, publishes the captures to S3/CloudFront,
+  `playwright-cli` for before/after screenshots and video, publishes the captures via the configured
+  [`evidence.publisher`](#evidence-optional-repo-wide) (S3, the local server, or a custom command),
   and records a per-criterion verdict table (with the public URLs) in its handoff. If the evidence
   doesn't prove a criterion it **bounces the run back to work** with findings. A flaky app that keeps
   re-capturing past `max_capture_attempts` parks for attention — but only as a backstop against a
@@ -427,11 +428,12 @@ brief's front-matter). Route bugs to one belt and stories to another, programmat
   a tick can be killed anywhere and the next one converges. The server is a coordinator, not a
   source of truth: every command falls back to running in-process when it's down, so a worker's
   `step-done` lands even mid-restart. Workers live in herdr and survive factory restarts. Source
-  status write-backs **and S3 evidence uploads** are persisted intents, retried in the background
-  until confirmed — an upload survives an AWS SSO session expiring mid-run instead of shipping a PR
-  with broken evidence links (a persistent auth failure pings you to `aws sso login`, and the next
-  tick auto-retries the moment credentials come back — it re-queues due-now instead of waiting out
-  the backoff, so there's nothing to press).
+  status write-backs **and evidence uploads** are persisted intents, retried in the background
+  until the backend confirms — an upload survives an AWS SSO session expiring mid-run (or any
+  transient backend outage) instead of shipping a PR with broken evidence links. For the `s3`
+  publisher a persistent auth failure pings you to `aws sso login`, and the next tick auto-retries
+  the moment credentials come back — it re-queues due-now instead of waiting out the backoff, so
+  there's nothing to press.
 - **Built to scale.** Active runs reconcile in parallel under per-run locks; Jira and GitHub
   traffic flows through token buckets (GitHub's is a process-wide budget) with
   `Retry-After`-honoring retries; all watched PRs share one batched
@@ -695,22 +697,53 @@ error. `evidence` and `review` are **read-only** (enforced: if one commits, the 
 ### `evidence` (optional, repo-wide)
 
 Where the evidence station publishes captures — omit the block and it still captures, assesses,
-and can bounce; it just publishes nothing:
+and can bounce; it just publishes nothing. The backend is a **seam**, selected by `publisher`
+(default `s3`; a block with no `publisher:` key is `s3`, unchanged). Every publisher lays evidence
+under the same key layout `herdr-factory/<github_username>/<key_prefix>/<key>/<run>-<timestamp>/`
+and produces "prefix + filename" URLs, so prompts and PR embedding never change. `key_prefix`
+(optional) and `github_username` (optional; default = the `gh` login at publish time) are shared by
+all three. Delivery is durable — the URLs are published up-front and the bytes retry in the
+background until the backend accepts them.
+
+**`s3`** — S3 + CloudFront (the original). Non-secret pointers only; AWS credentials come from the
+ambient chain (`AWS_*` env, SSO, `~/.aws`, or the named `profile`) — never stored in config or
+handed to an agent.
 
 ```yaml
-evidence:
+evidence: # publisher: s3 is the default
   bucket: my-evidence-bucket
   region: us-east-1
   cloudfront_domain: d123abc.cloudfront.net # bare host or URL; used to build the public links
   key_prefix: my-app # optional
   profile: my-aws-profile # optional named profile
-  github_username: raza # optional; default = `gh` login at upload time
+  github_username: raza # optional; default = `gh` login at publish time
 ```
 
-Non-secret pointers only: AWS credentials come from the ambient credential chain (`AWS_*` env,
-SSO, `~/.aws`, or the named `profile`) — never stored in config or handed to an agent. Objects
-land under `herdr-factory/<github_username>/<key_prefix>/<key>/<run>-<timestamp>/`.
-`doctor --deep` verifies the setup with a real S3 write probe.
+**`local`** — zero cloud setup. Captures are copied into a directory the resident server serves at
+`/evidence/<key>/…`, and the URLs point at that server. Good enough for same-machine/tailnet
+reviewers and the dashboard (the server must be running for the links to resolve).
+
+```yaml
+evidence:
+  publisher: local
+  public_base_url: http://my-box.tailnet.ts.net:8765 # optional; default http://127.0.0.1:<server port>
+```
+
+**`command`** — bring-your-own backend (GCS, Azure, an internal artifact store). The executable is
+run with two trailing args — the capture directory and the key prefix — and must upload the bytes
+and print one public URL per file to stdout (each ending in that file's path). A non-zero exit or a
+timeout is retried on the outbox's backoff. Because the URLs come from stdout, they are known only
+after a successful run (a deferred `command` publish has no links to embed until it lands).
+
+```yaml
+evidence:
+  publisher: command
+  command: ./publish-evidence.sh # a bare path, or an argv array [tool, --flag, …]
+  timeout_seconds: 300 # optional; default 300
+```
+
+`doctor --deep` verifies the setup with a per-publisher round-trip: an S3 write probe, a
+`local` static-serve fetch, or a `command` dry-run.
 
 ### `conventions` (optional)
 

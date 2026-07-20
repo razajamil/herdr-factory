@@ -39,7 +39,7 @@ export interface ProductCapability {
   /** Capability-scoped tokens injected into a step's prompt only when the step touches this product
    *  (universal tokens like @@KEY@@/@@WORK_DOC@@ stay always-injected in step.ts). */
   readonly tokens?: readonly string[];
-  /** Enables an existing durable outbox drained by the reconciler (evidence S3 upload). */
+  /** Enables an existing durable outbox drained by the reconciler (evidence publish upload). */
   readonly outbox?: "evidence_uploads";
   /** Source lifecycle transition emitted when this product is produced (forward-only). */
   readonly effectOnProduce?: { readonly to: WorkState };

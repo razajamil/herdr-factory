@@ -105,7 +105,7 @@ This document is the canonical design of the TypeScript implementation
 | Local API server | **Hono** on **`@hono/node-server`** (resident `serve`, 127.0.0.1); **`@hono/zod-openapi`** validates requests + generates the OpenAPI doc, **`@hono/swagger-ui`** at `/ui`; native **`fetch`** clients |
 | HTTP (Jira + GitHub REST) | **`clients/http.ts`** — an **Effect**-based pipeline over native `fetch`: interruption-wired timeouts, shared (chainable) token buckets, and `Schedule` retries (exponential + jitter) honoring `Retry-After` |
 | Effects / concurrency | **`effect`** — the HTTP retry/rate-limit pipeline, bounded-concurrency Phase A (`Effect.forEach`), and the OpenTelemetry runtime (`@effect/opentelemetry`) |
-| Evidence upload | **`@aws-sdk`** (`client-s3` + `lib-storage` multipart; ambient credential chain — no `aws` CLI) |
+| Evidence publish | a **publisher seam** (`evidence.publisher`, default `s3`) behind `EvidencePublisher`: **`s3`** — **`@aws-sdk`** (`client-s3` + `lib-storage` multipart; ambient credential chain, no `aws` CLI); **`local`** — copy into the resident server's serve dir; **`command`** — a user executable (`execFile`) that uploads + prints URLs |
 | TUI | **`@opentui/core`** (native renderer — Node ≥26 with FFI; the launcher adds the flags) |
 | Tests | **vitest** (dev-only) |
 | External CLIs | **herdr**, **gh**, **git** (+ **claude**, launched inside herdr panes) |
@@ -601,14 +601,14 @@ CREATE TABLE transition_outbox(          -- source status write-backs as persist
   stale_handled_at INTEGER,              -- the run-locked stale policy consumed it (v14)
   UNIQUE(run_id, to_state));             -- enqueue is idempotent across retried ticks
 
-CREATE TABLE evidence_uploads(           -- S3 evidence uploads as persisted INTENTS (v16) — the
-  id INTEGER PRIMARY KEY AUTOINCREMENT,  -- upload analog of transition_outbox (durable, retried)
-  run_id INTEGER NOT NULL REFERENCES runs(id),
-  repo TEXT NOT NULL, ticket_key TEXT NOT NULL,
+CREATE TABLE evidence_uploads(           -- evidence publishes as persisted INTENTS (v16) — the
+  id INTEGER PRIMARY KEY AUTOINCREMENT,  -- upload analog of transition_outbox (durable, retried).
+  run_id INTEGER NOT NULL REFERENCES runs(id),  -- publisher-agnostic (s3|local|command): only the
+  repo TEXT NOT NULL, ticket_key TEXT NOT NULL, -- delivery fn behind EvidencePublisher differs.
   key_prefix TEXT NOT NULL,              -- persisted so retry URLs stay stable (published up-front)
   evidence_dir TEXT NOT NULL,            -- abs worktree path; gone ⇒ abandon
   attempts INTEGER NOT NULL DEFAULT 0, next_attempt_at INTEGER NOT NULL,  -- backoff + enqueue LEASE
-  last_error TEXT, error_kind TEXT,      -- classifyS3Error: auth|transient|permanent (drives SSO light)
+  last_error TEXT, error_kind TEXT,      -- publisher.classifyError: auth|transient|permanent (auth: S3 only; drives SSO light)
   notified_at INTEGER,                   -- SSO/permanent-fail notify throttle (per row, never the run)
   permanent_failed_at INTEGER,           -- terminal: non-retryable config error / dir-gone
   abandoned_at INTEGER,                  -- superseded by a re-capture, or dropped at teardown
@@ -684,13 +684,17 @@ Phase-A pass (`stale_handled_at`): an `in_development` stale — the claim write
 item deleted/closed, i.e. "don't do this work" — aborts the run promptly; a mid-flight stale
 (e.g. `in_review` — a PR may be up) parks it for `attention` with **no source note** (the item
 the note would go to is what's gone). Phase 0 then also flushes the **evidence-upload outbox**
-(`flushEvidenceUploads`, same due/backoff/lease machinery): every undelivered S3 evidence upload is
-retried until it lands, so an AWS SSO session expiring mid-run no longer ships a PR with broken
-evidence links (the `evidence-upload` CLI publishes the deterministic URLs + attempts inline
-up-front, then enqueues the bytes here). A persistent auth failure notifies the human to
-`aws sso login`; and when a row is auth-stuck the flush cheaply probes creds once (gated on a stuck
-row — the happy path never probes) and, the moment they're live again, resets every auth-stuck row
-due-now (`retryEvidenceUploadsForRepo`, mirroring the source-auth `retryTransitionsForSource`) so
+(`flushEvidenceUploads`, same due/backoff/lease machinery): every undelivered evidence upload is
+retried through the run's `EvidencePublisher` (`s3`|`local`|`command`, selected from
+`evidence.publisher`) until the backend accepts it, so an AWS SSO session expiring mid-run — or any
+transient backend outage — no longer ships a PR with broken evidence links (the `evidence-upload`
+CLI publishes the URLs + attempts inline up-front, then enqueues the bytes here). The flush is
+publisher-agnostic: it drives `publisher.publish` / `publisher.classifyError`, and the SSO
+auto-resume is gated on the publisher exposing `probeLiveness` — only `s3` does, so `local`/`command`
+(no `auth` kind, never auth-stuck) skip it entirely. For `s3`, a persistent auth failure notifies the
+human to `aws sso login`; and when a row is auth-stuck the flush cheaply probes creds once (gated on a
+stuck row — the happy path never probes) and, the moment they're live again, resets every auth-stuck
+row due-now (`retryEvidenceUploadsForRepo`, mirroring the source-auth `retryTransitionsForSource`) so
 the same pass uploads it instead of waiting out the up-to-1h backoff — no manual retry, no waiting.
 A non-retryable error or a vanished capture dir is marked permanently failed —
 there's no source-stale two-phase, as evidence has no "gone at source". **Phase A** advances every active run one idempotent step, **in parallel
@@ -746,7 +750,7 @@ herdr agent in its own tab/pane, dispatched and gated by the reconciler. The run
 | Step | Does | Hands off |
 |---|---|---|
 | **work** | read the work doc + attachments → implement → lint/type/tests → commit | `handoff-work.md` + `step-done work` |
-| **evidence** *(opt-in)* | derive a test plan from acceptance criteria → run the app via the repo's dev-server/credentials skills (right persona) → capture before/after screenshots+video (`capture-attempt` signals each try) → publish to S3 → per-criterion verdict: pass forward or **bounce to work** | `handoff-evidence.md` + `step-done` / `bounce` |
+| **evidence** *(opt-in)* | derive a test plan from acceptance criteria → run the app via the repo's dev-server/credentials skills (right persona) → capture before/after screenshots+video (`capture-attempt` signals each try) → publish via `evidence.publisher` (s3/local/command) → per-criterion verdict: pass forward or **bounce to work** | `handoff-evidence.md` + `step-done` / `bounce` |
 | **review** | fresh-eyes **read-only** gate — never edits or commits (enforced: a commit parks the run): pass forward, or **bounce to work** with findings | `handoff-review.md` + `step-done` / `bounce` |
 | **pr** | push + open the PR (evidence URLs embedded) → drive the automated round (CI green + bot comments) | `step-done pr` → human review |
 
@@ -1225,14 +1229,19 @@ about to revert. It's driven two ways:
         a commit parks the run). Composition is validated at load — each primitive declares typed
         `consumes`/`produces`, and a belt whose step needs an input no earlier step or the source
         produces is rejected.
-    - `evidence` — optional repo-wide block: where the evidence step publishes captures.
-      `bucket` + `region` + `cloudfront_domain` (required together), optional `key_prefix` /
-      `profile` / `github_username` (default: the `gh` login at upload time). Non-secret
-      pointers only — AWS creds come from the ambient credential chain (or the named `profile`);
-      upload is pure `@aws-sdk` (multipart via `lib-storage`), keys under
-      `herdr-factory/<github_username>/<key_prefix>/<key>/<runId>-<timestamp>/`. Omit the block
-      and evidence still captures/assesses/bounces — it just publishes nothing
-      (`doctor --deep` verifies with a real S3 write probe).
+    - `evidence` — optional repo-wide block: where the evidence step publishes captures. A
+      **discriminated union on `publisher`** (same idiom as the source types; default `s3`, so a block
+      with no `publisher:` key is unchanged), resolved behind the `EvidencePublisher` seam in
+      `clients/evidence.ts`: **`s3`** (`bucket` + `region` + `cloudfront_domain` required together,
+      optional `profile`; pure `@aws-sdk` multipart via `lib-storage`, ambient creds), **`local`**
+      (optional `public_base_url`; copies captures into the resident server's serve dir, served at
+      `/evidence/<key>/…`), **`command`** (`command` argv + optional `timeout_seconds`; a user
+      executable run with `(captureDir, keyPrefix)` that uploads + prints one URL per file). All three
+      share optional `key_prefix` / `github_username` (default: the `gh` login at publish time) and the
+      key layout `herdr-factory/<github_username>/<key_prefix>/<key>/<runId>-<timestamp>/`, so the
+      "prefix + filename" URL shape is backend-independent. Omit the block and evidence still
+      captures/assesses/bounces — it just publishes nothing (`doctor --deep` runs a per-publisher
+      round-trip: an S3 write probe, a `local` static-serve fetch, or a `command` dry-run).
   - `guidelines-prompt.md` — optional; appended verbatim to every agent prompt (all sources).
 - **Editor schema** — each `config.yml`'s modeline
   (`# yaml-language-server: $schema=../../config.schema.json`) points at a JSON Schema generated
@@ -1272,7 +1281,7 @@ herdr-factory --repo <name> step-done <KEY> <step> [--source <name>]  # agent �
 herdr-factory --repo <name> ask-human <KEY> <step> --question[-file] …  # agent → park until a human replies
 herdr-factory --repo <name> bounce <KEY> <toStep> --reason[-file] …     # agent → send work back for rework
 herdr-factory --repo <name> capture-attempt <KEY> [--source <name>]   # evidence agent → count a capture try (flaky-capture cap)
-herdr-factory --repo <name> evidence-upload <KEY> [--source <name>]    # publish captured evidence (S3)
+herdr-factory --repo <name> evidence-upload <KEY> [--source <name>]    # publish captured evidence (via evidence.publisher)
 herdr-factory --repo <name> runs [--all] | timeline <KEY> | logs [n]   # read the DB / repo log
 # machine-wide (no --repo)
 herdr-factory serve                       # the resident daemon: tick every repo + Hono API (+ /doc, /ui)
@@ -1311,8 +1320,8 @@ supervisor service loaded, server responding, DB present), **you-provide** (`git
 **per-repo** (config loads + valid, main checkout, origin resolved, per-source `health()`, the
 descriptor-declared required secrets present, a local **evidence-upload-outbox** health check
 (pending uploads still retrying; an auth-class stuck upload is flagged ✗ with the `aws sso login`
-fix — the AWS session expired), and a `--deep` S3 write-probe of the evidence
-bucket). The you-provide tools are resolved against the **service's** PATH (`service.servicePath()`
+fix — the AWS session expired), and a `--deep` per-publisher round-trip of the evidence backend
+(S3 write-probe · `local` static-serve fetch · `command` dry-run)). The you-provide tools are resolved against the **service's** PATH (`service.servicePath()`
 reads the PATH baked into the launchd plist / systemd unit — §12), not the checking process's,
 falling back to `process.env.PATH` only when no service is installed. So the answer reflects the
 environment `serve` actually runs its tools in and is identical whether `doctor` runs from a
