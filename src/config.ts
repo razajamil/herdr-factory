@@ -193,6 +193,22 @@ const StepNameSchema = z
 // and an OPTIONAL augment for an engine-prompted one; `prompt_file_source` says where to read it.
 // Optional per-step budget (else the descriptor default, else limits.step_budget_seconds) and
 // commit-stall heartbeat (a `custom` step opts in; work/pr already have one).
+
+// The config-declared capability allow-list for a `custom` step ref — how a user builds their own
+// gates/stations without forking the registry. Only a step whose descriptor sets `refCapabilities`
+// (custom) may carry these; a descriptor-declared step is rejected in superRefine (its capabilities
+// are fixed). The product allow-list is deliberately TIGHT: `commits` is the only product a custom
+// step may consume/produce — `pull_request`/`evidence` drag heavy engine machinery and stay
+// descriptor/plugin territory (the enum rejects them at parse time). All four are still checked by
+// the load-time dataflow rules (a required consume needs an upstream producer; a bounce emitter
+// needs an upstream `bounce_feedback` consumer; `read_only` + producing `commits` is contradictory).
+const CustomProductSchema = z.enum(["commits"]);
+const capabilityFields = {
+  consumes: z.array(CustomProductSchema).optional(),
+  produces: z.array(CustomProductSchema).optional(),
+  read_only: z.boolean().optional(),
+  bounce: z.boolean().optional(),
+};
 const StepTypeSchema = z.enum(STEP_DESCRIPTORS.map((d) => d.name) as [string, ...string[]]);
 const BeltStepSchema = z
   .object({
@@ -200,11 +216,16 @@ const BeltStepSchema = z
     name: StepNameSchema.optional(),
     ...layoutFields,
     ...promptFileFields,
+    ...capabilityFields,
     budget_seconds: z.coerce.number().int().positive().optional(),
     heartbeat: z.boolean().default(false),
   })
   .strict()
   .refine(bothOrNeither, layoutRefine);
+
+/** The fields a step ref may carry from the custom-step capability allow-list (all optional, and
+ *  legal only on a `refCapabilities` step — enforced in superRefine). */
+type CapabilityRef = { consumes?: readonly string[]; produces?: readonly string[]; read_only?: boolean; bounce?: boolean };
 
 // A per-belt branch-name template (the worktree + workspace derive from it). Must include
 // {{work_id}} so the branch is identifiable by ticket; a short unique suffix is appended
@@ -262,12 +283,50 @@ function stepSkipped(d: StepDescriptor, ref: { tab?: string; pane?: string }): b
   return !!d.controls.posture?.requiresLayout && !(ref.tab && ref.pane);
 }
 
-/** The products a step ref actually produces: the descriptor's, plus `commits` when a step opts
- *  into a commit-stall heartbeat (heartbeat tracks commit HEAD movement, so it implies commits). */
-function stepProduces(d: StepDescriptor, ref: { heartbeat?: boolean }): ProductType[] {
+/** Whether a step ref may extend its descriptor's declarations from the capability allow-list. Only
+ *  a `refCapabilities` descriptor (custom) does — so a `read_only`/`bounce`/etc. on any other type
+ *  is inert here (and rejected outright in superRefine). Centralizing the gate keeps the effective-
+ *  declaration helpers below byte-identical to the descriptor's for every non-custom step. */
+function refExtends(d: StepDescriptor): boolean {
+  return d.refCapabilities === true;
+}
+
+/** The products a step ref actually produces: the descriptor's, plus `commits` when a step opts into
+ *  a commit-stall heartbeat (heartbeat tracks commit HEAD movement, so it implies commits) or a
+ *  custom step declares `produces: [commits]` (a code-writing station). */
+function stepProduces(d: StepDescriptor, ref: { heartbeat?: boolean } & CapabilityRef): ProductType[] {
   const p = [...d.produces];
-  if (ref.heartbeat && !p.includes("commits")) p.push("commits");
+  const producesCommits = ref.heartbeat || (refExtends(d) && !!ref.produces?.includes("commits"));
+  if (producesCommits && !p.includes("commits")) p.push("commits");
   return p;
+}
+
+/** The typed inputs a step ref actually consumes: the descriptor's, plus any custom-step
+ *  `consumes: […]` opt-ins (a REQUIRED consume, so the load-time dataflow rule demands an upstream
+ *  producer). Byte-identical to `d.consumes` for a non-custom step. */
+function stepConsumes(d: StepDescriptor, ref: CapabilityRef): InputSpec[] {
+  const consumes: InputSpec[] = d.consumes.map((c) => ({ ...c }));
+  if (refExtends(d) && ref.consumes) {
+    for (const type of ref.consumes) {
+      if (!consumes.some((c) => c.type === type)) consumes.push({ type: type as ProductType, required: true });
+    }
+  }
+  return consumes;
+}
+
+/** Whether a step EMITS a bounce: the descriptor declares it (evidence/review), or a custom step
+ *  opts in with `bounce: true`. The target is resolved (to the earliest earlier `bounce_feedback`
+ *  consumer) the same way for both. */
+function stepBounces(d: StepDescriptor, ref: CapabilityRef): boolean {
+  return !!d.controls.bounce || (refExtends(d) && ref.bounce === true);
+}
+
+/** The effective posture: the descriptor's, plus a custom step's `read_only` opt-in. For any
+ *  non-custom step this is exactly `d.controls.posture` (so StepConfig stays byte-identical). */
+function stepPosture(d: StepDescriptor, ref: CapabilityRef): StepPosture {
+  const base = d.controls.posture ?? {};
+  if (refExtends(d) && ref.read_only === true && !base.readOnly) return { ...base, readOnly: true };
+  return base;
 }
 
 /** Resolve a bounce emitter's targets to the earliest earlier NON-SKIPPED step that consumes
@@ -468,8 +527,21 @@ export const RepoConfigSchema = z
         if (d.promptFileRequired && !s.prompt_file) {
           ctx.addIssue({ code: "custom", message: `belt "${b.name}" step "${name}" (type ${s.type}) needs a prompt_file — it has no built-in prompt`, path: ["belt", i, "steps", j, "prompt_file"] });
         }
-        if (d.controls.posture?.readOnly && stepProduces(d, s).includes("commits")) {
-          ctx.addIssue({ code: "custom", message: `belt "${b.name}" step "${name}" (type ${s.type}) is read-only and cannot commit — remove heartbeat`, path: ["belt", i, "steps", j, "heartbeat"] });
+        // Capability opt-ins (consumes/produces/read_only/bounce) are legal ONLY on a step whose
+        // descriptor allows them (custom). A descriptor-declared step's capabilities are fixed —
+        // reject the field rather than silently applying the descriptor's own value.
+        if (!refExtends(d)) {
+          for (const field of ["consumes", "produces", "read_only", "bounce"] as const) {
+            if (s[field] != null) {
+              ctx.addIssue({ code: "custom", message: `belt "${b.name}" step "${name}" (type ${s.type}) cannot declare \`${field}\` — capability opt-ins are only for \`custom\` steps (a ${s.type} step's capabilities are fixed by its primitive)`, path: ["belt", i, "steps", j, field] });
+            }
+          }
+        }
+        // A read-only step must never produce commits — the two are contradictory (a gate that
+        // commits isn't a gate). Fires for a custom `read_only` + `produces: [commits]`/`heartbeat`,
+        // and for a stray `heartbeat` on the read-only descriptors (evidence/review).
+        if ((stepPosture(d, s).readOnly ?? false) && stepProduces(d, s).includes("commits")) {
+          ctx.addIssue({ code: "custom", message: `belt "${b.name}" step "${name}" (type ${s.type}) is read-only and cannot produce commits — drop \`read_only\`, or remove \`produces: [commits]\`/\`heartbeat\``, path: ["belt", i, "steps", j, "read_only"] });
         }
       });
       // Dataflow over the KEPT steps in order: a REQUIRED consume must be produced by the source or
@@ -479,12 +551,12 @@ export const RepoConfigSchema = z
         const d = stepDescriptorFor(s.type)!;
         const name = s.name ?? s.type;
         const beltIdx = b.steps.indexOf(s);
-        for (const c of d.consumes) {
+        for (const c of stepConsumes(d, s)) {
           if (c.required && !available.has(c.type)) {
             ctx.addIssue({ code: "custom", message: `belt "${b.name}" step "${name}" requires "${c.type}" but neither the source nor an earlier step produces it`, path: ["belt", i, "steps", beltIdx] });
           }
         }
-        if (d.controls.bounce && resolveBounceTargets(kept, ki).length === 0) {
+        if (stepBounces(d, s) && resolveBounceTargets(kept, ki).length === 0) {
           ctx.addIssue({ code: "custom", message: `belt "${b.name}" step "${name}" declares a bounce but no earlier step consumes bounce_feedback`, path: ["belt", i, "steps", beltIdx] });
         }
         for (const p of stepProduces(d, s)) available.add(p);
@@ -885,14 +957,18 @@ export function loadConfig(repoName: string): Loaded {
   const resolveStep = (
     beltName: string,
     sourceType: SourceType,
-    ref: { type: string; name?: string; tab?: string; pane?: string; prompt_file?: string; prompt_file_source?: "config" | "repo"; budget_seconds?: number; heartbeat: boolean },
+    ref: { type: string; name?: string; tab?: string; pane?: string; prompt_file?: string; prompt_file_source?: "config" | "repo"; budget_seconds?: number; heartbeat: boolean } & CapabilityRef,
     kept: { type: string; name?: string }[],
     index: number,
   ): StepConfig => {
     const d = stepDescriptorFor(ref.type)!; // existence guaranteed by the schema step-type enum
     const name = ref.name ?? ref.type;
     if (ref.prompt_file) checkConfigPromptFile(beltName, `step "${name}" prompt_file`, ref.prompt_file_source!, ref.prompt_file);
+    // Effective declarations: the descriptor's, plus any custom-step capability opt-ins (byte-
+    // identical to the descriptor for a non-custom step). The reconciler drives off the RESOLVED
+    // StepConfig below, so a declared gate is the same machinery as w2pr's evidence/review.
     const produces = stepProduces(d, ref);
+    const posture = stepPosture(d, ref);
     // Guards that actually attach: descriptor guards whose conditions hold (layout_wait needs a
     // tab/pane; heartbeat/capture_cap need their product) + a heartbeat guard if the ref opted in.
     const guards: GuardSpec[] = [];
@@ -902,7 +978,6 @@ export function loadConfig(repoName: string): Loaded {
       guards.push(g);
     }
     if (ref.heartbeat && !guards.some((g) => g.kind === "heartbeat")) guards.push(HEARTBEAT_GUARD);
-    const posture: StepPosture = d.controls.posture ?? {};
     return {
       name,
       type: ref.type,
@@ -916,10 +991,10 @@ export function loadConfig(repoName: string): Loaded {
       heartbeat: guards.some((g) => g.kind === "heartbeat"),
       opensPr: produces.includes("pull_request"),
       gathersEvidence: produces.includes("evidence"),
-      canBounceTo: d.controls.bounce ? resolveBounceTargets(kept, index) : [],
+      canBounceTo: stepBounces(d, ref) ? resolveBounceTargets(kept, index) : [],
       readOnly: posture.readOnly ?? false,
       requiresLayout: posture.requiresLayout ?? false,
-      consumes: [...d.consumes],
+      consumes: stepConsumes(d, ref),
       produces,
       guards,
       effects: [...d.effects],

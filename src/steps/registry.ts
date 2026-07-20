@@ -40,11 +40,17 @@ export interface StepControls {
  *  "handoff" (mandatory on every step; enforced by the contract suite).
  *  - `basePrompt` ABSENT ⇒ the generic step whose user `prompt_file` is the WHOLE body (custom);
  *    `promptFileRequired` is then true. PRESENT ⇒ an engine base the optional `prompt_file` augments.
- *  - `defaultBudgetSeconds` ABSENT ⇒ the belt step ref's `budget_seconds` else `limits.step_budget_seconds`. */
+ *  - `defaultBudgetSeconds` ABSENT ⇒ the belt step ref's `budget_seconds` else `limits.step_budget_seconds`.
+ *  - `refCapabilities` ⇒ a belt step ref of this type may EXTEND the descriptor's declarations from
+ *    the config-declared allow-list (`consumes`/`produces` `[commits]`, `read_only`, `bounce`) so a
+ *    user builds their own gates/stations. Only `custom` sets it; a descriptor-declared step's
+ *    capabilities are fixed. The reconciler still branches only on the RESOLVED StepConfig, so a
+ *    declared gate wires through the exact same machinery as w2pr's evidence/review. */
 export interface StepDescriptor {
   readonly name: string;
   readonly basePrompt?: PromptRef;
   readonly promptFileRequired?: boolean;
+  readonly refCapabilities?: boolean;
   readonly defaultBudgetSeconds?: number;
   readonly consumes: readonly InputSpec[];
   readonly produces: readonly ProductType[];

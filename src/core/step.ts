@@ -303,11 +303,23 @@ function scaffold(
       `If the handoff note isn't enough, query it on demand: \`herdr agent read ${prior.paneId} --source recent\`, ` +
       `read its session transcript, or ask it directly with \`herdr agent send ${prior.paneId} "<question>"\`.\n`
     : "\n\n## Input\nThis is the first step of the belt — start from the work item.\n";
+  // A read-only gate whose posture isn't described by an engine base prompt (a `custom` step —
+  // enginePrompt is undefined) is told, by the engine, that it must not commit. The engine ENFORCES
+  // this (HEAD movement during the step parks the run), so the agent needs to know up front. A
+  // base-prompted read-only step (evidence/review) describes its own posture, so this is skipped.
+  const readOnlyNote =
+    step.readOnly && step.enginePrompt === undefined
+      ? `\n## This is a read-only step (no commits)\n` +
+        `This step is a **gate/check, not a workstation**: do NOT edit files or create commits. ` +
+        `The engine enforces this — if the branch HEAD moves while you run, the run is parked for a human as a read-only violation. ` +
+        `If the work needs changes, ${bounceCmd && bounceTarget ? "send it back for rework (see below)" : "record what's wrong in your handoff note and finish"} — do not fix it here.\n`
+      : "";
   return (
     `\n\n## You are an agent in a herdr-factory belt\n` +
     `You are the **${step.name}** step of the **${belt.name}** belt. The belt runs these steps in order: ${seq}. ` +
     `Each step is a separate agent in its own herdr pane; you hand work forward via a handoff note (and can query earlier agents directly).\n` +
     inputs +
+    readOnlyNote +
     `\n## Asking a human for guidance\n` +
     `If you are blocked by ambiguous requirements, missing source material, impossible verification, or conflicting evidence, do NOT guess and do NOT run step-done. ` +
     `Write a concise question to \`${MEMORY_DIR}/human-question-${step.name}.md\`, then run \`${askHumanCmd}\` and stop. ` +

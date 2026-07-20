@@ -518,6 +518,30 @@
                     "config"
                   ]
                 },
+                "consumes": {
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "enum": [
+                      "commits"
+                    ]
+                  }
+                },
+                "produces": {
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "enum": [
+                      "commits"
+                    ]
+                  }
+                },
+                "read_only": {
+                  "type": "boolean"
+                },
+                "bounce": {
+                  "type": "boolean"
+                },
                 "budget_seconds": {
                   "type": "integer",
                   "exclusiveMinimum": 0,
