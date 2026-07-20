@@ -146,8 +146,8 @@ export function prAutomatedRoundBlock(belt: BeltRuntime): string {
   const mins = belt.pr?.automatedRoundMinutes;
   if (mins === 0) {
     return (
-      "2. **No automated round for this belt.** Don't poll CI or wait for bot comments here — as soon as the PR\n" +
-      "   is open, finish this step. The dispatcher watches the PR for CI and human review from here on."
+      "2. **No automated round for this belt.** Don't run a CI/bot polling round here — as soon as the PR is\n" +
+      "   open, finish this step. The dispatcher watches the PR for CI and human review from here on."
     );
   }
   const window = mins != null ? `~${mins} min` : "~10 min";
