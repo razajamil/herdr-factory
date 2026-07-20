@@ -13,6 +13,7 @@ const CLI_ENTRY = join(PKG_ROOT, "src", "cli", "index.ts");
 // per-repo `com.herdr-factory.<repo>` `watch` jobs.
 const LABEL = "com.herdr-factory.server";
 const PASSTHROUGH_ENV = [
+  "HERDR_CHANNEL",
   "HERDR_FACTORY_AUTO_UPDATE",
   "HERDR_FACTORY_TELEMETRY",
   "OTEL_EXPORTER_OTLP_ENDPOINT",

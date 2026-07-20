@@ -29,6 +29,14 @@ export function serverInfoPath(): string {
   return join(stateRoot(), "server.json");
 }
 
+/** Where the supervised auto-updater records its LAST attempt's outcome (channel, whether it
+ *  updated / was skipped for a dirty checkout / failed, and the current-vs-target commit). Sits
+ *  next to server.json so `doctor` and the TUI can surface a failed/behind update instead of it
+ *  living only in the supervisor log. */
+export function updateStatusPath(): string {
+  return join(stateRoot(), "update-status.json");
+}
+
 /** Root the `local` evidence publisher copies captures into and the resident server serves at
  *  `/evidence/<key>/…`. Global (not per-repo): keys carry a globally-unique run id, so repos never
  *  collide, and one HTTP server serves every repo. Files persist past teardown — a merged PR links

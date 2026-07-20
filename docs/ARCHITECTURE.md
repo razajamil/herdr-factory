@@ -186,7 +186,9 @@ herdr-factory/
       launchd.ts          the macOS LaunchAgent (com.herdr-factory.server) running `ensure-up`
       systemd.ts          the Linux systemd --user service + timer (herdr-factory.timer)
       supervisor.ts       stateless `ensure-up` / killServer (health-check + detached serve spawn)
-      updater.ts          selfUpdate: git fetch + hard-reset to upstream (HERDR_FACTORY_AUTO_UPDATE);
+      updater.ts          selfUpdate: git fetch + hard-reset to the channel target (HERDR_CHANNEL:
+                          main=upstream / stable=newest release tag); dirty-checkout guard (skip +
+                          notify); records each attempt to update-status.json for doctor/TUI;
                           re-provisions Node / re-installs deps when .node-version / the lockfile change
       provision.ts        vendored-Node download + SHA-256 verify + atomic `current` flip
     db/{index,migrate,store,tx}.ts
@@ -1314,8 +1316,10 @@ no server needed); the server exposes the same reads as JSON (`GET /repos/:repo/
 web UI ([§16](#16-web-ui-future)).
 
 `eligible` lists todo items **across all sources** (each annotated with its `source`). `doctor`
-reports three groups: **managed** (node runtime ≥26 — vendored or ambient, auto-update upstream,
-supervisor service loaded, server responding, DB present), **you-provide** (`git` / `herdr` /
+reports three groups: **managed** (node runtime ≥26 — vendored or ambient; **auto-update** — the
+channel + its target, amber when the last attempt failed / was skipped for a dirty checkout / left
+the box behind its target (from `update-status.json`); supervisor service loaded, server responding,
+DB present), **you-provide** (`git` / `herdr` /
 `gh` / `claude` on PATH; `--deep` exercises herdr and `gh auth status`), and — with `--repo` —
 **per-repo** (config loads + valid, main checkout, origin resolved, per-source `health()`, the
 descriptor-declared required secrets present, a local **evidence-upload-outbox** health check
@@ -1418,7 +1422,7 @@ lock heartbeat so its locks expire.
   boots out any legacy per-repo `com.herdr-factory.<repo>` `watch` jobs so an upgrade is clean.
 - **Updates are fully unattended.** Each `ensure-up` tick first runs the **supervised updater**
   (`watchers/updater.ts`, on by default — set `HERDR_FACTORY_AUTO_UPDATE=0` to disable): `git fetch`
-  + a **hard reset** to the current branch's upstream (`@{u}`), resolved against the package dir;
+  + a **hard reset** to the current **channel target**, resolved against the package dir;
   then, when `.node-version` changed, **re-provisions the vendored Node** (download + SHA-256
   verify + atomic `current` flip — a Node bump also forces the dep re-install); and a
   `pnpm`/`npm install` when `package.json`/`pnpm-lock.yaml` changed.
@@ -1428,9 +1432,28 @@ lock heartbeat so its locks expire.
   *any* code change also trips the version-mismatch restart on the next tick. `herdr-factory restart`
   (= `ensure-up --restart`) forces a restart now; `herdr-factory update` runs the updater + restart on
   demand (and works even when auto-update is disabled). The hard reset discards local edits on the
-  daemon machine — by design (see §14). Note `HERDR_FACTORY_AUTO_UPDATE` is captured into the
-  service environment **at install time** (the launchd/systemd env allowlist) — change it by
-  re-running `herdr-factory install` with the variable set, or just commit/push your code.
+  daemon machine — *unless the guard below fires* (see §14). Note `HERDR_FACTORY_AUTO_UPDATE` and
+  `HERDR_CHANNEL` are captured into the service environment **at install time** (the launchd/systemd
+  env allowlist) — change either by re-running `herdr-factory install` with the variable set, or just
+  commit/push your code.
+- **Channels — `HERDR_CHANNEL=main | stable`.** The channel changes *which commit the reset lands
+  on*, nothing else (migrations stay expand/contract; the agent CLI stays additive). `main` (default)
+  tracks the branch upstream `@{u}` — today's behavior. `stable` fetches **tags** and resets to the
+  newest **release tag** (highest `vX.Y.Z`, compared numerically, pre-releases ignored), so a broken
+  `main` commit never reaches a stable box; it stays on that tag until a newer one is pushed. Cutting
+  a tag *is* the release process — see [`RELEASING.md`](../RELEASING.md).
+- **Dirty-checkout guard.** Before the reset, the updater checks `git status --porcelain`; a checkout
+  with uncommitted changes is **not** reset (that would silently discard a hand-patch). The tick
+  **skips**, notifies the operator **once** (throttled — the herdr notification surface), and records
+  the skip. This is the escape hatch for a hand-patched install: your edits survive update ticks, and
+  `doctor` shows why the box is behind. (An *up-to-date* dirty checkout was already safe — the reset
+  only runs when there's a new target — so the guard bites exactly the dangerous case.)
+- **Surfaced update outcomes.** Every attempt (updated / up-to-date / skipped / failed) is recorded
+  to `update-status.json` next to `server.json` (channel, current-vs-target sha, reason, `behind`
+  flag). `doctor` and the TUI Doctor tab read it and paint an **amber** `auto-update` line when the
+  last attempt **failed** (network / reset / `pnpm` / Node provision), was **skipped** (dirty
+  checkout, or `stable` with no tag yet), or the box is **behind its target** — so a failure is
+  visible, not buried in the supervisor log. A warn is not a `doctor` exit-code failure.
 
 ---
 
@@ -1585,9 +1608,10 @@ Hard-won from the bash prototype — encode as types/tests/asserts:
   without reinstalling the service.
 - **Self-update + `VERSION` resolve against the package dir, never the caller's cwd.** A worker
   invokes the CLI from another repo's worktree, so `version.ts` (git HEAD sha → `VERSION`) and
-  `watchers/updater.ts` (`git fetch` + hard reset to `@{u}`) both run git in the herdr-factory
-  package dir. A successful auto-update **forces** a restart — the running process's `VERSION` was
-  read at start, so the version compare alone wouldn't catch the freshly-reset code.
+  `watchers/updater.ts` (`git fetch` + hard reset to the channel target — `@{u}` on `main`, the
+  newest release tag on `stable`) both run git in the herdr-factory package dir. A successful
+  auto-update **forces** a restart — the running process's `VERSION` was read at start, so the version
+  compare alone wouldn't catch the freshly-reset code.
 - **Migrations are expand/contract; in-flight runs must survive every upgrade.** Auto-update
   restarts `serve` on *every pushed commit*, so a migration always meets a DB with runs mid-flight —
   and, for a few seconds around the restart, a still-draining old-code process writing to the

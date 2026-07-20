@@ -1062,6 +1062,7 @@ resolves the same vendored Node the engine uses, so there's nothing to set up.
 ~/.local/share/herdr-factory/    the code checkout (managed by install.sh + auto-update)
 ~/.config/herdr-factory/         config.schema.json · repos/<name>/{config.yml, env, guidelines-prompt.md, …}
 ~/.local/state/herdr-factory/    herdr-factory.db · runtime/<node>/ · node-path · server.json
+                                 update-status.json (last auto-update outcome — surfaced in doctor/TUI)
                                  logs/ (supervisor + server) · <repo>/logs/<date>.log (per-repo)
 <worktree>/.memory/herdr-factory/   per-run working memory: prompts · handoffs · work doc · evidence
 ```
@@ -1074,8 +1075,14 @@ resolves the same vendored Node the engine uses, so there's nothing to set up.
 | `HERDR_FACTORY_CONFIG_DIR`  | config root (default `~/.config/herdr-factory`)             |
 | `HERDR_FACTORY_STATE_ROOT`  | state root (default `~/.local/state/herdr-factory`)         |
 | `HERDR_FACTORY_AUTO_UPDATE` | `0` disables the supervised auto-update                     |
+| `HERDR_CHANNEL`             | update channel: `main` (default, tracks upstream) or `stable` (follows the latest release tag) |
 | `HERDR_FACTORY_TELEMETRY`   | `1` enables OpenTelemetry (plus the standard `OTEL_*` vars) |
 | `HERDR_BIN_PATH`            | path to the `herdr` binary (default: `herdr` on PATH)       |
+
+`HERDR_FACTORY_AUTO_UPDATE` and `HERDR_CHANNEL` are captured into the launchd/systemd **service
+environment at install time** — set them and re-run `herdr-factory install` (or the installer) to
+change them; exporting the variable in your shell alone does nothing. See
+[`RELEASING.md`](RELEASING.md) for the channel model and how a release tag is cut.
 
 ## Security note
 

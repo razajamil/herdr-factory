@@ -18,7 +18,8 @@
 #   8. installs the machine-wide supervisor service (launchd on macOS, systemd --user on Linux).
 #
 # After install, the app self-updates: a git pull that bumps .node-version re-provisions Node, and a
-# lockfile change re-runs pnpm install — automatically, on the supervisor tick.
+# lockfile change re-runs pnpm install — automatically, on the supervisor tick. Set HERDR_CHANNEL=stable
+# to follow the latest release tag instead of tip-of-main (captured into the service env; see RELEASING.md).
 #
 # Prerequisites: git, curl, tar (self-update is git-based). Everything else — Node, SQLite (built
 # into Node), pnpm, the AWS SDK — is provided here. On MINIMAL Linux images the vendored Node also

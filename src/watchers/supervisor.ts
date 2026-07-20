@@ -9,6 +9,7 @@ import { telemetrySpan } from "../telemetry/index.ts";
 
 const CLI_ENTRY = fileURLToPath(new URL("../cli/index.ts", import.meta.url));
 const SERVE_ENV_KEYS = [
+  "HERDR_CHANNEL",
   "HERDR_FACTORY_AUTO_UPDATE",
   "HERDR_FACTORY_CONFIG_DIR",
   "HERDR_FACTORY_PORT",

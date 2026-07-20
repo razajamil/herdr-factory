@@ -13,12 +13,16 @@ import { buildDeps } from "./build-deps.ts";
 import type { Deps } from "./core/deps.ts";
 import { pingHealth, readServerInfo } from "./server/client.ts";
 import * as service from "./watchers/service.ts";
+import { readUpdateStatus, updateChannel } from "./watchers/updater.ts";
 
 /** One check's outcome. `detail` is extra context: a version/path/endpoint on success, or the
- *  failure reason on ✗. */
+ *  failure reason on ✗. `warn` marks an amber (not-a-failure) state — a healthy check that still
+ *  wants attention, e.g. an auto-update that was skipped/failed or left the box behind its channel
+ *  target. A warn is `ok: true` (it never fails `doctor`'s exit code) but paints amber. */
 export interface DoctorCheck {
   name: string;
   ok: boolean;
+  warn?: boolean;
   detail?: string;
 }
 export interface DoctorGroup {
@@ -34,6 +38,49 @@ async function attempt(name: string, fn: () => Promise<string | void>): Promise<
   try {
     const detail = await fn();
     return { name, ok: true, detail: detail || undefined };
+  } catch (e) {
+    return { name, ok: false, detail: e instanceof Error && e.message ? e.message : undefined };
+  }
+}
+
+/** A compact "3m ago" / "2h ago" / "5d ago" for an epoch-ms timestamp (relative to now). */
+function ago(at: number): string {
+  const s = Math.max(0, Math.round((Date.now() - at) / 1000));
+  if (s < 90) return `${s}s ago`;
+  const m = Math.round(s / 60);
+  if (m < 90) return `${m}m ago`;
+  const h = Math.round(m / 60);
+  return h < 48 ? `${h}h ago` : `${Math.round(h / 24)}d ago`;
+}
+
+/** The auto-update check — channel-aware, and the surface for a skipped/failed/behind update. It
+ *  reads the updater's recorded status file (written every supervisor tick) so a dirty-checkout skip
+ *  or a failed reset shows up here (amber) instead of only in the supervisor log. The channel is
+ *  read from that status file when present (what the SERVICE actually ran — the env var is captured
+ *  at install time and may not be exported in this shell), falling back to the ambient env. On a box
+ *  that has never updated (no status file) it validates the `main` upstream exists, as before. */
+async function updateCheck(): Promise<DoctorCheck> {
+  const name = "auto-update";
+  const status = readUpdateStatus();
+  const channel = status?.channel ?? updateChannel();
+  const target = status?.targetRef ?? (channel === "stable" ? "latest release tag" : "upstream");
+
+  if (status) {
+    const when = ago(status.at);
+    if (status.outcome === "failed") return { name, ok: true, warn: true, detail: `${channel}: last update FAILED — ${status.reason ?? "unknown"} (${when})` };
+    if (status.dirtySkip) return { name, ok: true, warn: true, detail: `${channel}: reset to ${target} skipped — checkout has uncommitted changes (${when})` };
+    if (status.behind) return { name, ok: true, warn: true, detail: `${channel}: behind ${target}${status.reason ? ` — ${status.reason}` : ""} (${when})` };
+    if (status.warning) return { name, ok: true, warn: true, detail: `${channel}: updated but ${status.warning} (${when})` };
+    const state = status.outcome === "updated" ? `updated (${status.reason ?? "reset"})` : `up to date on ${target}`;
+    return { name, ok: true, detail: `${channel}: ${state} (${when})` };
+  }
+
+  // No attempt recorded yet (fresh box, or auto-update disabled). Fall back to the historical check:
+  // confirm the branch has an upstream to update from (main); stable resolves its target from tags.
+  if (channel === "stable") return { name, ok: true, detail: "stable: follows the latest release tag (no update attempt recorded yet)" };
+  try {
+    const upstream = (await run("git", ["rev-parse", "--abbrev-ref", "@{u}"], { cwd: PKG_ROOT })).stdout.trim();
+    return { name, ok: true, detail: `main: upstream ${upstream}` };
   } catch (e) {
     return { name, ok: false, detail: e instanceof Error && e.message ? e.message : undefined };
   }
@@ -60,7 +107,7 @@ export async function baseGroups(deep = false): Promise<DoctorGroup[]> {
       if (Number(process.versions.node.split(".")[0]) < 26) throw new Error(`v${process.versions.node} is too old`);
       return `v${process.versions.node}, ${isManagedNode(process.execPath) ? "vendored" : "ambient"}`;
     }),
-    attempt("auto-update", async () => `upstream ${(await run("git", ["rev-parse", "--abbrev-ref", "@{u}"], { cwd: PKG_ROOT })).stdout.trim()}`),
+    updateCheck(),
     attempt("supervisor service", async () => {
       if (!(await service.isLoaded())) throw new Error("not loaded — run `herdr-factory install`");
     }),

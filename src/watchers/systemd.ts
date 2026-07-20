@@ -13,8 +13,9 @@ const PKG_ROOT = fileURLToPath(new URL("../../", import.meta.url));
 const CLI_ENTRY = join(PKG_ROOT, "src", "cli", "index.ts");
 const UNIT = "herdr-factory"; // → herdr-factory.service + herdr-factory.timer
 
-// Mirrors launchd.ts PASSTHROUGH_ENV — telemetry + auto-update toggles the daemon must inherit.
+// Mirrors launchd.ts PASSTHROUGH_ENV — telemetry + auto-update/channel toggles the daemon must inherit.
 const PASSTHROUGH_ENV = [
+  "HERDR_CHANNEL",
   "HERDR_FACTORY_AUTO_UPDATE",
   "HERDR_FACTORY_TELEMETRY",
   "OTEL_EXPORTER_OTLP_ENDPOINT",

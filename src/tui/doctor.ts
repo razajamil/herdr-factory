@@ -70,20 +70,26 @@ export function createDoctor(renderer: CliRenderer): TabView {
 
     clearList();
     let failures = 0;
+    let warnings = 0;
     groups.forEach((g, gi) => {
       if (gi > 0) addText("", theme.text.tertiary); // blank line between groups
       addText(`${g.title}:`, theme.text.secondary);
       for (const c of g.checks) {
+        const warn = !!c.warn && c.ok; // amber: a healthy-but-wants-attention check (e.g. a skipped/failed update)
         if (!c.ok) failures++;
+        else if (warn) warnings++;
         const line = c.detail ? `${c.name} — ${c.detail}` : c.name;
-        addCheck(c.ok ? "✓" : "✗", c.ok ? theme.status.good : theme.status.bad, `  ${line}`, c.ok ? theme.text.primary : theme.status.bad);
+        const mark = warn ? "⚠" : c.ok ? "✓" : "✗";
+        const fg = warn ? theme.status.warn : c.ok ? theme.status.good : theme.status.bad;
+        addCheck(mark, fg, `  ${line}`, c.ok && !warn ? theme.text.primary : fg);
       }
     });
     list.scrollTop = 0;
     const mode = deep ? "deep" : "shallow";
     const hint = "r: re-run · d: deep";
-    banner.content = failures === 0 ? `● all checks passed (${mode}) · ${hint}` : `⚠ ${failures} check(s) failing (${mode}) · ${hint}`;
-    banner.fg = failures === 0 ? theme.status.good : theme.status.warn;
+    const warnNote = warnings > 0 ? ` · ${warnings} warning(s)` : "";
+    banner.content = failures === 0 ? `● all checks passed (${mode})${warnNote} · ${hint}` : `⚠ ${failures} check(s) failing (${mode})${warnNote} · ${hint}`;
+    banner.fg = failures === 0 ? (warnings > 0 ? theme.status.warn : theme.status.good) : theme.status.warn;
   }
 
   list.onKeyDown = (key: KeyEvent) => {

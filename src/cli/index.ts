@@ -161,13 +161,15 @@ function cliAction<Args extends unknown[]>(name: string, fn: (...args: Args) => 
   };
 }
 
-/** Print one doctor group as `✓/✗ <name> — <detail>` lines. Returns whether any check failed. */
+/** Print one doctor group as `✓/⚠/✗ <name> — <detail>` lines. Returns whether any check failed (an
+ *  amber `⚠` warn is not a failure — it never gates the exit code). */
 function printDoctorGroup(g: DoctorGroup): boolean {
   let failed = false;
   console.log(`${g.title}:`);
   for (const c of g.checks) {
     if (!c.ok) failed = true;
-    console.log(`  ${c.ok ? "✓" : "✗"} ${c.name}${c.detail ? ` — ${c.detail}` : ""}`);
+    const mark = c.warn && c.ok ? "⚠" : c.ok ? "✓" : "✗";
+    console.log(`  ${mark} ${c.name}${c.detail ? ` — ${c.detail}` : ""}`);
   }
   return failed;
 }
