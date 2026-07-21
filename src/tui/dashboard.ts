@@ -16,7 +16,7 @@ import { hoverable, text } from "./render.ts";
 import { listConfiguredRepos } from "../config-paths.ts";
 import { fetchEligible, fetchHealth, fetchStatus, fetchTimeline, postClaim, postTeardown, postTick, serverPort, type ActiveRun, type EligibleItem, type RepoStatus } from "./api.ts";
 import { foldEligible, withoutClaimed } from "./eligible-cache.ts";
-import { updateWarning } from "../watchers/updater.ts";
+import { updateWarning } from "../watchers/update-status.ts";
 import { BORDER, theme } from "./theme.ts";
 import type { ChooseFn, ConfirmFn, PromptFn, ShowInfoFn, TabView } from "./types.ts";
 import { formatWorkTable, type WorkTableRow } from "./work-table.ts";

@@ -13,7 +13,7 @@ import { buildDeps } from "./build-deps.ts";
 import type { Deps } from "./core/deps.ts";
 import { pingHealth, readServerInfo } from "./server/client.ts";
 import * as service from "./watchers/service.ts";
-import { readUpdateStatus, updateChannel } from "./watchers/updater.ts";
+import { readUpdateStatus, updateChannel } from "./watchers/update-status.ts";
 
 /** One check's outcome. `detail` is extra context: a version/path/endpoint on success, or the
  *  failure reason on ✗. `warn` marks an amber (not-a-failure) state — a healthy check that still

@@ -15,101 +15,41 @@
 // server.json so `doctor` and the TUI can surface a failure or a behind-its-target box, rather than
 // it living only in the supervisor log.
 import { execFile } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { existsSync } from "node:fs";
+import { join } from "node:path";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 import type { Log } from "./supervisor.ts";
 import { pinnedNodeVersion, provisionNode } from "./provision.ts";
 import { updateStatusPath } from "../config-paths.ts";
 import { recordDependencyDuration, telemetrySpan } from "../telemetry/index.ts";
+// The update-status model + pure readers live in a telemetry-free module so surfaces that only READ
+// the last attempt (TUI dashboard, doctor) don't pull this execution path — and its Effect + OTel
+// stack — into their startup graph. Re-exported below so existing importers keep working unchanged.
+import {
+  DIRTY_RENOTIFY_MS,
+  readUpdateStatusAt,
+  updateChannel,
+  writeUpdateStatus,
+  type UpdateChannel,
+  type UpdateResult,
+  type UpdateStatus,
+} from "./update-status.ts";
+
+export {
+  autoUpdateEnabled,
+  readUpdateStatus,
+  updateChannel,
+  updateWarning,
+  type UpdateChannel,
+  type UpdateResult,
+  type UpdateStatus,
+} from "./update-status.ts";
 
 const execFileP = promisify(execFile);
 const PKG_ROOT = fileURLToPath(new URL("../../", import.meta.url));
 
 const msg = (e: unknown): string => (e instanceof Error ? e.message : String(e));
-
-/** Auto-update is ON by default; set HERDR_FACTORY_AUTO_UPDATE to 0/false/no/off to disable it. */
-export function autoUpdateEnabled(): boolean {
-  const v = (process.env.HERDR_FACTORY_AUTO_UPDATE ?? "").trim().toLowerCase();
-  return !["0", "false", "no", "off"].includes(v);
-}
-
-/** Which commit the updater lands on. `main` = the branch upstream tip (today's behavior); `stable`
- *  = the newest release tag, so a broken main commit can't reach the box. Like the auto-update flag,
- *  it's captured into the service environment at INSTALL time — re-run `herdr-factory install` (with
- *  HERDR_CHANNEL set) to change it. Anything but `stable` (incl. unset/typo) resolves to `main`. */
-export type UpdateChannel = "main" | "stable";
-export function updateChannel(): UpdateChannel {
-  return (process.env.HERDR_CHANNEL ?? "").trim().toLowerCase() === "stable" ? "stable" : "main";
-}
-
-/** How long a dirty checkout stays quiet after we've notified about a skipped reset, before we
- *  re-notify (the "once, throttled" backstop — the common case notifies exactly once, on the tick
- *  the checkout first goes dirty-and-behind). */
-const DIRTY_RENOTIFY_MS = 6 * 60 * 60 * 1000; // 6h
-
-export interface UpdateResult {
-  updated: boolean;
-  reason?: string; // why it didn't update (when updated === false)
-  from?: string;
-  to?: string;
-}
-
-/** The outcome of the LAST update attempt, persisted to {@link updateStatusPath} each tick so it can
- *  be surfaced outside the supervisor log. `behind` = the checkout is NOT on its channel target
- *  (a dirty skip, a failed reset, or a stable box with no tag yet) — what `doctor`/TUI paint amber. */
-export interface UpdateStatus {
-  channel: UpdateChannel;
-  at: number; // epoch ms of this attempt
-  outcome: "updated" | "up_to_date" | "skipped" | "failed";
-  reason?: string; // skip/failure reason (absent on updated/up_to_date)
-  head?: string; // HEAD sha after this tick
-  target?: string; // the channel target's sha (upstream tip / newest-tag commit), when resolved
-  targetRef?: string; // human ref for the target: "origin/main" (main) or the tag name (stable)
-  behind: boolean; // head !== target — the box isn't running what its channel says it should
-  dirtySkip?: boolean; // the reset was skipped because the checkout had uncommitted changes
-  warning?: string; // reset landed but a post-step (Node provision / dep install) failed — degraded
-  notifiedAt?: number; // last time we notified about a dirty skip (throttle bookkeeping)
-}
-
-/** Read the last recorded update attempt (or null if none / malformed — treated as "no attempt"). */
-export function readUpdateStatus(): UpdateStatus | null {
-  return readUpdateStatusAt(updateStatusPath());
-}
-function readUpdateStatusAt(path: string): UpdateStatus | null {
-  try {
-    const o = JSON.parse(readFileSync(path, "utf8")) as Partial<UpdateStatus>;
-    if (typeof o.at === "number" && typeof o.outcome === "string") return o as UpdateStatus;
-    return null;
-  } catch {
-    return null;
-  }
-}
-
-/** A short amber note for a warn-worthy last update — the box failed to update, skipped a reset over
- *  a dirty checkout, is behind its channel target, or updated but a post-step (deps/Node) failed —
- *  or null when the last attempt is clean or unrecorded. Shared by the `doctor` check and the TUI
- *  dashboard banner so both agree on when the update state wants attention. */
-export function updateWarning(status: UpdateStatus | null = readUpdateStatus()): string | null {
-  if (!status) return null;
-  const target = status.targetRef ?? (status.channel === "stable" ? "the latest tag" : "upstream");
-  if (status.outcome === "failed") return `auto-update failed (${status.channel}): ${status.reason ?? "unknown"}`;
-  if (status.dirtySkip) return `auto-update skipped (${status.channel}): checkout has uncommitted changes`;
-  if (status.behind) return `${status.channel} channel behind ${target}`;
-  if (status.warning) return `updated (${status.channel}) but ${status.warning}`;
-  return null;
-}
-
-/** Persist the attempt outcome. Best-effort — a write failure must never break the tick. */
-function writeUpdateStatus(status: UpdateStatus, path: string): void {
-  try {
-    mkdirSync(dirname(path), { recursive: true });
-    writeFileSync(path, `${JSON.stringify(status, null, 2)}\n`);
-  } catch {
-    /* the state file is a convenience surface, not load-bearing — ignore */
-  }
-}
 
 async function git(args: string[], cwd: string): Promise<string> {
   const startedAt = Date.now();
