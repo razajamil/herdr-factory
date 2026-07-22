@@ -1333,25 +1333,30 @@ export async function recordCaptureAttempt(
  *  are allowed to be slow). At the 5-min backoff cap this is ~100 min of a failing source. */
 const HUMAN_POLL_ERROR_ESCALATE = 20;
 
-/** Attention reasons raised by a STEP's own execution watchdog that trips while the step's agent is
- *  RUNNING — the evidence flaky-capture cap, the per-step budget, and the commit-stall heartbeat.
- *  These are backstops against a stuck agent, NOT a veto on its terminal decision: an agent that
- *  reaches a terminal signal is by definition not looping, so a genuine step-done from the parked
- *  step un-parks the run and advances it (reconcileAttention), and a genuine BOUNCE from it lands
- *  the same way (bounceStep accepts a watchdog-parked bouncer). The layout-pane wait is NOT here:
- *  it trips BEFORE the agent exists (no pane ⇒ no agent ⇒ no terminal signal can ever arrive), so
- *  it is rescued by re-attempting the spawn instead — see STEP_RESPAWN_ATTENTION. Every OTHER
- *  park — source item gone, PR closed, bounce oscillation, human loop, config error — needs a
- *  human decision and is never auto-rescued. */
-// DERIVED (not a hardcoded literal) as the union of every registered step primitive's guards whose
-// `autoRescueOnDone` is true. A plugin guard that parks a run participates automatically — no edit
-// to a literal Set. read_only_violation / source_item_stale / pr_closed / bounce_limit / human /
-// config parks are NOT guards, so they stay non-auto-rescued (a human decides).
-const STEP_WATCHDOG_ATTENTION = new Set(
-  STEP_DESCRIPTORS.flatMap((d) => d.guards)
+/** Attention reasons raised by a STEP's own execution while its agent is RUNNING — the evidence
+ *  flaky-capture cap, the per-step budget, the commit-stall heartbeat, AND the read-only-posture
+ *  HEAD-move guard. These are backstops against a misbehaving agent, NOT a veto on its terminal
+ *  decision: an agent that reaches a terminal signal is by definition not looping, so a genuine
+ *  step-done from the parked step un-parks the run and advances it (reconcileAttention), and a
+ *  genuine BOUNCE from it lands the same way (bounceStep accepts a watchdog-parked bouncer). The
+ *  layout-pane wait is NOT here: it trips BEFORE the agent exists (no pane ⇒ no agent ⇒ no terminal
+ *  signal can ever arrive), so it is rescued by re-attempting the spawn instead — see
+ *  STEP_RESPAWN_ATTENTION. Every OTHER park — source item gone, PR closed, bounce oscillation,
+ *  human loop, config error — needs a human decision and is never auto-rescued. */
+// The union of every registered step primitive's guards whose `autoRescueOnDone` is true (a plugin
+// guard participates automatically — no edit to a literal Set), PLUS `read_only_violation`.
+// read_only_violation is NOT a guard — it rides the `readOnly` posture, enforced inline in
+// reconcileStep — but it belongs here for the same reason: it is a backstop against an agent that
+// touched the tree, not a veto on a completed step. A completed read-only step must never wedge
+// forever on a commit it didn't make (RWR-18204: an evidence step parked permanently after the
+// PRIOR work step's still-alive agent committed a trailing lint fix). source_item_stale / pr_closed
+// / bounce_limit / human / config parks stay non-auto-rescued (a human decides).
+const STEP_WATCHDOG_ATTENTION = new Set([
+  ...STEP_DESCRIPTORS.flatMap((d) => d.guards)
     .filter((g) => g.autoRescueOnDone)
     .map((g) => g.escalationReason),
-);
+  "read_only_violation",
+]);
 
 /** Attention reasons whose park is rescued by RE-ATTEMPTING THE SPAWN, bounded by the guard's
  *  `autoRespawnLimit` — today only the layout-pane wait (`layout_wait_timeout`). Its park means the
@@ -1578,18 +1583,38 @@ async function reconcileStep(deps: Deps, run: Run, belt: BeltRuntime, src: Sourc
   if (pr && pr.state === "CLOSED" && pr.number === run.prNumber) return prClosedAttention(deps, run, pr);
   const livePr = pr && pr.state !== "CLOSED" ? pr : null;
 
-  // read_only enforcement: a read-only step (review/evidence) must never edit or commit. The
-  // baseline HEAD was captured at spawn (progressSig); a moved HEAD means it committed — a contract
-  // violation. Park for a human (NOT auto-rescuable) rather than advancing a step that misbehaved.
+  // read_only enforcement: a read-only step (review/evidence) must never edit or commit. HEAD
+  // movement while the step's OWN agent is running is a contract violation. The subtlety: the
+  // baseline is captured at spawn, but the PRIOR step's agent stays alive in its pane (kept for
+  // on-demand queries) and can keep committing AFTER its own step-done — those trailing commits
+  // must not be blamed on this step (RWR-18204: the work agent committed a lint fix 101s after
+  // evidence spawned, wedging the run in a read_only park for a commit evidence never made). So the
+  // baseline TRACKS live HEAD until this step's agent is first observed `working`, absorbing the
+  // handoff-window commits; once frozen, any further HEAD move is the real violation. progressAt is
+  // the freeze marker — a read-only step has no heartbeat, so it's free to hold it. Even the frozen
+  // violation is a BACKSTOP, not a veto: a genuine step-done un-parks it (STEP_WATCHDOG_ATTENTION).
   if (step.readOnly && rs.progressSig && run.worktreePath) {
     const head = await deps.git.headSha(run.worktreePath).catch(() => null);
-    if (head && head !== rs.progressSig) {
-      return escalateAttention(deps, run, {
-        reason: "read_only_violation",
-        attentionReason: `${step.name} is read-only but committed (HEAD moved)`,
-        body: `${run.ticketKey}: the ${step.name} step is read-only — it must never edit or commit — but the branch HEAD moved from ${rs.progressSig.slice(0, 8)} to ${head.slice(0, 8)}. A human should review; the agent violated the read-only contract.`,
-        detail: { step: step.name, baseline: rs.progressSig, head },
-      });
+    if (head) {
+      if (rs.progressAt == null) {
+        // Not yet frozen. Freeze at the current HEAD the first pass this step's agent is `working`;
+        // until then keep the baseline synced to HEAD so the prior step's trailing commits absorb.
+        let working = false;
+        try {
+          working = rs.paneId != null && (await deps.herdr.paneState(rs.paneId)) === "working";
+        } catch (e) {
+          if (!(e instanceof HerdrUnreachableError)) throw e; // herdr flaky → treat as not-working, defer the freeze
+        }
+        if (working) deps.store.upsertRunStep(run.id, step.name, { progressSig: head, progressAt: deps.now() });
+        else if (head !== rs.progressSig) deps.store.upsertRunStep(run.id, step.name, { progressSig: head });
+      } else if (head !== rs.progressSig) {
+        return escalateAttention(deps, run, {
+          reason: "read_only_violation",
+          attentionReason: `${step.name} is read-only but committed (HEAD moved)`,
+          body: `${run.ticketKey}: the ${step.name} step is read-only — it must never edit or commit — but the branch HEAD moved from ${rs.progressSig.slice(0, 8)} to ${head.slice(0, 8)} after its agent took over. A human should review; the agent violated the read-only contract. (A genuine step-done from this step will un-park and advance.)`,
+          detail: { step: step.name, baseline: rs.progressSig, head },
+        });
+      }
     }
   }
 
@@ -1858,6 +1883,10 @@ async function reconcileAttention(deps: Deps, run: Run, belt: BeltRuntime, src: 
     const rs = deps.store.getRunStep(run.id, run.step);
     if (step && rs?.done && STEP_WATCHDOG_ATTENTION.has(deps.store.lastAttentionReasonCode(run.id) ?? "")) {
       deps.store.updateRun(run.id, { phase: "running", attentionReason: null });
+      // A read_only_violation park heals by ADVANCING the completed step. Clear its enforcement
+      // baseline so reconcileStep skips the read-only HEAD check (which would otherwise re-detect
+      // the same move and re-park before reaching the done-advance) — mirrors resumeRun.
+      if (step.readOnly) deps.store.upsertRunStep(run.id, run.step, { progressSig: null, progressAt: null });
       deps.store.recordEvent({
         runId: run.id,
         repo: deps.config.repoName,

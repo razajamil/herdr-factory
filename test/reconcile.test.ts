@@ -945,12 +945,14 @@ describe("reconcile pipeline (work_to_pull_request belt)", () => {
     expect(calls.transitions).not.toContainEqual(["W-1", "in_development"]);
   });
 
-  it("read_only enforcement: a read-only step that moves HEAD (commits) parks for attention", async () => {
+  it("read_only enforcement: a FROZEN read-only step that moves HEAD (commits) parks for attention", async () => {
     const { deps, store, state, worktree, shipBelt } = build();
     shipBelt.steps[1]!.readOnly = true; // make the review step read-only for this test
     state.headSha = "sha-baseline";
     const run = seed(store, worktree, "RO-1", "running", "review");
-    store.upsertRunStep(run.id, "review", { progressSig: "sha-baseline" }); // baseline captured at spawn
+    // progressAt set ⇒ the baseline is FROZEN: the step's own agent has been observed working, so a
+    // later HEAD move is attributable to THIS step, not the prior step's trailing commits.
+    store.upsertRunStep(run.id, "review", { progressSig: "sha-baseline", progressAt: 100 });
     state.headSha = "sha-moved"; // the read-only agent illicitly committed
     await reconcileRun(deps, store.getRun(run.id)!);
     const after = store.getRun(run.id)!;
@@ -969,6 +971,53 @@ describe("reconcile pipeline (work_to_pull_request belt)", () => {
     const after = store.getRun(run.id)!;
     expect(after.phase).toBe("running");
     expect(after.step).toBe("pr"); // advanced past the read-only step
+  });
+
+  // RWR-18204: the PRIOR step's agent stays alive in its pane and can commit AFTER its own step-done
+  // (a trailing lint/test fix). Until the read-only step's OWN agent is observed working, such a move
+  // is absorbed into the baseline — never blamed on (nor wedging) the read-only step.
+  it("read_only: a trailing commit while the step's agent is still starting up is ABSORBED, not parked", async () => {
+    const { deps, store, state, worktree, shipBelt } = build();
+    shipBelt.steps[1]!.readOnly = true;
+    state.headSha = "sha-baseline";
+    const run = seed(store, worktree, "RO-3", "running", "review");
+    store.upsertRunStep(run.id, "review", { progressSig: "sha-baseline" }); // NOT frozen (progressAt null)
+    state.paneState = "idle"; // the read-only agent hasn't taken over yet (still spinning up)
+    state.headSha = "sha-trailing"; // the PRIOR step's still-alive agent committed after handoff
+    await reconcileRun(deps, store.getRun(run.id)!);
+    const rs = store.getRunStep(run.id, "review")!;
+    expect(store.getRun(run.id)!.phase).toBe("running"); // NOT parked
+    expect(rs.progressSig).toBe("sha-trailing"); // baseline advanced to absorb it
+    expect(rs.progressAt).toBe(null); // still not frozen
+  });
+
+  it("read_only: the baseline FREEZES once the step's own agent is working (progressAt stamped)", async () => {
+    const { deps, store, state, worktree, shipBelt, setNow } = build();
+    shipBelt.steps[1]!.readOnly = true;
+    setNow(5000);
+    state.headSha = "sha-baseline";
+    const run = seed(store, worktree, "RO-4", "running", "review");
+    store.upsertRunStep(run.id, "review", { progressSig: "sha-baseline" });
+    state.paneState = "working"; // the read-only agent has taken over
+    await reconcileRun(deps, store.getRun(run.id)!);
+    expect(store.getRunStep(run.id, "review")!.progressAt).toBe(5000); // frozen at now
+    expect(store.getRun(run.id)!.phase).toBe("running"); // no park (no move since spawn)
+  });
+
+  it("read_only park HEALS: a step-done from the parked read-only step un-parks and advances (RWR-18204)", async () => {
+    const { deps, store, state, worktree, shipBelt } = build();
+    shipBelt.steps[1]!.readOnly = true;
+    state.headSha = "sha-moved";
+    const run = seed(store, worktree, "RO-5", "attention", "review", { attentionReason: "review is read-only but committed (HEAD moved)" });
+    // frozen baseline + HEAD moved is what parked it; the step then genuinely finished (done).
+    store.upsertRunStep(run.id, "review", { paneId: "w1:p1", progressSig: "sha-baseline", progressAt: 100, done: true });
+    store.recordEvent({ runId: run.id, repo: "demo", ticketKey: "RO-5", type: "attention", detail: { reason: "read_only_violation", step: "review" } });
+    await reconcileRun(deps, store.getRun(run.id)!);
+    const after = store.getRun(run.id)!;
+    expect(after.phase).toBe("running"); // un-parked
+    expect(after.step).toBe("pr"); // advanced past the read-only step
+    const resumed = store.timeline("demo", "RO-5").filter((e) => e.type === "resumed").map((e) => JSON.parse(e.detail ?? "{}").reason);
+    expect(resumed).toContain("step_done_after_watchdog_park");
   });
 
   it("claiming + configured pane never comes up: bounded window re-arms, THEN attention; resume refunds the budget", async () => {
