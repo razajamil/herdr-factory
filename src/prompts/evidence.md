@@ -51,11 +51,14 @@ evidence is a **bounce or a recapture — never a pass**.
    failed. `@@EVIDENCE_DIR@@` is scratch — **never commit it.** Make the capture *prove* the change:
    - Work from your test plan as a **shot list**: each beat is one deliberate action and the criterion
      it proves. Do one legible action at a time, wait for content to settle (no loading-spinner
-     dead-time), and use a deterministic viewport. Don't improvise or wander the UI.
+     dead-time), and use a **wide, deterministic desktop viewport** (≈1920×1080) so the *whole app
+     is in frame* — never a cropped or zoomed-in region. Don't improvise or wander the UI.
    - **Show the contrast.** Capture a **before** state as well as the **after** so the difference is
      unmistakable — use the repro in `@@MEMORY_DIR@@/attachments/` as the "before" when one exists.
    - Record a short **video** of each interaction (trigger → result) end to end, plus a still **PNG**
-     for each criterion. If the surface isn't a browser UI (CLI/API/service), capture the real
+     for each criterion. Capture the **full browser window** at a legible desktop resolution — record
+     at the viewport's native size (don't let the tool downscale it) so text stays readable, and never
+     a cropped or magnified slice. If the surface isn't a browser UI (CLI/API/service), capture the real
      observable output instead — terminal session, API response, log — not a forced browser shot.
    - **Never capture secrets** — real passwords, tokens, session URLs, or customer PII — into assets;
      these get published. If a take is flaky or aimless, **re-record it** within the same attempt: a
