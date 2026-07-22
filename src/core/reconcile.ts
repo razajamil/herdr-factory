@@ -428,18 +428,23 @@ export async function withRunLockWaiting<T>(
 }
 
 /** Per-tick shared context. `prSnapshots` is the batched GitHub fetch for every watched PR
- *  (reviewing/attention) — one GraphQL request replaces 3 gh calls per run per tick. Undefined ⇒
- *  the batch fetch failed or the caller is a single-run nudge; per-run fallback polling applies. */
+ *  (reviewing/attention/waiting_for_human) — one GraphQL request replaces 3 gh calls per run per
+ *  tick. Undefined ⇒ the batch fetch failed or the caller is a single-run nudge; per-run fallback
+ *  polling applies. */
 export interface TickCtx {
   prSnapshots?: Map<number, PrSnapshot>;
 }
 
-/** Bulk-fetch PR state + review signatures for every run that watches a PR by number. */
+/** Bulk-fetch PR state + review signatures for every run that watches a PR by number — the
+ *  `reviewing`/`attention` watches plus a `waiting_for_human` park that has already adopted a PR
+ *  (so a merge that lands while a human question is outstanding still tears the run down). */
 async function fetchPrSnapshots(deps: Deps, runs: Run[]): Promise<Map<number, PrSnapshot> | undefined> {
   const numbers = [
     ...new Set(
       runs
-        .filter((r) => (r.phase === "reviewing" || r.phase === "attention") && r.prNumber != null)
+        .filter(
+          (r) => (r.phase === "reviewing" || r.phase === "attention" || r.phase === "waiting_for_human") && r.prNumber != null,
+        )
         .map((r) => r.prNumber!),
     ),
   ];
@@ -808,7 +813,7 @@ async function dispatchPhase(deps: Deps, run: Run, belt: BeltRuntime, src: Sourc
           });
         }
         case "waiting_for_human":
-          return reconcileWaitingForHuman(deps, run, belt, src);
+          return reconcileWaitingForHuman(deps, run, belt, src, ctx);
         case "reviewing":
           return reconcileReviewing(deps, run, src, ctx);
         case "tearing_down":
@@ -1382,7 +1387,17 @@ function humanLoopStale(deps: Deps, run: Run, q: HumanQuestion, why: string): Pr
   });
 }
 
-async function reconcileWaitingForHuman(deps: Deps, run: Run, belt: BeltRuntime, src: SourceRuntime): Promise<void> {
+async function reconcileWaitingForHuman(deps: Deps, run: Run, belt: BeltRuntime, src: SourceRuntime, ctx: TickCtx): Promise<void> {
+  // A PR merged out from under a parked run must still tear it down — even while we wait on a human
+  // question. Mirrors the attention-phase watch (reconcileAttention): once a PR is adopted, a merge
+  // (a human merging early without waiting for the step, or CI auto-merge) ends the run and fires the
+  // terminal transition, instead of the merge going unnoticed until the question is answered or the
+  // run is abandoned (RWR-18204).
+  if (belt.watchPr && run.prNumber) {
+    const pr = ctx.prSnapshots?.get(run.prNumber) ?? (await currentPr(deps, run));
+    if (pr?.state === "MERGED") return teardown(deps, run, "merged", src);
+  }
+
   let q = deps.store.pendingHumanQuestionForRun(run.id);
   if (!q) {
     if (run.step && stepByName(belt, run.step)) {
@@ -1618,8 +1633,20 @@ async function reconcileStep(deps: Deps, run: Run, belt: BeltRuntime, src: Sourc
     }
   }
 
-  // Advance when the agent signalled step-done (or its PR merged out from under us).
-  if (rs.done || livePr?.state === "MERGED") {
+  // Hand off to the reviewing watch the moment a live, review-ready PR is adopted — WITHOUT waiting
+  // for step-done. Once the PR exists the run's job is to WATCH it (merge → teardown → done), and a
+  // pr-step agent that keeps working or stalls on a human question must not strand a mergeable PR
+  // (RWR-18204: the pr agent opened the PR, then blocked on unanswered questions; the run was
+  // abandoned and the human's later merge moved nothing). A DRAFT PR is not up for review yet, so it
+  // keeps the step-done gate; a MERGED PR always hands off (even if it merged straight from a draft).
+  // Scoped to the belt's TERMINAL PR-opening step — enterReviewing ends the step sequence, so a PR
+  // opened by a non-last step (unusual) keeps its existing step-done/merge advance below.
+  const prReadyForReview =
+    step.opensPr && belt.watchPr && !nextStep(belt, step.name) && !!livePr && (livePr.state === "MERGED" || !livePr.isDraft);
+
+  // Advance when the agent signalled step-done (or its PR merged out from under us, or a review-ready
+  // PR was adopted before step-done).
+  if (rs.done || livePr?.state === "MERGED" || prReadyForReview) {
     releaseStepLocks(deps, run, step); // leaving the step → free any exclusive_resource it held
     // The step completed this pass — archive an addressed rework note (feedback-<step>.md) under a
     // pass-stamped name. The rework banner keys on the file's existence, so a re-render in a LATER

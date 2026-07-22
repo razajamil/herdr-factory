@@ -818,10 +818,15 @@ agent ⇒ its `step-done` can never arrive), so a `layout_wait_timeout` park is 
 expired wait window in place — and auto-un-parks + re-dispatches an already-parked run — until the
 budget is exhausted, after which the park is a genuine human park (a successful dispatch or a human
 `resume` refunds the budget). A
-source-stale / PR-closed / bounce-limit / human / config park stays put for a human. After the last step, the run enters the `reviewing`
-human-review watch (watches the PR, wakes a resolver). A **custom** belt runs the same machinery
-over user-defined steps with no PR watch — its last `step-done` tears the run down with outcome
-`completed`.
+source-stale / PR-closed / bounce-limit / human / config park stays put for a human. The `pr` step hands off to
+the `reviewing` human-review watch (watches the PR, wakes a resolver) **the moment it opens a
+review-ready PR — it need not signal `step-done`**: once the PR exists the run's job is to watch it,
+so a `pr` agent that keeps working, blocks on a question, or is abandoned can't strand a mergeable PR
+(a **draft** PR keeps the `step-done` gate until it's marked ready; a **merged** PR always hands
+off). A merge is caught even while the run is parked in `attention` or `waiting_for_human` (both poll
+the adopted PR) — it tears the run down with outcome `merged`. A **custom** belt runs the same
+machinery over user-defined steps with no PR watch — its last `step-done` tears the run down with
+outcome `completed`.
 
 ```mermaid
 flowchart TD
@@ -846,7 +851,7 @@ flowchart TD
 
     todo["Jira: To Do (labelled)"] -->|"disp → herdr worktree create<br/>Jira REST → In Development"| wt["herdr worktree + workspace"]
     wt -->|"disp → herdr agent send (spawn work)"| work
-    pr -->|"agent → herdr-factory step-done KEY pr<br/>disp → Jira REST → In Review"| human["reviewing<br/>human review (dispatcher-watched)"]
+    pr -->|"disp sees the PR open (non-draft) or merged<br/>disp → Jira REST → In Review"| human["reviewing<br/>human review (dispatcher-watched)"]
     human -->|"disp → herdr worktree remove<br/>· git branch -D"| done["done (merged / closed)"]
 
     nudge -.->|"disp → herdr agent send (spawn next step)"| PIPE

@@ -38,24 +38,24 @@ export class GitHubClient {
    *  recorded its number) — `--head` stops matching once the head branch is deleted, so once a number
    *  is known callers poll `prByNumber` instead, which survives head-branch deletion on merge. */
   async prForBranch(repo: string, branch: string): Promise<PrInfo | null> {
-    const arr = await runJson<{ number: number; state: string; url: string }[]>(
+    const arr = await runJson<{ number: number; state: string; url: string; isDraft: boolean }[]>(
       this.gh,
-      ["pr", "list", "--repo", repo, "--head", branch, "--state", "all", "--json", "number,state,url", "--limit", "1"],
+      ["pr", "list", "--repo", repo, "--head", branch, "--state", "all", "--json", "number,state,url,isDraft", "--limit", "1"],
       { allowFail: true },
-    ).catch(() => [] as { number: number; state: string; url: string }[]);
+    ).catch(() => [] as { number: number; state: string; url: string; isDraft: boolean }[]);
     const first = arr[0];
-    return first ? { number: first.number, state: first.state as PrState, url: first.url } : null;
+    return first ? { number: first.number, state: first.state as PrState, url: first.url, isDraft: !!first.isDraft } : null;
   }
 
   /** Look up a PR by number — the durable identity once a run has adopted one. Unlike `--head`,
    *  this keeps resolving after the head branch is deleted (e.g. GitHub auto-delete-on-merge). */
   async prByNumber(repo: string, prNumber: number): Promise<PrInfo | null> {
-    const pr = await runJson<{ number: number; state: string; url: string }>(
+    const pr = await runJson<{ number: number; state: string; url: string; isDraft: boolean }>(
       this.gh,
-      ["pr", "view", String(prNumber), "--repo", repo, "--json", "number,state,url"],
+      ["pr", "view", String(prNumber), "--repo", repo, "--json", "number,state,url,isDraft"],
       { allowFail: true },
     ).catch(() => null);
-    return pr && pr.number ? { number: pr.number, state: pr.state as PrState, url: pr.url } : null;
+    return pr && pr.number ? { number: pr.number, state: pr.state as PrState, url: pr.url, isDraft: !!pr.isDraft } : null;
   }
 
   /**
@@ -77,7 +77,7 @@ export class GitHubClient {
       const fields = chunk
         .map(
           (n) =>
-            `pr${n}: pullRequest(number: ${n}) { number state url ` +
+            `pr${n}: pullRequest(number: ${n}) { number state url isDraft ` +
             `reviewThreads(first: 100) { nodes { isResolved comments(last: 1) { nodes { id } } } } ` +
             `commits(last: 1) { nodes { commit { statusCheckRollup { contexts(first: 100) { nodes { ` +
             `__typename ... on CheckRun { name conclusion } ... on StatusContext { context state } } } } } } } }`,
@@ -88,6 +88,7 @@ export class GitHubClient {
         number: number;
         state: string;
         url: string;
+        isDraft?: boolean;
         reviewThreads?: { nodes?: { isResolved: boolean; comments?: { nodes?: { id: string }[] } }[] };
         commits?: {
           nodes?: {
@@ -117,6 +118,7 @@ export class GitHubClient {
           number: pr.number,
           state: pr.state as PrState,
           url: pr.url,
+          isDraft: !!pr.isDraft,
           sig: { unresolved: unresolvedIds.length, failing: failing.length, sig },
         });
       }

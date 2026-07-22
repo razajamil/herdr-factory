@@ -636,6 +636,10 @@ export interface PrInfo {
   number: number;
   state: PrState;
   url: string;
+  /** A draft PR is not yet up for review. The reconciler adopts it (records the number) but does NOT
+   *  hand off to the `reviewing` watch until it's marked ready-for-review — a draft keeps the
+   *  step-done gate. A MERGED PR always hands off regardless. */
+  isDraft: boolean;
 }
 
 export interface ReviewSig {

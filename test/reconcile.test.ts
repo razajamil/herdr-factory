@@ -22,11 +22,16 @@ afterEach(() => {
   resetAuthGate(); // the gate Map is process-global (keyed by repo "demo") — don't leak across tests
 });
 
+// PR template for the fakes: `isDraft` is optional here (most tests don't care) and normalized to
+// false on return, so existing `{ number, state, url }` literals stay valid; draft tests set it.
+type FakePr = (Omit<PrInfo, "isDraft"> & { isDraft?: boolean }) | null;
+const asPrInfo = (pr: FakePr): PrInfo | null => (pr ? { isDraft: false, ...pr } : null);
+
 interface FakeState {
   eligible: Ticket[]; // jira source's eligible items
   eligible2: Ticket[]; // the optional second (lm) source's eligible items
-  pr: PrInfo | null; // what prForBranch (branch discovery) returns
-  prByNumber?: PrInfo | null; // what prByNumber returns; undefined ⇒ mirror `pr`
+  pr: FakePr; // what prForBranch (branch discovery) returns (isDraft optional ⇒ defaults false)
+  prByNumber?: FakePr; // what prByNumber returns; undefined ⇒ mirror `pr`
   sig: ReviewSig;
   paneState: string;
   deadPanes: Set<string>; // panes herdr no longer tracks (paneAlive → false)
@@ -211,8 +216,8 @@ function build(opts: { multi?: boolean } = {}) {
     notify: async () => { calls.notify += 1; },
   };
   const github: GitHubApi = {
-    prForBranch: async () => state.pr,
-    prByNumber: async () => (state.prByNumber === undefined ? state.pr : state.prByNumber),
+    prForBranch: async () => asPrInfo(state.pr),
+    prByNumber: async () => asPrInfo(state.prByNumber === undefined ? state.pr : state.prByNumber),
     reviewSignature: async () => {
       calls.reviewSig += 1;
       return state.sig;
@@ -220,7 +225,7 @@ function build(opts: { multi?: boolean } = {}) {
     // Loose fake (like prByNumber): every requested number resolves from the PR template.
     prSnapshots: async (_repo, numbers) => {
       calls.prSnapshots.push([...numbers]);
-      const pr = state.prByNumber === undefined ? state.pr : state.prByNumber;
+      const pr = asPrInfo(state.prByNumber === undefined ? state.pr : state.prByNumber);
       const map = new Map<number, PrSnapshot>();
       for (const n of numbers) if (pr) map.set(n, { ...pr, number: n, sig: state.sig });
       return map;
@@ -1484,6 +1489,33 @@ describe("reconcile pipeline (work_to_pull_request belt)", () => {
     expect(store.getRun(run.id)!.phase).toBe("reviewing");
   });
 
+  it("running pr + PR open (non-draft) + NOT step-done → reviewing (hands off on adoption; review transition fires)", async () => {
+    const { deps, store, state, worktree, calls } = build();
+    const run = seed(store, worktree, "K-6d", "running", "pr", { prNumber: 16 });
+    // The pr agent opened a real (non-draft) PR but hasn't signalled step-done — it may still be
+    // working or about to block on a question. The run must stop waiting on the step and hand off to
+    // the review watch, so a later merge still lands (RWR-18204).
+    state.pr = { number: 16, state: "OPEN", url: "u", isDraft: false };
+    state.paneState = "working"; // agent still busy — must NOT gate the handoff
+    await reconcileRun(deps, store.getRun(run.id)!);
+    const got = store.getRun(run.id)!;
+    expect(got.phase).toBe("reviewing");
+    expect(got.step).toBeNull();
+    expect(calls.transitions).toContainEqual(["K-6d", "in_review"]);
+  });
+
+  it("running pr + DRAFT PR open + NOT step-done → stays in the pr step (a draft isn't up for review)", async () => {
+    const { deps, store, state, worktree, calls } = build();
+    const run = seed(store, worktree, "K-6e", "running", "pr", { prNumber: 17 });
+    state.pr = { number: 17, state: "OPEN", url: "u", isDraft: true };
+    state.paneState = "working"; // agent still finalizing the draft
+    await reconcileRun(deps, store.getRun(run.id)!);
+    const got = store.getRun(run.id)!;
+    expect(got.phase).toBe("running"); // a draft keeps the step-done gate
+    expect(got.step).toBe("pr");
+    expect(calls.transitions).not.toContainEqual(["K-6e", "in_review"]);
+  });
+
   it("running pr + our PR closed without merging → attention (not torn down)", async () => {
     const { deps, store, state, worktree, calls } = build();
     const run = seed(store, worktree, "K-8", "running", "pr", { prNumber: 15 });
@@ -1701,6 +1733,21 @@ describe("reconcile pipeline (work_to_pull_request belt)", () => {
     const got = store.getRun(run.id)!;
     expect(got.phase).toBe("attention");
     expect(got.outcome).toBeNull();
+  });
+
+  it("waiting_for_human + adopted PR merges out-of-band → teardown (merged), even with a question outstanding", async () => {
+    const { deps, store, state, worktree, calls } = build();
+    const run = seed(store, worktree, "K-WH1", "waiting_for_human", "pr", { prNumber: 24 });
+    // The pr step is parked on an unanswered question (RWR-18204's exact state) …
+    store.createHumanQuestion({ runId: run.id, repo: "demo", workSource: "jira", ticketKey: "K-WH1", step: "pr", question: "restore the login route?" });
+    // … and the human merges the PR anyway instead of answering. The merge must still be caught.
+    state.pr = { number: 24, state: "MERGED", url: "u" };
+    await reconcileRun(deps, store.getRun(run.id)!);
+    const got = store.getRun(run.id)!;
+    expect(got.phase).toBe("done");
+    expect(got.outcome).toBe("merged");
+    expect(calls.transitions).toContainEqual(["K-WH1", "merged"]); // terminal write-back fires
+    expect(calls.worktreeRemove).toContain("w1"); // slot reclaimed
   });
 
   it("teardown falls back to workspace close + dir removal when worktree remove leaves the workspace", async () => {
