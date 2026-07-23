@@ -343,3 +343,56 @@ describe("agent_signal on the ledger (v31 cutover)", () => {
     expect(legacy.consumed_result).toContain("migrated to the intent ledger (v31)");
   });
 });
+
+describe("human_reply_poll on the ledger (v32 cutover)", () => {
+  it("the poll clock lives on the ledger: miss backoff, stacked error curve, reset, and close-on-answer", () => {
+    const { store, run, setNow } = makeStore();
+    const q = store.createHumanQuestion({ runId: run.id, repo: "r", workSource: "s", ticketKey: "K-1", question: "which flag?" });
+    expect(q.nextPollAt).toBeLessThanOrEqual(1000); // armed due-now
+    // Two misses: 60s then 120s, errors stay 0 (a miss is a successful poll).
+    expect(store.recordHumanPollMiss(q.id)).toMatchObject({ pollAttempts: 1, pollErrors: 0, nextPollAt: 1060 });
+    setNow(1060);
+    expect(store.recordHumanPollMiss(q.id)).toMatchObject({ pollAttempts: 2, pollErrors: 0, nextPollAt: 1060 + 120 });
+    // An error STACKS on the miss exponent: backoff(2 misses + 1 error) = 240s.
+    setNow(1180);
+    expect(store.recordHumanPollError(q.id)).toMatchObject({ pollAttempts: 2, pollErrors: 1, nextPollAt: 1180 + 240 });
+    // A later miss resets the error run.
+    setNow(1420);
+    expect(store.recordHumanPollMiss(q.id)).toMatchObject({ pollAttempts: 3, pollErrors: 0 });
+    // Resume: fresh window, due now.
+    store.resetHumanPollBackoff(q.id);
+    expect(store.getHumanQuestion(q.id)!).toMatchObject({ pollAttempts: 0, pollErrors: 0 });
+    expect(store.getHumanQuestion(q.id)!.nextPollAt).toBeLessThanOrEqual(1420);
+    // Answering closes the ledger row (the poll obligation ends with the question).
+    store.answerHumanQuestion(q.id, { body: "use A", externalId: "a-1" });
+    const intent = store.intentByKey("human_reply_poll", `run:${run.id}`, `q-${q.id}`)!;
+    expect(intent.status).toBe("delivered");
+    expect(store.getHumanQuestion(q.id)!.pollErrors).toBe(0);
+  });
+
+  it("migration v32 carries a mid-backoff, mid-escalation question over exactly", () => {
+    const { DatabaseSync } = require("node:sqlite") as typeof import("node:sqlite");
+    const db = new DatabaseSync(":memory:");
+    db.exec("CREATE TABLE schema_version (version INTEGER NOT NULL)");
+    const { MIGRATIONS, migrate } = require("../src/db/migrate.ts") as typeof import("../src/db/migrate.ts");
+    for (const m of MIGRATIONS.filter((m) => m.version <= 31)) {
+      db.exec(m.sql);
+      db.prepare("INSERT INTO schema_version (version) VALUES (?)").run(m.version);
+    }
+    db.prepare("INSERT INTO runs (repo, ticket_key, phase, created_at, updated_at) VALUES ('r','K-1','waiting_for_human',1,1)").run();
+    db.prepare(
+      `INSERT INTO human_questions (run_id, repo, work_source, ticket_key, step, question, status,
+         poll_attempts, poll_errors, next_poll_at, created_at, updated_at)
+       VALUES (1, 'r', 's', 'K-1', 'review', 'q?', 'pending', 4, 7, 9999, 100, 100)`,
+    ).run();
+    db.prepare(
+      `INSERT INTO human_questions (run_id, repo, work_source, ticket_key, question, status, created_at, updated_at, answered_at)
+       VALUES (1, 'r', 's', 'K-1', 'old q', 'answered', 100, 100, 200)`,
+    ).run();
+    migrate(db);
+    const rows = db.prepare("SELECT * FROM intents WHERE kind = 'human_reply_poll'").all() as Record<string, unknown>[];
+    expect(rows.length).toBe(1); // the answered question owes nothing
+    expect(rows[0]).toMatchObject({ scope: "run:1", dedup_key: "q-1", status: "waiting", attempts: 7, next_attempt_at: 9999 });
+    expect(JSON.parse(rows[0]!.state as string)).toEqual({ pollAttempts: 4 });
+  });
+});

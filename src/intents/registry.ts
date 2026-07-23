@@ -22,6 +22,7 @@ import { backoffDelaySeconds } from "../schedule.ts";
 import { agentSignalKind } from "./kinds/agent-signal.ts";
 import { evidencePublishKind } from "./kinds/evidence-publish.ts";
 import { externalWaitKind } from "./kinds/external-wait.ts";
+import { humanReplyPollKind } from "./kinds/human-reply-poll.ts";
 
 /** The outcome of one lock-free delivery attempt. */
 export type IntentOutcome =
@@ -80,7 +81,7 @@ export interface IntentKindDef {
   readonly survivesTeardown?: boolean;
 }
 
-export const INTENT_KINDS: readonly IntentKindDef[] = [agentSignalKind, evidencePublishKind, externalWaitKind];
+export const INTENT_KINDS: readonly IntentKindDef[] = [agentSignalKind, evidencePublishKind, externalWaitKind, humanReplyPollKind];
 
 export function intentKindFor(kind: string): IntentKindDef | undefined {
   return INTENT_KINDS.find((k) => k.kind === kind);

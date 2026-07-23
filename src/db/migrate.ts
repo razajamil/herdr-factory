@@ -705,6 +705,26 @@ export const MIGRATIONS: { version: number; sql: string }[] = [
        WHERE consumed_at IS NULL;
     `,
   },
+  {
+    version: 32,
+    // The human-question SCHEDULING cuts over to the ledger (kind `human_reply_poll`): each
+    // pending question gets one `waiting` row carrying its poll clock — next_attempt_at (was
+    // next_poll_at), state.pollAttempts (was poll_attempts) and attempts (was poll_errors) — so a
+    // mid-backoff question polls at exactly the cadence it had, and a mid-escalation error run
+    // keeps its count. The DOMAIN row stays in human_questions (question/answer/external ids);
+    // its legacy poll columns freeze (unread by new code). A pending question with no ledger row
+    // (written by a draining old-code process around the upgrade) is armed lazily on first read.
+    sql: `
+      INSERT INTO intents (repo, kind, scope, run_id, ticket_key, dedup_key, payload, state, status,
+                           attempts, next_attempt_at, created_at, updated_at)
+      SELECT repo, 'human_reply_poll', 'run:' || run_id, run_id, ticket_key, 'q-' || id,
+             json_object('questionId', id), json_object('pollAttempts', poll_attempts),
+             'waiting', poll_errors, next_poll_at, created_at, unixepoch()
+        FROM human_questions
+       WHERE status = 'pending';
+      UPDATE intents SET seq = id WHERE seq = 0;
+    `,
+  },
 ];
 
 /** Apply pending migrations in a transaction. Idempotent. */

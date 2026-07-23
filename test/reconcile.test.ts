@@ -2325,7 +2325,9 @@ describe("human-loop resilience — poll errors back off; a gone item escalates"
     // waiting_for_human polls for replies) and silently drop whatever the human answered.
     expect(res).toMatchObject({ ok: true, phase: "waiting_for_human" });
     expect(store.getHumanQuestion(asked.questionId)!.pollErrors).toBe(0); // fresh escalation window
-    expect(store.getHumanQuestion(asked.questionId)!.nextPollAt).toBe(0); // due immediately
+    // Due immediately: the ledger-backed clock writes "now" rather than the legacy literal 0 —
+    // the contract is that the next pass polls without waiting out the accrued backoff.
+    expect(store.getHumanQuestion(asked.questionId)!.nextPollAt).toBeLessThanOrEqual(deps.now());
 
     // The source healed and the human answered — the resumed run picks the reply up.
     state.humanPollError = null;

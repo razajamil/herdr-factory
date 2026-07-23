@@ -580,7 +580,13 @@ CREATE TABLE work_items(                 -- internal lifecycle ledger for source
   created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, UNIQUE(repo, source, key));
 CREATE INDEX idx_work_items ON work_items(repo, source, status);
 
-CREATE TABLE human_questions(            -- ask-human park: one pending question per run (v8)
+CREATE TABLE human_questions(            -- ask-human park: one pending question per run (v8).
+                                         -- DOMAIN row only since v32 — the poll SCHEDULING (clock,
+                                         -- miss backoff, error escalation) lives on the intent
+                                         -- ledger (kind `human_reply_poll`, one waiting row per
+                                         -- pending question; the store's methods OVERLAY it onto
+                                         -- this shape). poll_attempts/poll_errors/next_poll_at
+                                         -- below are frozen legacy columns (unread by new code).
   id INTEGER PRIMARY KEY AUTOINCREMENT, run_id INTEGER NOT NULL REFERENCES runs(id),
   repo TEXT NOT NULL, work_source TEXT NOT NULL, ticket_key TEXT NOT NULL, step TEXT,
   question TEXT NOT NULL, status TEXT NOT NULL CHECK (status IN ('pending','answered')),

@@ -1438,6 +1438,7 @@ export class Store {
     ticketKey?: string | null;
     dedupKey?: string;
     payload?: string;
+    state?: string;
     status?: "pending" | "waiting";
     causeScope?: string | null;
     deadlineAt?: number | null;
@@ -1459,11 +1460,11 @@ export class Store {
       }
       this.db
         .prepare(
-          `INSERT INTO intents (repo, kind, scope, run_id, ticket_key, dedup_key, payload, status, next_attempt_at,
+          `INSERT INTO intents (repo, kind, scope, run_id, ticket_key, dedup_key, payload, state, status, next_attempt_at,
              cause_scope, deadline_at, lease_until, handoff_at, handoff_marker, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(kind, scope, dedup_key) DO UPDATE SET
-             payload = excluded.payload, status = excluded.status, next_attempt_at = excluded.next_attempt_at,
+             payload = excluded.payload, state = excluded.state, status = excluded.status, next_attempt_at = excluded.next_attempt_at,
              cause_scope = excluded.cause_scope, deadline_at = excluded.deadline_at, lease_until = excluded.lease_until,
              error_class = NULL, handoff_at = excluded.handoff_at, handoff_marker = excluded.handoff_marker,
              consumed_at = NULL, consumed_result = NULL,
@@ -1477,6 +1478,7 @@ export class Store {
           input.ticketKey ?? null,
           dedup,
           input.payload ?? "{}",
+          input.state ?? "{}",
           status,
           t,
           input.causeScope ?? null,
@@ -1533,13 +1535,15 @@ export class Store {
   }
 
   /** Record a failed delivery attempt: bump, classify, back off by `delaySeconds` (the kind's
-   *  curve), clear any lease. Guarded to pending rows so a raced terminal stamp isn't reopened. */
+   *  curve), clear any lease. Guarded to live rows so a raced terminal stamp isn't reopened
+   *  ('waiting' included for engine-scheduled rows whose probes run outside the kernel — the
+   *  human reply poll). */
   recordIntentAttempt(id: number, error: string, errorClass: Intent["errorClass"], delaySeconds: number): Intent | undefined {
     const t = this.now();
     this.db
       .prepare(
         `UPDATE intents SET attempts = attempts + 1, next_attempt_at = ?, lease_until = NULL,
-         last_error = ?, error_class = ?, updated_at = ? WHERE id = ? AND status = 'pending'`,
+         last_error = ?, error_class = ?, updated_at = ? WHERE id = ? AND status IN ('pending','waiting')`,
       )
       .run(t + delaySeconds, error.slice(0, 500), errorClass, t, id);
     const e = this.getIntent(id);
@@ -1547,15 +1551,25 @@ export class Store {
     return e;
   }
 
-  /** Reschedule a pending row without counting an error (a reply-poll miss): due again in
-   *  `delaySeconds`, kind-owned `state` optionally replaced. */
-  rescheduleIntent(id: number, delaySeconds: number, state?: string): void {
+  /** Reschedule a live row without counting an error (a reply-poll miss): due again in
+   *  `delaySeconds`, kind-owned `state` optionally replaced. `resetAttempts` also zeroes the
+   *  consecutive-error count — a successful probe that found nothing ends an error run. */
+  rescheduleIntent(id: number, delaySeconds: number, state?: string, opts: { resetAttempts?: boolean } = {}): void {
     const t = this.now();
+    const sets: string[] = ["next_attempt_at = ?", "lease_until = NULL", "updated_at = ?"];
+    const vals: Bind[] = [t + delaySeconds, t];
     if (state !== undefined) {
-      this.db.prepare("UPDATE intents SET next_attempt_at = ?, state = ?, lease_until = NULL, updated_at = ? WHERE id = ? AND status = 'pending'").run(t + delaySeconds, state, t, id);
-    } else {
-      this.db.prepare("UPDATE intents SET next_attempt_at = ?, lease_until = NULL, updated_at = ? WHERE id = ? AND status = 'pending'").run(t + delaySeconds, t, id);
+      sets.push("state = ?");
+      vals.push(state);
     }
+    if (opts.resetAttempts) sets.push("attempts = 0", "error_class = NULL");
+    this.db.prepare(`UPDATE intents SET ${sets.join(", ")} WHERE id = ? AND status IN ('pending','waiting')`).run(...vals, id);
+  }
+
+  /** One row by its identity key (the UNIQUE(kind, scope, dedup_key) handle). */
+  intentByKey(kind: string, scope: string, dedupKey: string): Intent | undefined {
+    const row = this.db.prepare("SELECT * FROM intents WHERE kind = ? AND scope = ? AND dedup_key = ?").get(kind, scope, dedupKey) as IntentRow | undefined;
+    return row ? toIntent(row) : undefined;
   }
 
   /** Replace a row's kind-owned mutable state (poll counters, fulfil results). */
@@ -1713,17 +1727,62 @@ export class Store {
   }
 
   // --- human-in-the-loop questions ------------------------------------------
+  // The DOMAIN rows (question / answer / external ids / status) live in human_questions; the
+  // question's SCHEDULING — the reply-poll clock, miss backoff, and consecutive-error escalation —
+  // lives on the intent ledger since v32 (kind `human_reply_poll`, one `waiting` row per pending
+  // question, keyed q-<id>): attempts = consecutive poll ERRORS (reset by any successful poll),
+  // state.pollAttempts = misses (drives the base backoff exponent), next_attempt_at = the poll
+  // gate. The methods below OVERLAY the ledger clock onto the domain shape, so the reply loop in
+  // reconcileWaitingForHuman is unchanged. The legacy poll columns are frozen (unread); a pending
+  // question with no ledger row (written by a draining old-code process) gets one lazily. Polling
+  // itself stays under the run lock — moving it onto the kernel's lock-free walk is a possible
+  // follow-up, deliberately not taken with the storage cutover.
+
+  /** The question's ledger scheduling row (its poll clock), creating it lazily for a pending
+   *  question that predates the ledger (the old-code drain window). */
+  private humanPollIntent(q: { id: number; runId: number; repo: string; ticketKey: string; status: string }, createIfMissing = true): Intent | undefined {
+    const existing = this.intentByKey("human_reply_poll", `run:${q.runId}`, `q-${q.id}`);
+    if (existing || !createIfMissing || q.status !== "pending") return existing;
+    return this.enqueueIntent({
+      repo: q.repo,
+      kind: "human_reply_poll",
+      scope: `run:${q.runId}`,
+      runId: q.runId,
+      ticketKey: q.ticketKey,
+      dedupKey: `q-${q.id}`,
+      payload: JSON.stringify({ questionId: q.id }),
+      state: JSON.stringify({ pollAttempts: 0 }),
+      status: "waiting", // engine-scheduled: the run-locked reply loop drives it, never the kernel
+    });
+  }
+
+  /** Overlay the ledger clock onto the domain row (the shape every caller keeps reading). */
+  private withPollClock(row: HumanQuestionRow): HumanQuestion {
+    const q = toHumanQuestion(row);
+    const intent = this.humanPollIntent(q, q.status === "pending");
+    if (!intent) return q; // answered pre-ledger: the frozen legacy columns are as good as any
+    let pollAttempts = 0;
+    try {
+      pollAttempts = (JSON.parse(intent.state) as { pollAttempts?: number }).pollAttempts ?? 0;
+    } catch {
+      /* state is engine-written; tolerate anything */
+    }
+    // A resolved row's error run is OVER (the answering poll succeeded — the legacy contract
+    // zeroed poll_errors on answer); only a live row's consecutive-error count is reportable.
+    const live = intent.status === "waiting" || intent.status === "pending";
+    return { ...q, pollAttempts, pollErrors: live ? intent.attempts : 0, nextPollAt: intent.nextAttemptAt };
+  }
 
   getHumanQuestion(id: number): HumanQuestion | undefined {
     const row = this.db.prepare("SELECT * FROM human_questions WHERE id = ?").get(id) as HumanQuestionRow | undefined;
-    return row ? toHumanQuestion(row) : undefined;
+    return row ? this.withPollClock(row) : undefined;
   }
 
   pendingHumanQuestionForRun(runId: number): HumanQuestion | undefined {
     const row = this.db
       .prepare("SELECT * FROM human_questions WHERE run_id = ? AND status = 'pending' ORDER BY id DESC LIMIT 1")
       .get(runId) as HumanQuestionRow | undefined;
-    return row ? toHumanQuestion(row) : undefined;
+    return row ? this.withPollClock(row) : undefined;
   }
 
   createHumanQuestion(input: {
@@ -1743,7 +1802,7 @@ export class Store {
          VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)`,
       )
       .run(input.runId, input.repo, input.workSource, input.ticketKey, input.step ?? null, input.question, t, t);
-    const q = this.getHumanQuestion(Number(info.lastInsertRowid));
+    const q = this.getHumanQuestion(Number(info.lastInsertRowid)); // getHumanQuestion arms the poll row
     if (!q) throw new Error("createHumanQuestion: row vanished after insert");
     telemetryEvent("store.human_question.create", { repo: q.repo, "run.id": q.runId, "question.id": q.id, "work.key": q.ticketKey, step: q.step ?? undefined });
     return q;
@@ -1766,6 +1825,19 @@ export class Store {
     if (sets.length === 0) return;
     set("updated_at", this.now());
     this.db.prepare(`UPDATE human_questions SET ${sets.join(", ")} WHERE id = ?`).run(...vals, id);
+    // A question leaving `pending` (answered, or superseded-as-answered by a newer ask) ends its
+    // poll obligation — close the ledger row so the clock can't outlive the question.
+    if (patch.status === "answered") {
+      const q = this.db.prepare("SELECT * FROM human_questions WHERE id = ?").get(id) as HumanQuestionRow | undefined;
+      if (q) {
+        const intent = this.intentByKey("human_reply_poll", `run:${q.run_id}`, `q-${id}`);
+        if (intent && (intent.status === "waiting" || intent.status === "pending")) {
+          this.db
+            .prepare("UPDATE intents SET status = 'delivered', resolved_at = ?, updated_at = ? WHERE id = ?")
+            .run(this.now(), this.now(), intent.id);
+        }
+      }
+    }
     const q = this.getHumanQuestion(id);
     telemetryEvent("store.human_question.update", {
       repo: q?.repo,
@@ -1782,21 +1854,21 @@ export class Store {
   recordHumanPollMiss(id: number): HumanQuestion {
     const q = this.getHumanQuestion(id);
     if (!q) throw new Error(`recordHumanPollMiss: no question ${id}`);
+    const intent = this.humanPollIntent(q)!;
     const attempts = q.pollAttempts + 1;
     const delay = backoffDelaySeconds(attempts, HUMAN_POLL_BACKOFF_CAP_SECONDS);
-    const t = this.now();
     // A miss is a SUCCESSFUL poll that found no reply — it also resets the consecutive-error run.
-    this.db
-      .prepare("UPDATE human_questions SET poll_attempts = ?, poll_errors = 0, next_poll_at = ?, updated_at = ? WHERE id = ?")
-      .run(attempts, t + delay, t, id);
+    this.rescheduleIntent(intent.id, delay, JSON.stringify({ pollAttempts: attempts }), { resetAttempts: true });
     return this.getHumanQuestion(id)!;
   }
 
   /** Fresh polling window for a resumed run: due now, error run cleared (a resume must get a
    *  full escalation window, not instantly re-trip the consecutive-error cap). */
   resetHumanPollBackoff(id: number): void {
-    const t = this.now();
-    this.db.prepare("UPDATE human_questions SET poll_attempts = 0, poll_errors = 0, next_poll_at = 0, updated_at = ? WHERE id = ?").run(t, id);
+    const q = this.getHumanQuestion(id);
+    if (!q) return;
+    const intent = this.humanPollIntent(q);
+    if (intent) this.rescheduleIntent(intent.id, 0, JSON.stringify({ pollAttempts: 0 }), { resetAttempts: true });
   }
 
   /** Record a pollHumanReply THROW: same backoff as a miss, but counted separately so a
@@ -1804,15 +1876,12 @@ export class Store {
   recordHumanPollError(id: number): HumanQuestion {
     const q = this.getHumanQuestion(id);
     if (!q) throw new Error(`recordHumanPollError: no question ${id}`);
+    const intent = this.humanPollIntent(q)!;
     const errors = q.pollErrors + 1;
     // The error backoff STACKS on the miss exponent (attempts + errors) so a flapping source keeps
-    // thinning out even while misses reset between throws — a curve the shared helper expresses by
-    // being handed the stacked count.
+    // thinning out even while misses reset between throws.
     const delay = backoffDelaySeconds(q.pollAttempts + errors, HUMAN_POLL_BACKOFF_CAP_SECONDS);
-    const t = this.now();
-    this.db
-      .prepare("UPDATE human_questions SET poll_errors = ?, next_poll_at = ?, updated_at = ? WHERE id = ?")
-      .run(errors, t + delay, t, id);
+    this.recordIntentAttempt(intent.id, "reply poll failed", "transient", delay);
     telemetryEvent("store.human_question.poll_error", { repo: q.repo, "run.id": q.runId, "question.id": q.id, "poll.errors": errors });
     return this.getHumanQuestion(id)!;
   }
@@ -1829,8 +1898,6 @@ export class Store {
       answerAuthor: reply.author ?? null,
       answeredAt: t,
     });
-    // The answering poll succeeded — close out the consecutive-error run too.
-    this.db.prepare("UPDATE human_questions SET poll_errors = 0 WHERE id = ?").run(id);
     const q = this.getHumanQuestion(id);
     if (!q) throw new Error("answerHumanQuestion: row vanished after update");
     telemetryEvent("store.human_question.answer", { repo: q.repo, "run.id": q.runId, "question.id": q.id, "work.key": q.ticketKey });
