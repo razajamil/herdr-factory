@@ -274,3 +274,72 @@ describe("shipped kinds", () => {
     expect(k.ordering).toBe("independent");
   });
 });
+
+describe("agent_signal on the ledger (v31 cutover)", () => {
+  it("the pending-signal adapters keep the domain shapes: enqueue/supersede/consume round-trip", () => {
+    const { store, run } = makeStore();
+    const first = store.enqueuePendingSignal({ runId: run.id, repo: "r", ticketKey: "K-1", signal: "ask_human", step: "review", payload: "q1" });
+    const second = store.enqueuePendingSignal({ runId: run.id, repo: "r", ticketKey: "K-1", signal: "bounce", step: "review", toStep: "fix", payload: "findings", pass: 2 });
+    expect(store.getPendingSignal(first.id)!.consumedResult).toBe("superseded");
+    const live = store.unconsumedPendingSignalForRun(run.id)!;
+    expect(live).toMatchObject({ id: second.id, signal: "bounce", step: "review", toStep: "fix", payload: "findings", pass: 2 });
+    store.markPendingSignalConsumed(second.id, "applied");
+    expect(store.unconsumedPendingSignalForRun(run.id)).toBeUndefined();
+    expect(store.getPendingSignal(second.id)!.consumedResult).toBe("applied");
+    expect(store.getIntent(second.id)!.status).toBe("delivered"); // the row closed with the consume
+  });
+
+  it("agent_signal handoffs are invisible to the generic consume loop and to the kernel's due walk", async () => {
+    const { store, run, now } = makeStore();
+    const deps = makeDeps(store, now);
+    const sig = store.enqueuePendingSignal({ runId: run.id, repo: "r", ticketKey: "K-1", signal: "bounce", step: "review", toStep: "fix", payload: "x" });
+    // The generic run-locked loop must NOT acknowledge (eat) a reconciler-consumed kind's handoff…
+    const { INTENT_KINDS } = await import("../src/intents/registry.ts");
+    expect(await consumeIntentHandoffs(deps, { id: run.id, ticketKey: "K-1" } as Run, INTENT_KINDS)).toBeNull();
+    expect(store.getIntent(sig.id)!.consumedAt).toBeNull();
+    // …and the kernel's due walk must not touch a waiting/handoff row either.
+    await flushOutbox(deps, ledgerFlow(deps));
+    expect(store.getIntent(sig.id)!.status).toBe("waiting");
+    expect(store.unconsumedPendingSignalForRun(run.id)!.id).toBe(sig.id); // still consumable
+  });
+
+  it("a legacy pending_signals row is lazily converted to a ledger row on first read (old-server drain)", () => {
+    const { store, run } = makeStore();
+    // Simulate a row a draining OLD-code process wrote directly into the legacy table.
+    // @ts-expect-error reaching into the private db handle is deliberate here
+    const db = store.db as import("node:sqlite").DatabaseSync;
+    db.prepare(
+      `INSERT INTO pending_signals (run_id, repo, ticket_key, signal, step, to_step, payload, pass, created_at)
+       VALUES (?, 'r', 'K-1', 'bounce', 'review', 'fix', 'legacy findings', 3, 999)`,
+    ).run(run.id);
+    const converted = store.unconsumedPendingSignalForRun(run.id)!;
+    expect(converted).toMatchObject({ signal: "bounce", step: "review", toStep: "fix", payload: "legacy findings", pass: 3 });
+    expect(store.getIntent(converted.id)!.kind).toBe("agent_signal"); // it now lives on the ledger
+    const legacy = db.prepare("SELECT consumed_result FROM pending_signals WHERE run_id = ?").get(run.id) as { consumed_result: string };
+    expect(legacy.consumed_result).toContain("migrated");
+    // Second read comes straight from the ledger (no duplicate conversion).
+    expect(store.unconsumedPendingSignalForRun(run.id)!.id).toBe(converted.id);
+  });
+
+  it("migration v31 converts unconsumed legacy rows into waiting+handoff ledger rows and closes the old ones", () => {
+    const { DatabaseSync } = require("node:sqlite") as typeof import("node:sqlite");
+    const db = new DatabaseSync(":memory:");
+    db.exec("CREATE TABLE schema_version (version INTEGER NOT NULL)");
+    const { MIGRATIONS, migrate } = require("../src/db/migrate.ts") as typeof import("../src/db/migrate.ts");
+    for (const m of MIGRATIONS.filter((m) => m.version <= 30)) {
+      db.exec(m.sql);
+      db.prepare("INSERT INTO schema_version (version) VALUES (?)").run(m.version);
+    }
+    db.prepare("INSERT INTO runs (repo, ticket_key, phase, created_at, updated_at) VALUES ('r','K-1','running',1,1)").run();
+    db.prepare(
+      `INSERT INTO pending_signals (run_id, repo, ticket_key, signal, step, to_step, payload, pass, created_at)
+       VALUES (1, 'r', 'K-1', 'bounce', 'review', 'fix', 'pre-upgrade findings', 2, 500)`,
+    ).run();
+    migrate(db);
+    const row = db.prepare("SELECT * FROM intents WHERE kind = 'agent_signal'").get() as Record<string, unknown>;
+    expect(row).toMatchObject({ scope: "run:1", status: "waiting", handoff_marker: "signal", dedup_key: expect.stringMatching(/^legacy-/) });
+    expect(JSON.parse(row.payload as string)).toMatchObject({ signal: "bounce", toStep: "fix", body: "pre-upgrade findings", pass: 2 });
+    const legacy = db.prepare("SELECT consumed_result FROM pending_signals").get() as { consumed_result: string };
+    expect(legacy.consumed_result).toContain("migrated to the intent ledger (v31)");
+  });
+});

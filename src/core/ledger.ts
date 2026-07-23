@@ -113,6 +113,9 @@ export async function consumeIntentHandoffs(
 ): Promise<IntentConsumeVerdict["escalate"] | null> {
   for (const row of deps.store.unconsumedIntentHandoffsForRun(run.id)) {
     const kind = kinds.find((k) => k.kind === row.kind);
+    // A reconciler-consumed kind's handoffs are OWNED by bespoke reconciler code (agent_signal →
+    // consumePendingSignal); acknowledging them here would eat the signal before it applies.
+    if (kind?.consumedBy === "reconciler") continue;
     if (!kind?.consume) {
       deps.store.markIntentConsumed(row.id, "acknowledged");
       continue;

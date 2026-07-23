@@ -593,7 +593,14 @@ CREATE TABLE human_questions(            -- ask-human park: one pending question
   created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, answered_at INTEGER);
 CREATE UNIQUE INDEX idx_human_questions_one_pending_run ON human_questions(run_id) WHERE status='pending';
 
-CREATE TABLE pending_signals(            -- bounce / ask-human as durable per-run INTENTS (v22) —
+CREATE TABLE pending_signals(            -- LEGACY since v31: agent signals live on the intent
+                                         -- ledger as the `agent_signal` kind (waiting + an atomic
+                                         -- 'signal' handoff; the store's pending-signal methods are
+                                         -- ADAPTERS over ledger rows, so the signal machinery kept
+                                         -- its shapes). v31 converted the unconsumed backlog; a row
+                                         -- a draining old-code process writes is converted lazily
+                                         -- on first read. Drops in a contract migration.
+                                         -- Original design (v22) —
   id INTEGER PRIMARY KEY AUTOINCREMENT,  -- the outbox pattern applied to the non-monotonic agent
   run_id INTEGER NOT NULL REFERENCES runs(id),  -- signals. Persisted BEFORE the run lock is tried:
   repo TEXT NOT NULL, ticket_key TEXT NOT NULL, -- an apply that loses the lock race (or crashes

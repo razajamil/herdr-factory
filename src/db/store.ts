@@ -373,6 +373,10 @@ export function isUniqueViolation(e: unknown): boolean {
   return e.message.startsWith("UNIQUE constraint failed");
 }
 
+/** Per-process counter for agent-signal dedup keys (unique alongside the pid — see
+ *  enqueuePendingSignal; single-slot semantics come from supersession, not the key). */
+let signalSeq = 0;
+
 /** Typed repository over the SQLite DB. All methods are synchronous. */
 export class Store {
   private readonly db: DatabaseSync;
@@ -522,7 +526,7 @@ export class Store {
       // Detach (keep) the timeline; the FK on events(run_id) permits NULL, so the rows survive.
       this.db.prepare(`UPDATE events SET run_id = NULL WHERE run_id IN (${ph})`).run(...ids);
       // Delete every run-scoped child row. Table names are a fixed internal list (never user input).
-      for (const table of ["run_steps", "run_products", "guard_counters", "transition_outbox", "evidence_uploads", "human_questions", "pending_signals"]) {
+      for (const table of ["run_steps", "run_products", "guard_counters", "transition_outbox", "evidence_uploads", "human_questions", "pending_signals", "intents"]) {
         this.db.prepare(`DELETE FROM ${table} WHERE run_id IN (${ph})`).run(...ids);
       }
       this.db.prepare(`DELETE FROM runs WHERE id IN (${ph})`).run(...ids);
@@ -1311,23 +1315,65 @@ export class Store {
   // persisted BEFORE the run lock is attempted, so a signal whose immediate apply loses the lock
   // race (or crashes mid-apply) is consumed by a later reconcile pass instead of being dropped
   // after the agent was already told to stop.
+  //
+  // STORAGE: the intent LEDGER since v31 (kind `agent_signal` — status 'waiting' + a 'signal'
+  // handoff stamped atomically at enqueue; single-slot via latest-wins supersession). These
+  // methods are the domain API the signal machinery keeps using — they adapt to/from the ledger
+  // row, so signals.ts / consumePendingSignal never changed shape. The legacy `pending_signals`
+  // table is drained LAZILY for one release: a row a still-draining old-code process enqueues
+  // around the upgrade is converted to a ledger row on its first read (see below), then closed.
+
+  /** Map a ledger `agent_signal` row back onto the domain PendingSignal shape. */
+  private intentToPendingSignal(i: Intent): PendingSignal {
+    const p = JSON.parse(i.payload) as { signal: PendingSignal["signal"]; step: string | null; toStep: string | null; body: string; pass: number | null };
+    return {
+      id: i.id,
+      runId: i.runId!,
+      repo: i.repo,
+      ticketKey: i.ticketKey ?? "",
+      signal: p.signal,
+      step: p.step,
+      toStep: p.toStep,
+      payload: p.body,
+      pass: p.pass,
+      createdAt: i.createdAt,
+      consumedAt: i.consumedAt,
+      // A superseded row's null result reads as "superseded" (the legacy vocabulary).
+      consumedResult: i.consumedResult ?? (i.status === "superseded" ? "superseded" : null),
+    };
+  }
 
   getPendingSignal(id: number): PendingSignal | undefined {
-    const row = this.db.prepare("SELECT * FROM pending_signals WHERE id = ?").get(id) as PendingSignalRow | undefined;
-    return row ? toPendingSignal(row) : undefined;
+    const i = this.getIntent(id);
+    return i && i.kind === "agent_signal" ? this.intentToPendingSignal(i) : undefined;
   }
 
   unconsumedPendingSignalForRun(runId: number): PendingSignal | undefined {
-    const row = this.db
+    // Lazy drain: a legacy pending_signals row (written by a draining old-code process around the
+    // upgrade) is converted to a ledger row on first read, then closed — so there is exactly one
+    // id space past this point. Kept one release; the v31 migration converted the backlog.
+    const legacy = this.db
       .prepare("SELECT * FROM pending_signals WHERE run_id = ? AND consumed_at IS NULL ORDER BY id DESC LIMIT 1")
       .get(runId) as PendingSignalRow | undefined;
-    return row ? toPendingSignal(row) : undefined;
+    if (legacy) {
+      const l = toPendingSignal(legacy);
+      this.db
+        .prepare("UPDATE pending_signals SET consumed_at = ?, consumed_result = 'superseded: migrated to the intent ledger' WHERE run_id = ? AND consumed_at IS NULL")
+        .run(this.now(), runId);
+      return this.enqueuePendingSignal({ runId: l.runId, repo: l.repo, ticketKey: l.ticketKey, signal: l.signal, step: l.step, toStep: l.toStep, payload: l.payload, pass: l.pass });
+    }
+    // status IN (waiting, pending): 'waiting' is the normal shape; 'pending' covers a
+    // kernel-backstopped row (mis-created without the atomic handoff) so it is still consumable.
+    const row = this.db
+      .prepare("SELECT * FROM intents WHERE run_id = ? AND kind = 'agent_signal' AND status IN ('waiting','pending') AND consumed_at IS NULL ORDER BY id DESC LIMIT 1")
+      .get(runId) as IntentRow | undefined;
+    return row ? this.intentToPendingSignal(toIntent(row)) : undefined;
   }
 
   /** Persist a bounce/ask-human intent. At most one unconsumed intent per run: an earlier
    *  unconsumed one is superseded (newest wins — an agent re-deciding replaces its prior signal),
-   *  keeping its row + result for the timeline. Transactional so two racing enqueues can't leave
-   *  two unconsumed intents. */
+   *  keeping its row + result for the timeline. Ledger-backed: status 'waiting' (the kernel never
+   *  retries it — the run-locked consume owns it) with the 'signal' handoff stamped atomically. */
   enqueuePendingSignal(input: {
     runId: number;
     repo: string;
@@ -1338,28 +1384,30 @@ export class Store {
     payload: string;
     pass?: number | null;
   }): PendingSignal {
-    const t = this.now();
-    const id = tx(this.db, () => {
-      this.db
-        .prepare("UPDATE pending_signals SET consumed_at = ?, consumed_result = 'superseded' WHERE run_id = ? AND consumed_at IS NULL")
-        .run(t, input.runId);
-      const info = this.db
-        .prepare(
-          `INSERT INTO pending_signals (run_id, repo, ticket_key, signal, step, to_step, payload, pass, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        )
-        .run(input.runId, input.repo, input.ticketKey, input.signal, input.step ?? null, input.toStep ?? null, input.payload, input.pass ?? null, t);
-      return Number(info.lastInsertRowid);
+    const intent = this.enqueueIntent({
+      repo: input.repo,
+      kind: "agent_signal",
+      scope: `run:${input.runId}`,
+      runId: input.runId,
+      ticketKey: input.ticketKey,
+      // Unique per enqueue (single-slot semantics come from the supersession, not the key); the
+      // pid keeps two processes' same-second enqueues distinct.
+      dedupKey: `sig-${process.pid}-${++signalSeq}`,
+      payload: JSON.stringify({ signal: input.signal, step: input.step ?? null, toStep: input.toStep ?? null, body: input.payload, pass: input.pass ?? null }),
+      status: "waiting",
+      handoff: "signal",
+      supersedeScope: true,
     });
-    const sig = this.getPendingSignal(id);
-    if (!sig) throw new Error("enqueuePendingSignal: row vanished after insert");
-    telemetryEvent("store.pending_signal.enqueue", { repo: sig.repo, "run.id": sig.runId, "signal.id": sig.id, signal: sig.signal, "work.key": sig.ticketKey, step: sig.step ?? undefined });
-    return sig;
+    telemetryEvent("store.pending_signal.enqueue", { repo: input.repo, "run.id": input.runId, "signal.id": intent.id, signal: input.signal, "work.key": input.ticketKey, step: input.step ?? undefined });
+    return this.intentToPendingSignal(intent);
   }
 
-  /** Stamp an intent consumed with its outcome: applied | escalated | rejected: <why>. */
+  /** Stamp an intent consumed with its outcome: applied | escalated | rejected: <why>. Closes the
+   *  ledger row (its scheduling obligation ended with the consume). */
   markPendingSignalConsumed(id: number, result: string): void {
-    this.db.prepare("UPDATE pending_signals SET consumed_at = ?, consumed_result = ? WHERE id = ?").run(this.now(), result, id);
+    const t = this.now();
+    this.db.prepare("UPDATE intents SET status = 'delivered', resolved_at = ?, updated_at = ? WHERE id = ? AND status IN ('waiting','pending')").run(t, t, id);
+    this.markIntentConsumed(id, result);
     telemetryEvent("store.pending_signal.consumed", { "signal.id": id, result });
   }
 
@@ -1379,7 +1427,9 @@ export class Store {
    *  delivery must be idempotent at the backend — the transition/evidence re-open precedent),
    *  keeping its original `seq` so a re-opened row holds its FIFO slot. `supersedeScope` (the
    *  latest-wins orderings) first supersedes every other live row in (kind, scope) — newest wins,
-   *  superseded rows keep their outcome for the timeline. Transactional. */
+   *  superseded rows keep their outcome for the timeline. `handoff` stamps the handoff marker
+   *  ATOMICALLY with the enqueue — a pure-handoff kind (agent_signal) has no crash window between
+   *  "recorded" and "owed to the run". Transactional. */
   enqueueIntent(input: {
     repo: string;
     kind: string;
@@ -1393,6 +1443,7 @@ export class Store {
     deadlineAt?: number | null;
     leaseUntil?: number | null;
     supersedeScope?: boolean;
+    handoff?: string;
   }): Intent {
     const t = this.now();
     const dedup = input.dedupKey ?? "";
@@ -1409,12 +1460,13 @@ export class Store {
       this.db
         .prepare(
           `INSERT INTO intents (repo, kind, scope, run_id, ticket_key, dedup_key, payload, status, next_attempt_at,
-             cause_scope, deadline_at, lease_until, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             cause_scope, deadline_at, lease_until, handoff_at, handoff_marker, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(kind, scope, dedup_key) DO UPDATE SET
              payload = excluded.payload, status = excluded.status, next_attempt_at = excluded.next_attempt_at,
              cause_scope = excluded.cause_scope, deadline_at = excluded.deadline_at, lease_until = excluded.lease_until,
-             error_class = NULL, handoff_at = NULL, handoff_marker = NULL, consumed_at = NULL, consumed_result = NULL,
+             error_class = NULL, handoff_at = excluded.handoff_at, handoff_marker = excluded.handoff_marker,
+             consumed_at = NULL, consumed_result = NULL,
              resolved_at = NULL, updated_at = excluded.updated_at`,
         )
         .run(
@@ -1430,6 +1482,8 @@ export class Store {
           input.causeScope ?? null,
           input.deadlineAt ?? null,
           input.leaseUntil ?? null,
+          input.handoff != null ? t : null,
+          input.handoff ?? null,
           t,
           t,
         );
@@ -1444,14 +1498,17 @@ export class Store {
     });
   }
 
-  /** Pending intents due for a delivery attempt: due-now AND not leased by an inline attempt.
-   *  Ordered (scope, seq) so a scope's FIFO chain is walked in intent order. */
+  /** Pending intents due for a delivery attempt: due-now, not leased by an inline attempt, and not
+   *  sitting on an unconsumed handoff (such a row is in the RUN's court — re-delivering before the
+   *  run-locked consume would double-stamp it). Ordered (scope, seq) so a scope's FIFO chain is
+   *  walked in intent order. */
   dueIntents(repo: string, limit = 25): Intent[] {
     const now = this.now();
     const rows = this.db
       .prepare(
         `SELECT * FROM intents WHERE repo = ? AND status = 'pending' AND next_attempt_at <= ?
-         AND (lease_until IS NULL OR lease_until <= ?) ORDER BY scope, seq LIMIT ?`,
+         AND (lease_until IS NULL OR lease_until <= ?)
+         AND (handoff_at IS NULL OR consumed_at IS NOT NULL) ORDER BY scope, seq LIMIT ?`,
       )
       .all(repo, now, now, limit) as unknown as IntentRow[];
     return rows.map(toIntent);
@@ -1549,10 +1606,11 @@ export class Store {
     telemetryEvent("store.intent.handoff", { repo: e?.repo, "intent.kind": e?.kind, "intent.id": id, "intent.handoff": marker });
   }
 
-  /** Unconsumed handoffs owed to a run — Phase A's consume input, oldest first. */
+  /** Unconsumed handoffs owed to a run — Phase A's consume input, oldest first. A superseded row's
+   *  handoff dies with it (a newer decision replaced it; consuming both would double-apply). */
   unconsumedIntentHandoffsForRun(runId: number): Intent[] {
     const rows = this.db
-      .prepare("SELECT * FROM intents WHERE run_id = ? AND handoff_at IS NOT NULL AND consumed_at IS NULL ORDER BY id")
+      .prepare("SELECT * FROM intents WHERE run_id = ? AND handoff_at IS NOT NULL AND consumed_at IS NULL AND status <> 'superseded' ORDER BY id")
       .all(runId) as unknown as IntentRow[];
     return rows.map(toIntent);
   }

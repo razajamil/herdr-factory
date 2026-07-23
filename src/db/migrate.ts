@@ -682,6 +682,29 @@ export const MIGRATIONS: { version: number; sql: string }[] = [
        WHERE delivered_at IS NULL AND permanent_failed_at IS NULL AND abandoned_at IS NULL;
     `,
   },
+  {
+    version: 31,
+    // agent_signal cuts over to the ledger: every unconsumed pending_signals row (a queued
+    // bounce/ask-human whose apply lost the run-lock race and is owed to the next reconcile pass)
+    // converts to an `agent_signal` intent — status 'waiting' with the 'signal' handoff already
+    // stamped, exactly the shape enqueuePendingSignal now writes — then the legacy rows close.
+    // The store's pending-signal methods became ADAPTERS over the ledger (same domain shapes, so
+    // signals.ts / consumePendingSignal are unchanged), with a lazy drain of any legacy row a
+    // still-draining old-code process enqueues around the upgrade. The legacy table drops in a
+    // later contract migration.
+    sql: `
+      INSERT INTO intents (repo, kind, scope, run_id, ticket_key, dedup_key, payload, status,
+                           handoff_at, handoff_marker, created_at, updated_at)
+      SELECT repo, 'agent_signal', 'run:' || run_id, run_id, ticket_key, 'legacy-' || id,
+             json_object('signal', signal, 'step', step, 'toStep', to_step, 'body', payload, 'pass', pass),
+             'waiting', unixepoch(), 'signal', created_at, unixepoch()
+        FROM pending_signals
+       WHERE consumed_at IS NULL;
+      UPDATE intents SET seq = id WHERE seq = 0;
+      UPDATE pending_signals SET consumed_at = unixepoch(), consumed_result = 'superseded: migrated to the intent ledger (v31)'
+       WHERE consumed_at IS NULL;
+    `,
+  },
 ];
 
 /** Apply pending migrations in a transaction. Idempotent. */

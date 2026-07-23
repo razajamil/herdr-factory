@@ -19,6 +19,7 @@
 import type { Deps } from "../core/deps.ts";
 import type { Intent, Run } from "../types.ts";
 import { backoffDelaySeconds } from "../schedule.ts";
+import { agentSignalKind } from "./kinds/agent-signal.ts";
 import { evidencePublishKind } from "./kinds/evidence-publish.ts";
 import { externalWaitKind } from "./kinds/external-wait.ts";
 
@@ -65,6 +66,11 @@ export interface IntentKindDef {
   /** Operator notification for a failure, throttled per row by attention_renotify_seconds against
    *  `notified_at`. null = nothing to say for this failure. */
   notify?(deps: Deps, row: Intent, failure: { errorClass: string; reason: string }): { title: string; body: string } | null;
+  /** Who consumes this kind's handoffs. "kernel" (default): the generic run-locked loop calls
+   *  `consume` (or stamps 'acknowledged'). "reconciler": the reconciler owns a bespoke consume —
+   *  the run reaction is too entangled with step machinery for a registry callback (agent_signal's
+   *  bounce rewind) — and the generic loop must NOT touch the handoff. */
+  readonly consumedBy?: "kernel" | "reconciler";
   /** Run-locked consume of this kind's handoffs. Omitted ⇒ handoffs are stamped 'acknowledged'. */
   consume?(deps: Deps, run: Run, row: Intent): Promise<IntentConsumeVerdict>;
   /** What a human `resume` of the run does to this kind's live rows. */
@@ -74,7 +80,7 @@ export interface IntentKindDef {
   readonly survivesTeardown?: boolean;
 }
 
-export const INTENT_KINDS: readonly IntentKindDef[] = [evidencePublishKind, externalWaitKind];
+export const INTENT_KINDS: readonly IntentKindDef[] = [agentSignalKind, evidencePublishKind, externalWaitKind];
 
 export function intentKindFor(kind: string): IntentKindDef | undefined {
   return INTENT_KINDS.find((k) => k.kind === kind);
