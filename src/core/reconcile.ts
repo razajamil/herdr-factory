@@ -5,7 +5,7 @@ import { createEvidencePublisher } from "../clients/evidence.ts";
 import { runEffect } from "../runtime/effect.ts";
 import { HerdrUnreachableError, type BeltRuntime, type Deps, type SourceRuntime } from "./deps.ts";
 import type { StepConfig } from "../config.ts";
-import type { BeltEffectTrigger, GuardSpec, HumanQuestion, HumanReply, MatchItem, Outcome, PrInfo, PrSnapshot, Run, RunStep, Ticket, TransitionIntent, WorkState } from "../types.ts";
+import type { BeltEffectTrigger, EvidenceUpload, GuardSpec, HumanQuestion, HumanReply, MatchItem, Outcome, PrInfo, PrSnapshot, Run, RunStep, Ticket, TransitionIntent, WorkState } from "../types.ts";
 import { EFFECT_PRODUCE_PRODUCTS, effectRank, outcomeToWorkState, StaleItemError, ticketOf, type TransitionContext } from "../types.ts";
 import { isUniqueViolation } from "../db/store.ts";
 import { notifyDue } from "../schedule.ts";
@@ -220,92 +220,148 @@ function sameTrigger(a: BeltEffectTrigger, b: BeltEffectTrigger): boolean {
   return false;
 }
 
-/** Retry every due undelivered intent (in per-run order, stopping a run's chain at its first
- *  failure). Runs at the top of each tick so write-backs converge even while the repo is at
- *  capacity or the affected runs are parked/ended. */
-export async function flushTransitionOutbox(deps: Deps): Promise<void> {
-  const due = deps.store.dueTransitions(deps.config.repoName);
-  for (const intent of due) {
-    const src = deps.resolveSource(intent.workSource);
-    if (!src) {
-      // Source removed from config — the intent can never deliver; close it out loudly rather
-      // than retrying forever against nothing.
-      deps.store.recordTransitionAttempt(intent.id, `work source "${intent.workSource}" no longer configured`);
-      deps.store.markTransitionDelivered(intent.id);
-      deps.log("warn", `${intent.ticketKey}: dropping ${intent.toState} write-back — source "${intent.workSource}" is gone`);
-      continue;
+/** One durable-intent outbox the Phase 0 flush drives. The DRIVER (`flushOutbox`) owns the pass
+ *  shape — run the optional pre-pass hook, walk the due rows, isolate per-row failures — while each
+ *  flow keeps its own delivery semantics (per-run FIFO gates, terminal vocabulary, error
+ *  classification, notify policy) inside `attempt`. Every flow is LOCK-FREE by contract: it must
+ *  never mutate a run — only its own rows + events + best-effort notifies (a run-policy reaction
+ *  crosses to the run-locked Phase A, e.g. the stale two-phase). Adding outbox N+1 is one more
+ *  entry in `outboxFlows`, not a third copy of the loop. */
+interface OutboxFlow<J> {
+  readonly name: string;
+  /** Runs once before the due rows are walked (the evidence flow's creds-recovery probe + due-now
+   *  requeue of auth-stuck rows). */
+  prePass?(): Promise<void>;
+  /** Rows due for a delivery attempt this pass. */
+  due(): J[];
+  /** One row's delivery attempt. Owns its outcome bookkeeping entirely — delivered / backoff /
+   *  terminal stamp / throttled notify. Expected failures must be RECORDED, never thrown: a throw
+   *  here is a flow bug, which the driver logs and skips so one bad row can't stall the pass. */
+  attempt(job: J): Promise<void>;
+}
+
+async function flushOutbox<J>(deps: Deps, flow: OutboxFlow<J>): Promise<void> {
+  if (flow.prePass) await flow.prePass();
+  for (const job of flow.due()) {
+    try {
+      await flow.attempt(job);
+    } catch (e) {
+      deps.log("error", `${flow.name} flush: attempt failed unexpectedly: ${err(e)}`);
     }
-    // In-order per run, checked against the DB (not just this pass): an earlier sibling that is
-    // undelivered but backed off (not due) must still block this one — delivering out of order
-    // would let a retried in_development land after in_review and walk the source backward.
-    if (deps.store.undeliveredTransitionBefore(intent.runId, intent.id)) continue;
-    await deliverTransition(deps, src, intent);
   }
 }
 
+/** The source status write-backs (transition outbox) as a flush flow: retry every due undelivered
+ *  intent, strictly in-order per run. */
+function transitionOutboxFlow(deps: Deps): OutboxFlow<TransitionIntent> {
+  return {
+    name: "transition outbox",
+    due: () => deps.store.dueTransitions(deps.config.repoName),
+    attempt: async (intent) => {
+      const src = deps.resolveSource(intent.workSource);
+      if (!src) {
+        // Source removed from config — the intent can never deliver; close it out loudly rather
+        // than retrying forever against nothing.
+        deps.store.recordTransitionAttempt(intent.id, `work source "${intent.workSource}" no longer configured`);
+        deps.store.markTransitionDelivered(intent.id);
+        deps.log("warn", `${intent.ticketKey}: dropping ${intent.toState} write-back — source "${intent.workSource}" is gone`);
+        return;
+      }
+      // In-order per run, checked against the DB (not just this pass): an earlier sibling that is
+      // undelivered but backed off (not due) must still block this one — delivering out of order
+      // would let a retried in_development land after in_review and walk the source backward.
+      if (deps.store.undeliveredTransitionBefore(intent.runId, intent.id)) return;
+      await deliverTransition(deps, src, intent);
+    },
+  };
+}
+
 /**
- * Retry every due evidence-upload intent (Phase 0, alongside the transition outbox). The evidence
- * agent published deterministic URLs into its handoff immediately; this lands the actual bytes in S3,
- * retrying with backoff until AWS accepts them — so an expired SSO session defers the upload instead of
- * losing it (the PR #6541 bug). LOCK-FREE like flushTransitionOutbox: it must never mutate a run (only
- * the evidence_uploads row + events + best-effort notify). A creds/token (`auth`) failure that keeps
- * recurring notifies the human to `aws sso login` (throttled per row via attentionRenotifySeconds).
+ * The evidence-upload outbox as a flush flow. The evidence agent published deterministic URLs into
+ * its handoff immediately; this lands the actual bytes in S3, retrying with backoff until AWS
+ * accepts them — so an expired SSO session defers the upload instead of losing it (the PR #6541
+ * bug). A creds/token (`auth`) failure that keeps recurring notifies the human to `aws sso login`
+ * (throttled per row via attentionRenotifySeconds).
  */
-export async function flushEvidenceUploads(deps: Deps): Promise<void> {
+function evidenceUploadFlow(deps: Deps): OutboxFlow<EvidenceUpload> {
   const repo = deps.config.repoName;
   const ev = deps.config.evidence;
   const publisher = ev ? createEvidencePublisher(ev, { currentLogin: () => deps.github.currentLogin() }) : undefined;
-  // Auto-resume on creds recovery (S3 only — `local`/`command` have no `auth` kind, so no row is ever
-  // auth-stuck and this branch is skipped). If an upload is stuck on expired creds, cheaply probe once
-  // (gated so the happy path never probes). The moment creds are live again, make every auth-stuck row
-  // due now so THIS pass uploads it — no human "retry" gesture, no waiting out the backoff. Mirrors the
-  // source-auth path's retryTransitionsForSource. A probe error is treated as still-down (conservative).
-  if (publisher?.probeLiveness && deps.store.authStuckEvidenceUpload(repo)) {
-    const probe = await publisher.probeLiveness().catch(() => ({ auth: true, reason: "probe failed" }));
-    if (!probe.auth) {
-      const requeued = deps.store.retryEvidenceUploadsForRepo(repo);
-      if (requeued > 0) deps.log("info", `evidence publish: creds recovered — re-queued ${requeued} stuck upload(s) for immediate retry`);
-    }
-  }
-  for (const job of deps.store.dueEvidenceUploads(repo)) {
-    if (!ev || !publisher) {
-      deps.store.markEvidencePermanentFailed(job.id, "evidence config removed");
-      continue;
-    }
-    // Best-effort drop policy: the bytes live in the worktree, which teardown removes. If the dir is
-    // gone the publish can never land — stop retrying (this also covers the manual-teardown race).
-    if (!existsSync(job.evidenceDir)) {
-      deps.store.markEvidencePermanentFailed(job.id, "evidence dir gone (torn down before publish)");
-      deps.log("warn", `${job.ticketKey}: evidence publish dropped — worktree removed before it landed`);
-      continue;
-    }
-    try {
-      const { files } = await publisher.publish({ dir: job.evidenceDir, prefix: job.keyPrefix });
-      deps.store.markEvidenceDelivered(job.id);
-      deps.store.recordEvent({ runId: job.runId, repo, ticketKey: job.ticketKey, type: "evidence_uploaded", detail: { files: files.length, prefix: job.keyPrefix, attempts: job.attempts, publisher: ev.publisher } });
-      deps.log("info", `${job.ticketKey}: evidence published (${files.length} file(s)) after ${job.attempts} retr${job.attempts === 1 ? "y" : "ies"}`);
-    } catch (e) {
-      const c = publisher.classifyError(e);
-      // Notify on the FIRST failure, then throttle re-notifies by attentionRenotifySeconds.
-      const shouldNotify = notifyDue(job.notifiedAt, deps.config.limits.attentionRenotifySeconds, deps.now());
-      if (c.kind === "permanent") {
-        deps.store.markEvidencePermanentFailed(job.id, c.reason);
-        deps.store.recordEvent({ runId: job.runId, repo, ticketKey: job.ticketKey, type: "evidence_upload_failed", detail: { reason: c.reason } });
-        if (shouldNotify) {
-          await deps.herdr.notify(`herdr-factory: ${job.ticketKey} evidence publish failed`, `Evidence publish can't proceed: ${c.reason}. Run \`herdr-factory --repo ${repo} doctor --deep\`; the published URLs won't resolve until it's fixed.`).catch(() => {});
-          deps.store.markEvidenceNotified(job.id);
-        }
-      } else {
-        const updated = deps.store.recordEvidenceAttempt(job.id, c.reason, c.kind);
-        deps.log("warn", `${job.ticketKey}: evidence publish deferred (attempt ${updated?.attempts}): ${c.reason}`);
-        if (c.kind === "auth" && shouldNotify) {
-          const profile = ev.publisher === "s3" ? ev.profile : undefined;
-          await deps.herdr.notify(`herdr-factory: AWS SSO expired`, `Evidence publish for ${job.ticketKey} is blocked on AWS creds — run \`aws sso login${profile ? ` --profile ${profile}` : ""}\`. It uploads automatically on the next tick.`).catch(() => {});
-          deps.store.markEvidenceNotified(job.id);
+  return {
+    name: "evidence upload",
+    // Auto-resume on creds recovery (S3 only — `local`/`command` have no `auth` kind, so no row is
+    // ever auth-stuck and this hook is a cheap boolean read). If an upload is stuck on expired
+    // creds, probe once (gated so the happy path never probes). The moment creds are live again,
+    // make every auth-stuck row due now so THIS pass uploads it — no human "retry" gesture, no
+    // waiting out the backoff. Mirrors the source-auth path's retryTransitionsForSource. A probe
+    // error is treated as still-down (conservative).
+    prePass: async () => {
+      if (!publisher?.probeLiveness || !deps.store.authStuckEvidenceUpload(repo)) return;
+      const probe = await publisher.probeLiveness().catch(() => ({ auth: true, reason: "probe failed" }));
+      if (!probe.auth) {
+        const requeued = deps.store.retryEvidenceUploadsForRepo(repo);
+        if (requeued > 0) deps.log("info", `evidence publish: creds recovered — re-queued ${requeued} stuck upload(s) for immediate retry`);
+      }
+    },
+    due: () => deps.store.dueEvidenceUploads(repo),
+    attempt: async (job) => {
+      if (!ev || !publisher) {
+        deps.store.markEvidencePermanentFailed(job.id, "evidence config removed");
+        return;
+      }
+      // Best-effort drop policy: the bytes live in the worktree, which teardown removes. If the dir is
+      // gone the publish can never land — stop retrying (this also covers the manual-teardown race).
+      if (!existsSync(job.evidenceDir)) {
+        deps.store.markEvidencePermanentFailed(job.id, "evidence dir gone (torn down before publish)");
+        deps.log("warn", `${job.ticketKey}: evidence publish dropped — worktree removed before it landed`);
+        return;
+      }
+      try {
+        const { files } = await publisher.publish({ dir: job.evidenceDir, prefix: job.keyPrefix });
+        deps.store.markEvidenceDelivered(job.id);
+        deps.store.recordEvent({ runId: job.runId, repo, ticketKey: job.ticketKey, type: "evidence_uploaded", detail: { files: files.length, prefix: job.keyPrefix, attempts: job.attempts, publisher: ev.publisher } });
+        deps.log("info", `${job.ticketKey}: evidence published (${files.length} file(s)) after ${job.attempts} retr${job.attempts === 1 ? "y" : "ies"}`);
+      } catch (e) {
+        const c = publisher.classifyError(e);
+        // Notify on the FIRST failure, then throttle re-notifies by attentionRenotifySeconds.
+        const shouldNotify = notifyDue(job.notifiedAt, deps.config.limits.attentionRenotifySeconds, deps.now());
+        if (c.kind === "permanent") {
+          deps.store.markEvidencePermanentFailed(job.id, c.reason);
+          deps.store.recordEvent({ runId: job.runId, repo, ticketKey: job.ticketKey, type: "evidence_upload_failed", detail: { reason: c.reason } });
+          if (shouldNotify) {
+            await deps.herdr.notify(`herdr-factory: ${job.ticketKey} evidence publish failed`, `Evidence publish can't proceed: ${c.reason}. Run \`herdr-factory --repo ${repo} doctor --deep\`; the published URLs won't resolve until it's fixed.`).catch(() => {});
+            deps.store.markEvidenceNotified(job.id);
+          }
+        } else {
+          const updated = deps.store.recordEvidenceAttempt(job.id, c.reason, c.kind);
+          deps.log("warn", `${job.ticketKey}: evidence publish deferred (attempt ${updated?.attempts}): ${c.reason}`);
+          if (c.kind === "auth" && shouldNotify) {
+            const profile = ev.publisher === "s3" ? ev.profile : undefined;
+            await deps.herdr.notify(`herdr-factory: AWS SSO expired`, `Evidence publish for ${job.ticketKey} is blocked on AWS creds — run \`aws sso login${profile ? ` --profile ${profile}` : ""}\`. It uploads automatically on the next tick.`).catch(() => {});
+            deps.store.markEvidenceNotified(job.id);
+          }
         }
       }
-    }
-  }
+    },
+  };
+}
+
+/** The Phase 0 outbox flows, in delivery order: status write-backs first (they gate claiming — the
+ *  known-stale-eligibility veto — so they converge before anything else), then evidence uploads. */
+function outboxFlows(deps: Deps): OutboxFlow<unknown>[] {
+  return [transitionOutboxFlow(deps), evidenceUploadFlow(deps)];
+}
+
+/** Retry every due undelivered transition intent (in per-run order, stopping a run's chain at its
+ *  first failure). Runs at the top of each tick so write-backs converge even while the repo is at
+ *  capacity or the affected runs are parked/ended. */
+export async function flushTransitionOutbox(deps: Deps): Promise<void> {
+  return flushOutbox(deps, transitionOutboxFlow(deps));
+}
+
+/** Retry every due evidence-upload intent (Phase 0, alongside the transition outbox). */
+export async function flushEvidenceUploads(deps: Deps): Promise<void> {
+  return flushOutbox(deps, evidenceUploadFlow(deps));
 }
 
 /**
@@ -465,18 +521,15 @@ async function reconcileRepoImpl(deps: Deps): Promise<void> {
   const repo = deps.config.repoName;
   deps.store.upsertRepo(repo, deps.config.repo.path, deps.config.repo.baseRef, deps.ghRepo);
 
-  // Phase 0 — retry undelivered source status write-backs (before anything else, so they
-  // converge even at capacity and for already-ended runs).
-  try {
-    await flushTransitionOutbox(deps);
-  } catch (e) {
-    deps.log("error", `transition outbox flush failed: ${err(e)}`);
-  }
-  // Phase 0 (cont.) — retry undelivered evidence-upload intents (durable S3 upload; survives SSO expiry).
-  try {
-    await flushEvidenceUploads(deps);
-  } catch (e) {
-    deps.log("error", `evidence upload flush failed: ${err(e)}`);
+  // Phase 0 — flush every registered durable-intent outbox (before anything else, so intents
+  // converge even at capacity and for already-ended runs): source status write-backs, then
+  // evidence uploads. One failing flow must not starve the others.
+  for (const flow of outboxFlows(deps)) {
+    try {
+      await flushOutbox(deps, flow);
+    } catch (e) {
+      deps.log("error", `${flow.name} flush failed: ${err(e)}`);
+    }
   }
 
   // Phase A — advance everything in flight, in parallel with bounded concurrency (most of a
