@@ -140,6 +140,11 @@ export interface Run {
   resolverActive: boolean;
   lastThreadSig: string | null;
   attentionReason: string | null;
+  /** The MACHINE reason code of the run's most recent attention escalation (step_budget /
+   *  layout_wait_timeout / bounce_limit / …) — the routing key that selects a park's rescue class.
+   *  First-class since v28 (it used to be JSON-parsed back out of the events log); written by
+   *  escalateAttention, never cleared (reads are always guarded by phase === "attention"). */
+  attentionReasonCode: string | null;
   attentionNotifiedAt: number | null; // when the operator was last notified about a parked run
   outcome: Outcome | null;
   focusPending: boolean; // active step changed; focus shift deferred until the user views this worktree
@@ -164,6 +169,7 @@ export type RunPatch = Partial<
     | "resolverActive"
     | "lastThreadSig"
     | "attentionReason"
+    | "attentionReasonCode"
     | "attentionNotifiedAt"
     | "outcome"
     | "focusPending"
@@ -180,8 +186,15 @@ export interface RunStep {
   step: StepName;
   paneId: string | null;
   sessionId: string | null; // the agent's claude session id (on-demand query handle)
-  progressSig: string | null; // last-seen branch HEAD (per-step heartbeat)
+  progressSig: string | null; // last-seen branch HEAD (the commit-stall heartbeat; heartbeat steps only)
   progressAt: number | null;
+  /** The read-only guard's enforcement baseline (read-only steps only; own columns since v28 — it
+   *  used to alias progress_sig, safe only via the config-level heartbeat/read_only exclusion).
+   *  TRACKS live HEAD until the step's own agent is first observed working, then freezes. */
+  baselineSig: string | null;
+  /** When the baseline froze (the step's agent was first observed working); null = still tracking,
+   *  absorbing the prior step's trailing handoff-window commits (RWR-18204). */
+  baselineFrozenAt: number | null;
   done: boolean;
   startedAt: number | null;
   doneAt: number | null;
@@ -202,7 +215,7 @@ export interface RunStep {
 
 /** Fields the reconciler may patch on a run step. */
 export type RunStepPatch = Partial<
-  Pick<RunStep, "paneId" | "sessionId" | "progressSig" | "progressAt" | "done" | "startedAt" | "absentAt" | "pass" | "dispatchedAt">
+  Pick<RunStep, "paneId" | "sessionId" | "progressSig" | "progressAt" | "baselineSig" | "baselineFrozenAt" | "done" | "startedAt" | "absentAt" | "pass" | "dispatchedAt">
 >;
 
 /** A durable agent-signal intent (`pending_signals`): bounce / ask-human persisted BEFORE the run

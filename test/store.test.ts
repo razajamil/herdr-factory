@@ -240,24 +240,44 @@ describe("Store", () => {
     // Simulate a pre-v6 DB: schema_version=5, a runs table WITHOUT work_source, one in-flight row.
     // Include watch_deadline + pr_number + last_thread_sig + outcome (all part of the v1 CREATE
     // TABLE) so v17's and v18's DROP COLUMNs and v25's duplicate-active sweep apply cleanly
-    // (resolver_active is ADDED by v17, then dropped by v18), and
-    // seed run_steps (created back in v4) so v9's ALTER applies — a genuine v5 DB always has both.
+    // (resolver_active is ADDED by v17, then dropped by v18); seed run_steps (created back in v4)
+    // so v9's ALTER applies, and events (created in v1) so v28's attention backfill applies — a
+    // genuine v5 DB always has all three.
     db.exec(`
       CREATE TABLE schema_version (version INTEGER NOT NULL);
       INSERT INTO schema_version (version) VALUES (5);
       CREATE TABLE runs (id INTEGER PRIMARY KEY AUTOINCREMENT, repo TEXT, ticket_key TEXT, phase TEXT,
         pr_number INTEGER, last_thread_sig TEXT, outcome TEXT,
         watch_deadline INTEGER, created_at INTEGER, updated_at INTEGER, ended_at INTEGER);
-      INSERT INTO runs (repo, ticket_key, phase, created_at, updated_at) VALUES ('r','OLD-1','fixing',1,1);
+      INSERT INTO runs (repo, ticket_key, phase, created_at, updated_at)
+        VALUES ('r','OLD-1','attention',1,1), ('r','OLD-2','fixing',1,1);
       CREATE TABLE run_steps (id INTEGER PRIMARY KEY AUTOINCREMENT, run_id INTEGER NOT NULL, step TEXT NOT NULL,
         pane_id TEXT, session_id TEXT, progress_sig TEXT, progress_at INTEGER,
         done INTEGER NOT NULL DEFAULT 0, started_at INTEGER, done_at INTEGER);
+      INSERT INTO run_steps (run_id, step, progress_sig, progress_at) VALUES (1, 'review', 'sha-ro', 42);
+      CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, run_id INTEGER, repo TEXT, ticket_key TEXT,
+        ts INTEGER NOT NULL, type TEXT NOT NULL, detail TEXT);
+      INSERT INTO events (run_id, repo, ticket_key, ts, type, detail)
+        VALUES (1, 'r', 'OLD-1', 5, 'attention', '{"reason":"step_budget"}'),
+               (1, 'r', 'OLD-1', 9, 'attention', '{"reason":"pr_closed"}'),
+               (1, 'r', 'OLD-1', 12, 'attention', 'not json — must not brick the migration'),
+               (2, 'r', 'OLD-2', 7, 'attention', '{"reason":"bounce_limit"}');
     `);
     migrate(db);
     const v = db.prepare("SELECT MAX(version) AS v FROM schema_version").get() as { v: number };
     expect(v.v).toBeGreaterThanOrEqual(6);
-    const row = db.prepare("SELECT work_source FROM runs WHERE ticket_key = 'OLD-1'").get() as { work_source: string };
+    const row = db.prepare("SELECT work_source, attention_reason_code FROM runs WHERE ticket_key = 'OLD-1'").get() as { work_source: string; attention_reason_code: string };
     expect(row.work_source).toBe("jira"); // backfilled in the same migration
+    expect(row.attention_reason_code).toBe("pr_closed"); // v28: LATEST valid attention reason wins; garbage skipped
+    // v28's attention backfill is SCOPED to currently-PARKED runs: a healthy run's historical park
+    // must stay NULL, or the stale code would shadow a fresher old-code park during the drain
+    // window (the runtime read falls back to the events log only when the column is NULL).
+    const healthy = db.prepare("SELECT attention_reason_code AS c FROM runs WHERE ticket_key = 'OLD-2'").get() as { c: string | null };
+    expect(healthy.c).toBeNull();
+    // v28: the read-only baseline columns are backfilled from the aliased heartbeat columns.
+    const rs = db.prepare("SELECT baseline_sig, baseline_frozen_at FROM run_steps WHERE run_id = 1").get() as { baseline_sig: string; baseline_frozen_at: number };
+    expect(rs.baseline_sig).toBe("sha-ro");
+    expect(rs.baseline_frozen_at).toBe(42);
     expect(db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='work_items'").get()).toBeTruthy();
     expect(() => migrate(db)).not.toThrow(); // re-running is a no-op
   });

@@ -517,6 +517,13 @@ CREATE TABLE runs(                       -- ONE attempt at a work item (history 
   -- worker_done/review_done/review_pane/progress_* (migrations v2-v3) are superseded
   -- by run_steps and left in place for history only.
   attention_reason TEXT,
+  attention_reason_code TEXT,            -- MACHINE reason of the latest attention park (step_budget /
+                                         -- layout_wait_timeout / bounce_limit / …) — the key that
+                                         -- routes a park to its rescue class (step-done rescue /
+                                         -- bounded respawn / human-only). First-class since v28
+                                         -- (was JSON-parsed back out of the events log); written by
+                                         -- escalateAttention, backfilled from events, event-log
+                                         -- fallback kept for one release (old-code drain window).
   attention_notified_at INTEGER,         -- last operator notification for a parked run (v12)
   outcome TEXT,                          -- merged|closed|abandoned|timeout|completed|NULL
   created_at INTEGER, updated_at INTEGER, ended_at INTEGER);
@@ -528,7 +535,13 @@ CREATE TABLE run_steps(                  -- one row per pipeline agent (migratio
   id INTEGER PRIMARY KEY AUTOINCREMENT, run_id INTEGER NOT NULL,
   step TEXT NOT NULL,                    -- belt step name (work/evidence/review/pr/custom)
   pane_id TEXT, session_id TEXT,         -- on-demand cross-agent query handles
-  progress_sig TEXT, progress_at INTEGER,   -- per-step commit heartbeat
+  progress_sig TEXT, progress_at INTEGER,   -- per-step commit heartbeat (heartbeat steps only)
+  baseline_sig TEXT, baseline_frozen_at INTEGER, -- the read-only guard's enforcement baseline (v28;
+                                         -- de-aliased from progress_sig, which read-only steps used
+                                         -- to borrow): tracks live HEAD — absorbing the prior step's
+                                         -- trailing handoff commits (RWR-18204) — until the step's
+                                         -- own agent is first observed working, then freezes; a HEAD
+                                         -- move past the freeze parks `read_only_violation`.
   done INTEGER NOT NULL DEFAULT 0, started_at INTEGER, done_at INTEGER,
   bounces INTEGER NOT NULL DEFAULT 0,    -- SUPERSEDED (with capture_attempts) by guard_counters (v21),
   absent_at INTEGER,                     -- left unread. absent_at: pane first CONFIRMED absent (v10)

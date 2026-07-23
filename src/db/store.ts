@@ -41,6 +41,7 @@ interface RunRow {
   resolver_active: number;
   last_thread_sig: string | null;
   attention_reason: string | null;
+  attention_reason_code: string | null;
   attention_notified_at: number | null;
   outcome: string | null;
   focus_pending: number;
@@ -68,6 +69,7 @@ function toRun(r: RunRow): Run {
     resolverActive: r.resolver_active !== 0,
     lastThreadSig: r.last_thread_sig,
     attentionReason: r.attention_reason,
+    attentionReasonCode: r.attention_reason_code,
     attentionNotifiedAt: r.attention_notified_at,
     outcome: r.outcome as Outcome | null,
     focusPending: r.focus_pending !== 0,
@@ -95,6 +97,8 @@ interface RunStepRow {
   session_id: string | null;
   progress_sig: string | null;
   progress_at: number | null;
+  baseline_sig: string | null;
+  baseline_frozen_at: number | null;
   done: number;
   started_at: number | null;
   done_at: number | null;
@@ -112,6 +116,8 @@ function toRunStep(r: RunStepRow): RunStep {
     sessionId: r.session_id,
     progressSig: r.progress_sig,
     progressAt: r.progress_at,
+    baselineSig: r.baseline_sig,
+    baselineFrozenAt: r.baseline_frozen_at,
     done: r.done !== 0,
     startedAt: r.started_at,
     doneAt: r.done_at,
@@ -508,6 +514,7 @@ export class Store {
     if (patch.paneId !== undefined) set("pane_id", patch.paneId);
     if (patch.worktreePath !== undefined) set("worktree_path", patch.worktreePath);
     if (patch.attentionReason !== undefined) set("attention_reason", patch.attentionReason);
+    if (patch.attentionReasonCode !== undefined) set("attention_reason_code", patch.attentionReasonCode);
     if (patch.attentionNotifiedAt !== undefined) set("attention_notified_at", patch.attentionNotifiedAt);
     if (patch.outcome !== undefined) set("outcome", patch.outcome);
     if (patch.focusPending !== undefined) set("focus_pending", patch.focusPending ? 1 : 0);
@@ -697,13 +704,18 @@ export class Store {
       .all(repo, afterId) as unknown as RepoEvent[];
   }
 
-  /** The machine `reason` of the run's most recent `attention` escalation (read from the event log —
-   *  the run row carries only the human-readable string). Lets reconcileAttention tell an
-   *  auto-rescuable park apart from a human-only one: a step-execution watchdog park (evidence
-   *  capture cap / per-step budget / stall) is rescued by a genuine step-done, a layout-wait park by
-   *  the bounded spawn re-attempt, and a source-stale / pr-closed / bounce / human / config park only
-   *  by a human. null if the run was never parked (or the reason is unrecorded). */
+  /** The machine `reason` of the run's most recent `attention` escalation. Lets reconcileAttention
+   *  tell an auto-rescuable park apart from a human-only one: a step-execution watchdog park
+   *  (evidence capture cap / per-step budget / stall / read-only violation) is rescued by a genuine
+   *  step-done, a layout-wait park by the bounded spawn re-attempt, and a source-stale / pr-closed /
+   *  bounce / human / config park only by a human. First-class on the run row since v28
+   *  (backfilled from the events log); the event-log readback below stays as the fallback for one
+   *  release — a park written by a still-draining OLD-code process during the upgrade window has no
+   *  column value, and routing state must not silently vanish for it. null if the run was never
+   *  parked (or the reason is unrecorded). */
   lastAttentionReasonCode(runId: number): string | null {
+    const run = this.db.prepare("SELECT attention_reason_code AS c FROM runs WHERE id = ?").get(runId) as { c: string | null } | undefined;
+    if (run?.c) return run.c;
     const row = this.db
       .prepare("SELECT detail FROM events WHERE run_id = ? AND type = 'attention' ORDER BY id DESC LIMIT 1")
       .get(runId) as { detail: string | null } | undefined;
@@ -750,6 +762,8 @@ export class Store {
     if (patch.sessionId !== undefined) set("session_id", patch.sessionId);
     if (patch.progressSig !== undefined) set("progress_sig", patch.progressSig);
     if (patch.progressAt !== undefined) set("progress_at", patch.progressAt);
+    if (patch.baselineSig !== undefined) set("baseline_sig", patch.baselineSig);
+    if (patch.baselineFrozenAt !== undefined) set("baseline_frozen_at", patch.baselineFrozenAt);
     if (patch.startedAt !== undefined) set("started_at", patch.startedAt);
     if (patch.absentAt !== undefined) set("absent_at", patch.absentAt);
     if (patch.pass !== undefined) set("pass", patch.pass);

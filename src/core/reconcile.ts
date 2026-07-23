@@ -984,7 +984,7 @@ async function escalateAttention(
   run: Run,
   opts: { reason: string; attentionReason: string; body: string; detail?: Record<string, unknown>; skipSourceNote?: boolean },
 ): Promise<void> {
-  deps.store.updateRun(run.id, { phase: "attention", attentionReason: opts.attentionReason, attentionNotifiedAt: deps.now() });
+  deps.store.updateRun(run.id, { phase: "attention", attentionReason: opts.attentionReason, attentionReasonCode: opts.reason, attentionNotifiedAt: deps.now() });
   deps.store.recordEvent({
     runId: run.id,
     repo: deps.config.repoName,
@@ -1258,7 +1258,7 @@ export async function bounceStep(
   //     re-capture the reworked change, not re-PR the pre-fix evidence). The bouncer (idxFrom) didn't
   //     step-done, so it's excluded; its clocks reset when the forward pass respawns it.
   for (let i = idxTo; i < idxFrom; i++) {
-    deps.store.upsertRunStep(run.id, belt.steps[i]!.name, { done: false, progressSig: null, progressAt: null });
+    deps.store.upsertRunStep(run.id, belt.steps[i]!.name, { done: false, progressSig: null, progressAt: null, baselineSig: null, baselineFrozenAt: null });
   }
   // (2) Open the TARGET's next pass — it re-enters NOW, and its re-rendered prompt stamps the new
   //     pass into its commands so a stale step-done from the pre-bounce pass can't complete the
@@ -1651,13 +1651,14 @@ async function reconcileStep(deps: Deps, run: Run, belt: BeltRuntime, src: Sourc
   // must not be blamed on this step (RWR-18204: the work agent committed a lint fix 101s after
   // evidence spawned, wedging the run in a read_only park for a commit evidence never made). So the
   // baseline TRACKS live HEAD until this step's agent is first observed `working`, absorbing the
-  // handoff-window commits; once frozen, any further HEAD move is the real violation. progressAt is
-  // the freeze marker — a read-only step has no heartbeat, so it's free to hold it. Even the frozen
-  // violation is a BACKSTOP, not a veto: a genuine step-done un-parks it (STEP_WATCHDOG_ATTENTION).
-  if (step.readOnly && rs.progressSig && run.worktreePath) {
+  // handoff-window commits; once frozen (baselineFrozenAt stamped), any further HEAD move is the
+  // real violation. The baseline lives in its own columns (baseline_sig / baseline_frozen_at, v28 —
+  // it used to alias the heartbeat's progress_sig). Even the frozen violation is a BACKSTOP, not a
+  // veto: a genuine step-done un-parks it (STEP_WATCHDOG_ATTENTION).
+  if (step.readOnly && rs.baselineSig && run.worktreePath) {
     const head = await deps.git.headSha(run.worktreePath).catch(() => null);
     if (head) {
-      if (rs.progressAt == null) {
+      if (rs.baselineFrozenAt == null) {
         // Not yet frozen. Freeze at the current HEAD the first pass this step's agent is `working`;
         // until then keep the baseline synced to HEAD so the prior step's trailing commits absorb.
         let working = false;
@@ -1666,14 +1667,14 @@ async function reconcileStep(deps: Deps, run: Run, belt: BeltRuntime, src: Sourc
         } catch (e) {
           if (!(e instanceof HerdrUnreachableError)) throw e; // herdr flaky → treat as not-working, defer the freeze
         }
-        if (working) deps.store.upsertRunStep(run.id, step.name, { progressSig: head, progressAt: deps.now() });
-        else if (head !== rs.progressSig) deps.store.upsertRunStep(run.id, step.name, { progressSig: head });
-      } else if (head !== rs.progressSig) {
+        if (working) deps.store.upsertRunStep(run.id, step.name, { baselineSig: head, baselineFrozenAt: deps.now() });
+        else if (head !== rs.baselineSig) deps.store.upsertRunStep(run.id, step.name, { baselineSig: head });
+      } else if (head !== rs.baselineSig) {
         return escalateAttention(deps, run, {
           reason: READ_ONLY_GUARD.escalationReason,
           attentionReason: `${step.name} is read-only but committed (HEAD moved)`,
-          body: `${run.ticketKey}: the ${step.name} step is read-only — it must never edit or commit — but the branch HEAD moved from ${rs.progressSig.slice(0, 8)} to ${head.slice(0, 8)} after its agent took over. A human should review; the agent violated the read-only contract. (A genuine step-done from this step will un-park and advance.)`,
-          detail: { step: step.name, baseline: rs.progressSig, head },
+          body: `${run.ticketKey}: the ${step.name} step is read-only — it must never edit or commit — but the branch HEAD moved from ${rs.baselineSig.slice(0, 8)} to ${head.slice(0, 8)} after its agent took over. A human should review; the agent violated the read-only contract. (A genuine step-done from this step will un-park and advance.)`,
+          detail: { step: step.name, baseline: rs.baselineSig, head },
         });
       }
     }
@@ -1745,7 +1746,7 @@ async function reconcileStep(deps: Deps, run: Run, belt: BeltRuntime, src: Sourc
       // machinery own the retry on later ticks, instead of the kept pane_id masking the pass as
       // dispatched and the budget watchdog parking it on a misleading "over budget (worker: gone)".
       const prevPass = deps.store.getRunStep(run.id, next.name)?.pass ?? 0;
-      deps.store.upsertRunStep(run.id, next.name, { done: false, startedAt: deps.now(), progressSig: null, progressAt: null, absentAt: null, pass: prevPass + 1, dispatchedAt: null });
+      deps.store.upsertRunStep(run.id, next.name, { done: false, startedAt: deps.now(), progressSig: null, progressAt: null, baselineSig: null, baselineFrozenAt: null, absentAt: null, pass: prevPass + 1, dispatchedAt: null });
       deps.log("info", `${run.ticketKey}: ${step.name} done -> ${next.name}`);
       const res = await spawnStep(deps, run, belt, src, next.name);
       if (res.status === "waiting") await handleLayoutWait(deps, run, belt, next);
@@ -1960,7 +1961,7 @@ async function reconcileAttention(deps: Deps, run: Run, belt: BeltRuntime, src: 
       // A read_only_violation park heals by ADVANCING the completed step. Clear its enforcement
       // baseline so reconcileStep skips the read-only HEAD check (which would otherwise re-detect
       // the same move and re-park before reaching the done-advance) — mirrors resumeRun.
-      if (step.readOnly) deps.store.upsertRunStep(run.id, run.step, { progressSig: null, progressAt: null });
+      if (step.readOnly) deps.store.upsertRunStep(run.id, run.step, { baselineSig: null, baselineFrozenAt: null });
       deps.store.recordEvent({
         runId: run.id,
         repo: deps.config.repoName,
@@ -2082,7 +2083,7 @@ export async function resumeRun(deps: Deps, run: Run): Promise<{ ok: boolean; ph
     // a layout-wait park gets its full bounded respawn budget back. Derived from the step's guard
     // declarations (GuardSpec.resetOn), so a plugin guard's counter refunds correctly for free.
     const step = stepByName(belt, run.step)!;
-    deps.store.upsertRunStep(run.id, run.step, { startedAt: deps.now(), progressSig: null, progressAt: null, absentAt: null });
+    deps.store.upsertRunStep(run.id, run.step, { startedAt: deps.now(), progressSig: null, progressAt: null, baselineSig: null, baselineFrozenAt: null, absentAt: null });
     for (const g of guardsResetOn(step.guards, "resume")) deps.store.resetGuardCounter(run.id, step.name, g.kind);
     phase = "running";
   } else if (belt.watchPr && run.prNumber) {

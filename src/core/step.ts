@@ -674,11 +674,12 @@ async function spawnStepImpl(
   // respawn) starts with its full bounded-retry allowance. Derived from GuardSpec.resetOn.
   for (const g of guardsResetOn(step.guards, "dispatch")) deps.store.resetGuardCounter(run.id, stepName, g.kind);
   // read_only enforcement baseline: capture HEAD before the agent runs, so a later commit (a
-  // read-only-contract violation) is detectable as HEAD movement in reconcileStep. Read-only steps
-  // never have a heartbeat, so progressSig is free to hold this baseline.
+  // read-only-contract violation) is detectable as HEAD movement in reconcileStep. Starts UNFROZEN
+  // (baselineFrozenAt null): it tracks live HEAD — absorbing the prior step's trailing handoff
+  // commits — until this step's agent is first observed working (RWR-18204). Own columns since v28.
   if (step.readOnly && worktree) {
     const head = await deps.git.headSha(worktree).catch(() => null);
-    if (head) deps.store.upsertRunStep(run.id, stepName, { progressSig: head });
+    if (head) deps.store.upsertRunStep(run.id, stepName, { baselineSig: head, baselineFrozenAt: null });
   }
   deps.store.updateRun(run.id, { paneId: result.paneId }); // latest active pane (reviewing/resolver reuse it)
   deps.store.recordEvent({

@@ -955,9 +955,9 @@ describe("reconcile pipeline (work_to_pull_request belt)", () => {
     shipBelt.steps[1]!.readOnly = true; // make the review step read-only for this test
     state.headSha = "sha-baseline";
     const run = seed(store, worktree, "RO-1", "running", "review");
-    // progressAt set ⇒ the baseline is FROZEN: the step's own agent has been observed working, so a
-    // later HEAD move is attributable to THIS step, not the prior step's trailing commits.
-    store.upsertRunStep(run.id, "review", { progressSig: "sha-baseline", progressAt: 100 });
+    // baselineFrozenAt set ⇒ the baseline is FROZEN: the step's own agent has been observed working,
+    // so a later HEAD move is attributable to THIS step, not the prior step's trailing commits.
+    store.upsertRunStep(run.id, "review", { baselineSig: "sha-baseline", baselineFrozenAt: 100 });
     state.headSha = "sha-moved"; // the read-only agent illicitly committed
     await reconcileRun(deps, store.getRun(run.id)!);
     const after = store.getRun(run.id)!;
@@ -971,7 +971,7 @@ describe("reconcile pipeline (work_to_pull_request belt)", () => {
     shipBelt.steps[1]!.readOnly = true;
     state.headSha = "sha-baseline";
     const run = seed(store, worktree, "RO-2", "running", "review");
-    store.upsertRunStep(run.id, "review", { progressSig: "sha-baseline", done: true }); // finished, no commit
+    store.upsertRunStep(run.id, "review", { baselineSig: "sha-baseline", done: true }); // finished, no commit
     await reconcileRun(deps, store.getRun(run.id)!);
     const after = store.getRun(run.id)!;
     expect(after.phase).toBe("running");
@@ -986,14 +986,14 @@ describe("reconcile pipeline (work_to_pull_request belt)", () => {
     shipBelt.steps[1]!.readOnly = true;
     state.headSha = "sha-baseline";
     const run = seed(store, worktree, "RO-3", "running", "review");
-    store.upsertRunStep(run.id, "review", { progressSig: "sha-baseline" }); // NOT frozen (progressAt null)
+    store.upsertRunStep(run.id, "review", { baselineSig: "sha-baseline" }); // NOT frozen (baselineFrozenAt null)
     state.paneState = "idle"; // the read-only agent hasn't taken over yet (still spinning up)
     state.headSha = "sha-trailing"; // the PRIOR step's still-alive agent committed after handoff
     await reconcileRun(deps, store.getRun(run.id)!);
     const rs = store.getRunStep(run.id, "review")!;
     expect(store.getRun(run.id)!.phase).toBe("running"); // NOT parked
-    expect(rs.progressSig).toBe("sha-trailing"); // baseline advanced to absorb it
-    expect(rs.progressAt).toBe(null); // still not frozen
+    expect(rs.baselineSig).toBe("sha-trailing"); // baseline advanced to absorb it
+    expect(rs.baselineFrozenAt).toBe(null); // still not frozen
   });
 
   it("read_only: the baseline FREEZES once the step's own agent is working (progressAt stamped)", async () => {
@@ -1002,10 +1002,10 @@ describe("reconcile pipeline (work_to_pull_request belt)", () => {
     setNow(5000);
     state.headSha = "sha-baseline";
     const run = seed(store, worktree, "RO-4", "running", "review");
-    store.upsertRunStep(run.id, "review", { progressSig: "sha-baseline" });
+    store.upsertRunStep(run.id, "review", { baselineSig: "sha-baseline" });
     state.paneState = "working"; // the read-only agent has taken over
     await reconcileRun(deps, store.getRun(run.id)!);
-    expect(store.getRunStep(run.id, "review")!.progressAt).toBe(5000); // frozen at now
+    expect(store.getRunStep(run.id, "review")!.baselineFrozenAt).toBe(5000); // frozen at now
     expect(store.getRun(run.id)!.phase).toBe("running"); // no park (no move since spawn)
   });
 
@@ -1015,7 +1015,7 @@ describe("reconcile pipeline (work_to_pull_request belt)", () => {
     state.headSha = "sha-moved";
     const run = seed(store, worktree, "RO-5", "attention", "review", { attentionReason: "review is read-only but committed (HEAD moved)" });
     // frozen baseline + HEAD moved is what parked it; the step then genuinely finished (done).
-    store.upsertRunStep(run.id, "review", { paneId: "w1:p1", progressSig: "sha-baseline", progressAt: 100, done: true });
+    store.upsertRunStep(run.id, "review", { paneId: "w1:p1", baselineSig: "sha-baseline", baselineFrozenAt: 100, done: true });
     store.recordEvent({ runId: run.id, repo: "demo", ticketKey: "RO-5", type: "attention", detail: { reason: "read_only_violation", step: "review" } });
     await reconcileRun(deps, store.getRun(run.id)!);
     const after = store.getRun(run.id)!;

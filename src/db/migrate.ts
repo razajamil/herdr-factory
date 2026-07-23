@@ -561,6 +561,46 @@ const MIGRATIONS: { version: number; sql: string }[] = [
       CREATE INDEX idx_transition_outbox_stale ON transition_outbox(run_id) WHERE stale_at IS NOT NULL AND stale_handled_at IS NULL;
     `,
   },
+  {
+    version: 28,
+    // Two de-aliasing fixes, both expand-only:
+    //
+    // (1) runs.attention_reason_code — the MACHINE reason code of a run's most recent attention
+    //     park, previously recoverable only by JSON-parsing the run's latest `attention` event.
+    //     That readback was load-bearing routing state (it selects a park's rescue class:
+    //     step-done rescue / bounded respawn / human-only) living in an audit table; it becomes a
+    //     first-class column, written by escalateAttention and backfilled here from the events log
+    //     (json_valid-guarded — `detail` is engine-written JSON, but an audit row must never brick
+    //     a migration). The events rows are untouched (the timeline keeps its gold), and reads keep
+    //     an event-log fallback for one release so a park written by a still-draining OLD-code
+    //     process around the upgrade restart stays routable. The backfill is SCOPED to runs parked
+    //     at upgrade time (phase='attention' — their latest attention event IS their current park):
+    //     stamping every run would plant a STALE code on a healthy run, which then SHADOWS a fresher
+    //     old-code park during the drain window (the fallback only fires on NULL) and misroutes its
+    //     rescue class for the park's whole lifetime. A healthy run needs no carry-over — new code
+    //     writes the column at its next park.
+    //
+    // (2) run_steps.baseline_sig + baseline_frozen_at — the read-only guard's enforcement baseline
+    //     (the HEAD sha it tracks-until-frozen, and the freeze marker) used to ALIAS the commit
+    //     heartbeat's progress_sig/progress_at, safe only because config rejects heartbeat +
+    //     read_only on one step — an aliasing trap for every reader, and it forced each
+    //     heartbeat-clock reset site to double as a baseline reset. The baseline gets its own
+    //     columns. Backfill copies progress_sig/progress_at into them for EVERY row: a heartbeat
+    //     step's copy is inert (only the read-only enforcement branch reads baselines, keyed on the
+    //     step's posture), and an in-flight read-only step's live baseline — tracking or frozen —
+    //     carries over exactly, so no run parks (or absorbs a violation) across the upgrade.
+    sql: `
+      ALTER TABLE runs ADD COLUMN attention_reason_code TEXT;
+      UPDATE runs SET attention_reason_code = (
+        SELECT json_extract(e.detail, '$.reason') FROM events e
+        WHERE e.run_id = runs.id AND e.type = 'attention' AND e.detail IS NOT NULL AND json_valid(e.detail)
+        ORDER BY e.id DESC LIMIT 1
+      ) WHERE phase = 'attention';
+      ALTER TABLE run_steps ADD COLUMN baseline_sig TEXT;
+      ALTER TABLE run_steps ADD COLUMN baseline_frozen_at INTEGER;
+      UPDATE run_steps SET baseline_sig = progress_sig, baseline_frozen_at = progress_at;
+    `,
+  },
 ];
 
 /** Apply pending migrations in a transaction. Idempotent. */
