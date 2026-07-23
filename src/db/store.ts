@@ -986,6 +986,19 @@ export class Store {
     return Number(info.changes);
   }
 
+  /** A run's outstanding write-back obligations: every undelivered intent, plus a delivered-but-
+   *  stale one whose run-locked policy reaction is still owed (stale_at set, unhandled). Read-only —
+   *  the obligations introspection view (core/obligations.ts). */
+  pendingTransitionsForRun(runId: number): TransitionIntent[] {
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM transition_outbox WHERE run_id = ?
+         AND (delivered_at IS NULL OR (stale_at IS NOT NULL AND stale_handled_at IS NULL)) ORDER BY id`,
+      )
+      .all(runId) as unknown as TransitionIntentRow[];
+    return rows.map((r) => this.toTransitionIntent(r));
+  }
+
   /** Does this work item have any undelivered status write-back? While it does, the item's
    *  source status is known-stale — Phase B must not trust an "eligible" listing for it. */
   pendingTransitionForKey(repo: string, source: string, key: string): boolean {

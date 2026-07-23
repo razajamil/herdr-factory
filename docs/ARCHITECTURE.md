@@ -1419,7 +1419,12 @@ what the old per-repo `watch` did, but collapsed into a single process plus a lo
   watchdog signal) · `POST /reload` (re-discover repos / reload config) · `POST /shutdown`
   (graceful drain) · `POST /repos/:repo/{tick,step-done,ask-human,bounce,resume,claim,teardown}`
   (the mutating CLI paths) · `GET /repos/:repo/{status,runs,eligible,timeline}` (reads for the
-  web UI) · `GET /doc` (the generated OpenAPI 3.0 spec) · `GET /ui` (Swagger UI). Validation
+  web UI) · `GET /repos/:repo/obligations?key=` ("why is this run waiting and what would move
+  it": the run's undelivered outbox intents + pending signal/question, and its armed watches —
+  the active step's guards with live clocks/counters and rescue class, the engine-universal
+  watches, counted bounce caps — all registry-derived, read-only and lock-free;
+  `src/core/obligations.ts`) · `GET /doc` (the generated OpenAPI 3.0 spec) · `GET /ui`
+  (Swagger UI). Validation
   failures, unknown routes and thrown errors are all normalised to `{ error }` (a `defaultHook` +
   `notFound`/`onError`) — the shape `server/client.ts` parses. Per-repo work logs to each repo's
   own logger; server-lifecycle events log to stdout/err (captured by the supervisor).

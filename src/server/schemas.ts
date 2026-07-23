@@ -387,3 +387,71 @@ export const timelineRoute = createRoute({
     ...repoErrors,
   },
 });
+
+// "Why is this run waiting and what would move it": the run's outstanding deliver-lane intents
+// (undelivered write-backs, pending evidence uploads, an unconsumed agent signal, a pending human
+// question) + its armed observe-lane watches (the active step's guards with live clocks/counters
+// and rescue class, the engine-universal watches, any counted bounce caps). Read-only, lock-free,
+// registry-derived — see src/core/obligations.ts.
+const GuardFacts = z.record(z.string(), z.union([z.string(), z.number(), z.boolean(), z.null()]));
+const ObligationsResponse = z
+  .object({
+    run: z.object({
+      id: z.number(),
+      key: z.string(),
+      phase: z.string(),
+      step: z.string().nullable(),
+      belt: z.string().nullable(),
+      workSource: z.string().nullable(),
+      prNumber: z.number().nullable(),
+      resolverActive: z.boolean(),
+      attentionReason: z.string().nullable(),
+      attentionReasonCode: z.string().nullable(),
+    }),
+    intents: z.object({
+      transitions: z.array(
+        z.object({
+          toState: z.string(),
+          toStatus: z.string(),
+          attempts: z.number(),
+          nextAttemptAt: z.number(),
+          lastError: z.string().nullable(),
+          staleUnhandled: z.boolean(),
+        }),
+      ),
+      evidenceUploads: z.array(
+        z.object({
+          keyPrefix: z.string(),
+          attempts: z.number(),
+          nextAttemptAt: z.number(),
+          errorKind: z.string().nullable(),
+          lastError: z.string().nullable(),
+        }),
+      ),
+      pendingSignal: z
+        .object({ signal: z.string(), step: z.string().nullable(), toStep: z.string().nullable(), createdAt: z.number() })
+        .nullable(),
+      humanQuestion: z
+        .object({ id: z.number(), step: z.string().nullable(), posted: z.boolean(), pollAttempts: z.number(), pollErrors: z.number(), nextPollAt: z.number() })
+        .nullable(),
+    }),
+    watches: z.object({
+      step: z.string().nullable(),
+      guards: z.array(z.object({ kind: z.string(), escalationReason: z.string(), rescue: z.string(), facts: GuardFacts })),
+      engine: z.array(z.object({ kind: z.string(), watches: z.string(), rescue: z.string(), facts: GuardFacts })),
+      bounceCaps: z.array(z.object({ step: z.string(), count: z.number(), max: z.number() })),
+    }),
+  })
+  .openapi("Obligations");
+
+export const obligationsRoute = createRoute({
+  method: "get",
+  path: "/repos/{repo}/obligations",
+  tags: ["repo"],
+  summary: "Why is this run waiting and what would move it (?key=, &source= to disambiguate)",
+  request: { params: RepoParam, query: z.object({ key: z.string(), source: z.string().optional() }) },
+  responses: {
+    200: { description: "The run's pending intents + armed watches", content: { "application/json": { schema: ObligationsResponse } } },
+    ...repoErrors,
+  },
+});

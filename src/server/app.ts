@@ -15,6 +15,7 @@ import { withExtractedTelemetryContext } from "../telemetry/index.ts";
 import { annotateCurrentSpan, recordHttpServerDurationEffect, withHttpServerSpan } from "../telemetry/effect.ts";
 import { runEffect } from "../runtime/effect.ts";
 import { claimTicket, reconcileRepo, reconcileRun, resumeRun, teardownTicket, withRunLockWaiting, withTickLock } from "../core/reconcile.ts";
+import { runObligations } from "../core/obligations.ts";
 import { applySignal } from "../core/signals.ts";
 import { createEvidencePublisher } from "../clients/evidence.ts";
 import { evidenceServeDir } from "../config-paths.ts";
@@ -29,6 +30,7 @@ import {
   askHumanRoute,
   eligibleRoute,
   healthRoute,
+  obligationsRoute,
   reloadRoute,
   resumeRoute,
   runsRoute,
@@ -456,6 +458,16 @@ export function createApp(ctx: ServerContext): OpenAPIHono {
     const rt = ctx.getRepo(repo);
     if (!rt) return c.json({ error: notConfigured(repo) }, 404);
     return c.json({ timeline: rt.deps.store.timeline(repo, key) }, 200);
+  });
+
+  app.openapi(obligationsRoute, async (c) => {
+    const { repo } = c.req.valid("param");
+    const { key, source } = c.req.valid("query");
+    const rt = ctx.getRepo(repo);
+    if (!rt) return c.json({ error: notConfigured(repo) }, 404);
+    const run = resolveActiveRun(rt.deps, key, source); // throws (→ {error}) on cross-source ambiguity
+    if (!run) return c.json({ error: `${key}: no active run` }, 404);
+    return c.json(runObligations(rt.deps, run), 200);
   });
 
   // --- `local` evidence publisher static serve ----------------------------

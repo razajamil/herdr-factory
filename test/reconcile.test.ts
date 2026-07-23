@@ -11,7 +11,8 @@ import { HerdrUnreachableError, type BeltRuntime, type Deps, type GitApi, type G
 import { SourceUnauthenticatedError } from "../src/auth/errors.ts";
 import { getAuthFailure, resetAuthGate } from "../src/auth/gate.ts";
 import type { Config, StepConfig } from "../src/config.ts";
-import { LAYOUT_WAIT_GUARD } from "../src/steps/guards.ts";
+import { LAYOUT_WAIT_GUARD, READ_ONLY_GUARD } from "../src/steps/guards.ts";
+import { runObligations } from "../src/core/obligations.ts";
 import type { FocusedPane, HumanAskInput, HumanPollInput, HumanReply, JiraMatchItem, LocalMarkdownMatchItem, Phase, PrInfo, PrSnapshot, ReviewSig, Ticket, WorkState } from "../src/types.ts";
 import { DEFAULT_AGENT_CONFIG, StaleItemError } from "../src/types.ts";
 
@@ -2819,5 +2820,51 @@ describe("belt effects — configurable task progression", () => {
     await reconcileRun(deps, store.getRun(run.id)!);
     expect(store.getRun(run.id)!.outcome).toBe("merged");
     expect(calls.transitionOverrides).toContainEqual(["K-T1", "done", "shipped"]);
+  });
+});
+
+// The obligations view (core/obligations.ts) — the read-only "why is this run waiting and what
+// would move it" answer the server exposes at GET /repos/:repo/obligations. Pure reads over the
+// store + registries; these lock the shape and the registry derivation, not the mechanisms
+// themselves (each watch/outbox has its own suite above).
+describe("runObligations — pending intents + armed watches, registry-derived", () => {
+  it("surfaces undelivered transitions, pending uploads, armed guards with clocks, and engine watches", async () => {
+    const { deps, store, worktree } = build();
+    const run = seed(store, worktree, "K-OB1", "running", "fix");
+    // An undelivered write-back + a pending evidence upload + a bounce already counted against review.
+    store.enqueueTransition({ runId: run.id, repo: "demo", workSource: "jira", ticketKey: "K-OB1", toState: "in_development" });
+    store.enqueueEvidenceUpload({ runId: run.id, repo: "demo", ticketKey: "K-OB1", keyPrefix: "p1", evidenceDir: join(worktree, "ev") });
+    store.bumpGuardCounter(run.id, "fix", "bounce_cap");
+
+    const ob = runObligations(deps, store.getRun(run.id)!);
+    expect(ob.run).toMatchObject({ key: "K-OB1", phase: "running", step: "fix" });
+    expect(ob.intents.transitions).toMatchObject([{ toState: "in_development", staleUnhandled: false }]);
+    expect(ob.intents.evidenceUploads).toMatchObject([{ keyPrefix: "p1" }]);
+    expect(ob.intents.pendingSignal).toBeNull();
+    expect(ob.intents.humanQuestion).toBeNull();
+    // The watched step is the active one; its armed guards carry live facts + a derived rescue class.
+    expect(ob.watches.step).toBe("fix");
+    const layout = ob.watches.guards.find((g) => g.kind === "layout_wait")!;
+    expect(layout.rescue).toBe("respawn");
+    expect(layout.facts).toMatchObject({ respawnsUsed: 0, respawnLimit: 3, waitingSince: null }); // dispatched → not waiting
+    // Engine-universal watches ride along with their live facts.
+    expect(ob.watches.engine.map((w) => w.kind).sort()).toEqual(["pane_liveness", "pass_staleness"]);
+    expect(ob.watches.engine.find((w) => w.kind === "pane_liveness")!.facts).toMatchObject({ paneId: "w1:p1", absentAt: null });
+    expect(ob.watches.bounceCaps).toEqual([{ step: "fix", count: 1, max: 3 }]); // the harness's limits.maxBounces
+  });
+
+  it("a waiting_for_human run reports its pending question; a read-only step reports its baseline", async () => {
+    const { deps, store, worktree, shipBelt } = build();
+    shipBelt.steps[1]!.readOnly = true;
+    shipBelt.steps[1]!.guards = [...shipBelt.steps[1]!.guards, READ_ONLY_GUARD];
+    const run = seed(store, worktree, "K-OB2", "waiting_for_human", "review");
+    store.createHumanQuestion({ runId: run.id, repo: "demo", workSource: "jira", ticketKey: "K-OB2", step: "review", question: "q?" });
+    store.upsertRunStep(run.id, "review", { baselineSig: "sha-b", baselineFrozenAt: 77 });
+
+    const ob = runObligations(deps, store.getRun(run.id)!);
+    expect(ob.intents.humanQuestion).toMatchObject({ step: "review", posted: false });
+    const ro = ob.watches.guards.find((g) => g.kind === "read_only")!;
+    expect(ro.rescue).toBe("terminal-signal");
+    expect(ro.facts).toMatchObject({ baselineSig: "sha-b", frozenAt: 77 });
   });
 });

@@ -1,0 +1,162 @@
+// The "why is this run waiting and what would move it" view: one queryable answer assembling a
+// run's outstanding DELIVER-lane intents (undelivered source write-backs, pending evidence
+// uploads, an unconsumed agent signal, a pending human question) and its armed OBSERVE-lane
+// watches (the active step's guards with their live clocks/counters and rescue class, plus the
+// engine-universal watches). PURE READS — no locks taken, nothing mutated; the snapshot may be
+// a tick stale, which is fine for an introspection surface. Everything here is derived from the
+// registries (GuardSpec / BOUNCE_CAP / ENGINE_WATCHES) and the store, so a plugin step's guards
+// appear without edits.
+import type { StepConfig } from "../config.ts";
+import type { Deps } from "./deps.ts";
+import type { GuardSpec, Run } from "../types.ts";
+import { firstStep, stepByName } from "./step.ts";
+import { BOUNCE_CAP } from "../steps/registry.ts";
+import { ENGINE_WATCHES } from "../steps/engine-watches.ts";
+
+/** A guard's rescue class, derived from its declaration — how a park it raised is un-parked. */
+export function guardRescueClass(g: GuardSpec): "terminal-signal" | "respawn" | "human" | "none" {
+  if (g.autoRescueOnDone) return "terminal-signal";
+  if ((g.autoRespawnLimit ?? 0) > 0) return "respawn";
+  // exclusive_resource never parks at all; anything else without a rescue declaration is human-only.
+  return g.kind === "exclusive_resource" ? "none" : "human";
+}
+
+export interface RunObligations {
+  run: {
+    id: number;
+    key: string;
+    phase: string;
+    step: string | null;
+    belt: string | null;
+    workSource: string | null;
+    prNumber: number | null;
+    resolverActive: boolean;
+    attentionReason: string | null;
+    attentionReasonCode: string | null;
+  };
+  /** Deliver-lane: durable intents the engine still owes the world for this run. */
+  intents: {
+    transitions: { toState: string; toStatus: string; attempts: number; nextAttemptAt: number; lastError: string | null; staleUnhandled: boolean }[];
+    evidenceUploads: { keyPrefix: string; attempts: number; nextAttemptAt: number; errorKind: string | null; lastError: string | null }[];
+    pendingSignal: { signal: string; step: string | null; toStep: string | null; createdAt: number } | null;
+    humanQuestion: { id: number; step: string | null; posted: boolean; pollAttempts: number; pollErrors: number; nextPollAt: number } | null;
+  };
+  /** Observe-lane: what is watching the run right now. */
+  watches: {
+    /** The step whose guards are armed (the active step, or the first step while claiming). */
+    step: string | null;
+    guards: {
+      kind: string;
+      escalationReason: string;
+      rescue: string;
+      /** Live facts per kind: budget/layout_wait clocks, heartbeat progress, read-only baseline,
+       *  counter positions — whatever the guard measures, keyed by fact name. */
+      facts: Record<string, string | number | boolean | null>;
+    }[];
+    /** Engine-universal watches (pane liveness, pass staleness) with their live facts. */
+    engine: { kind: string; watches: string; rescue: string; facts: Record<string, string | number | null> }[];
+    /** Bounce-cap counters (keyed by TARGET step) that have counted at least one bounce. */
+    bounceCaps: { step: string; count: number; max: number }[];
+  };
+}
+
+export function runObligations(deps: Deps, run: Run): RunObligations {
+  const belt = deps.resolveBelt(run.belt);
+
+  const transitions = deps.store.pendingTransitionsForRun(run.id).map((t) => ({
+    toState: t.toState,
+    toStatus: t.toStatus,
+    attempts: t.attempts,
+    nextAttemptAt: t.nextAttemptAt,
+    lastError: t.lastError,
+    staleUnhandled: t.staleAt !== null && t.staleHandledAt === null,
+  }));
+  const evidenceUploads = deps.store.undeliveredEvidenceUploadsForRun(run.id).map((u) => ({
+    keyPrefix: u.keyPrefix,
+    attempts: u.attempts,
+    nextAttemptAt: u.nextAttemptAt,
+    errorKind: u.errorKind,
+    lastError: u.lastError,
+  }));
+  const sig = deps.store.unconsumedPendingSignalForRun(run.id);
+  const q = deps.store.pendingHumanQuestionForRun(run.id);
+
+  // The step under watch: the active one, or the belt's first while the claim's dispatch is pending.
+  const watched: StepConfig | undefined = belt
+    ? run.step
+      ? stepByName(belt, run.step)
+      : run.phase === "claiming"
+        ? firstStep(belt)
+        : undefined
+    : undefined;
+  const rs = watched ? deps.store.getRunStep(run.id, watched.name) : undefined;
+
+  const guards = (watched?.guards ?? []).map((g) => {
+    const facts: Record<string, string | number | boolean | null> = {};
+    switch (g.kind) {
+      case "budget":
+        facts.startedAt = rs?.startedAt ?? null;
+        facts.budgetSeconds = watched!.budgetSeconds;
+        facts.deadlineAt = rs?.startedAt != null ? rs.startedAt + watched!.budgetSeconds : null;
+        break;
+      case "heartbeat":
+        facts.lastProgressAt = rs?.progressAt ?? null;
+        facts.stallSeconds = deps.config.limits.stallSeconds;
+        facts.stallsAt = rs?.progressAt != null ? rs.progressAt + deps.config.limits.stallSeconds : null;
+        break;
+      case "read_only":
+        facts.baselineSig = rs?.baselineSig ?? null;
+        facts.frozenAt = rs?.baselineFrozenAt ?? null; // null = still tracking (absorbing handoff commits)
+        break;
+      case "layout_wait":
+        facts.waitingSince = rs?.dispatchedAt == null ? (rs?.startedAt ?? null) : null; // null once dispatched
+        facts.windowSeconds = deps.config.limits.layoutWaitSeconds;
+        facts.respawnsUsed = deps.store.guardCounter(run.id, watched!.name, g.kind);
+        facts.respawnLimit = g.autoRespawnLimit ?? 0;
+        break;
+      case "capture_cap":
+        facts.attempts = deps.store.guardCounter(run.id, watched!.name, g.kind);
+        facts.cap = deps.config.limits.maxCaptureAttempts;
+        break;
+      case "exclusive_resource":
+        facts.resource = g.resourceName ?? null;
+        break;
+    }
+    return { kind: g.kind, escalationReason: g.escalationReason, rescue: guardRescueClass(g), facts };
+  });
+
+  const engine = ENGINE_WATCHES.map((w) => {
+    const facts: Record<string, string | number | null> =
+      w.kind === "pane_liveness"
+        ? { paneId: rs?.paneId ?? null, absentAt: rs?.absentAt ?? null }
+        : { pass: rs?.pass ?? null, dispatchedAt: rs?.dispatchedAt ?? null };
+    return { kind: w.kind, watches: w.watches, rescue: w.rescue, facts };
+  });
+
+  const maxBounces = belt?.maxBounces ?? deps.config.limits.maxBounces;
+  const bounceCaps = (belt?.steps ?? [])
+    .map((s) => ({ step: s.name, count: deps.store.guardCounter(run.id, s.name, BOUNCE_CAP.guard), max: maxBounces }))
+    .filter((b) => b.count > 0);
+
+  return {
+    run: {
+      id: run.id,
+      key: run.ticketKey,
+      phase: run.phase,
+      step: run.step,
+      belt: run.belt,
+      workSource: run.workSource,
+      prNumber: run.prNumber,
+      resolverActive: run.resolverActive,
+      attentionReason: run.attentionReason,
+      attentionReasonCode: run.attentionReasonCode,
+    },
+    intents: {
+      transitions,
+      evidenceUploads,
+      pendingSignal: sig ? { signal: sig.signal, step: sig.step, toStep: sig.toStep, createdAt: sig.createdAt } : null,
+      humanQuestion: q ? { id: q.id, step: q.step, posted: q.externalId !== null, pollAttempts: q.pollAttempts, pollErrors: q.pollErrors, nextPollAt: q.nextPollAt } : null,
+    },
+    watches: { step: watched?.name ?? null, guards, engine, bounceCaps },
+  };
+}
