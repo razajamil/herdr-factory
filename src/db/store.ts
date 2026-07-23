@@ -1599,6 +1599,15 @@ export class Store {
     return requeued;
   }
 
+  /** Is any pending intent of `kind` stuck on an AUTH failure? Gates cause-recovery probes (the
+   *  happy path never probes) and drives the dashboard SSO light. */
+  authStuckIntents(repo: string, kind: string): boolean {
+    const row = this.db
+      .prepare("SELECT 1 AS x FROM intents WHERE repo = ? AND kind = ? AND status = 'pending' AND error_class = 'auth' LIMIT 1")
+      .get(repo, kind) as { x: number } | undefined;
+    return row !== undefined;
+  }
+
   /** Operator due-now for one pending row (the /intents/:id/retry endpoint). */
   retryIntentNow(id: number): boolean {
     const info = this.db.prepare("UPDATE intents SET next_attempt_at = ?, updated_at = ? WHERE id = ? AND status = 'pending'").run(this.now(), this.now(), id);

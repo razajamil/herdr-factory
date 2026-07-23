@@ -245,11 +245,16 @@ function transitionOutboxFlow(deps: Deps): OutboxFlow<TransitionIntent> {
 }
 
 /**
- * The evidence-upload outbox as a flush flow. The evidence agent published deterministic URLs into
- * its handoff immediately; this lands the actual bytes in S3, retrying with backoff until AWS
- * accepts them — so an expired SSO session defers the upload instead of losing it (the PR #6541
- * bug). A creds/token (`auth`) failure that keeps recurring notifies the human to `aws sso login`
- * (throttled per row via attentionRenotifySeconds).
+ * LEGACY DRAIN ONLY (since v30): evidence publishes live on the intent ledger as the
+ * `evidence_publish` kind (src/intents/kinds/evidence-publish.ts) — v30 converted every pending
+ * `evidence_uploads` row and closed the old ones, so this flow finds nothing due in practice. It
+ * stays registered for one release as the backstop for any row a still-draining old-code process
+ * touched around the upgrade, then goes with the table's contract-phase drop.
+ *
+ * The evidence agent published deterministic URLs into its handoff immediately; this lands the
+ * actual bytes in S3, retrying with backoff until AWS accepts them — so an expired SSO session
+ * defers the upload instead of losing it (the PR #6541 bug). A creds/token (`auth`) failure that
+ * keeps recurring notifies the human to `aws sso login` (throttled per row).
  */
 function evidenceUploadFlow(deps: Deps): OutboxFlow<EvidenceUpload> {
   const repo = deps.config.repoName;

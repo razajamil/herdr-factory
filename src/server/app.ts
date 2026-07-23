@@ -100,7 +100,7 @@ async function evidenceSsoStatus(rt: RepoRuntime, refresh = false): Promise<{ st
   const publisher = createEvidencePublisher(ev, { currentLogin: () => rt.deps.github.currentLogin() });
   if (!publisher.probeLiveness) return { state: "ok" };
   const profile = ev.publisher === "s3" ? ev.profile : undefined;
-  if (rt.deps.store.authStuckEvidenceUpload(cfg.repoName)) {
+  if (rt.deps.store.authStuckIntents(cfg.repoName, "evidence_publish") || rt.deps.store.authStuckEvidenceUpload(cfg.repoName)) {
     return { state: "down", detail: `an evidence upload is stuck on expired AWS creds — run \`aws sso login${profile ? ` --profile ${profile}` : ""}\`` };
   }
   const now = rt.deps.now();
@@ -186,9 +186,13 @@ async function statusPayload(rt: RepoRuntime, quick = false, refreshDiagnostics 
   const active = rt.deps.store.activeRuns(cfg.repoName);
   const finished = rt.deps.store.listRuns(cfg.repoName, true).filter((r) => r.endedAt !== null);
   const runView = async (r: (typeof active)[number]) => {
-    // Surface a stuck async upload hiding behind a "done" evidence step. errorKind != null ⇒ at least
-    // one attempt has failed (a freshly-enqueued, not-yet-attempted row is pending, not a problem).
-    const stuckUploads = rt.deps.store.undeliveredEvidenceUploadsForRun(r.id).filter((u) => u.errorKind != null);
+    // Surface a stuck async upload hiding behind a "done" evidence step. An error class/kind ⇒ at
+    // least one attempt has failed (a freshly-enqueued, not-yet-attempted row is pending, not a
+    // problem). Ledger rows (live since v30) + legacy drain rows, one release.
+    const stuckUploads = [
+      ...rt.deps.store.listIntents(cfg.repoName, { kind: "evidence_publish", status: "pending", runId: r.id }).filter((i) => i.errorClass != null).map((i) => ({ errorKind: i.errorClass })),
+      ...rt.deps.store.undeliveredEvidenceUploadsForRun(r.id).filter((u) => u.errorKind != null).map((u) => ({ errorKind: u.errorKind })),
+    ];
     const problem = stuckUploads.length === 0
       ? undefined
       : {

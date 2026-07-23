@@ -623,7 +623,11 @@ CREATE TABLE transition_outbox(          -- source status write-backs as persist
   UNIQUE(run_id, to_state, to_status));  -- enqueue idempotent across ticks; a custom status and a
                                          -- canonical transition at the same anchor are distinct (v27)
 
-CREATE TABLE evidence_uploads(           -- evidence publishes as persisted INTENTS (v16) — the
+CREATE TABLE evidence_uploads(           -- LEGACY since v30: evidence publishes live on the intent
+                                         -- ledger as the `evidence_publish` kind (v30 converted
+                                         -- every pending row + closed the old ones; reads stay a
+                                         -- union for one release, then this table drops in a
+                                         -- contract migration). Original design (v16) — the
   id INTEGER PRIMARY KEY AUTOINCREMENT,  -- upload analog of transition_outbox (durable, retried).
   run_id INTEGER NOT NULL REFERENCES runs(id),  -- publisher-agnostic (s3|local|command): only the
   repo TEXT NOT NULL, ticket_key TEXT NOT NULL, -- delivery fn behind EvidencePublisher differs.

@@ -51,6 +51,8 @@ describe("dashboard server payloads", () => {
           runStepsFor: () => [],
           getSourceAuth: () => undefined,
           authStuckEvidenceUpload: () => false,
+          authStuckIntents: () => false,
+          listIntents: () => [],
           undeliveredEvidenceUploadsForRun: () => [],
         },
         herdr: { paneState },

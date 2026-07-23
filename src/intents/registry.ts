@@ -19,6 +19,7 @@
 import type { Deps } from "../core/deps.ts";
 import type { Intent, Run } from "../types.ts";
 import { backoffDelaySeconds } from "../schedule.ts";
+import { evidencePublishKind } from "./kinds/evidence-publish.ts";
 import { externalWaitKind } from "./kinds/external-wait.ts";
 
 /** The outcome of one lock-free delivery attempt. */
@@ -73,7 +74,7 @@ export interface IntentKindDef {
   readonly survivesTeardown?: boolean;
 }
 
-export const INTENT_KINDS: readonly IntentKindDef[] = [externalWaitKind];
+export const INTENT_KINDS: readonly IntentKindDef[] = [evidencePublishKind, externalWaitKind];
 
 export function intentKindFor(kind: string): IntentKindDef | undefined {
   return INTENT_KINDS.find((k) => k.kind === kind);

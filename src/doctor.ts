@@ -223,7 +223,12 @@ export async function repoGroup(repo: string, deep = false): Promise<DoctorGroup
     // Evidence-upload outbox health (local, no network): pending uploads still retrying. An auth-class
     // stuck upload almost always means the AWS SSO session expired — the actionable fix (S3 only).
     if (ev) {
-      const pending = d.store.pendingEvidenceUploads(repo);
+      // Ledger rows (the live path since v30) + any legacy evidence_uploads rows a draining
+      // old-code process left (none in practice — v30 converts and closes them; drop next release).
+      const pending: { errorKind: string | null; lastError: string | null }[] = [
+        ...d.store.listIntents(repo, { kind: "evidence_publish", status: "pending" }).map((i) => ({ errorKind: i.errorClass, lastError: i.lastError })),
+        ...d.store.pendingEvidenceUploads(repo).map((u) => ({ errorKind: u.errorKind, lastError: u.lastError })),
+      ];
       const profile = ev.publisher === "s3" ? ev.profile : undefined;
       if (pending.length === 0) {
         checks.push({ name: "evidence uploads", ok: true, detail: "none pending" });

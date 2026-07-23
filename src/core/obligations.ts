@@ -73,13 +73,25 @@ export function runObligations(deps: Deps, run: Run): RunObligations {
     lastError: t.lastError,
     staleUnhandled: t.staleAt !== null && t.staleHandledAt === null,
   }));
-  const evidenceUploads = deps.store.undeliveredEvidenceUploadsForRun(run.id).map((u) => ({
-    keyPrefix: u.keyPrefix,
-    attempts: u.attempts,
-    nextAttemptAt: u.nextAttemptAt,
-    errorKind: u.errorKind,
-    lastError: u.lastError,
-  }));
+  // Ledger evidence_publish rows (the live path since v30) + legacy drain rows for one release.
+  const evidenceUploads = [
+    ...deps.store.listIntents(deps.config.repoName, { kind: "evidence_publish", status: "pending", runId: run.id }).map((i) => {
+      let keyPrefix = "";
+      try {
+        keyPrefix = (JSON.parse(i.payload) as { keyPrefix?: string }).keyPrefix ?? "";
+      } catch {
+        /* introspection only — a bad payload just shows an empty prefix */
+      }
+      return { keyPrefix, attempts: i.attempts, nextAttemptAt: i.nextAttemptAt, errorKind: i.errorClass as string | null, lastError: i.lastError };
+    }),
+    ...deps.store.undeliveredEvidenceUploadsForRun(run.id).map((u) => ({
+      keyPrefix: u.keyPrefix,
+      attempts: u.attempts,
+      nextAttemptAt: u.nextAttemptAt,
+      errorKind: u.errorKind as string | null,
+      lastError: u.lastError,
+    })),
+  ];
   const sig = deps.store.unconsumedPendingSignalForRun(run.id);
   const q = deps.store.pendingHumanQuestionForRun(run.id);
   const ledger = deps.store

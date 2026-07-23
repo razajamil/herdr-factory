@@ -15,6 +15,8 @@ import { afterDoctorHint, afterInstallHint, afterStartHint } from "../onboarding
 import { systemClock, type Run, type SourceType } from "../types.ts";
 import type { Deps } from "../core/deps.ts";
 import { claimTicket, reconcileRepo, reconcileRun, resumeRun, teardownTicket, withRunLockWaiting, withTickLock } from "../core/reconcile.ts";
+import { evidencePublishKind, EVIDENCE_PUBLISH_LEASE_SECONDS } from "../intents/kinds/evidence-publish.ts";
+import { intentRetryDelay } from "../intents/registry.ts";
 import { applySignal, type SignalBody, type SignalResult } from "../core/signals.ts";
 import { runForeground } from "./run.ts";
 import { MEMORY_DIR } from "../core/step.ts";
@@ -676,22 +678,36 @@ program
       const prefix = evidenceKeyPrefix({ githubUsername, keyPrefix: ev.keyPrefix, ticketKey: activeRun.ticketKey, runId: activeRun.id, stamp });
       const publisher = createEvidencePublisher(ev, { currentLogin: () => deps.github.currentLogin() });
 
-      // Enqueue the publish as a durable outbox intent (persisting `prefix` so retry URLs stay stable),
-      // then print the deterministic URLs UP FRONT so the handoff/PR get correct links regardless of
-      // whether delivery lands now. The `command` publisher can't pre-compute URLs (they come from its
+      // Enqueue the publish as a durable LEDGER intent (persisting `prefix` so retry URLs stay
+      // stable), then print the deterministic URLs UP FRONT so the handoff/PR get correct links
+      // regardless of whether delivery lands now. Latest-wins: a re-capture (different prefix)
+      // supersedes the run's earlier undelivered publishes. The lease keeps the server's Phase-0
+      // flush from claiming the row while the inline attempt below is mid-upload; a failed inline
+      // attempt clears it. The `command` publisher can't pre-compute URLs (they come from its
       // stdout) — its links print only after a successful publish below.
-      const job = deps.store.enqueueEvidenceUpload({ runId: activeRun.id, repo, ticketKey: activeRun.ticketKey, keyPrefix: prefix, evidenceDir: dir });
+      const job = deps.store.enqueueIntent({
+        repo,
+        kind: evidencePublishKind.kind,
+        scope: `run:${activeRun.id}`,
+        runId: activeRun.id,
+        ticketKey: activeRun.ticketKey,
+        dedupKey: prefix,
+        payload: JSON.stringify({ keyPrefix: prefix, evidenceDir: dir }),
+        causeScope: `publisher:${ev.publisher}`,
+        leaseUntil: deps.now() + EVIDENCE_PUBLISH_LEASE_SECONDS,
+        supersedeScope: true,
+      });
       const predicted = publisher.predictUrls(prefix, files);
       if (predicted) {
         console.log("public URLs (use these in your handoff even if delivery is deferred — they resolve once the bytes land):");
         for (const url of predicted) console.log(url);
       }
 
-      // Inline fast path: publish now (the common success case). On failure DON'T hard-fail — the outbox
-      // owns retry from here, so the agent proceeds (with the URLs above, for s3/local).
+      // Inline fast path: publish now (the common success case). On failure DON'T hard-fail — the
+      // ledger owns retry from here, so the agent proceeds (with the URLs above, for s3/local).
       try {
         const { urls } = await publisher.publish({ dir, prefix });
-        deps.store.markEvidenceDelivered(job.id);
+        deps.store.markIntentDelivered(job.id);
         if (!predicted) {
           console.log("public URLs (use these in your handoff):");
           for (const url of urls) console.log(url);
@@ -700,10 +716,10 @@ program
       } catch (e) {
         const c = publisher.classifyError(e);
         if (c.kind === "permanent") {
-          deps.store.markEvidencePermanentFailed(job.id, c.reason);
+          deps.store.markIntentFailed(job.id, c.reason);
           console.log(`evidence-upload: publish FAILED (config error) — ${c.reason}. Run \`herdr-factory --repo ${repo} doctor --deep\`.${predicted ? " The URLs above will not resolve until this is fixed." : ""}`);
         } else {
-          deps.store.recordEvidenceAttempt(job.id, c.reason, c.kind);
+          deps.store.recordIntentAttempt(job.id, c.reason, c.kind, intentRetryDelay(evidencePublishKind, job));
           const tail = predicted ? "the URLs above resolve once it lands." : "URLs will appear in the server logs once it lands (a `command` publisher can't pre-compute links).";
           console.log(`evidence-upload: publish deferred — ${c.reason}. The engine will retry automatically; ${tail}`);
         }

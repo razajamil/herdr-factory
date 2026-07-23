@@ -1,7 +1,9 @@
 import type { DatabaseSync } from "node:sqlite";
 import { tx } from "./tx.ts";
 
-const MIGRATIONS: { version: number; sql: string }[] = [
+/** Exported for the upgrade tests only (migrateTo builds a mid-chain DB to exercise a later
+ *  version's in-flight-row conversion). Runtime callers use migrate(). */
+export const MIGRATIONS: { version: number; sql: string }[] = [
   {
     version: 1,
     sql: `
@@ -653,6 +655,31 @@ const MIGRATIONS: { version: number; sql: string }[] = [
       CREATE INDEX idx_intents_handoff ON intents(run_id) WHERE handoff_at IS NOT NULL AND consumed_at IS NULL;
       CREATE INDEX idx_intents_cause ON intents(repo, cause_scope) WHERE status IN ('pending','waiting');
       CREATE INDEX idx_intents_run ON intents(run_id) WHERE status IN ('pending','waiting');
+    `,
+  },
+  {
+    version: 30,
+    // evidence_publish cuts over to the ledger: every still-pending evidence upload is CONVERTED
+    // to an `evidence_publish` intent (preserving its attempts/backoff/error/notify clocks — an
+    // auth-stuck row stays auth-stuck and requeues the moment SSO recovers), then the old rows are
+    // closed as migrated so a still-draining old-code flush finds nothing due (a row it had
+    // already claimed mid-pass can still double-deliver — harmless: the publish is an idempotent
+    // re-put of the same keys). cause_scope is stamped 'publisher:s3' unconditionally: only S3
+    // classifies `auth` (the only class the cause requeue targets), so the label is inert for
+    // local/command rows. New code never writes evidence_uploads again; its reads stay as a union
+    // for one release, and the table drops in a later contract migration.
+    sql: `
+      INSERT INTO intents (repo, kind, scope, run_id, ticket_key, dedup_key, payload, status, attempts,
+                           next_attempt_at, last_error, error_class, cause_scope, notified_at, created_at, updated_at)
+      SELECT repo, 'evidence_publish', 'run:' || run_id, run_id, ticket_key, key_prefix,
+             json_object('keyPrefix', key_prefix, 'evidenceDir', evidence_dir),
+             'pending', attempts, next_attempt_at, last_error, error_kind, 'publisher:s3', notified_at,
+             created_at, unixepoch()
+        FROM evidence_uploads
+       WHERE delivered_at IS NULL AND permanent_failed_at IS NULL AND abandoned_at IS NULL;
+      UPDATE intents SET seq = id WHERE seq = 0;
+      UPDATE evidence_uploads SET abandoned_at = unixepoch(), last_error = 'migrated to the intent ledger (v30)'
+       WHERE delivered_at IS NULL AND permanent_failed_at IS NULL AND abandoned_at IS NULL;
     `,
   },
 ];
