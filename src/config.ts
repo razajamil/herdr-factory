@@ -18,7 +18,7 @@ import {
 import { type BranchTaxonomy, DEFAULT_BRANCH_TAXONOMY } from "./core/branch.ts";
 import { expandHome } from "./paths.ts";
 import { SOURCE_DESCRIPTORS, descriptorFor } from "./sources/registry.ts";
-import { HEARTBEAT_GUARD, STEP_DESCRIPTORS, stepDescriptorFor, type StepDescriptor } from "./steps/registry.ts";
+import { HEARTBEAT_GUARD, READ_ONLY_GUARD, STEP_DESCRIPTORS, stepDescriptorFor, type StepDescriptor } from "./steps/registry.ts";
 import { productCapabilityFor } from "./products/registry.ts";
 import { SOURCE_PRODUCTS, productActiveFor, validatePromptBody } from "./prompts/contract.ts";
 import { CONFIG_PACK_SUBDIR, SHIPPED_PROMPTS_DIR, resolvePromptFile } from "./prompt-packs.ts";
@@ -1319,6 +1319,10 @@ export function loadConfig(repoName: string): Loaded {
       guards.push(g);
     }
     if (ref.heartbeat && !guards.some((g) => g.kind === "heartbeat")) guards.push(HEARTBEAT_GUARD);
+    // A read-only posture ALWAYS carries the read_only guard: descriptor-declared postures
+    // (evidence/review) bring it via d.guards above; a custom ref's `read_only: true` opt-in adds
+    // it here — so the watchdog rescue routing (STEP_WATCHDOG_ATTENTION) is fully registry-derived.
+    if ((posture.readOnly ?? false) && !guards.some((g) => g.kind === "read_only")) guards.push(READ_ONLY_GUARD);
     return {
       name,
       type: ref.type,

@@ -13,7 +13,7 @@
 import type { EffectSpec, GuardSpec, InputSpec, ProductType, StepPosture } from "../types.ts";
 // Re-export the guard builders (defined in the leaf ./guards.ts to avoid a load-time cycle:
 // registry imports descriptors, and descriptors need the guards at import-eval time).
-export { BUDGET_GUARD, HEARTBEAT_GUARD, LAYOUT_WAIT_GUARD, CAPTURE_CAP_GUARD, CAPTURE_LOCK_GUARD } from "./guards.ts";
+export { BOUNCE_CAP, BUDGET_GUARD, CAPTURE_CAP_GUARD, CAPTURE_LOCK_GUARD, guardsResetOn, HEARTBEAT_GUARD, LAYOUT_WAIT_GUARD, READ_ONLY_GUARD } from "./guards.ts";
 import { workDescriptor } from "./work/descriptor.ts";
 import { evidenceDescriptor } from "./evidence/descriptor.ts";
 import { reviewDescriptor } from "./review/descriptor.ts";

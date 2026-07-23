@@ -54,16 +54,24 @@ describe("StepDescriptor contract (per registered step primitive)", () => {
         if (d.controls.posture?.readOnly) expect(d.produces).not.toContain("commits");
       });
 
-      it("every guard declares a non-empty escalation reason; capture_cap resets on forward_entry", () => {
+      it("every guard declares a non-empty escalation reason; counter guards declare their resets", () => {
         for (const g of d.guards) {
           expect(g.escalationReason.length).toBeGreaterThan(0);
           if (g.kind === "capture_cap") {
-            expect(g.reset).toBe("forward_entry");
+            // Fresh forward pass + human resume refill the cap; a crash-recovery respawn NEVER does
+            // (resetOn has no such trigger — a self-crash must not refill its own budget).
+            expect(g.resetOn).toEqual(["forward_entry", "resume"]);
             expect(g.cumulative).toBe(false);
             expect(g.counterScope).toBe("run+step+guard"); // counter lives in the generalized guard_counters table
           }
+          if (g.kind === "layout_wait") expect(g.resetOn).toEqual(["dispatch", "resume"]); // respawn budget refunds
           if (g.kind === "heartbeat") expect(g.requiresProduct).toBe("commits");
         }
+      });
+
+      it("a read-only posture always carries the read_only guard (and only read-only steps do)", () => {
+        const declared = d.controls.posture?.readOnly ?? false;
+        expect(d.guards.some((g) => g.kind === "read_only")).toBe(declared);
       });
 
       it("a bounce emitter only makes sense with an evidence/gate posture (has a base prompt to bounce from)", () => {
@@ -81,7 +89,9 @@ describe("StepDescriptor contract (per registered step primitive)", () => {
     );
     // layout_wait is deliberately NOT here: it trips before the step's agent exists (no pane ⇒ no
     // agent ⇒ its step-done can never arrive), so it recovers by bounded respawn instead.
-    expect([...union].sort()).toEqual(["capture_limit", "step_budget", "step_stalled"]);
+    // read_only_violation IS here (via READ_ONLY_GUARD, registry-derived — no hand-added literal):
+    // a completed read-only step must never wedge on a commit it didn't make (RWR-18204).
+    expect([...union].sort()).toEqual(["capture_limit", "read_only_violation", "step_budget", "step_stalled"]);
   });
 
   it("layout_wait recovers by bounded respawn, never by step-done (no pane ⇒ no agent ⇒ no signal)", () => {

@@ -1,5 +1,5 @@
 import type { StepDescriptor } from "../registry.ts";
-import { BUDGET_GUARD, CAPTURE_CAP_GUARD, CAPTURE_LOCK_GUARD, LAYOUT_WAIT_GUARD } from "../guards.ts";
+import { BUDGET_GUARD, CAPTURE_CAP_GUARD, CAPTURE_LOCK_GUARD, LAYOUT_WAIT_GUARD, READ_ONLY_GUARD } from "../guards.ts";
 
 /** The **evidence** step (opt-in): derive a test plan from the work item's acceptance criteria,
  *  drive the running app, capture + publish before/after proof, and give a per-criterion verdict —
@@ -20,6 +20,6 @@ export const evidenceDescriptor: StepDescriptor = {
     bounce: { toEarliestConsumerOf: "bounce_feedback" }, // → work
     posture: { readOnly: true, requiresLayout: true },
   },
-  guards: [BUDGET_GUARD, CAPTURE_CAP_GUARD, LAYOUT_WAIT_GUARD, CAPTURE_LOCK_GUARD],
+  guards: [BUDGET_GUARD, READ_ONLY_GUARD, CAPTURE_CAP_GUARD, LAYOUT_WAIT_GUARD, CAPTURE_LOCK_GUARD],
   effects: [],
 };

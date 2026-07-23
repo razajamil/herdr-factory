@@ -11,7 +11,8 @@ import { isUniqueViolation } from "../db/store.ts";
 import { notifyDue } from "../schedule.ts";
 import { branchName } from "./branch.ts";
 import { firstStep, indexOfStep, materializeWork, MEMORY_DIR, nextStep, scrubCommittedMemoryDir, spawnStep, stepByName } from "./step.ts";
-import { STEP_DESCRIPTORS } from "../steps/registry.ts";
+import { BOUNCE_CAP, CAPTURE_CAP_GUARD, guardsResetOn, READ_ONLY_GUARD, STEP_DESCRIPTORS } from "../steps/registry.ts";
+import { PANE_ABSENCE_CONFIRM_SECONDS } from "../steps/engine-watches.ts";
 import { wakeResolver } from "./watch.ts";
 import { recordSourceAuthEvent, recordTick, recordTickDuration, recordTickLockSkipped, telemetryEvent, telemetrySpan } from "../telemetry/index.ts";
 import { isSourceUnauthenticated, type SourceUnauthenticatedError } from "../auth/errors.ts";
@@ -63,11 +64,6 @@ function noteSourceAuthRecovered(deps: Deps, source: string): void {
   recordSourceAuthEvent({ "work.source": source, "auth.state": "recovered" });
   void deps.herdr.notify(`herdr-factory: ${source} re-authenticated`, `Work source "${source}" is authenticated again — paused work is resuming.`).catch(() => {});
 }
-
-/** How long a step's pane must stay CONFIRMED absent before the reconciler respawns it. Two
- *  confirmed observations at least this far apart are required — long enough to ride out a herdr
- *  daemon restart, short enough that a genuinely dead pane restarts within ~a tick. */
-const PANE_ABSENCE_CONFIRM_SECONDS = 45;
 
 // --- source status write-backs (the transition outbox) -----------------------
 // A transition is an INTENT persisted until the source confirms it, not a one-shot call: run
@@ -1228,10 +1224,10 @@ export async function bounceStep(
   // Safety backstop only: the loop is meant to end when the later step passes (aligned) or the fix
   // agent asks a human — this cap just catches oscillation. Per-belt override wins over the repo limit.
   const maxBounces = belt.maxBounces ?? deps.config.limits.maxBounces;
-  const bounces = deps.store.bumpGuardCounter(run.id, toStep, "bounce_cap");
+  const bounces = deps.store.bumpGuardCounter(run.id, toStep, BOUNCE_CAP.guard);
   if (bounces > maxBounces) {
     await escalateAttention(deps, run, {
-      reason: "bounce_limit",
+      reason: BOUNCE_CAP.escalationReason,
       attentionReason: `bounced to ${toStep} ${bounces}× (max ${maxBounces})`,
       body: `${run.ticketKey}: the work has been bounced back to the ${toStep} step ${bounces} times (from ${fromStep}), exceeding max_bounces (${maxBounces}). A human should look — the agents may be stuck in a rework loop.`,
       detail: { fromStep, toStep, bounces },
@@ -1371,11 +1367,11 @@ export async function recordCaptureAttempt(
 
   const repo = deps.config.repoName;
   const cap = deps.config.limits.maxCaptureAttempts;
-  const attempts = deps.store.bumpGuardCounter(run.id, step, "capture_cap");
+  const attempts = deps.store.bumpGuardCounter(run.id, step, CAPTURE_CAP_GUARD.kind);
   deps.store.recordEvent({ runId: run.id, repo, ticketKey: run.ticketKey, type: "capture_attempt", detail: { step, attempts, cap } });
   if (attempts > cap) {
     await escalateAttention(deps, run, {
-      reason: "capture_limit",
+      reason: CAPTURE_CAP_GUARD.escalationReason,
       attentionReason: `capture attempt ${attempts} over cap (${cap}) on ${step}`,
       body: `${run.ticketKey}: the ${step} step has begun ${attempts} capture attempts (cap ${cap}) without passing evidence forward. The app may be too flaky to capture cleanly, or the change isn't demonstrable — a human should look.`,
       detail: { step, attempts, cap },
@@ -1400,20 +1396,18 @@ const HUMAN_POLL_ERROR_ESCALATE = 20;
  *  signal can ever arrive), so it is rescued by re-attempting the spawn instead — see
  *  STEP_RESPAWN_ATTENTION. Every OTHER park — source item gone, PR closed, bounce oscillation,
  *  human loop, config error — needs a human decision and is never auto-rescued. */
-// The union of every registered step primitive's guards whose `autoRescueOnDone` is true (a plugin
-// guard participates automatically — no edit to a literal Set), PLUS `read_only_violation`.
-// read_only_violation is NOT a guard — it rides the `readOnly` posture, enforced inline in
-// reconcileStep — but it belongs here for the same reason: it is a backstop against an agent that
-// touched the tree, not a veto on a completed step. A completed read-only step must never wedge
-// forever on a commit it didn't make (RWR-18204: an evidence step parked permanently after the
-// PRIOR work step's still-alive agent committed a trailing lint fix). source_item_stale / pr_closed
-// / bounce_limit / human / config parks stay non-auto-rescued (a human decides).
-const STEP_WATCHDOG_ATTENTION = new Set([
-  ...STEP_DESCRIPTORS.flatMap((d) => d.guards)
+// The union of every registered step primitive's guards whose `autoRescueOnDone` is true — a plugin
+// guard participates automatically, no edit to a literal Set. `read_only_violation` arrives via
+// READ_ONLY_GUARD on the read-only primitives (its enforcement stays inline in reconcileStep, keyed
+// on the posture; the guard is the declaration the rescue routing derives from). A completed
+// read-only step must never wedge forever on a commit it didn't make (RWR-18204: an evidence step
+// parked permanently after the PRIOR work step's still-alive agent committed a trailing lint fix).
+// source_item_stale / pr_closed / bounce_limit / human / config parks stay non-auto-rescued.
+const STEP_WATCHDOG_ATTENTION = new Set(
+  STEP_DESCRIPTORS.flatMap((d) => d.guards)
     .filter((g) => g.autoRescueOnDone)
     .map((g) => g.escalationReason),
-  "read_only_violation",
-]);
+);
 
 /** Attention reasons whose park is rescued by RE-ATTEMPTING THE SPAWN, bounded by the guard's
  *  `autoRespawnLimit` — today only the layout-pane wait (`layout_wait_timeout`). Its park means the
@@ -1676,7 +1670,7 @@ async function reconcileStep(deps: Deps, run: Run, belt: BeltRuntime, src: Sourc
         else if (head !== rs.progressSig) deps.store.upsertRunStep(run.id, step.name, { progressSig: head });
       } else if (head !== rs.progressSig) {
         return escalateAttention(deps, run, {
-          reason: "read_only_violation",
+          reason: READ_ONLY_GUARD.escalationReason,
           attentionReason: `${step.name} is read-only but committed (HEAD moved)`,
           body: `${run.ticketKey}: the ${step.name} step is read-only — it must never edit or commit — but the branch HEAD moved from ${rs.progressSig.slice(0, 8)} to ${head.slice(0, 8)} after its agent took over. A human should review; the agent violated the read-only contract. (A genuine step-done from this step will un-park and advance.)`,
           detail: { step: step.name, baseline: rs.progressSig, head },
@@ -1728,10 +1722,11 @@ async function reconcileStep(deps: Deps, run: Run, belt: BeltRuntime, src: Sourc
       // enter(next) effect: a belt may move the source status on entering a step (e.g. entering the
       // QA/review step). No engine default for a non-first step, so it fires only if configured.
       await fireEffect(deps, run, belt, src, { on: "enter", step: next.name });
-      // Fresh pass into an evidence step ⇒ reset its flaky-capture budget (the capture cap is reset
-      // ONLY here on the forward path; a crash-recovery respawn below deliberately does NOT reset it,
-      // so a self-crash can't refill the cap). Cheap + scoped: only a gathersEvidence step holds a count.
-      if (next.gathersEvidence) deps.store.resetGuardCounter(run.id, next.name, "capture_cap");
+      // Fresh FORWARD pass into the next step ⇒ reset every counter guard that declares a
+      // forward-entry refund (the evidence capture cap). Reset ONLY here on the forward path; a
+      // crash-recovery respawn below deliberately does NOT reset (a self-crash can't refill its own
+      // cap — GuardSpec.resetOn has no such trigger). Derived from the step's declarations.
+      for (const g of guardsResetOn(next.guards, "forward_entry")) deps.store.resetGuardCounter(run.id, next.name, g.kind);
       // Re-base the next step's execution state as we ENTER it, so a stale clock left by a PRIOR
       // pass into that step can't misfire. This bites after a bounce: bounceStep clears an intermediate
       // step's `done` (so it re-runs) but its started_at survives from the first pass — and if
@@ -2067,8 +2062,8 @@ export async function resumeRun(deps: Deps, run: Run): Promise<{ ok: boolean; ph
   // park reason (teardown was effectively the only exit). Scoped to bounce_limit parks: a resume
   // from any other reason leaves the oscillation backstop's counts intact. The counter is keyed on
   // the bounce TARGET step, so refund across the belt's steps.
-  if (deps.store.lastAttentionReasonCode(run.id) === "bounce_limit") {
-    for (const s of belt.steps) deps.store.resetGuardCounter(run.id, s.name, "bounce_cap");
+  if (deps.store.lastAttentionReasonCode(run.id) === BOUNCE_CAP.escalationReason) {
+    for (const s of belt.steps) deps.store.resetGuardCounter(run.id, s.name, BOUNCE_CAP.guard);
     deps.log("info", `${run.ticketKey}: bounce budget refunded on resume from a bounce_limit park`);
   }
   const pendingQuestion = deps.store.pendingHumanQuestionForRun(run.id);
@@ -2081,13 +2076,14 @@ export async function resumeRun(deps: Deps, run: Run): Promise<{ ok: boolean; ph
     deps.store.resetHumanPollBackoff(pendingQuestion.id);
     phase = "waiting_for_human";
   } else if (run.step && stepByName(belt, run.step)) {
-    // Fresh slate on human resume: reset the step budget clocks AND the flaky-capture + layout-wait
-    // respawn counters — a human just intervened, so a capture-cap park must not immediately re-park
-    // on the next attempt, and a layout-wait park gets its full bounded respawn budget back.
-    // resetGuardCounter is a no-op for a step with no counter, so this never touches unrelated state.
+    // Fresh slate on human resume: reset the step budget clocks AND every counter guard that
+    // declares a resume refund (the flaky-capture cap, the layout-wait respawn budget) — a human
+    // just intervened, so a capture-cap park must not immediately re-park on the next attempt, and
+    // a layout-wait park gets its full bounded respawn budget back. Derived from the step's guard
+    // declarations (GuardSpec.resetOn), so a plugin guard's counter refunds correctly for free.
+    const step = stepByName(belt, run.step)!;
     deps.store.upsertRunStep(run.id, run.step, { startedAt: deps.now(), progressSig: null, progressAt: null, absentAt: null });
-    deps.store.resetGuardCounter(run.id, run.step, "capture_cap");
-    deps.store.resetGuardCounter(run.id, run.step, "layout_wait");
+    for (const g of guardsResetOn(step.guards, "resume")) deps.store.resetGuardCounter(run.id, step.name, g.kind);
     phase = "running";
   } else if (belt.watchPr && run.prNumber) {
     // Back to watching the PR: clear the handled-signature so the next actionable review state
@@ -2100,7 +2096,7 @@ export async function resumeRun(deps: Deps, run: Run): Promise<{ ok: boolean; ph
     // started_at and the spent budget and re-park on the same pass that resumed it.
     const first = firstStep(belt);
     deps.store.upsertRunStep(run.id, first.name, { startedAt: deps.now(), absentAt: null });
-    deps.store.resetGuardCounter(run.id, first.name, "layout_wait");
+    for (const g of guardsResetOn(first.guards, "resume")) deps.store.resetGuardCounter(run.id, first.name, g.kind);
     phase = "claiming";
   }
   deps.store.updateRun(run.id, { phase, attentionReason: null, focusPending: true });

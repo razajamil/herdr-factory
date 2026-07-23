@@ -7,6 +7,7 @@ import type { AgentConfig, Run, RunStep, SourceType } from "../types.ts";
 import { DEFAULT_AGENT_CONFIG } from "../types.ts";
 import { renderWorkVars } from "./branch.ts";
 import { productActiveFor, type PromptStepContext, stripInactiveProductBlocks, validatePromptBody } from "../prompts/contract.ts";
+import { guardsResetOn } from "../steps/guards.ts";
 import { signalCommand } from "../signals/registry.ts";
 import { REPO_PACK_SUBDIR, resolvePromptFile } from "../prompt-packs.ts";
 import { telemetrySpan } from "../telemetry/index.ts";
@@ -668,9 +669,10 @@ async function spawnStepImpl(
   // dispatched_at (this pass's prompt has reached an agent — the reconciler's spawn branch keys on
   // it), and clear any pending absence confirmation — this pane is definitionally alive right now.
   deps.store.upsertRunStep(run.id, stepName, { paneId: result.paneId, startedAt: deps.now(), absentAt: null, dispatchedAt: deps.now() });
-  // The pane came up — refund the layout-wait respawn budget, so a FUTURE wait by this step (a
-  // re-entry after a bounce, a crash respawn) starts with its full bounded-retry allowance.
-  deps.store.resetGuardCounter(run.id, stepName, "layout_wait");
+  // The pane came up — refund every counter guard that declares a dispatch-success reset (the
+  // layout-wait respawn budget), so a FUTURE wait by this step (a re-entry after a bounce, a crash
+  // respawn) starts with its full bounded-retry allowance. Derived from GuardSpec.resetOn.
+  for (const g of guardsResetOn(step.guards, "dispatch")) deps.store.resetGuardCounter(run.id, stepName, g.kind);
   // read_only enforcement baseline: capture HEAD before the agent runs, so a later commit (a
   // read-only-contract violation) is detectable as HEAD movement in reconcileStep. Read-only steps
   // never have a heartbeat, so progressSig is free to hold this baseline.

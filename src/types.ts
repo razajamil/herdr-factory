@@ -465,20 +465,29 @@ export interface InputSpec {
 
 /** The watchdog kinds a step can attach. Each GuardSpec carries its own lifecycle so a flat set
  *  can't lose the load-bearing per-guard semantics. */
-export type GuardKind = "budget" | "heartbeat" | "capture_cap" | "layout_wait" | "exclusive_resource";
+export type GuardKind = "budget" | "heartbeat" | "read_only" | "capture_cap" | "layout_wait" | "exclusive_resource";
+
+/** The engine seams at which a guard's `guard_counters` row is cleared. Every trigger is an
+ *  affirmative signal the counted failure mode is over: a fresh FORWARD pass into the step (never a
+ *  crash-recovery respawn — a self-crash must not refill its own cap), a successful DISPATCH (the
+ *  awaited pane came up), or a human RESUME (the human judged the loop worth continuing). */
+export type GuardCounterReset = "forward_entry" | "dispatch" | "resume";
 
 /** A watchdog attached to a step. `budget`/`heartbeat`/`layout_wait` are clock/liveness guards;
- *  `capture_cap` is the only counter guard among the shipped set (`reset`/`cumulative` apply to it).
- *  The bounce cap is NOT modelled here — it rides on `controls.bounce` (see StepControls). */
+ *  `read_only` is the HEAD-move contract check on a read-only posture; `capture_cap` is the only
+ *  counter guard among the shipped set (`resetOn`/`cumulative` apply to counters). The bounce cap
+ *  is NOT modelled here — it is a cross-step control keyed on the bounce TARGET (see BOUNCE_CAP in
+ *  steps/guards.ts); engine-universal watches with no per-step declaration (pane liveness, pass
+ *  staleness) are declared in steps/engine-watches.ts. */
 export interface GuardSpec {
   kind: GuardKind;
   /** Reason code recorded when this guard trips. The union of guards with autoRescueOnDone===true
    *  IS the STEP_WATCHDOG_ATTENTION set (a genuine step-done un-parks a run parked by such a guard). */
   escalationReason: string;
   /** A genuine step-done from the parked step un-parks the run. Only meaningful for guards that trip
-   *  while the step's AGENT IS RUNNING (budget/heartbeat/capture_cap) — layout_wait trips before the
-   *  agent exists (no pane ⇒ no agent ⇒ no step-done), so it declares false and recovers via
-   *  `autoRespawnLimit` instead. */
+   *  while the step's AGENT IS RUNNING (budget/heartbeat/read_only/capture_cap) — layout_wait trips
+   *  before the agent exists (no pane ⇒ no agent ⇒ no step-done), so it declares false and recovers
+   *  via `autoRespawnLimit` instead. */
   autoRescueOnDone: boolean;
   /** Bounded spawn-retry budget for a guard that trips BEFORE the step's agent exists (layout_wait).
    *  Each expired wait window re-arms the wait in place — and a run already parked by this guard is
@@ -486,9 +495,10 @@ export interface GuardSpec {
    *  the kind), before the park becomes a genuine human-attention park. Reset on successful dispatch
    *  and on a human `resume`. */
   autoRespawnLimit?: number;
-  /** Counter guards only (capture_cap): when the counter resets. "forward_entry" = a fresh forward
-   *  pass into the step, NOT a crash-recovery respawn (a self-crash must not refill the cap). */
-  reset?: "forward_entry" | "never" | "resume";
+  /** Counter guards only: the engine seams that clear this guard's counter. The engine DERIVES its
+   *  reset calls from this (spawnStep's dispatch, reconcileStep's forward advance, resumeRun) —
+   *  a plugin guard's counter participates in the right refunds by declaring, not by editing core. */
+  resetOn?: readonly GuardCounterReset[];
   cumulative?: boolean;
   /** Counter guards only: the storage key for the guard's counter — always the generalized
    *  (run, step, guard) row in `guard_counters`, so two capped guards on one step never collide. */

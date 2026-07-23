@@ -1,5 +1,5 @@
 import type { StepDescriptor } from "../registry.ts";
-import { BUDGET_GUARD, LAYOUT_WAIT_GUARD } from "../guards.ts";
+import { BUDGET_GUARD, LAYOUT_WAIT_GUARD, READ_ONLY_GUARD } from "../guards.ts";
 
 /** The **review** step: a fresh-eyes, strictly read-only gate. It never edits or commits — it
  *  passes the work forward or bounces back to work with findings. `evidence` is an OPTIONAL consume
@@ -18,6 +18,6 @@ export const reviewDescriptor: StepDescriptor = {
     bounce: { toEarliestConsumerOf: "bounce_feedback" }, // → work
     posture: { readOnly: true },
   },
-  guards: [BUDGET_GUARD, LAYOUT_WAIT_GUARD],
+  guards: [BUDGET_GUARD, READ_ONLY_GUARD, LAYOUT_WAIT_GUARD],
   effects: [],
 };
