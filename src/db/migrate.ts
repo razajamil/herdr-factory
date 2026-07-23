@@ -601,6 +601,60 @@ const MIGRATIONS: { version: number; sql: string }[] = [
       UPDATE run_steps SET baseline_sig = progress_sig, baseline_frozen_at = progress_at;
     `,
   },
+  {
+    version: 29,
+    // The INTENT LEDGER: one durable-intent table for the deliver lane, absorbing (kind by kind,
+    // leaf-first across releases) the four outbox-shaped tables that each re-typed the same
+    // scheduling spine — evidence_uploads, pending_signals, human_questions' scheduling half, and
+    // transition_outbox last (it gates claiming). Rows carry only the SHARED facts (due time,
+    // attempts, lease, terminal status, cause key, notify throttle, the two-phase handoff);
+    // everything kind-specific — ordering (FIFO-per-scope / latest-wins / independent), backoff
+    // curves, delivery, run reactions — stays code in the INTENT_KINDS registry, dispatched by the
+    // kernel (src/core/ledger.ts). `status='waiting'` + deadline_at is the genuinely new
+    // capability: a first-class "wait for an external trigger" row resolved by POST /fulfil (a
+    // webhook, a CI callback) or escalated when its deadline passes.
+    //
+    // UNIQUE(kind, scope, dedup_key) makes enqueue idempotent (re-enqueue re-opens, keeping `seq`
+    // so a re-opened row holds its original FIFO slot — seq is stamped = id on first insert).
+    // Expand-only: nothing existing is touched; the kinds cut over in later versions.
+    sql: `
+      CREATE TABLE intents (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        repo TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        scope TEXT NOT NULL,
+        run_id INTEGER REFERENCES runs(id),
+        ticket_key TEXT,
+        dedup_key TEXT NOT NULL DEFAULT '',
+        seq INTEGER NOT NULL DEFAULT 0,
+        payload TEXT NOT NULL DEFAULT '{}',
+        state TEXT NOT NULL DEFAULT '{}',
+        status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN
+          ('pending','waiting','delivered','superseded','failed','abandoned')),
+        attempts INTEGER NOT NULL DEFAULT 0,
+        next_attempt_at INTEGER NOT NULL DEFAULT 0,
+        lease_until INTEGER,
+        deadline_at INTEGER,
+        last_error TEXT,
+        error_class TEXT CHECK (error_class IN ('auth','transient','permanent','stale')),
+        cause_scope TEXT,
+        notified_at INTEGER,
+        handoff_at INTEGER,
+        handoff_marker TEXT,
+        consumed_at INTEGER,
+        consumed_result TEXT,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        resolved_at INTEGER,
+        UNIQUE(kind, scope, dedup_key)
+      );
+      CREATE INDEX idx_intents_due ON intents(repo, next_attempt_at) WHERE status = 'pending';
+      CREATE INDEX idx_intents_waiting ON intents(repo, deadline_at) WHERE status = 'waiting';
+      CREATE INDEX idx_intents_handoff ON intents(run_id) WHERE handoff_at IS NOT NULL AND consumed_at IS NULL;
+      CREATE INDEX idx_intents_cause ON intents(repo, cause_scope) WHERE status IN ('pending','waiting');
+      CREATE INDEX idx_intents_run ON intents(run_id) WHERE status IN ('pending','waiting');
+    `,
+  },
 ];
 
 /** Apply pending migrations in a transaction. Idempotent. */

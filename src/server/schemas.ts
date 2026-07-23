@@ -434,6 +434,17 @@ const ObligationsResponse = z
       humanQuestion: z
         .object({ id: z.number(), step: z.string().nullable(), posted: z.boolean(), pollAttempts: z.number(), pollErrors: z.number(), nextPollAt: z.number() })
         .nullable(),
+      ledger: z.array(
+        z.object({
+          id: z.number(),
+          kind: z.string(),
+          status: z.string(),
+          nextAttemptAt: z.number(),
+          deadlineAt: z.number().nullable(),
+          handoffOwed: z.boolean(),
+          lastError: z.string().nullable(),
+        }),
+      ),
     }),
     watches: z.object({
       step: z.string().nullable(),
@@ -452,6 +463,117 @@ export const obligationsRoute = createRoute({
   request: { params: RepoParam, query: z.object({ key: z.string(), source: z.string().optional() }) },
   responses: {
     200: { description: "The run's pending intents + armed watches", content: { "application/json": { schema: ObligationsResponse } } },
+    ...repoErrors,
+  },
+});
+
+// ---- the intent ledger --------------------------------------------------------
+// Row lifecycle ONLY: enqueue an external wait, inspect, operator retry, fulfil, cause recovery.
+// Run transitions stay the run-locked reconciler's — a fulfil/deadline crosses into the run as a
+// HANDOFF the next run-locked pass consumes (see src/core/ledger.ts).
+
+const IntentSchema = z
+  .object({
+    id: z.number(),
+    kind: z.string(),
+    scope: z.string(),
+    key: z.string().nullable(),
+    status: z.string(),
+    attempts: z.number(),
+    nextAttemptAt: z.number(),
+    deadlineAt: z.number().nullable(),
+    lastError: z.string().nullable(),
+    errorClass: z.string().nullable(),
+    causeScope: z.string().nullable(),
+    handoffMarker: z.string().nullable(),
+    consumedResult: z.string().nullable(),
+    payload: z.string(),
+    state: z.string(),
+    createdAt: z.number(),
+    resolvedAt: z.number().nullable(),
+  })
+  .openapi("Intent");
+const IntentsResponse = z.object({ intents: z.array(IntentSchema) }).openapi("Intents");
+const IntentIdParam = RepoParam.extend({ id: z.string().regex(/^\d+$/).openapi({ param: { name: "id", in: "path" }, example: "42" }) });
+
+export const intentsListRoute = createRoute({
+  method: "get",
+  path: "/repos/{repo}/intents",
+  tags: ["intents"],
+  summary: "List ledger intents (?kind=&status=&key=)",
+  request: { params: RepoParam, query: z.object({ kind: z.string().optional(), status: z.string().optional(), key: z.string().optional() }) },
+  responses: {
+    200: { description: "Intents", content: { "application/json": { schema: IntentsResponse } } },
+    ...repoErrors,
+  },
+});
+
+export const intentEnqueueRoute = createRoute({
+  method: "post",
+  path: "/repos/{repo}/intents",
+  tags: ["intents"],
+  summary: "Create an external-trigger wait (externally-enqueuable kinds only, e.g. external_wait)",
+  request: {
+    params: RepoParam,
+    body: {
+      content: {
+        "application/json": {
+          schema: z.object({
+            kind: z.string(),
+            key: z.string().optional(), // scope the wait to a run (resolved like every run command)
+            source: z.string().optional(),
+            dedupKey: z.string().optional(), // idempotence handle; omitted ⇒ a fresh unique wait
+            payload: z.record(z.string(), z.unknown()).optional(), // kind-owned (external_wait: {note, on_deadline})
+            deadlineAt: z.number().optional(), // epoch seconds; omitted ⇒ waits indefinitely
+          }),
+        },
+      },
+    },
+  },
+  responses: {
+    200: { description: "The created (waiting) intent", content: { "application/json": { schema: z.object({ intent: IntentSchema }).openapi("IntentCreated") } } },
+    ...repoErrors,
+  },
+});
+
+export const intentRetryRoute = createRoute({
+  method: "post",
+  path: "/repos/{repo}/intents/{id}/retry",
+  tags: ["intents"],
+  summary: "Operator due-now for a pending intent (skips its backoff)",
+  request: { params: IntentIdParam },
+  responses: {
+    200: { description: "Retry scheduled", content: { "application/json": { schema: OkResponse } } },
+    ...repoErrors,
+  },
+});
+
+export const intentFulfilRoute = createRoute({
+  method: "post",
+  path: "/repos/{repo}/intents/{id}/fulfil",
+  tags: ["intents"],
+  summary: "Resolve a waiting external-trigger intent (a webhook/CI callback landing)",
+  request: {
+    params: IntentIdParam,
+    body: { content: { "application/json": { schema: z.object({ result: z.record(z.string(), z.unknown()).optional() }) } }, required: false },
+  },
+  responses: {
+    200: {
+      description: "Fulfilled (the run reacts on its next run-locked pass, nudged immediately when possible)",
+      content: { "application/json": { schema: z.object({ ok: z.boolean(), message: z.string().optional() }).openapi("IntentFulfil") } },
+    },
+    ...repoErrors,
+  },
+});
+
+export const intentRecoverRoute = createRoute({
+  method: "post",
+  path: "/repos/{repo}/intents/recover",
+  tags: ["intents"],
+  summary: "Cause-scoped recovery: make every pending intent under a cause due now (auth restored)",
+  request: { params: RepoParam, body: { content: { "application/json": { schema: z.object({ causeScope: z.string() }) } } } },
+  responses: {
+    200: { description: "Requeued count", content: { "application/json": { schema: z.object({ requeued: z.number() }).openapi("IntentRecover") } } },
     ...repoErrors,
   },
 });

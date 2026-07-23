@@ -14,8 +14,9 @@ import { VERSION } from "../version.ts";
 import { withExtractedTelemetryContext } from "../telemetry/index.ts";
 import { annotateCurrentSpan, recordHttpServerDurationEffect, withHttpServerSpan } from "../telemetry/effect.ts";
 import { runEffect } from "../runtime/effect.ts";
-import { claimTicket, reconcileRepo, reconcileRun, resumeRun, teardownTicket, withRunLockWaiting, withTickLock } from "../core/reconcile.ts";
+import { claimTicket, reconcileRepo, reconcileRun, resumeRun, teardownTicket, withRunLock, withRunLockWaiting, withTickLock } from "../core/reconcile.ts";
 import { runObligations } from "../core/obligations.ts";
+import { intentKindFor } from "../intents/registry.ts";
 import { applySignal } from "../core/signals.ts";
 import { createEvidencePublisher } from "../clients/evidence.ts";
 import { evidenceServeDir } from "../config-paths.ts";
@@ -30,6 +31,11 @@ import {
   askHumanRoute,
   eligibleRoute,
   healthRoute,
+  intentEnqueueRoute,
+  intentFulfilRoute,
+  intentRecoverRoute,
+  intentRetryRoute,
+  intentsListRoute,
   obligationsRoute,
   reloadRoute,
   resumeRoute,
@@ -468,6 +474,106 @@ export function createApp(ctx: ServerContext): OpenAPIHono {
     const run = resolveActiveRun(rt.deps, key, source); // throws (→ {error}) on cross-source ambiguity
     if (!run) return c.json({ error: `${key}: no active run` }, 404);
     return c.json(runObligations(rt.deps, run), 200);
+  });
+
+  // --- the intent ledger: row lifecycle only (run transitions stay the reconciler's) ------------
+  const intentJson = (i: import("../types.ts").Intent) => ({
+    id: i.id,
+    kind: i.kind,
+    scope: i.scope,
+    key: i.ticketKey,
+    status: i.status,
+    attempts: i.attempts,
+    nextAttemptAt: i.nextAttemptAt,
+    deadlineAt: i.deadlineAt,
+    lastError: i.lastError,
+    errorClass: i.errorClass,
+    causeScope: i.causeScope,
+    handoffMarker: i.handoffMarker,
+    consumedResult: i.consumedResult,
+    payload: i.payload,
+    state: i.state,
+    createdAt: i.createdAt,
+    resolvedAt: i.resolvedAt,
+  });
+
+  app.openapi(intentsListRoute, async (c) => {
+    const { repo } = c.req.valid("param");
+    const { kind, status, key } = c.req.valid("query");
+    const rt = ctx.getRepo(repo);
+    if (!rt) return c.json({ error: notConfigured(repo) }, 404);
+    const intents = rt.deps.store.listIntents(repo, { kind, status: status as never, key });
+    return c.json({ intents: intents.map(intentJson) }, 200);
+  });
+
+  app.openapi(intentEnqueueRoute, async (c) => {
+    const { repo } = c.req.valid("param");
+    const body = c.req.valid("json");
+    const rt = ctx.getRepo(repo);
+    if (!rt) return c.json({ error: notConfigured(repo) }, 404);
+    const kind = intentKindFor(body.kind);
+    // Only externally-enqueuable kinds may be created over HTTP — a hand-made engine-owned intent
+    // (a source_transition row) would bypass the reconciler's monotonicity/ordering rules.
+    if (!kind?.externallyEnqueuable) return c.json({ error: `intent kind "${body.kind}" cannot be enqueued externally` }, 400);
+    let runId: number | null = null;
+    let ticketKey: string | null = null;
+    if (body.key) {
+      const run = resolveActiveRun(rt.deps, body.key, body.source);
+      if (!run) return c.json({ error: `${body.key}: no active run` }, 404);
+      runId = run.id;
+      ticketKey = run.ticketKey;
+    }
+    // Externally-created rows are external TRIGGER waits: born `waiting` (never retried by the
+    // kernel), resolved by /fulfil or their deadline. A fresh uid dedup key per call unless the
+    // caller supplies an idempotence handle.
+    const intent = rt.deps.store.enqueueIntent({
+      repo,
+      kind: kind.kind,
+      scope: runId != null ? `run:${runId}` : "repo",
+      runId,
+      ticketKey,
+      dedupKey: body.dedupKey ?? `wait-${rt.deps.uid()}`,
+      payload: JSON.stringify(body.payload ?? {}),
+      status: "waiting",
+      deadlineAt: body.deadlineAt ?? null,
+    });
+    return c.json({ intent: intentJson(intent) }, 200);
+  });
+
+  app.openapi(intentRetryRoute, async (c) => {
+    const { repo, id } = c.req.valid("param");
+    const rt = ctx.getRepo(repo);
+    if (!rt) return c.json({ error: notConfigured(repo) }, 404);
+    const intent = rt.deps.store.getIntent(Number(id));
+    if (!intent || intent.repo !== repo) return c.json({ error: `no intent #${id} in ${repo}` }, 404);
+    return c.json({ ok: rt.deps.store.retryIntentNow(intent.id) }, 200);
+  });
+
+  app.openapi(intentFulfilRoute, async (c) => {
+    const { repo, id } = c.req.valid("param");
+    const body = c.req.valid("json");
+    const rt = ctx.getRepo(repo);
+    if (!rt) return c.json({ error: notConfigured(repo) }, 404);
+    const intent = rt.deps.store.getIntent(Number(id));
+    if (!intent || intent.repo !== repo) return c.json({ error: `no intent #${id} in ${repo}` }, 404);
+    const fulfilled = rt.deps.store.fulfilIntent(intent.id, JSON.stringify(body?.result ?? {}));
+    if (!fulfilled) return c.json({ ok: false, message: `intent #${id} is ${intent.status}, not waiting — nothing to fulfil` }, 200);
+    rt.deps.store.recordEvent({ runId: fulfilled.runId, repo, ticketKey: fulfilled.ticketKey, type: "intent_fulfilled", detail: { intentId: fulfilled.id, kind: fulfilled.kind } });
+    // Latency nudge (fire-and-forget, like step-done): the handoff is durable, so a contended lock
+    // just defers the run reaction to the next tick's pass.
+    if (fulfilled.runId != null) {
+      const run = rt.deps.store.getRun(fulfilled.runId);
+      if (run && run.endedAt === null) await withRunLock(rt.deps, run.id, () => reconcileRun(rt.deps, rt.deps.store.getRun(run.id)!));
+    }
+    return c.json({ ok: true }, 200);
+  });
+
+  app.openapi(intentRecoverRoute, async (c) => {
+    const { repo } = c.req.valid("param");
+    const { causeScope } = c.req.valid("json");
+    const rt = ctx.getRepo(repo);
+    if (!rt) return c.json({ error: notConfigured(repo) }, 404);
+    return c.json({ requeued: rt.deps.store.requeueIntentsByCause(repo, causeScope) }, 200);
   });
 
   // --- `local` evidence publisher static serve ----------------------------

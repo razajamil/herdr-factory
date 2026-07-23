@@ -639,9 +639,47 @@ CREATE TABLE evidence_uploads(           -- evidence publishes as persisted INTE
 CREATE INDEX idx_evidence_uploads_pending ON evidence_uploads(repo, next_attempt_at)
   WHERE delivered_at IS NULL AND permanent_failed_at IS NULL AND abandoned_at IS NULL;
 
+CREATE TABLE intents(                    -- the INTENT LEDGER (v29): one durable-intent substrate for
+  id INTEGER PRIMARY KEY AUTOINCREMENT,  -- the deliver lane. A row is an obligation the engine owes
+  repo TEXT NOT NULL, kind TEXT NOT NULL,-- the world, retried/watched until it resolves; behavior
+  scope TEXT NOT NULL,                   -- lives in the INTENT_KINDS registry (src/intents/) — the
+  run_id INTEGER REFERENCES runs(id),    -- kernel (src/core/ledger.ts) dispatches on it, never on a
+  ticket_key TEXT,                       -- kind name. `scope` is the dedup+ordering domain
+  dedup_key TEXT NOT NULL DEFAULT '',    -- ('run:<id>' | 'repo'); UNIQUE(kind, scope, dedup_key)
+  seq INTEGER NOT NULL DEFAULT 0,        -- makes enqueue idempotent (re-open keeps `seq`, the FIFO
+  payload TEXT NOT NULL DEFAULT '{}',    -- slot). Kinds declare ordering (fifo | latest-wins |
+  state TEXT NOT NULL DEFAULT '{}',      -- independent), backoff curves, delivery + run reactions.
+  status TEXT NOT NULL DEFAULT 'pending' -- 'waiting' rows are the EXTERNAL-TRIGGER capability:
+    CHECK (status IN ('pending','waiting','delivered','superseded','failed','abandoned')),
+  attempts INTEGER NOT NULL DEFAULT 0, next_attempt_at INTEGER NOT NULL DEFAULT 0,
+  lease_until INTEGER,                   -- an inline (CLI) attempt's claim vs the Phase-0 flush
+  deadline_at INTEGER,                   -- waiting rows escalate via a handoff when it passes
+  last_error TEXT, error_class TEXT CHECK (error_class IN ('auth','transient','permanent','stale')),
+  cause_scope TEXT,                      -- cause-scoped due-now requeues ('source:<n>'|'publisher:s3')
+  notified_at INTEGER,                   -- per-row operator-notify throttle (the one config knob)
+  handoff_at INTEGER, handoff_marker TEXT, -- the two-phase handoff, generalized from the stale
+  consumed_at INTEGER, consumed_result TEXT, -- pattern: the LOCK-FREE kernel stamps; the run-locked
+  created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, -- Phase A consumes exactly once.
+  resolved_at INTEGER,
+  UNIQUE(kind, scope, dedup_key));
+
 CREATE TABLE locks(name TEXT PRIMARY KEY, owner TEXT, acquired_at INTEGER, expires_at INTEGER);
 CREATE TABLE schema_version(version INTEGER);
 ```
+
+**The intent ledger** (v29) is the deliver-lane substrate the legacy outbox tables migrate onto,
+kind by kind, leaf-first (evidence uploads → agent signals → the human-question loop →
+source transitions LAST, because they gate claiming) — each cutover converts in-flight rows in its
+migration and keeps a dual-read for one release. The kernel is two halves split on the codebase's
+lock-free/run-locked line: `ledgerFlow` (an `OutboxFlow` beside the legacy flushes — kind
+pre-passes, the deadline sweep for `waiting` rows, then the due walk with the per-scope FIFO gate
+checked against the DB) and `consumeIntentHandoffs` (top of each run's Phase-A pass — each owed
+handoff consumed exactly once via the kind's `consume()`, whose verdict, including any attention
+escalation, the reconciler applies; kinds never park runs themselves). `status='waiting'` +
+`POST /repos/:repo/intents/:id/fulfil` is the genuinely new capability: a first-class "wait for an
+external trigger" (webhook, CI callback, remote approval) with deadline escalation — shipped as the
+`external_wait` kind, the only externally-enqueuable one (hand-made engine-owned intents would
+bypass the reconciler's ordering/monotonicity rules).
 
 `db/store.ts` (synchronous): `countActive(repo)` / `countOccupying(repo)` (active minus parked —
 what the claim cap counts) / `countOccupyingBySource(repo)` (the same posture grouped by
@@ -1423,7 +1461,13 @@ what the old per-repo `watch` did, but collapsed into a single process plus a lo
   it": the run's undelivered outbox intents + pending signal/question, and its armed watches —
   the active step's guards with live clocks/counters and rescue class, the engine-universal
   watches, counted bounce caps — all registry-derived, read-only and lock-free;
-  `src/core/obligations.ts`) · `GET /doc` (the generated OpenAPI 3.0 spec) · `GET /ui`
+  `src/core/obligations.ts`) · the intent-ledger routes (`GET /repos/:repo/intents` ·
+  `POST /repos/:repo/intents` — externally-enqueuable kinds only, i.e. `external_wait` ·
+  `POST /repos/:repo/intents/{id}/retry` · `POST /repos/:repo/intents/{id}/fulfil` — resolve a
+  waiting external-trigger row; the run reacts on its next run-locked pass ·
+  `POST /repos/:repo/intents/recover` — cause-scoped due-now requeue), which own intent-ROW
+  lifecycle only — `run.phase` keeps exactly one writer (§6, the intent ledger) ·
+  `GET /doc` (the generated OpenAPI 3.0 spec) · `GET /ui`
   (Swagger UI). Validation
   failures, unknown routes and thrown errors are all normalised to `{ error }` (a `defaultHook` +
   `notFound`/`onError`) — the shape `server/client.ts` parses. Per-repo work logs to each repo's

@@ -96,6 +96,8 @@ export type EventType =
   | "evidence_uploaded" // the evidence-upload outbox delivered a capture's media to S3
   | "evidence_upload_failed" // the evidence-upload outbox hit a permanent (non-retryable) failure
   | "stale" // a write-back found the item gone at the source (deleted/transferred)
+  | "intent_fulfilled" // a waiting external-trigger intent was fulfilled (POST /intents/:id/fulfil)
+  | "intent_deadline" // a waiting intent's deadline expired (kernel sweep; run-scoped ⇒ may park)
   | "human_question"
   | "human_reply"
   | "focus_applied"
@@ -255,6 +257,57 @@ export interface WorkItem {
   lastRelease: string | null;
   createdAt: number;
   updatedAt: number;
+}
+
+// --- the intent ledger (the `intents` table, v29) ----------------------------
+// One durable-intent substrate for the deliver lane: a row is an obligation the engine owes the
+// world, retried/watched until it resolves. Behavior lives in the INTENT_KINDS registry
+// (src/intents/registry.ts) — the row carries only the shared scheduling facts; everything
+// kind-specific (ordering, backoff curve, delivery, run reactions) is code the kernel dispatches to.
+
+export type IntentStatus =
+  | "pending" // due-scheduled; the kernel retries it
+  | "waiting" // an external-trigger row: not retried — resolved by /fulfil or its deadline
+  | "delivered"
+  | "superseded" // a latest-wins sibling replaced it
+  | "failed" // terminal: permanent error / expired deadline
+  | "abandoned"; // dropped at teardown / by an operator
+
+/** One ledger row. `payload` is kind-owned and immutable after enqueue (re-enqueue replaces it);
+ *  `state` is kind-owned MUTABLE bookkeeping (poll counters, fulfil results). The two-phase handoff
+ *  columns generalize the transition outbox's stale pattern: the LOCK-FREE kernel only stamps
+ *  `handoffAt`/`handoffMarker`; the run-locked Phase A consumes it exactly once (`consumedAt`). */
+export interface Intent {
+  id: number;
+  repo: string;
+  kind: string;
+  /** The dedup + ordering domain: `run:<id>` | `repo` | a kind-chosen scope string. */
+  scope: string;
+  runId: number | null; // denormalized from a run scope (teardown/consume joins)
+  ticketKey: string | null; // denormalized for logs/UI
+  dedupKey: string; // idempotence within (kind, scope); "" = the kind's singleton
+  /** FIFO position within the scope (= id at first enqueue; kept across re-opens so a re-opened
+   *  row holds its original slot). */
+  seq: number;
+  payload: string; // kind-owned JSON
+  state: string; // kind-owned mutable JSON
+  status: IntentStatus;
+  attempts: number;
+  nextAttemptAt: number;
+  leaseUntil: number | null; // in-flight lease (an inline CLI attempt vs the Phase-0 flush)
+  deadlineAt: number | null; // waiting rows: escalate via handoff when it passes
+  lastError: string | null;
+  errorClass: "auth" | "transient" | "permanent" | "stale" | null;
+  /** Recovery key for cause-scoped due-now requeues (`source:<name>`, `publisher:s3`). */
+  causeScope: string | null;
+  notifiedAt: number | null; // per-row operator-notify throttle
+  handoffAt: number | null;
+  handoffMarker: string | null;
+  consumedAt: number | null;
+  consumedResult: string | null;
+  createdAt: number;
+  updatedAt: number;
+  resolvedAt: number | null;
 }
 
 /** One intended source status write-back, persisted until confirmed delivered (the transition

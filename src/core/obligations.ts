@@ -40,6 +40,8 @@ export interface RunObligations {
     evidenceUploads: { keyPrefix: string; attempts: number; nextAttemptAt: number; errorKind: string | null; lastError: string | null }[];
     pendingSignal: { signal: string; step: string | null; toStep: string | null; createdAt: number } | null;
     humanQuestion: { id: number; step: string | null; posted: boolean; pollAttempts: number; pollErrors: number; nextPollAt: number } | null;
+    /** Live ledger rows (pending/waiting) + resolved ones whose run reaction is still owed. */
+    ledger: { id: number; kind: string; status: string; nextAttemptAt: number; deadlineAt: number | null; handoffOwed: boolean; lastError: string | null }[];
   };
   /** Observe-lane: what is watching the run right now. */
   watches: {
@@ -80,6 +82,18 @@ export function runObligations(deps: Deps, run: Run): RunObligations {
   }));
   const sig = deps.store.unconsumedPendingSignalForRun(run.id);
   const q = deps.store.pendingHumanQuestionForRun(run.id);
+  const ledger = deps.store
+    .listIntents(deps.config.repoName, { runId: run.id })
+    .filter((i) => i.status === "pending" || i.status === "waiting" || (i.handoffAt !== null && i.consumedAt === null))
+    .map((i) => ({
+      id: i.id,
+      kind: i.kind,
+      status: i.status,
+      nextAttemptAt: i.nextAttemptAt,
+      deadlineAt: i.deadlineAt,
+      handoffOwed: i.handoffAt !== null && i.consumedAt === null,
+      lastError: i.lastError,
+    }));
 
   // The step under watch: the active one, or the belt's first while the claim's dispatch is pending.
   const watched: StepConfig | undefined = belt
@@ -156,6 +170,7 @@ export function runObligations(deps: Deps, run: Run): RunObligations {
       evidenceUploads,
       pendingSignal: sig ? { signal: sig.signal, step: sig.step, toStep: sig.toStep, createdAt: sig.createdAt } : null,
       humanQuestion: q ? { id: q.id, step: q.step, posted: q.externalId !== null, pollAttempts: q.pollAttempts, pollErrors: q.pollErrors, nextPollAt: q.nextPollAt } : null,
+      ledger,
     },
     watches: { step: watched?.name ?? null, guards, engine, bounceCaps },
   };

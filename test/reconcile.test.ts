@@ -2868,3 +2868,31 @@ describe("runObligations — pending intents + armed watches, registry-derived",
     expect(ro.facts).toMatchObject({ baselineSig: "sha-b", frozenAt: 77 });
   });
 });
+
+// The intent ledger's run-facing half through the REAL reconcile machinery: a fulfilled wait is
+// consumed on the run's next pass; an expired one parks the run via the kind's escalation verdict.
+describe("external_wait intents — fulfil and deadline through reconcileRun", () => {
+  it("a fulfilled wait is consumed exactly once and recorded on the timeline", async () => {
+    const { deps, store, worktree } = build();
+    const run = seed(store, worktree, "K-EW1", "running", "fix");
+    const wait = store.enqueueIntent({ repo: "demo", kind: "external_wait", scope: `run:${run.id}`, runId: run.id, ticketKey: "K-EW1", dedupKey: "ci-gate", payload: JSON.stringify({ note: "release CI" }), status: "waiting" });
+    store.fulfilIntent(wait.id, '{"conclusion":"success"}');
+    await reconcileRun(deps, store.getRun(run.id)!);
+    expect(store.getIntent(wait.id)!.consumedResult).toBe("applied");
+    expect(store.getRun(run.id)!.phase).toBe("running"); // no park; the run just carries on
+    const events = store.timeline("demo", "K-EW1").filter((e) => e.type === "intent_fulfilled");
+    expect(events.length).toBe(1);
+  });
+
+  it("an expired wait parks the run for attention with reason external_wait_deadline", async () => {
+    const { deps, store, worktree, setNow } = build();
+    const run = seed(store, worktree, "K-EW2", "running", "fix");
+    store.enqueueIntent({ repo: "demo", kind: "external_wait", scope: `run:${run.id}`, runId: run.id, ticketKey: "K-EW2", dedupKey: "approval", payload: JSON.stringify({ note: "security approval" }), status: "waiting", deadlineAt: 1500 });
+    setNow(1501);
+    await reconcileRepo(deps); // Phase 0 sweeps the deadline; Phase A consumes the handoff → park
+    const got = store.getRun(run.id)!;
+    expect(got.phase).toBe("attention");
+    expect(got.attentionReasonCode).toBe("external_wait_deadline");
+    expect(got.attentionReason).toContain("security approval");
+  });
+});

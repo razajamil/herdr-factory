@@ -13,6 +13,9 @@ import { branchName } from "./branch.ts";
 import { firstStep, indexOfStep, materializeWork, MEMORY_DIR, nextStep, scrubCommittedMemoryDir, spawnStep, stepByName } from "./step.ts";
 import { BOUNCE_CAP, CAPTURE_CAP_GUARD, guardsResetOn, READ_ONLY_GUARD, STEP_DESCRIPTORS } from "../steps/registry.ts";
 import { PANE_ABSENCE_CONFIRM_SECONDS } from "../steps/engine-watches.ts";
+import { flushOutbox, type OutboxFlow } from "./outbox.ts";
+import { consumeIntentHandoffs, ledgerFlow } from "./ledger.ts";
+import { INTENT_KINDS } from "../intents/registry.ts";
 import { wakeResolver } from "./watch.ts";
 import { recordSourceAuthEvent, recordTick, recordTickDuration, recordTickLockSkipped, telemetryEvent, telemetrySpan } from "../telemetry/index.ts";
 import { isSourceUnauthenticated, type SourceUnauthenticatedError } from "../auth/errors.ts";
@@ -216,37 +219,6 @@ function sameTrigger(a: BeltEffectTrigger, b: BeltEffectTrigger): boolean {
   return false;
 }
 
-/** One durable-intent outbox the Phase 0 flush drives. The DRIVER (`flushOutbox`) owns the pass
- *  shape — run the optional pre-pass hook, walk the due rows, isolate per-row failures — while each
- *  flow keeps its own delivery semantics (per-run FIFO gates, terminal vocabulary, error
- *  classification, notify policy) inside `attempt`. Every flow is LOCK-FREE by contract: it must
- *  never mutate a run — only its own rows + events + best-effort notifies (a run-policy reaction
- *  crosses to the run-locked Phase A, e.g. the stale two-phase). Adding outbox N+1 is one more
- *  entry in `outboxFlows`, not a third copy of the loop. */
-interface OutboxFlow<J> {
-  readonly name: string;
-  /** Runs once before the due rows are walked (the evidence flow's creds-recovery probe + due-now
-   *  requeue of auth-stuck rows). */
-  prePass?(): Promise<void>;
-  /** Rows due for a delivery attempt this pass. */
-  due(): J[];
-  /** One row's delivery attempt. Owns its outcome bookkeeping entirely — delivered / backoff /
-   *  terminal stamp / throttled notify. Expected failures must be RECORDED, never thrown: a throw
-   *  here is a flow bug, which the driver logs and skips so one bad row can't stall the pass. */
-  attempt(job: J): Promise<void>;
-}
-
-async function flushOutbox<J>(deps: Deps, flow: OutboxFlow<J>): Promise<void> {
-  if (flow.prePass) await flow.prePass();
-  for (const job of flow.due()) {
-    try {
-      await flow.attempt(job);
-    } catch (e) {
-      deps.log("error", `${flow.name} flush: attempt failed unexpectedly: ${err(e)}`);
-    }
-  }
-}
-
 /** The source status write-backs (transition outbox) as a flush flow: retry every due undelivered
  *  intent, strictly in-order per run. */
 function transitionOutboxFlow(deps: Deps): OutboxFlow<TransitionIntent> {
@@ -343,9 +315,10 @@ function evidenceUploadFlow(deps: Deps): OutboxFlow<EvidenceUpload> {
 }
 
 /** The Phase 0 outbox flows, in delivery order: status write-backs first (they gate claiming — the
- *  known-stale-eligibility veto — so they converge before anything else), then evidence uploads. */
+ *  known-stale-eligibility veto — so they converge before anything else), then evidence uploads,
+ *  then the intent ledger (the generic kernel the legacy flows migrate onto, kind by kind). */
 function outboxFlows(deps: Deps): OutboxFlow<unknown>[] {
-  return [transitionOutboxFlow(deps), evidenceUploadFlow(deps)];
+  return [transitionOutboxFlow(deps), evidenceUploadFlow(deps), ledgerFlow(deps)];
 }
 
 /** Retry every due undelivered transition intent (in per-run order, stopping a run's chain at its
@@ -824,6 +797,14 @@ async function reconcileRunImpl(deps: Deps, run: Run, ctx: TickCtx): Promise<voi
       if (consumed.ok) return;
       run = deps.store.getRun(run.id)!;
     }
+  }
+  // Consume ledger handoffs owed to this run (the run-locked half of the intent kernel — the
+  // generalized stale two-phase): each is consumed exactly once; an escalation verdict parks here,
+  // where the escalation machinery lives (kinds never park runs themselves).
+  if (run.phase !== "done" && run.phase !== "tearing_down") {
+    const escalate = await consumeIntentHandoffs(deps, run);
+    if (escalate) return escalateAttention(deps, run, escalate);
+    run = deps.store.getRun(run.id)!;
   }
   await dispatchPhase(deps, run, belt, src, ctx);
   // Then, on every pass for every active run, try to apply any deferred focus shift. Doing
@@ -2067,6 +2048,12 @@ export async function resumeRun(deps: Deps, run: Run): Promise<{ ok: boolean; ph
     for (const s of belt.steps) deps.store.resetGuardCounter(run.id, s.name, BOUNCE_CAP.guard);
     deps.log("info", `${run.ticketKey}: bounce budget refunded on resume from a bounce_limit park`);
   }
+  // Ledger refunds, derived from the kind declarations: a human resume makes any of the run's
+  // pending intents whose kind declares `refundOnResume: "due_now"` due immediately.
+  for (const k of INTENT_KINDS) {
+    if (k.refundOnResume !== "due_now") continue;
+    for (const row of deps.store.listIntents(repo, { runId: run.id, kind: k.kind, status: "pending" })) deps.store.retryIntentNow(row.id);
+  }
   const pendingQuestion = deps.store.pendingHumanQuestionForRun(run.id);
   let phase: Run["phase"];
   if (pendingQuestion && run.step && stepByName(belt, run.step)) {
@@ -2212,6 +2199,11 @@ async function teardownImpl(deps: Deps, run: Run, outcome: Outcome, src: SourceR
   // so the bytes can't be uploaded anymore. Log the loss so it's visible rather than silent.
   const dropped = deps.store.abandonEvidenceUploadsForRun(run.id, `run torn down (${outcome}) before upload landed`);
   if (dropped > 0) deps.log("warn", `${run.ticketKey}: ${dropped} evidence upload(s) dropped at teardown — bytes never reached S3 (likely SSO was down through merge)`);
+  // Drop the run's live ledger intents whose kind dies with the run (external waits, and — as kinds
+  // cut over — anything not marked survivesTeardown; terminal write-backs must outlive the run).
+  const teardownKinds = INTENT_KINDS.filter((k) => !k.survivesTeardown).map((k) => k.kind);
+  const droppedIntents = teardownKinds.length > 0 ? deps.store.abandonIntentsForRun(run.id, `run torn down (${outcome})`, teardownKinds) : 0;
+  if (droppedIntents > 0) deps.log("warn", `${run.ticketKey}: ${droppedIntents} pending intent(s) abandoned at teardown`);
 
   deps.store.endRun(run.id, outcome);
   deps.store.recordEvent({ runId: run.id, repo, ticketKey: run.ticketKey, type: "torn_down", detail: { outcome } });

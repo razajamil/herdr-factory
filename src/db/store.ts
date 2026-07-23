@@ -5,6 +5,8 @@ import type {
   EvidenceUpload,
   HumanQuestion,
   HumanQuestionPatch,
+  Intent,
+  IntentStatus,
   Outcome,
   PendingSignal,
   RepoEvent,
@@ -263,6 +265,66 @@ function toHumanQuestion(r: HumanQuestionRow): HumanQuestion {
     createdAt: r.created_at,
     updatedAt: r.updated_at,
     answeredAt: r.answered_at,
+  };
+}
+
+interface IntentRow {
+  id: number;
+  repo: string;
+  kind: string;
+  scope: string;
+  run_id: number | null;
+  ticket_key: string | null;
+  dedup_key: string;
+  seq: number;
+  payload: string;
+  state: string;
+  status: string;
+  attempts: number;
+  next_attempt_at: number;
+  lease_until: number | null;
+  deadline_at: number | null;
+  last_error: string | null;
+  error_class: string | null;
+  cause_scope: string | null;
+  notified_at: number | null;
+  handoff_at: number | null;
+  handoff_marker: string | null;
+  consumed_at: number | null;
+  consumed_result: string | null;
+  created_at: number;
+  updated_at: number;
+  resolved_at: number | null;
+}
+
+function toIntent(r: IntentRow): Intent {
+  return {
+    id: r.id,
+    repo: r.repo,
+    kind: r.kind,
+    scope: r.scope,
+    runId: r.run_id,
+    ticketKey: r.ticket_key,
+    dedupKey: r.dedup_key,
+    seq: r.seq,
+    payload: r.payload,
+    state: r.state,
+    status: r.status as Intent["status"],
+    attempts: r.attempts,
+    nextAttemptAt: r.next_attempt_at,
+    leaseUntil: r.lease_until,
+    deadlineAt: r.deadline_at,
+    lastError: r.last_error,
+    errorClass: r.error_class as Intent["errorClass"],
+    causeScope: r.cause_scope,
+    notifiedAt: r.notified_at,
+    handoffAt: r.handoff_at,
+    handoffMarker: r.handoff_marker,
+    consumedAt: r.consumed_at,
+    consumedResult: r.consumed_result,
+    createdAt: r.created_at,
+    updatedAt: r.updated_at,
+    resolvedAt: r.resolved_at,
   };
 }
 
@@ -1299,6 +1361,288 @@ export class Store {
   markPendingSignalConsumed(id: number, result: string): void {
     this.db.prepare("UPDATE pending_signals SET consumed_at = ?, consumed_result = ? WHERE id = ?").run(this.now(), result, id);
     telemetryEvent("store.pending_signal.consumed", { "signal.id": id, result });
+  }
+
+  // --- the intent ledger (`intents`, v29) -------------------------------------
+  // The shared deliver-lane substrate the INTENT_KINDS registry rides on. These methods carry the
+  // SHARED mechanics only (idempotent enqueue with FIFO-slot-preserving re-open, latest-wins
+  // supersession, due/lease queries, terminal stamps, the two-phase handoff, cause-scoped
+  // requeues); everything kind-specific stays in the kind's own code, dispatched by core/ledger.ts.
+
+  getIntent(id: number): Intent | undefined {
+    const row = this.db.prepare("SELECT * FROM intents WHERE id = ?").get(id) as IntentRow | undefined;
+    return row ? toIntent(row) : undefined;
+  }
+
+  /** Record (or re-open) an intent. Idempotent per (kind, scope, dedupKey): re-enqueueing a live
+   *  row makes it due now with the fresh payload; re-enqueueing a RESOLVED one re-opens it (the
+   *  delivery must be idempotent at the backend — the transition/evidence re-open precedent),
+   *  keeping its original `seq` so a re-opened row holds its FIFO slot. `supersedeScope` (the
+   *  latest-wins orderings) first supersedes every other live row in (kind, scope) — newest wins,
+   *  superseded rows keep their outcome for the timeline. Transactional. */
+  enqueueIntent(input: {
+    repo: string;
+    kind: string;
+    scope: string;
+    runId?: number | null;
+    ticketKey?: string | null;
+    dedupKey?: string;
+    payload?: string;
+    status?: "pending" | "waiting";
+    causeScope?: string | null;
+    deadlineAt?: number | null;
+    leaseUntil?: number | null;
+    supersedeScope?: boolean;
+  }): Intent {
+    const t = this.now();
+    const dedup = input.dedupKey ?? "";
+    const status = input.status ?? "pending";
+    return tx(this.db, () => {
+      if (input.supersedeScope) {
+        this.db
+          .prepare(
+            `UPDATE intents SET status = 'superseded', resolved_at = ?, updated_at = ?
+             WHERE kind = ? AND scope = ? AND dedup_key <> ? AND status IN ('pending','waiting')`,
+          )
+          .run(t, t, input.kind, input.scope, dedup);
+      }
+      this.db
+        .prepare(
+          `INSERT INTO intents (repo, kind, scope, run_id, ticket_key, dedup_key, payload, status, next_attempt_at,
+             cause_scope, deadline_at, lease_until, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(kind, scope, dedup_key) DO UPDATE SET
+             payload = excluded.payload, status = excluded.status, next_attempt_at = excluded.next_attempt_at,
+             cause_scope = excluded.cause_scope, deadline_at = excluded.deadline_at, lease_until = excluded.lease_until,
+             error_class = NULL, handoff_at = NULL, handoff_marker = NULL, consumed_at = NULL, consumed_result = NULL,
+             resolved_at = NULL, updated_at = excluded.updated_at`,
+        )
+        .run(
+          input.repo,
+          input.kind,
+          input.scope,
+          input.runId ?? null,
+          input.ticketKey ?? null,
+          dedup,
+          input.payload ?? "{}",
+          status,
+          t,
+          input.causeScope ?? null,
+          input.deadlineAt ?? null,
+          input.leaseUntil ?? null,
+          t,
+          t,
+        );
+      // Stamp the FIFO slot on first insert (seq = id); a re-opened row keeps its original seq.
+      this.db.prepare("UPDATE intents SET seq = id WHERE kind = ? AND scope = ? AND dedup_key = ? AND seq = 0").run(input.kind, input.scope, dedup);
+      const row = this.db
+        .prepare("SELECT * FROM intents WHERE kind = ? AND scope = ? AND dedup_key = ?")
+        .get(input.kind, input.scope, dedup) as IntentRow | undefined;
+      if (!row) throw new Error("enqueueIntent: row vanished after upsert");
+      telemetryEvent("store.intent.enqueue", { repo: input.repo, "intent.kind": input.kind, "intent.scope": input.scope, "intent.id": row.id, "intent.status": status });
+      return toIntent(row);
+    });
+  }
+
+  /** Pending intents due for a delivery attempt: due-now AND not leased by an inline attempt.
+   *  Ordered (scope, seq) so a scope's FIFO chain is walked in intent order. */
+  dueIntents(repo: string, limit = 25): Intent[] {
+    const now = this.now();
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM intents WHERE repo = ? AND status = 'pending' AND next_attempt_at <= ?
+         AND (lease_until IS NULL OR lease_until <= ?) ORDER BY scope, seq LIMIT ?`,
+      )
+      .all(repo, now, now, limit) as unknown as IntentRow[];
+    return rows.map(toIntent);
+  }
+
+  /** Is an EARLIER live intent of this kind still unresolved in the scope? The FIFO gate — checked
+   *  against the DB, not the pass, so an earlier sibling that is backed off (not due) still blocks. */
+  earlierPendingIntentInScope(kind: string, scope: string, seq: number): boolean {
+    const row = this.db
+      .prepare("SELECT 1 AS x FROM intents WHERE kind = ? AND scope = ? AND seq < ? AND status IN ('pending','waiting') LIMIT 1")
+      .get(kind, scope, seq) as { x: number } | undefined;
+    return row !== undefined;
+  }
+
+  /** Waiting rows whose deadline has passed and whose handoff hasn't fired — the kernel escalates
+   *  these (status → failed + a 'deadline' handoff for the run-locked reaction). */
+  dueIntentDeadlines(repo: string): Intent[] {
+    const rows = this.db
+      .prepare("SELECT * FROM intents WHERE repo = ? AND status = 'waiting' AND deadline_at IS NOT NULL AND deadline_at <= ? AND handoff_at IS NULL")
+      .all(repo, this.now()) as unknown as IntentRow[];
+    return rows.map(toIntent);
+  }
+
+  /** Record a failed delivery attempt: bump, classify, back off by `delaySeconds` (the kind's
+   *  curve), clear any lease. Guarded to pending rows so a raced terminal stamp isn't reopened. */
+  recordIntentAttempt(id: number, error: string, errorClass: Intent["errorClass"], delaySeconds: number): Intent | undefined {
+    const t = this.now();
+    this.db
+      .prepare(
+        `UPDATE intents SET attempts = attempts + 1, next_attempt_at = ?, lease_until = NULL,
+         last_error = ?, error_class = ?, updated_at = ? WHERE id = ? AND status = 'pending'`,
+      )
+      .run(t + delaySeconds, error.slice(0, 500), errorClass, t, id);
+    const e = this.getIntent(id);
+    telemetryEvent("store.intent.attempt_failed", { repo: e?.repo, "intent.kind": e?.kind, "intent.id": id, "intent.attempts": e?.attempts, "intent.error_class": errorClass ?? undefined });
+    return e;
+  }
+
+  /** Reschedule a pending row without counting an error (a reply-poll miss): due again in
+   *  `delaySeconds`, kind-owned `state` optionally replaced. */
+  rescheduleIntent(id: number, delaySeconds: number, state?: string): void {
+    const t = this.now();
+    if (state !== undefined) {
+      this.db.prepare("UPDATE intents SET next_attempt_at = ?, state = ?, lease_until = NULL, updated_at = ? WHERE id = ? AND status = 'pending'").run(t + delaySeconds, state, t, id);
+    } else {
+      this.db.prepare("UPDATE intents SET next_attempt_at = ?, lease_until = NULL, updated_at = ? WHERE id = ? AND status = 'pending'").run(t + delaySeconds, t, id);
+    }
+  }
+
+  /** Replace a row's kind-owned mutable state (poll counters, fulfil results). */
+  setIntentState(id: number, state: string): void {
+    this.db.prepare("UPDATE intents SET state = ?, updated_at = ? WHERE id = ?").run(state, this.now(), id);
+  }
+
+  markIntentDelivered(id: number): void {
+    const t = this.now();
+    this.db
+      .prepare("UPDATE intents SET status = 'delivered', resolved_at = ?, lease_until = NULL, updated_at = ? WHERE id = ? AND status IN ('pending','waiting')")
+      .run(t, t, id);
+    const e = this.getIntent(id);
+    telemetryEvent("store.intent.delivered", { repo: e?.repo, "intent.kind": e?.kind, "intent.id": id });
+  }
+
+  markIntentFailed(id: number, reason: string): void {
+    const t = this.now();
+    this.db
+      .prepare(
+        `UPDATE intents SET status = 'failed', last_error = ?, error_class = COALESCE(error_class, 'permanent'),
+         resolved_at = ?, lease_until = NULL, updated_at = ? WHERE id = ? AND status IN ('pending','waiting')`,
+      )
+      .run(reason.slice(0, 500), t, t, id);
+    const e = this.getIntent(id);
+    telemetryEvent("store.intent.failed", { repo: e?.repo, "intent.kind": e?.kind, "intent.id": id });
+  }
+
+  /** Stamp a handoff — "a run-policy reaction is owed" — from the LOCK-FREE kernel; the run-locked
+   *  Phase A consumes it exactly once. `resolve` also closes the row (the stale pattern: delivered
+   *  as far as the kernel is concerned, owed to the run). A run-less (repo-scoped) handoff has no
+   *  consumer loop, so it is stamped consumed immediately. */
+  markIntentHandoff(id: number, marker: string, opts: { resolve?: "delivered" | "failed"; error?: string } = {}): void {
+    const t = this.now();
+    const sets: string[] = ["handoff_at = ?", "handoff_marker = ?", "updated_at = ?"];
+    const vals: Bind[] = [t, marker, t];
+    if (opts.resolve) {
+      sets.push("status = ?", "resolved_at = ?", "lease_until = NULL");
+      vals.push(opts.resolve, t);
+    }
+    if (opts.error) {
+      sets.push("last_error = ?");
+      vals.push(opts.error.slice(0, 500));
+    }
+    this.db.prepare(`UPDATE intents SET ${sets.join(", ")} WHERE id = ?`).run(...vals, id);
+    const e = this.getIntent(id);
+    if (e && e.runId == null) this.markIntentConsumed(id, "acknowledged (no run)");
+    telemetryEvent("store.intent.handoff", { repo: e?.repo, "intent.kind": e?.kind, "intent.id": id, "intent.handoff": marker });
+  }
+
+  /** Unconsumed handoffs owed to a run — Phase A's consume input, oldest first. */
+  unconsumedIntentHandoffsForRun(runId: number): Intent[] {
+    const rows = this.db
+      .prepare("SELECT * FROM intents WHERE run_id = ? AND handoff_at IS NOT NULL AND consumed_at IS NULL ORDER BY id")
+      .all(runId) as unknown as IntentRow[];
+    return rows.map(toIntent);
+  }
+
+  markIntentConsumed(id: number, result: string): void {
+    this.db.prepare("UPDATE intents SET consumed_at = ?, consumed_result = ?, updated_at = ? WHERE id = ?").run(this.now(), result, this.now(), id);
+    telemetryEvent("store.intent.consumed", { "intent.id": id, result });
+  }
+
+  /** Resolve a `waiting` external-trigger row: the external thing happened. Stores the caller's
+   *  result in `state`, closes the row, and stamps the 'fulfilled' handoff for the run-locked
+   *  reaction. Returns the row, or undefined when it wasn't waiting (already fulfilled/expired). */
+  fulfilIntent(id: number, result?: string): Intent | undefined {
+    const t = this.now();
+    const info = this.db
+      .prepare("UPDATE intents SET status = 'delivered', state = ?, resolved_at = ?, updated_at = ? WHERE id = ? AND status = 'waiting'")
+      .run(result ?? "{}", t, t, id);
+    if (Number(info.changes) === 0) return undefined;
+    this.markIntentHandoff(id, "fulfilled");
+    const e = this.getIntent(id);
+    telemetryEvent("store.intent.fulfilled", { repo: e?.repo, "intent.kind": e?.kind, "intent.id": id });
+    return e;
+  }
+
+  /** Stamp the per-row operator-notify throttle. */
+  markIntentNotified(id: number): void {
+    this.db.prepare("UPDATE intents SET notified_at = ?, updated_at = ? WHERE id = ?").run(this.now(), this.now(), id);
+  }
+
+  /** Cause recovery (auth restored, creds back): make every live row under the cause due now, so
+   *  the next flush lands it instead of waiting out its backoff. Optionally scoped to an error
+   *  class (the SSO path requeues auth-stuck rows only). Returns how many were re-queued. */
+  requeueIntentsByCause(repo: string, causeScope: string, errorClass?: Intent["errorClass"]): number {
+    const t = this.now();
+    const info = errorClass
+      ? this.db
+          .prepare("UPDATE intents SET next_attempt_at = ?, updated_at = ? WHERE repo = ? AND cause_scope = ? AND error_class = ? AND status = 'pending'")
+          .run(t, t, repo, causeScope, errorClass)
+      : this.db
+          .prepare("UPDATE intents SET next_attempt_at = ?, updated_at = ? WHERE repo = ? AND cause_scope = ? AND status = 'pending'")
+          .run(t, t, repo, causeScope);
+    const requeued = Number(info.changes);
+    if (requeued > 0) telemetryEvent("store.intent.cause_recovered", { repo, "intent.cause": causeScope, "intent.requeued": requeued });
+    return requeued;
+  }
+
+  /** Operator due-now for one pending row (the /intents/:id/retry endpoint). */
+  retryIntentNow(id: number): boolean {
+    const info = this.db.prepare("UPDATE intents SET next_attempt_at = ?, updated_at = ? WHERE id = ? AND status = 'pending'").run(this.now(), this.now(), id);
+    return Number(info.changes) > 0;
+  }
+
+  /** Drop a run's live intents at teardown (optionally only some kinds — e.g. evidence bytes die
+   *  with the worktree, while terminal write-backs must outlive the run). Returns the count. */
+  abandonIntentsForRun(runId: number, reason: string, kinds?: readonly string[]): number {
+    const t = this.now();
+    const kindFilter = kinds && kinds.length > 0 ? ` AND kind IN (${kinds.map(() => "?").join(",")})` : "";
+    const info = this.db
+      .prepare(
+        `UPDATE intents SET status = 'abandoned', last_error = ?, resolved_at = ?, updated_at = ?
+         WHERE run_id = ? AND status IN ('pending','waiting')${kindFilter}`,
+      )
+      .run(reason.slice(0, 500), t, t, runId, ...(kinds ?? []));
+    return Number(info.changes);
+  }
+
+  /** Ledger rows for the introspection surfaces (the /intents endpoint, obligations, doctor). */
+  listIntents(repo: string, filter: { kind?: string; status?: IntentStatus; runId?: number; key?: string; limit?: number } = {}): Intent[] {
+    const where: string[] = ["repo = ?"];
+    const vals: Bind[] = [repo];
+    if (filter.kind) {
+      where.push("kind = ?");
+      vals.push(filter.kind);
+    }
+    if (filter.status) {
+      where.push("status = ?");
+      vals.push(filter.status);
+    }
+    if (filter.runId != null) {
+      where.push("run_id = ?");
+      vals.push(filter.runId);
+    }
+    if (filter.key) {
+      where.push("ticket_key = ?");
+      vals.push(filter.key);
+    }
+    const rows = this.db
+      .prepare(`SELECT * FROM intents WHERE ${where.join(" AND ")} ORDER BY id DESC LIMIT ?`)
+      .all(...vals, filter.limit ?? 100) as unknown as IntentRow[];
+    return rows.map(toIntent);
   }
 
   // --- human-in-the-loop questions ------------------------------------------
