@@ -891,37 +891,52 @@ export class Store {
   }
 
   // --- transition outbox (source status write-backs, retried until delivered) --
+  // STORAGE: the intent LEDGER since v33 (kind `source_transition` — FIFO per run scope, dedup
+  // `<toState>:<toStatus>`, the stale two-phase as a 'stale' handoff). These methods are the
+  // domain API the reconciler keeps using — they adapt to/from ledger rows, so deliverTransition,
+  // the flush flow's FIFO gate, the Phase-B claim veto, and fireEffect's rank scan are byte-
+  // unchanged. The kind is deliveredBy+consumedBy "reconciler" (delivery needs the resolved
+  // source/belt/auth machinery; the stale policy needs teardown/escalation), so the kernel's due
+  // walk never touches these rows. The legacy `transition_outbox` table's undelivered backlog was
+  // converted by v33; a row a still-draining old-code process writes around the upgrade is
+  // converted by drainLegacyTransitions (called from the flow's prePass — Phase 0, BEFORE Phase A
+  // can enqueue new transitions for the same run, so a converted row's FIFO slot always precedes
+  // the run's post-upgrade intents). The legacy table drops in a contract migration.
 
-  private toTransitionIntent(r: TransitionIntentRow): TransitionIntent {
+  /** Map a ledger `source_transition` row onto the domain TransitionIntent shape. */
+  private intentToTransition(i: Intent): TransitionIntent {
+    const p = JSON.parse(i.payload) as { toState: WorkState; toStatus: string; workSource: string };
+    const stale = i.handoffMarker === "stale" ? i.handoffAt : null;
     return {
-      id: r.id,
-      runId: r.run_id,
-      repo: r.repo,
-      workSource: r.work_source,
-      ticketKey: r.ticket_key,
-      toState: r.to_state as WorkState,
-      toStatus: r.to_status,
-      attempts: r.attempts,
-      nextAttemptAt: r.next_attempt_at,
-      lastError: r.last_error,
-      createdAt: r.created_at,
-      updatedAt: r.updated_at,
-      deliveredAt: r.delivered_at,
-      staleAt: r.stale_at,
-      staleHandledAt: r.stale_handled_at,
+      id: i.id,
+      runId: i.runId!,
+      repo: i.repo,
+      workSource: p.workSource,
+      ticketKey: i.ticketKey ?? "",
+      toState: p.toState,
+      toStatus: p.toStatus,
+      attempts: i.attempts,
+      nextAttemptAt: i.nextAttemptAt,
+      lastError: i.lastError,
+      createdAt: i.createdAt,
+      updatedAt: i.updatedAt,
+      deliveredAt: i.status === "delivered" ? (i.resolvedAt ?? i.updatedAt) : null,
+      staleAt: stale,
+      staleHandledAt: stale != null ? i.consumedAt : null,
     };
   }
 
   getTransitionIntent(id: number): TransitionIntent | undefined {
-    const row = this.db.prepare("SELECT * FROM transition_outbox WHERE id = ?").get(id) as TransitionIntentRow | undefined;
-    return row ? this.toTransitionIntent(row) : undefined;
+    const i = this.getIntent(id);
+    return i && i.kind === "source_transition" ? this.intentToTransition(i) : undefined;
   }
 
   /** Record the INTENT to move a work item to `toState` (with an optional source-native `toStatus`
    *  key from a belt effect; '' = canonical mapping). Idempotent per (run, state, status):
    *  re-enqueueing a delivered intent re-opens it for delivery (the transition itself is idempotent
-   *  at the source), re-enqueueing a pending one just makes it due now. A custom status and a
-   *  canonical transition at the same anchor are DISTINCT intents (they differ in `toStatus`). */
+   *  at the source — the re-open keeps the row's original FIFO slot), re-enqueueing a pending one
+   *  just makes it due now. A custom status and a canonical transition at the same anchor are
+   *  DISTINCT intents (they differ in `toStatus`). */
   enqueueTransition(input: {
     runId: number;
     repo: string;
@@ -930,58 +945,62 @@ export class Store {
     toState: WorkState;
     toStatus?: string;
   }): TransitionIntent {
-    const t = this.now();
+    // Drain-window guard (one release): convert THIS run's legacy rows BEFORE enqueueing, so a
+    // nudge-driven intent can never take a FIFO slot ahead of a write-back a still-draining
+    // old-code process recorded first — the per-run in-order invariant must hold across the
+    // cutover, not just within one process's tick (mirrors agent_signal's read-site lazy drain).
+    this.convertLegacyTransitions(this.legacyTransitionRows({ runId: input.runId }));
     const toStatus = input.toStatus ?? "";
-    this.db
-      .prepare(
-        `INSERT INTO transition_outbox (run_id, repo, work_source, ticket_key, to_state, to_status, attempts, next_attempt_at, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
-         ON CONFLICT(run_id, to_state, to_status) DO UPDATE SET next_attempt_at = excluded.next_attempt_at, delivered_at = NULL,
-           stale_at = NULL, stale_handled_at = NULL, updated_at = excluded.updated_at`,
-      )
-      .run(input.runId, input.repo, input.workSource, input.ticketKey, input.toState, toStatus, t, t, t);
-    const row = this.db
-      .prepare("SELECT * FROM transition_outbox WHERE run_id = ? AND to_state = ? AND to_status = ?")
-      .get(input.runId, input.toState, toStatus) as TransitionIntentRow | undefined;
-    if (!row) throw new Error("enqueueTransition: row vanished after upsert");
+    const intent = this.enqueueIntent({
+      repo: input.repo,
+      kind: "source_transition",
+      scope: `run:${input.runId}`,
+      runId: input.runId,
+      ticketKey: input.ticketKey,
+      dedupKey: `${input.toState}:${toStatus}`,
+      payload: JSON.stringify({ toState: input.toState, toStatus, workSource: input.workSource }),
+      causeScope: `source:${input.workSource}`,
+    });
     telemetryEvent("store.transition.enqueue", { repo: input.repo, "run.id": input.runId, "work.key": input.ticketKey, "work.state": input.toState, "work.status": toStatus || undefined });
-    return this.toTransitionIntent(row);
+    return this.intentToTransition(intent);
   }
 
   /** Every transition target ENQUEUED for a run (delivered or pending), for effect monotonicity:
    *  the reconciler ranks these to refuse an effect that would walk the source backward. */
   transitionTargetsForRun(runId: number): { toState: WorkState; toStatus: string }[] {
     const rows = this.db
-      .prepare("SELECT to_state, to_status FROM transition_outbox WHERE run_id = ?")
-      .all(runId) as { to_state: string; to_status: string }[];
-    return rows.map((r) => ({ toState: r.to_state as WorkState, toStatus: r.to_status }));
+      .prepare("SELECT payload FROM intents WHERE run_id = ? AND kind = 'source_transition'")
+      .all(runId) as { payload: string }[];
+    return rows.map((r) => {
+      const p = JSON.parse(r.payload) as { toState: WorkState; toStatus: string };
+      return { toState: p.toState, toStatus: p.toStatus };
+    });
   }
 
-  /** Undelivered intents due for a delivery attempt, ordered (run, id) so a run's transitions
+  /** Undelivered intents due for a delivery attempt, ordered (scope, seq) so a run's transitions
    *  are always attempted in the order they were intended. */
   dueTransitions(repo: string, limit = 25): TransitionIntent[] {
     const rows = this.db
       .prepare(
-        "SELECT * FROM transition_outbox WHERE repo = ? AND delivered_at IS NULL AND next_attempt_at <= ? ORDER BY run_id, id LIMIT ?",
+        `SELECT * FROM intents WHERE repo = ? AND kind = 'source_transition' AND status = 'pending'
+         AND next_attempt_at <= ? ORDER BY scope, seq LIMIT ?`,
       )
-      .all(repo, this.now(), limit) as unknown as TransitionIntentRow[];
-    return rows.map((r) => this.toTransitionIntent(r));
+      .all(repo, this.now(), limit) as unknown as IntentRow[];
+    return rows.map((r) => this.intentToTransition(toIntent(r)));
   }
 
   /** Is an EARLIER intent for this run still undelivered? Delivery must be in-order per run (a
    *  retried in_development firing after in_review landed would walk the source backward). */
   undeliveredTransitionBefore(runId: number, beforeId: number): boolean {
-    const row = this.db
-      .prepare("SELECT 1 AS x FROM transition_outbox WHERE run_id = ? AND id < ? AND delivered_at IS NULL LIMIT 1")
-      .get(runId, beforeId) as { x: number } | undefined;
-    return row !== undefined;
+    const row = this.getIntent(beforeId);
+    if (!row) return false;
+    return this.earlierPendingIntentInScope("source_transition", `run:${runId}`, row.seq);
   }
 
   markTransitionDelivered(id: number): void {
-    const t = this.now();
-    // last_error is left as-is: with delivered_at set it reads as history ("delivered after N
+    // last_error is left as-is: with the row delivered it reads as history ("delivered after N
     // failed attempts, last of which was …"), and the source-removed close-out relies on it.
-    this.db.prepare("UPDATE transition_outbox SET delivered_at = ?, updated_at = ? WHERE id = ?").run(t, t, id);
+    this.markIntentDelivered(id);
     const e = this.getTransitionIntent(id);
     telemetryEvent("store.transition.delivered", { repo: e?.repo, "run.id": e?.runId, "work.key": e?.ticketKey, "work.state": e?.toState });
   }
@@ -990,13 +1009,10 @@ export class Store {
    *  exponential backoff (60s doubling, capped at 1h). Never gives up — the intent stays visible
    *  and retried until the source accepts it or the entry is superseded by an operator. */
   recordTransitionAttempt(id: number, error: string): TransitionIntent {
-    const t = this.now();
-    const current = this.getTransitionIntent(id);
+    const current = this.getIntent(id);
     const attempts = (current?.attempts ?? 0) + 1;
     const delay = backoffDelaySeconds(attempts, OUTBOX_BACKOFF_CAP_SECONDS);
-    this.db
-      .prepare("UPDATE transition_outbox SET attempts = ?, next_attempt_at = ?, last_error = ?, updated_at = ? WHERE id = ?")
-      .run(attempts, t + delay, error.slice(0, 500), t, id);
+    this.recordIntentAttempt(id, error, "transient", delay);
     const e = this.getTransitionIntent(id)!;
     telemetryEvent("store.transition.attempt_failed", {
       repo: e.repo,
@@ -1008,14 +1024,11 @@ export class Store {
     return e;
   }
 
-  /** Delivery reported the item STALE (deleted/transferred — retrying cannot help). Marks the
-   *  intent delivered so the outbox stops retrying, and stamps stale_at for the run-locked
-   *  Phase A policy to consume. Called from the LOCK-FREE outbox flush — no run mutation here. */
+  /** Delivery reported the item STALE (deleted/transferred — retrying cannot help). Resolves the
+   *  row so the flush stops retrying, and stamps the 'stale' handoff for the run-locked Phase A
+   *  policy to consume. Called from the LOCK-FREE outbox flush — no run mutation here. */
   markTransitionStale(id: number, detail: string): void {
-    const t = this.now();
-    this.db
-      .prepare("UPDATE transition_outbox SET delivered_at = ?, stale_at = ?, last_error = ?, updated_at = ? WHERE id = ?")
-      .run(t, t, detail.slice(0, 500), t, id);
+    this.markIntentHandoff(id, "stale", { resolve: "delivered", error: detail });
     const e = this.getTransitionIntent(id);
     telemetryEvent("store.transition.stale", {
       repo: e?.repo,
@@ -1028,50 +1041,109 @@ export class Store {
   /** The oldest unconsumed stale intent for a run, if any — Phase A's per-run stale policy input. */
   unhandledStaleIntentForRun(runId: number): TransitionIntent | undefined {
     const row = this.db
-      .prepare("SELECT * FROM transition_outbox WHERE run_id = ? AND stale_at IS NOT NULL AND stale_handled_at IS NULL ORDER BY id LIMIT 1")
-      .get(runId) as TransitionIntentRow | undefined;
-    return row ? this.toTransitionIntent(row) : undefined;
+      .prepare(
+        `SELECT * FROM intents WHERE run_id = ? AND kind = 'source_transition'
+         AND handoff_marker = 'stale' AND handoff_at IS NOT NULL AND consumed_at IS NULL ORDER BY id LIMIT 1`,
+      )
+      .get(runId) as IntentRow | undefined;
+    return row ? this.intentToTransition(toIntent(row)) : undefined;
   }
 
   /** Stamp a stale intent consumed (abort/park applied — or deliberately ignored for an ended
    *  run) so it never fires the policy twice. */
   markTransitionStaleHandled(id: number): void {
-    const t = this.now();
-    this.db.prepare("UPDATE transition_outbox SET stale_handled_at = ?, updated_at = ? WHERE id = ?").run(t, t, id);
+    this.markIntentConsumed(id, "handled");
   }
 
   /** On auth RECOVERY for a source: make all its undelivered write-backs due now, so a restored
    *  session flushes them on the next tick's Phase 0 instead of waiting out the exponential backoff
    *  they accrued while the source was unauthenticated. Harmless if some were merely network-flaky
-   *  (they just retry a little sooner). Returns how many were re-queued. */
+   *  (they just retry a little sooner — the cause requeue is deliberately class-unscoped here).
+   *  Returns how many were re-queued. */
   retryTransitionsForSource(repo: string, source: string): number {
-    const t = this.now();
-    const info = this.db
-      .prepare("UPDATE transition_outbox SET next_attempt_at = ?, updated_at = ? WHERE repo = ? AND work_source = ? AND delivered_at IS NULL")
-      .run(t, t, repo, source);
-    return Number(info.changes);
+    return this.requeueIntentsByCause(repo, `source:${source}`);
   }
 
   /** A run's outstanding write-back obligations: every undelivered intent, plus a delivered-but-
-   *  stale one whose run-locked policy reaction is still owed (stale_at set, unhandled). Read-only —
-   *  the obligations introspection view (core/obligations.ts). */
+   *  stale one whose run-locked policy reaction is still owed. Read-only — the obligations view. */
   pendingTransitionsForRun(runId: number): TransitionIntent[] {
     const rows = this.db
       .prepare(
-        `SELECT * FROM transition_outbox WHERE run_id = ?
-         AND (delivered_at IS NULL OR (stale_at IS NOT NULL AND stale_handled_at IS NULL)) ORDER BY id`,
+        `SELECT * FROM intents WHERE run_id = ? AND kind = 'source_transition'
+         AND (status = 'pending' OR (handoff_marker = 'stale' AND handoff_at IS NOT NULL AND consumed_at IS NULL)) ORDER BY id`,
       )
-      .all(runId) as unknown as TransitionIntentRow[];
-    return rows.map((r) => this.toTransitionIntent(r));
+      .all(runId) as unknown as IntentRow[];
+    return rows.map((r) => this.intentToTransition(toIntent(r)));
   }
 
   /** Does this work item have any undelivered status write-back? While it does, the item's
-   *  source status is known-stale — Phase B must not trust an "eligible" listing for it. */
+   *  source status is known-stale — Phase B must not trust an "eligible" listing for it. Reads the
+   *  LEGACY table too (one release): a write-back a draining old-code process recorded mid-tick
+   *  must veto a claim NOW, not after the next Phase-0 drain converts it. */
   pendingTransitionForKey(repo: string, source: string, key: string): boolean {
     const row = this.db
+      .prepare(
+        `SELECT 1 AS x FROM intents WHERE repo = ? AND kind = 'source_transition'
+         AND cause_scope = ? AND ticket_key = ? AND status = 'pending' LIMIT 1`,
+      )
+      .get(repo, `source:${source}`, key) as { x: number } | undefined;
+    if (row !== undefined) return true;
+    const legacy = this.db
       .prepare("SELECT 1 AS x FROM transition_outbox WHERE repo = ? AND work_source = ? AND ticket_key = ? AND delivered_at IS NULL LIMIT 1")
       .get(repo, source, key) as { x: number } | undefined;
-    return row !== undefined;
+    return legacy !== undefined;
+  }
+
+  /** Live legacy transition rows (undelivered, or unhandled-stale) — the lazy-drain inputs. */
+  private legacyTransitionRows(scope: { repo?: string; runId?: number }): TransitionIntentRow[] {
+    const where = scope.runId != null ? "run_id = ?" : "repo = ?";
+    const bind = scope.runId != null ? scope.runId : scope.repo!;
+    return this.db
+      .prepare(
+        `SELECT * FROM transition_outbox WHERE ${where}
+         AND (delivered_at IS NULL OR (stale_at IS NOT NULL AND stale_handled_at IS NULL)) ORDER BY run_id, id`,
+      )
+      .all(bind) as unknown as TransitionIntentRow[];
+  }
+
+  /** Convert legacy rows onto the ledger (clock + stale posture intact), closing them. Uses
+   *  enqueueIntent DIRECTLY — enqueueTransition itself drains first, which would recurse. */
+  private convertLegacyTransitions(legacy: TransitionIntentRow[]): number {
+    for (const row of legacy) {
+      const converted = this.enqueueIntent({
+        repo: row.repo,
+        kind: "source_transition",
+        scope: `run:${row.run_id}`,
+        runId: row.run_id,
+        ticketKey: row.ticket_key,
+        dedupKey: `${row.to_state}:${row.to_status}`,
+        payload: JSON.stringify({ toState: row.to_state, toStatus: row.to_status, workSource: row.work_source }),
+        causeScope: `source:${row.work_source}`,
+      });
+      if (row.delivered_at === null) {
+        if (row.attempts > 0) {
+          this.db
+            .prepare("UPDATE intents SET attempts = ?, next_attempt_at = ?, last_error = ?, updated_at = ? WHERE id = ?")
+            .run(row.attempts, row.next_attempt_at, row.last_error, this.now(), converted.id);
+        }
+      } else {
+        this.markTransitionStale(converted.id, row.last_error ?? "item no longer exists at the source");
+      }
+      this.db
+        .prepare("UPDATE transition_outbox SET delivered_at = COALESCE(delivered_at, ?), stale_handled_at = COALESCE(stale_handled_at, CASE WHEN stale_at IS NOT NULL THEN ? END), last_error = 'migrated to the intent ledger', updated_at = ? WHERE id = ?")
+        .run(this.now(), this.now(), this.now(), row.id);
+    }
+    return legacy.length;
+  }
+
+  /** Lazy drain of the legacy transition_outbox (one release): convert any row a still-draining
+   *  old-code process wrote around the upgrade — undelivered rows to pending intents, unhandled
+   *  stale ones to resolved rows owing their 'stale' handoff — then close the legacy rows. Runs
+   *  in the transition flow's prePass (Phase 0) as the repo-wide backstop; the ORDER-critical
+   *  touch points drain inline (enqueueTransition per run, pendingTransitionForKey by union), so
+   *  a nudge landing between ticks can't slot ahead of an unconverted legacy row. */
+  drainLegacyTransitions(repo: string): number {
+    return this.convertLegacyTransitions(this.legacyTransitionRows({ repo }));
   }
 
   // --- source OAuth tokens (auth.method: oauth) -----------------------------
@@ -1502,17 +1574,19 @@ export class Store {
 
   /** Pending intents due for a delivery attempt: due-now, not leased by an inline attempt, and not
    *  sitting on an unconsumed handoff (such a row is in the RUN's court — re-delivering before the
-   *  run-locked consume would double-stamp it). Ordered (scope, seq) so a scope's FIFO chain is
-   *  walked in intent order. */
-  dueIntents(repo: string, limit = 25): Intent[] {
+   *  run-locked consume would double-stamp it). `excludeKinds` keeps reconciler-delivered kinds out
+   *  of the batch (their own flows drive them; skipped rows must not fill the limit). Ordered
+   *  (scope, seq) so a scope's FIFO chain is walked in intent order. */
+  dueIntents(repo: string, limit = 25, excludeKinds: readonly string[] = []): Intent[] {
     const now = this.now();
+    const exclusion = excludeKinds.length > 0 ? ` AND kind NOT IN (${excludeKinds.map(() => "?").join(",")})` : "";
     const rows = this.db
       .prepare(
         `SELECT * FROM intents WHERE repo = ? AND status = 'pending' AND next_attempt_at <= ?
          AND (lease_until IS NULL OR lease_until <= ?)
-         AND (handoff_at IS NULL OR consumed_at IS NOT NULL) ORDER BY scope, seq LIMIT ?`,
+         AND (handoff_at IS NULL OR consumed_at IS NOT NULL)${exclusion} ORDER BY scope, seq LIMIT ?`,
       )
-      .all(repo, now, now, limit) as unknown as IntentRow[];
+      .all(repo, now, now, ...excludeKinds, limit) as unknown as IntentRow[];
     return rows.map(toIntent);
   }
 

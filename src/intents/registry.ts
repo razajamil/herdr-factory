@@ -23,6 +23,7 @@ import { agentSignalKind } from "./kinds/agent-signal.ts";
 import { evidencePublishKind } from "./kinds/evidence-publish.ts";
 import { externalWaitKind } from "./kinds/external-wait.ts";
 import { humanReplyPollKind } from "./kinds/human-reply-poll.ts";
+import { sourceTransitionKind } from "./kinds/source-transition.ts";
 
 /** The outcome of one lock-free delivery attempt. */
 export type IntentOutcome =
@@ -70,8 +71,13 @@ export interface IntentKindDef {
   /** Who consumes this kind's handoffs. "kernel" (default): the generic run-locked loop calls
    *  `consume` (or stamps 'acknowledged'). "reconciler": the reconciler owns a bespoke consume —
    *  the run reaction is too entangled with step machinery for a registry callback (agent_signal's
-   *  bounce rewind) — and the generic loop must NOT touch the handoff. */
+   *  bounce rewind, source_transition's stale policy) — and the generic loop must NOT touch it. */
   readonly consumedBy?: "kernel" | "reconciler";
+  /** Who attempts this kind's pending rows. "kernel" (default): the ledger flow's due walk calls
+   *  `deliver`. "reconciler": a reconciler-owned flow drives the rows through the store adapters
+   *  (source_transition — its delivery needs the resolved source/belt/auth-gate machinery); the
+   *  kernel's due walk excludes the kind so the two can never double-attempt a row. */
+  readonly deliveredBy?: "kernel" | "reconciler";
   /** Run-locked consume of this kind's handoffs. Omitted ⇒ handoffs are stamped 'acknowledged'. */
   consume?(deps: Deps, run: Run, row: Intent): Promise<IntentConsumeVerdict>;
   /** What a human `resume` of the run does to this kind's live rows. */
@@ -81,7 +87,7 @@ export interface IntentKindDef {
   readonly survivesTeardown?: boolean;
 }
 
-export const INTENT_KINDS: readonly IntentKindDef[] = [agentSignalKind, evidencePublishKind, externalWaitKind, humanReplyPollKind];
+export const INTENT_KINDS: readonly IntentKindDef[] = [agentSignalKind, evidencePublishKind, externalWaitKind, humanReplyPollKind, sourceTransitionKind];
 
 export function intentKindFor(kind: string): IntentKindDef | undefined {
   return INTENT_KINDS.find((k) => k.kind === kind);

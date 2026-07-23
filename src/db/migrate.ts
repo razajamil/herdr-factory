@@ -725,6 +725,42 @@ export const MIGRATIONS: { version: number; sql: string }[] = [
       UPDATE intents SET seq = id WHERE seq = 0;
     `,
   },
+  {
+    version: 33,
+    // source_transition cuts over to the ledger — the LAST legacy outbox, deliberately (it gates
+    // claiming and feeds effect ranks). Undelivered write-backs convert to pending intents with
+    // their attempts/backoff clocks intact and their per-run order preserved (the INSERT..SELECT
+    // is ordered (run_id, id) and seq = id at insert, so FIFO slots reproduce the legacy id
+    // order); unhandled-stale rows convert to resolved intents still OWING their 'stale' handoff,
+    // so the run-locked stale policy fires exactly once post-upgrade. The legacy rows close; a row
+    // a draining old-code process writes afterward is converted by drainLegacyTransitions in the
+    // transition flow's Phase-0 prePass. The store's transition methods are now ADAPTERS over the
+    // ledger — deliverTransition, the FIFO gate, the Phase-B claim veto and fireEffect's rank scan
+    // kept their exact code. transition_outbox drops in a later contract migration.
+    sql: `
+      INSERT INTO intents (repo, kind, scope, run_id, ticket_key, dedup_key, payload, status, attempts,
+                           next_attempt_at, last_error, cause_scope, created_at, updated_at)
+      SELECT repo, 'source_transition', 'run:' || run_id, run_id, ticket_key, to_state || ':' || to_status,
+             json_object('toState', to_state, 'toStatus', to_status, 'workSource', work_source),
+             'pending', attempts, next_attempt_at, last_error, 'source:' || work_source, created_at, unixepoch()
+        FROM transition_outbox WHERE delivered_at IS NULL ORDER BY run_id, id;
+      INSERT INTO intents (repo, kind, scope, run_id, ticket_key, dedup_key, payload, status, attempts,
+                           next_attempt_at, last_error, error_class, cause_scope, handoff_at, handoff_marker,
+                           resolved_at, created_at, updated_at)
+      SELECT repo, 'source_transition', 'run:' || run_id, run_id, ticket_key, to_state || ':' || to_status,
+             json_object('toState', to_state, 'toStatus', to_status, 'workSource', work_source),
+             'delivered', attempts, next_attempt_at, last_error, 'stale', 'source:' || work_source,
+             stale_at, 'stale', delivered_at, created_at, unixepoch()
+        FROM transition_outbox WHERE delivered_at IS NOT NULL AND stale_at IS NOT NULL AND stale_handled_at IS NULL
+        ORDER BY run_id, id;
+      UPDATE intents SET seq = id WHERE seq = 0;
+      UPDATE transition_outbox
+         SET delivered_at = COALESCE(delivered_at, unixepoch()),
+             stale_handled_at = CASE WHEN stale_at IS NOT NULL AND stale_handled_at IS NULL THEN unixepoch() ELSE stale_handled_at END,
+             last_error = 'migrated to the intent ledger (v33)', updated_at = unixepoch()
+       WHERE delivered_at IS NULL OR (stale_at IS NOT NULL AND stale_handled_at IS NULL);
+    `,
+  },
 ];
 
 /** Apply pending migrations in a transaction. Idempotent. */

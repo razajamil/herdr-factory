@@ -224,6 +224,14 @@ function sameTrigger(a: BeltEffectTrigger, b: BeltEffectTrigger): boolean {
 function transitionOutboxFlow(deps: Deps): OutboxFlow<TransitionIntent> {
   return {
     name: "transition outbox",
+    // Lazy drain of the legacy transition_outbox table (one release, post-v33): a row a
+    // still-draining old-code process wrote around the upgrade converts onto the ledger HERE —
+    // Phase 0, before Phase A can enqueue newer intents for the same run — so its FIFO slot
+    // precedes the run's post-upgrade transitions and per-run order survives the cutover.
+    prePass: async () => {
+      const drained = deps.store.drainLegacyTransitions(deps.config.repoName);
+      if (drained > 0) deps.log("info", `transition outbox: converted ${drained} legacy row(s) onto the intent ledger`);
+    },
     due: () => deps.store.dueTransitions(deps.config.repoName),
     attempt: async (intent) => {
       const src = deps.resolveSource(intent.workSource);

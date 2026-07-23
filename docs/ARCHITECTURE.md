@@ -620,7 +620,17 @@ CREATE TABLE pending_signals(            -- LEGACY since v31: agent signals live
 CREATE INDEX idx_pending_signals_unconsumed    -- its done flag is durable before the nudge.
   ON pending_signals(run_id) WHERE consumed_at IS NULL;
 
-CREATE TABLE transition_outbox(          -- source status write-backs as persisted INTENTS (v11)
+CREATE TABLE transition_outbox(          -- LEGACY since v33: write-backs live on the intent ledger
+                                         -- as the `source_transition` kind (FIFO per run scope,
+                                         -- dedup to_state:to_status, the stale two-phase as a
+                                         -- 'stale' handoff; the store's transition methods are
+                                         -- ADAPTERS, so deliverTransition / the FIFO gate / the
+                                         -- claim veto / effect ranks kept their exact code). v33
+                                         -- converted the backlog; drain-window rows convert at the
+                                         -- touch points (enqueueTransition per run, the claim veto
+                                         -- by union, the flow prePass repo-wide) so per-run order
+                                         -- survives the cutover. Drops in a contract migration.
+                                         -- Original design (v11) —
   id INTEGER PRIMARY KEY AUTOINCREMENT, run_id INTEGER NOT NULL REFERENCES runs(id),
   repo TEXT NOT NULL, work_source TEXT NOT NULL, ticket_key TEXT NOT NULL,
   to_state TEXT NOT NULL CHECK (to_state IN ('todo','in_development','in_review','merged','aborted','done')),

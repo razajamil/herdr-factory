@@ -396,3 +396,97 @@ describe("human_reply_poll on the ledger (v32 cutover)", () => {
     expect(JSON.parse(rows[0]!.state as string)).toEqual({ pollAttempts: 4 });
   });
 });
+
+describe("source_transition on the ledger (v33 cutover)", () => {
+  it("migration v33 converts undelivered rows in per-run order and unhandled-stale rows still owing their handoff", () => {
+    const { DatabaseSync } = require("node:sqlite") as typeof import("node:sqlite");
+    const db = new DatabaseSync(":memory:");
+    db.exec("CREATE TABLE schema_version (version INTEGER NOT NULL)");
+    const { MIGRATIONS, migrate } = require("../src/db/migrate.ts") as typeof import("../src/db/migrate.ts");
+    for (const m of MIGRATIONS.filter((m) => m.version <= 32)) {
+      db.exec(m.sql);
+      db.prepare("INSERT INTO schema_version (version) VALUES (?)").run(m.version);
+    }
+    db.prepare("INSERT INTO runs (repo, ticket_key, phase, created_at, updated_at) VALUES ('r','K-1','running',1,1)").run();
+    // An in-order pair: in_development mid-backoff (attempt 4), then in_review queued behind it.
+    db.prepare(
+      `INSERT INTO transition_outbox (run_id, repo, work_source, ticket_key, to_state, to_status, attempts, next_attempt_at, last_error, created_at, updated_at)
+       VALUES (1, 'r', 'jira', 'K-1', 'in_development', '', 4, 8000, 'jira 500', 100, 100),
+              (1, 'r', 'jira', 'K-1', 'in_review', '', 0, 100, NULL, 200, 200)`,
+    ).run();
+    // A second run with an unhandled STALE intent (delivered, policy reaction still owed).
+    db.prepare("INSERT INTO runs (repo, ticket_key, phase, created_at, updated_at) VALUES ('r','K-2','running',1,1)").run();
+    db.prepare(
+      `INSERT INTO transition_outbox (run_id, repo, work_source, ticket_key, to_state, to_status, attempts, next_attempt_at, last_error, created_at, updated_at, delivered_at, stale_at)
+       VALUES (2, 'r', 'jira', 'K-2', 'in_development', '', 1, 300, 'issue deleted', 100, 100, 400, 400)`,
+    ).run();
+    migrate(db);
+
+    const { openDb } = require("../src/db/index.ts") as typeof import("../src/db/index.ts");
+    void openDb; // (db already migrated in place)
+    const { Store } = require("../src/db/store.ts") as typeof import("../src/db/store.ts");
+    const store = new Store(db, () => 10_000);
+    // Run 1: both rows pending on the ledger, clocks intact, FIFO order preserved.
+    const pending = store.pendingTransitionsForRun(1);
+    expect(pending.map((t) => t.toState)).toEqual(["in_development", "in_review"]);
+    expect(pending[0]).toMatchObject({ attempts: 4, nextAttemptAt: 8000, lastError: "jira 500" });
+    expect(store.undeliveredTransitionBefore(1, pending[1]!.id)).toBe(true); // gate holds across the upgrade
+    expect(store.pendingTransitionForKey("r", "jira", "K-1")).toBe(true); // the claim veto too
+    // Run 2: the stale intent is resolved but still owes its run-locked policy reaction.
+    const stale = store.unhandledStaleIntentForRun(2)!;
+    expect(stale).toMatchObject({ toState: "in_development", lastError: "issue deleted" });
+    store.markTransitionStaleHandled(stale.id);
+    expect(store.unhandledStaleIntentForRun(2)).toBeUndefined(); // exactly once
+    // Legacy rows are closed — nothing left for an old-code flush to double-deliver.
+    const legacyOpen = db.prepare("SELECT COUNT(*) AS n FROM transition_outbox WHERE delivered_at IS NULL").get() as { n: number };
+    expect(legacyOpen.n).toBe(0);
+  });
+
+  it("drainLegacyTransitions converts a drain-window row with its clock and closes it", () => {
+    const { store, run, setNow } = makeStore();
+    // Simulate an old-code process writing directly into the legacy table post-upgrade.
+    // @ts-expect-error private handle, deliberate
+    const db = store.db as import("node:sqlite").DatabaseSync;
+    db.prepare(
+      `INSERT INTO transition_outbox (run_id, repo, work_source, ticket_key, to_state, to_status, attempts, next_attempt_at, last_error, created_at, updated_at)
+       VALUES (?, 'r', 'jira', 'K-1', 'in_development', '', 2, 5000, 'flaky', 100, 100)`,
+    ).run(run.id);
+    setNow(2000);
+    expect(store.drainLegacyTransitions("r")).toBe(1);
+    const converted = store.pendingTransitionsForRun(run.id);
+    expect(converted).toHaveLength(1);
+    expect(converted[0]).toMatchObject({ toState: "in_development", attempts: 2, nextAttemptAt: 5000, lastError: "flaky" });
+    expect(store.drainLegacyTransitions("r")).toBe(0); // closed — idempotent
+  });
+
+  it("a nudge-window enqueue can NOT slot ahead of an unconverted legacy row (per-run order survives)", () => {
+    // The drain-window inversion: an old-code process records in_development into the LEGACY table
+    // (source down, undelivered); before the next tick's Phase-0 drain, a step-done nudge enqueues
+    // in_review on the ledger. enqueueTransition must convert the run's legacy rows FIRST, so
+    // in_development takes the earlier FIFO slot and the gate blocks in_review behind it.
+    const { store, run } = makeStore();
+    // @ts-expect-error private handle, deliberate
+    const db = store.db as import("node:sqlite").DatabaseSync;
+    db.prepare(
+      `INSERT INTO transition_outbox (run_id, repo, work_source, ticket_key, to_state, to_status, attempts, next_attempt_at, last_error, created_at, updated_at)
+       VALUES (?, 'r', 'jira', 'K-1', 'in_development', '', 3, 9000, 'jira down', 100, 100)`,
+    ).run(run.id);
+    const inReview = store.enqueueTransition({ runId: run.id, repo: "r", workSource: "jira", ticketKey: "K-1", toState: "in_review" });
+    const pending = store.pendingTransitionsForRun(run.id);
+    expect(pending.map((t) => t.toState)).toEqual(["in_development", "in_review"]); // converted row holds the earlier slot
+    expect(pending[0]).toMatchObject({ attempts: 3, nextAttemptAt: 9000 }); // clock intact
+    expect(store.undeliveredTransitionBefore(run.id, inReview.id)).toBe(true); // the FIFO gate holds
+  });
+
+  it("the Phase-B claim veto sees an unconverted legacy write-back immediately", () => {
+    const { store, run } = makeStore();
+    // @ts-expect-error private handle, deliberate
+    const db = store.db as import("node:sqlite").DatabaseSync;
+    expect(store.pendingTransitionForKey("r", "jira", "K-1")).toBe(false);
+    db.prepare(
+      `INSERT INTO transition_outbox (run_id, repo, work_source, ticket_key, to_state, to_status, attempts, next_attempt_at, created_at, updated_at)
+       VALUES (?, 'r', 'jira', 'K-1', 'merged', '', 0, 100, 100, 100)`,
+    ).run(run.id);
+    expect(store.pendingTransitionForKey("r", "jira", "K-1")).toBe(true); // legacy union — no drain needed
+  });
+});

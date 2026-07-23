@@ -58,6 +58,9 @@ async function maybeNotify(deps: Deps, kind: IntentKindDef, row: Intent, failure
 export function ledgerFlow(deps: Deps, kinds: readonly IntentKindDef[] = INTENT_KINDS): OutboxFlow<Intent> {
   const repo = deps.config.repoName;
   const kindFor = (name: string) => kinds.find((k) => k.kind === name);
+  // Reconciler-delivered kinds are excluded from the DUE QUERY, not just skipped per row — a
+  // backlog of skipped rows would otherwise fill the batch limit and starve kernel-owned kinds.
+  const excludeKinds = kinds.filter((k) => k.deliveredBy === "reconciler").map((k) => k.kind);
   return {
     name: "intent ledger",
     prePass: async () => {
@@ -79,9 +82,10 @@ export function ledgerFlow(deps: Deps, kinds: readonly IntentKindDef[] = INTENT_
         deps.log("warn", `${row.ticketKey ?? row.scope}: ${row.kind} intent #${row.id} deadline expired`);
       }
     },
-    due: () => deps.store.dueIntents(repo),
+    due: () => deps.store.dueIntents(repo, 25, excludeKinds),
     attempt: async (row) => {
       const kind = kindFor(row.kind);
+      if (kind?.deliveredBy === "reconciler") return; // its own flow drives it (belt-and-braces)
       if (!kind) {
         // A kind removed from the registry (or a downgrade artifact): close it out loudly rather
         // than retrying forever against nothing — mirrors the orphaned-source close-out.
