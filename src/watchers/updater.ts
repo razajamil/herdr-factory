@@ -22,6 +22,7 @@ import { fileURLToPath } from "node:url";
 import type { Log } from "./supervisor.ts";
 import { pinnedNodeVersion, provisionNode } from "./provision.ts";
 import { updateStatusPath } from "../config-paths.ts";
+import { notifyDue } from "../schedule.ts";
 import { recordDependencyDuration, telemetrySpan } from "../telemetry/index.ts";
 // The update-status model + pure readers live in a telemetry-free module so surfaces that only READ
 // the last attempt (TUI dashboard, doctor) don't pull this execution path — and its Effect + OTel
@@ -225,7 +226,9 @@ export async function runUpdate(log: Log, opts: RunUpdateOpts): Promise<UpdateRe
   // (so doctor shows the reason + that we're behind the target), and notify once (throttled).
   if (await isDirty(cwd)) {
     const prev = readUpdateStatusAt(statusPath);
-    const notified = prev?.dirtySkip && prev.notifiedAt && Date.now() - prev.notifiedAt < DIRTY_RENOTIFY_MS;
+    // The shared throttle, in MILLISECONDS here (this file's clock is Date.now()): a prior skip that
+    // never notified — or one outside the window — fires; anything else stays quiet.
+    const notified = !notifyDue(prev?.dirtySkip ? prev.notifiedAt : null, DIRTY_RENOTIFY_MS, Date.now());
     const reason = `dirty checkout — reset to ${target.ref} skipped (uncommitted local changes)`;
     log("warn", `self-update: ${reason}`);
     if (!notified) {

@@ -19,6 +19,7 @@ import type {
   WorkState,
 } from "../types.ts";
 import { systemClock } from "../types.ts";
+import { backoffDelaySeconds, HUMAN_POLL_BACKOFF_CAP_SECONDS, OUTBOX_BACKOFF_CAP_SECONDS } from "../schedule.ts";
 import { recordDomainEvent, telemetryEvent } from "../telemetry/index.ts";
 import { tx } from "./tx.ts";
 
@@ -207,6 +208,11 @@ interface SourceAuthRow {
  *  the flush from claiming the row mid inline-upload; a failed inline attempt resets it to the 60s
  *  backoff so the server picks it up promptly, and it doubles as crash-recovery if the CLI dies mid-upload. */
 const EVIDENCE_UPLOAD_LEASE_SECONDS = 300;
+
+/** An evidence-upload row still owed to the backend: not delivered and not terminally closed
+ *  (permanent config failure / abandoned at teardown or by a superseding re-capture). The pending
+ *  predicate every evidence-upload query filters on — one spelling, not seven. */
+const EVIDENCE_PENDING_SQL = "delivered_at IS NULL AND permanent_failed_at IS NULL AND abandoned_at IS NULL";
 
 interface HumanQuestionRow {
   id: number;
@@ -907,7 +913,7 @@ export class Store {
     const t = this.now();
     const current = this.getTransitionIntent(id);
     const attempts = (current?.attempts ?? 0) + 1;
-    const delay = Math.min(60 * 2 ** (attempts - 1), 3600);
+    const delay = backoffDelaySeconds(attempts, OUTBOX_BACKOFF_CAP_SECONDS);
     this.db
       .prepare("UPDATE transition_outbox SET attempts = ?, next_attempt_at = ?, last_error = ?, updated_at = ? WHERE id = ?")
       .run(attempts, t + delay, error.slice(0, 500), t, id);
@@ -1083,7 +1089,7 @@ export class Store {
       this.db
         .prepare(
           `UPDATE evidence_uploads SET abandoned_at = ?, last_error = 'superseded by re-capture', updated_at = ?
-           WHERE run_id = ? AND key_prefix <> ? AND delivered_at IS NULL AND permanent_failed_at IS NULL AND abandoned_at IS NULL`,
+           WHERE run_id = ? AND key_prefix <> ? AND ${EVIDENCE_PENDING_SQL}`,
         )
         .run(t, t, input.runId, input.keyPrefix);
       this.db
@@ -1107,8 +1113,8 @@ export class Store {
   dueEvidenceUploads(repo: string, limit = 25): EvidenceUpload[] {
     const rows = this.db
       .prepare(
-        `SELECT * FROM evidence_uploads WHERE repo = ? AND delivered_at IS NULL AND permanent_failed_at IS NULL
-         AND abandoned_at IS NULL AND next_attempt_at <= ? ORDER BY run_id, id LIMIT ?`,
+        `SELECT * FROM evidence_uploads WHERE repo = ? AND ${EVIDENCE_PENDING_SQL}
+         AND next_attempt_at <= ? ORDER BY run_id, id LIMIT ?`,
       )
       .all(repo, this.now(), limit) as unknown as EvidenceUploadRow[];
     return rows.map((r) => this.toEvidenceUpload(r));
@@ -1121,7 +1127,7 @@ export class Store {
     const t = this.now();
     const current = this.getEvidenceUpload(id);
     const attempts = (current?.attempts ?? 0) + 1;
-    const delay = Math.min(60 * 2 ** (attempts - 1), 3600);
+    const delay = backoffDelaySeconds(attempts, OUTBOX_BACKOFF_CAP_SECONDS);
     this.db
       .prepare(
         `UPDATE evidence_uploads SET attempts = ?, next_attempt_at = ?, last_error = ?, error_kind = ?, updated_at = ?
@@ -1157,7 +1163,7 @@ export class Store {
   /** Undelivered uploads for a run — teardown's drop input. */
   undeliveredEvidenceUploadsForRun(runId: number): EvidenceUpload[] {
     const rows = this.db
-      .prepare("SELECT * FROM evidence_uploads WHERE run_id = ? AND delivered_at IS NULL AND permanent_failed_at IS NULL AND abandoned_at IS NULL ORDER BY id")
+      .prepare(`SELECT * FROM evidence_uploads WHERE run_id = ? AND ${EVIDENCE_PENDING_SQL} ORDER BY id`)
       .all(runId) as unknown as EvidenceUploadRow[];
     return rows.map((r) => this.toEvidenceUpload(r));
   }
@@ -1169,7 +1175,7 @@ export class Store {
     const info = this.db
       .prepare(
         `UPDATE evidence_uploads SET abandoned_at = ?, last_error = ?, updated_at = ?
-         WHERE run_id = ? AND delivered_at IS NULL AND permanent_failed_at IS NULL AND abandoned_at IS NULL`,
+         WHERE run_id = ? AND ${EVIDENCE_PENDING_SQL}`,
       )
       .run(t, reason.slice(0, 500), t, runId);
     return Number(info.changes);
@@ -1179,7 +1185,7 @@ export class Store {
    *  each is currently due). */
   pendingEvidenceUploads(repo: string): EvidenceUpload[] {
     const rows = this.db
-      .prepare("SELECT * FROM evidence_uploads WHERE repo = ? AND delivered_at IS NULL AND permanent_failed_at IS NULL AND abandoned_at IS NULL ORDER BY id")
+      .prepare(`SELECT * FROM evidence_uploads WHERE repo = ? AND ${EVIDENCE_PENDING_SQL} ORDER BY id`)
       .all(repo) as unknown as EvidenceUploadRow[];
     return rows.map((r) => this.toEvidenceUpload(r));
   }
@@ -1188,10 +1194,7 @@ export class Store {
    *  light (red) and the doctor stuck-upload check. */
   authStuckEvidenceUpload(repo: string): boolean {
     const row = this.db
-      .prepare(
-        `SELECT 1 AS x FROM evidence_uploads WHERE repo = ? AND error_kind = 'auth'
-         AND delivered_at IS NULL AND permanent_failed_at IS NULL AND abandoned_at IS NULL LIMIT 1`,
-      )
+      .prepare(`SELECT 1 AS x FROM evidence_uploads WHERE repo = ? AND error_kind = 'auth' AND ${EVIDENCE_PENDING_SQL} LIMIT 1`)
       .get(repo) as { x: number } | undefined;
     return row !== undefined;
   }
@@ -1206,7 +1209,7 @@ export class Store {
     const info = this.db
       .prepare(
         `UPDATE evidence_uploads SET next_attempt_at = ?, updated_at = ?
-         WHERE repo = ? AND error_kind = 'auth' AND delivered_at IS NULL AND permanent_failed_at IS NULL AND abandoned_at IS NULL`,
+         WHERE repo = ? AND error_kind = 'auth' AND ${EVIDENCE_PENDING_SQL}`,
       )
       .run(t, t, repo);
     const requeued = Number(info.changes);
@@ -1342,7 +1345,7 @@ export class Store {
     const q = this.getHumanQuestion(id);
     if (!q) throw new Error(`recordHumanPollMiss: no question ${id}`);
     const attempts = q.pollAttempts + 1;
-    const delay = Math.min(60 * 2 ** (attempts - 1), 300);
+    const delay = backoffDelaySeconds(attempts, HUMAN_POLL_BACKOFF_CAP_SECONDS);
     const t = this.now();
     // A miss is a SUCCESSFUL poll that found no reply — it also resets the consecutive-error run.
     this.db
@@ -1364,7 +1367,10 @@ export class Store {
     const q = this.getHumanQuestion(id);
     if (!q) throw new Error(`recordHumanPollError: no question ${id}`);
     const errors = q.pollErrors + 1;
-    const delay = Math.min(60 * 2 ** (q.pollAttempts + errors - 1), 300);
+    // The error backoff STACKS on the miss exponent (attempts + errors) so a flapping source keeps
+    // thinning out even while misses reset between throws — a curve the shared helper expresses by
+    // being handed the stacked count.
+    const delay = backoffDelaySeconds(q.pollAttempts + errors, HUMAN_POLL_BACKOFF_CAP_SECONDS);
     const t = this.now();
     this.db
       .prepare("UPDATE human_questions SET poll_errors = ?, next_poll_at = ?, updated_at = ? WHERE id = ?")

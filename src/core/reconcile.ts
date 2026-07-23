@@ -8,6 +8,7 @@ import type { StepConfig } from "../config.ts";
 import type { BeltEffectTrigger, GuardSpec, HumanQuestion, HumanReply, MatchItem, Outcome, PrInfo, PrSnapshot, Run, RunStep, Ticket, TransitionIntent, WorkState } from "../types.ts";
 import { EFFECT_PRODUCE_PRODUCTS, effectRank, outcomeToWorkState, StaleItemError, ticketOf, type TransitionContext } from "../types.ts";
 import { isUniqueViolation } from "../db/store.ts";
+import { notifyDue } from "../schedule.ts";
 import { branchName } from "./branch.ts";
 import { firstStep, indexOfStep, materializeWork, MEMORY_DIR, nextStep, scrubCommittedMemoryDir, spawnStep, stepByName } from "./step.ts";
 import { STEP_DESCRIPTORS } from "../steps/registry.ts";
@@ -41,8 +42,7 @@ async function noteSourceAuthFailure(deps: Deps, source: string, e: SourceUnauth
     recordSourceAuthEvent({ "work.source": source, "auth.state": "unauthenticated", "auth.reason": e.reason });
   }
   const f = getAuthFailure(repo, source)!;
-  const notifyDue = f.notifiedAt == null || deps.now() - f.notifiedAt >= deps.config.limits.attentionRenotifySeconds;
-  if (notifyDue) {
+  if (notifyDue(f.notifiedAt, deps.config.limits.attentionRenotifySeconds, deps.now())) {
     await deps.herdr
       .notify(
         `herdr-factory: ${source} not authenticated`,
@@ -286,20 +286,19 @@ export async function flushEvidenceUploads(deps: Deps): Promise<void> {
       deps.log("info", `${job.ticketKey}: evidence published (${files.length} file(s)) after ${job.attempts} retr${job.attempts === 1 ? "y" : "ies"}`);
     } catch (e) {
       const c = publisher.classifyError(e);
-      // Notify on the FIRST failure, then throttle re-notifies by attentionRenotifySeconds (a null
-      // notifiedAt means never-notified — must always fire, not be read as "notified at epoch 0").
-      const notifyDue = job.notifiedAt == null || deps.now() - job.notifiedAt >= deps.config.limits.attentionRenotifySeconds;
+      // Notify on the FIRST failure, then throttle re-notifies by attentionRenotifySeconds.
+      const shouldNotify = notifyDue(job.notifiedAt, deps.config.limits.attentionRenotifySeconds, deps.now());
       if (c.kind === "permanent") {
         deps.store.markEvidencePermanentFailed(job.id, c.reason);
         deps.store.recordEvent({ runId: job.runId, repo, ticketKey: job.ticketKey, type: "evidence_upload_failed", detail: { reason: c.reason } });
-        if (notifyDue) {
+        if (shouldNotify) {
           await deps.herdr.notify(`herdr-factory: ${job.ticketKey} evidence publish failed`, `Evidence publish can't proceed: ${c.reason}. Run \`herdr-factory --repo ${repo} doctor --deep\`; the published URLs won't resolve until it's fixed.`).catch(() => {});
           deps.store.markEvidenceNotified(job.id);
         }
       } else {
         const updated = deps.store.recordEvidenceAttempt(job.id, c.reason, c.kind);
         deps.log("warn", `${job.ticketKey}: evidence publish deferred (attempt ${updated?.attempts}): ${c.reason}`);
-        if (c.kind === "auth" && notifyDue) {
+        if (c.kind === "auth" && shouldNotify) {
           const profile = ev.publisher === "s3" ? ev.profile : undefined;
           await deps.herdr.notify(`herdr-factory: AWS SSO expired`, `Evidence publish for ${job.ticketKey} is blocked on AWS creds — run \`aws sso login${profile ? ` --profile ${profile}` : ""}\`. It uploads automatically on the next tick.`).catch(() => {});
           deps.store.markEvidenceNotified(job.id);
@@ -1968,7 +1967,7 @@ async function reconcileAttention(deps: Deps, run: Run, belt: BeltRuntime, src: 
       return dispatchPhase(deps, deps.store.getRun(run.id)!, belt, src, ctx);
     }
   }
-  if (deps.now() - (run.attentionNotifiedAt ?? 0) >= deps.config.limits.attentionRenotifySeconds) {
+  if (notifyDue(run.attentionNotifiedAt, deps.config.limits.attentionRenotifySeconds, deps.now())) {
     deps.store.updateRun(run.id, { attentionNotifiedAt: deps.now() });
     const parkedFor = Math.round((deps.now() - run.updatedAt) / 60);
     await deps.herdr
