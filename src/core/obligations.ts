@@ -10,6 +10,7 @@ import type { StepConfig } from "../config.ts";
 import type { Deps } from "./deps.ts";
 import type { GuardSpec, Run } from "../types.ts";
 import { firstStep, stepByName } from "./step.ts";
+import { effectiveWatchClock } from "./watches.ts";
 import { BOUNCE_CAP } from "../steps/registry.ts";
 import { ENGINE_WATCHES } from "../steps/engine-watches.ts";
 
@@ -120,20 +121,26 @@ export function runObligations(deps: Deps, run: Run): RunObligations {
   const guards = (watched?.guards ?? []).map((g) => {
     const facts: Record<string, string | number | boolean | null> = {};
     switch (g.kind) {
-      case "budget":
-        facts.startedAt = rs?.startedAt ?? null;
+      case "budget": {
+        const clock = rs ? effectiveWatchClock(deps, rs, "budget") : { basedAt: null };
+        facts.startedAt = clock.basedAt;
         facts.budgetSeconds = watched!.budgetSeconds;
-        facts.deadlineAt = rs?.startedAt != null ? rs.startedAt + watched!.budgetSeconds : null;
+        facts.deadlineAt = clock.basedAt != null ? clock.basedAt + watched!.budgetSeconds : null;
         break;
-      case "heartbeat":
-        facts.lastProgressAt = rs?.progressAt ?? null;
+      }
+      case "heartbeat": {
+        const clock = rs ? effectiveWatchClock(deps, rs, "heartbeat") : { basedAt: null };
+        facts.lastProgressAt = clock.basedAt;
         facts.stallSeconds = deps.config.limits.stallSeconds;
-        facts.stallsAt = rs?.progressAt != null ? rs.progressAt + deps.config.limits.stallSeconds : null;
+        facts.stallsAt = clock.basedAt != null ? clock.basedAt + deps.config.limits.stallSeconds : null;
         break;
-      case "read_only":
-        facts.baselineSig = rs?.baselineSig ?? null;
-        facts.frozenAt = rs?.baselineFrozenAt ?? null; // null = still tracking (absorbing handoff commits)
+      }
+      case "read_only": {
+        const clock = rs ? effectiveWatchClock(deps, rs, "read_only") : { sig: null, basedAt: null };
+        facts.baselineSig = clock.sig ?? null;
+        facts.frozenAt = clock.basedAt ?? null; // null = still tracking (absorbing handoff commits)
         break;
+      }
       case "layout_wait":
         facts.waitingSince = rs?.dispatchedAt == null ? (rs?.startedAt ?? null) : null; // null once dispatched
         facts.windowSeconds = deps.config.limits.layoutWaitSeconds;

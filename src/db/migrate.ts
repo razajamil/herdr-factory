@@ -761,6 +761,40 @@ export const MIGRATIONS: { version: number; sql: string }[] = [
        WHERE delivered_at IS NULL OR (stale_at IS NOT NULL AND stale_handled_at IS NULL);
     `,
   },
+  {
+    version: 34,
+    // watch_state: one row per (run, step, watch) — each harness-evaluated watch owns its clock,
+    // completing the de-aliasing the baseline columns (v28) started. `sig` + `based_at` carry the
+    // watch's signature and clock (budget: based_at = the budget window's base; heartbeat:
+    // sig/based_at = last-seen HEAD + when; read_only: sig = the enforcement baseline, based_at =
+    // the freeze marker, null while tracking); `meta` is watch-owned JSON for anything richer. A
+    // PLUGIN watch now stores state without a migration — the point of the table. run_steps'
+    // started_at stays (it is ALSO the layout-wait window + dispatch bookkeeping, seeded into the
+    // budget row here); progress_* and baseline_* freeze as legacy columns, read only as the lazy
+    // fallback for rows a draining old-code process touches (evaluators NEVER delete a watch row —
+    // re-bases write nulls — so the fallback can't resurrect a cleared clock).
+    sql: `
+      CREATE TABLE watch_state (
+        run_id INTEGER NOT NULL REFERENCES runs(id),
+        step TEXT NOT NULL,
+        watch TEXT NOT NULL,
+        sig TEXT,
+        based_at INTEGER,
+        meta TEXT NOT NULL DEFAULT '{}',
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY (run_id, step, watch)
+      );
+      INSERT INTO watch_state (run_id, step, watch, sig, based_at, updated_at)
+        SELECT run_id, step, 'heartbeat', progress_sig, progress_at, unixepoch()
+          FROM run_steps WHERE progress_sig IS NOT NULL OR progress_at IS NOT NULL;
+      INSERT INTO watch_state (run_id, step, watch, sig, based_at, updated_at)
+        SELECT run_id, step, 'read_only', baseline_sig, baseline_frozen_at, unixepoch()
+          FROM run_steps WHERE baseline_sig IS NOT NULL OR baseline_frozen_at IS NOT NULL;
+      INSERT INTO watch_state (run_id, step, watch, sig, based_at, updated_at)
+        SELECT run_id, step, 'budget', NULL, started_at, unixepoch()
+          FROM run_steps WHERE started_at IS NOT NULL;
+    `,
+  },
 ];
 
 /** Apply pending migrations in a transaction. Idempotent. */

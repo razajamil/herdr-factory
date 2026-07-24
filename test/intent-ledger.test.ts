@@ -490,3 +490,47 @@ describe("source_transition on the ledger (v33 cutover)", () => {
     expect(store.pendingTransitionForKey("r", "jira", "K-1")).toBe(true); // legacy union — no drain needed
   });
 });
+
+describe("watch_state (v34) — per-watch clocks", () => {
+  it("migration v34 backfills a mid-flight step's clocks; evaluator writes go to watch_state; legacy fallback only when no row exists", () => {
+    const { DatabaseSync } = require("node:sqlite") as typeof import("node:sqlite");
+    const db = new DatabaseSync(":memory:");
+    db.exec("CREATE TABLE schema_version (version INTEGER NOT NULL)");
+    const { MIGRATIONS, migrate } = require("../src/db/migrate.ts") as typeof import("../src/db/migrate.ts");
+    for (const m of MIGRATIONS.filter((m) => m.version <= 33)) {
+      db.exec(m.sql);
+      db.prepare("INSERT INTO schema_version (version) VALUES (?)").run(m.version);
+    }
+    db.prepare("INSERT INTO runs (repo, ticket_key, phase, created_at, updated_at) VALUES ('r','K-1','running',1,1)").run();
+    db.prepare(
+      `INSERT INTO run_steps (run_id, step, started_at, progress_sig, progress_at, baseline_sig, baseline_frozen_at)
+       VALUES (1, 'work', 500, 'sha-hb', 900, NULL, NULL), (1, 'review', 700, NULL, NULL, 'sha-ro', 800)`,
+    ).run();
+    migrate(db);
+    const rows = db.prepare("SELECT step, watch, sig, based_at FROM watch_state ORDER BY step, watch").all() as Record<string, unknown>[];
+    expect(rows).toEqual([
+      { step: "review", watch: "budget", sig: null, based_at: 700 },
+      { step: "review", watch: "read_only", sig: "sha-ro", based_at: 800 },
+      { step: "work", watch: "budget", sig: null, based_at: 500 },
+      { step: "work", watch: "heartbeat", sig: "sha-hb", based_at: 900 },
+    ]);
+  });
+
+  it("a re-base writes a NULL row (never deletes), so the legacy fallback cannot resurrect a cleared clock", () => {
+    const { store, run } = makeStore();
+    // Simulate a drain-window row: legacy columns set, no watch_state row → fallback reads legacy.
+    store.upsertRunStep(run.id, "review", { baselineSig: "sha-legacy", baselineFrozenAt: 42 });
+    // (effectiveWatchClock is exercised through the evaluators in reconcile tests; here we pin the
+    // store contract the no-resurrection rule rides on.)
+    expect(store.getWatchState(run.id, "review", "read_only")).toBeUndefined();
+    store.upsertWatchState(run.id, "review", "read_only", { sig: null, basedAt: null }); // a clear
+    const ws = store.getWatchState(run.id, "review", "read_only")!;
+    expect(ws.sig).toBeNull();
+    expect(ws.basedAt).toBeNull(); // the row EXISTS with nulls — fallback to "sha-legacy" is dead
+    // Partial upserts only touch provided fields.
+    store.upsertWatchState(run.id, "review", "read_only", { sig: "sha-new" });
+    expect(store.getWatchState(run.id, "review", "read_only")!).toMatchObject({ sig: "sha-new", basedAt: null });
+    store.upsertWatchState(run.id, "review", "read_only", { basedAt: 99 });
+    expect(store.getWatchState(run.id, "review", "read_only")!).toMatchObject({ sig: "sha-new", basedAt: 99 });
+  });
+});

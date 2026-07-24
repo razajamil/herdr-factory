@@ -23,7 +23,28 @@
 import type { Deps } from "./deps.ts";
 import { HerdrUnreachableError } from "./deps.ts";
 import type { StepConfig } from "../config.ts";
-import type { Run, RunStep, RunStepPatch, WatchRebaseTrigger } from "../types.ts";
+import type { Run, RunStep, WatchRebaseTrigger } from "../types.ts";
+
+/**
+ * A watch's effective clock: its `watch_state` row (v34), else — for a row a draining old-code
+ * process touched, which has no watch row — the frozen legacy run_steps columns. A PRESENT row
+ * wins unconditionally: re-bases write nulls rather than deleting, so the fallback can never
+ * resurrect a deliberately-cleared clock. Exported for the obligations facts.
+ */
+export function effectiveWatchClock(deps: Deps, rs: RunStep, kind: string): { sig: string | null; basedAt: number | null } {
+  const ws = deps.store.getWatchState(rs.runId, rs.step, kind);
+  if (ws) return { sig: ws.sig, basedAt: ws.basedAt };
+  switch (kind) {
+    case "budget":
+      return { sig: null, basedAt: rs.startedAt };
+    case "heartbeat":
+      return { sig: rs.progressSig, basedAt: rs.progressAt };
+    case "read_only":
+      return { sig: rs.baselineSig, basedAt: rs.baselineFrozenAt };
+    default:
+      return { sig: null, basedAt: null };
+  }
+}
 
 export interface WatchCtx {
   deps: Deps;
@@ -52,9 +73,11 @@ export type WatchOutcome =
 
 // --- the shipped evaluators ---------------------------------------------------
 
-/** budget: the per-step wall clock (rs.startedAt re-bases at every (re-)entry — RWR-18147). */
+/** budget: the per-step wall clock (its base re-bases at every (re-)entry, dispatch and resume —
+ *  RWR-18147). */
 const budgetEvaluate: WatchEvaluator = async ({ deps, step, rs }) => {
-  if (rs.startedAt == null || deps.now() - rs.startedAt <= step.budgetSeconds) return { kind: "ok" };
+  const { basedAt } = effectiveWatchClock(deps, rs, "budget");
+  if (basedAt == null || deps.now() - basedAt <= step.budgetSeconds) return { kind: "ok" };
   return {
     kind: "trip",
     trippedWhat: "budget",
@@ -67,12 +90,15 @@ const budgetEvaluate: WatchEvaluator = async ({ deps, step, rs }) => {
 /** heartbeat: the commit-stall watch. OWNS its progress tracking — a moving branch HEAD is real
  *  work and resets the stall clock; only then is the window judged. */
 const heartbeatEvaluate: WatchEvaluator = async ({ deps, run, step, rs }) => {
-  let active = rs;
+  let clock = effectiveWatchClock(deps, rs, "heartbeat");
   if (run.worktreePath) {
     const sha = await deps.git.headSha(run.worktreePath);
-    if (sha && sha !== rs.progressSig) active = deps.store.upsertRunStep(run.id, step.name, { progressSig: sha, progressAt: deps.now() });
+    if (sha && sha !== clock.sig) {
+      deps.store.upsertWatchState(run.id, step.name, "heartbeat", { sig: sha, basedAt: deps.now() });
+      clock = { sig: sha, basedAt: deps.now() };
+    }
   }
-  const stalled = active.progressSig != null && active.progressAt != null && deps.now() - active.progressAt > deps.config.limits.stallSeconds;
+  const stalled = clock.sig != null && clock.basedAt != null && deps.now() - clock.basedAt > deps.config.limits.stallSeconds;
   if (!stalled) return { kind: "ok" };
   return {
     kind: "trip",
@@ -92,10 +118,11 @@ const heartbeatEvaluate: WatchEvaluator = async ({ deps, run, step, rs }) => {
  *  (STEP_WATCHDOG_ATTENTION), which is why this watch runs PRE-advance — a completed-but-violating
  *  step must park with its trail, and heal through the rescue, not slip through silently. */
 const readOnlyEvaluate: WatchEvaluator = async ({ deps, run, step, rs }) => {
-  if (!step.readOnly || !rs.baselineSig || !run.worktreePath) return { kind: "ok" };
+  const baseline = effectiveWatchClock(deps, rs, "read_only"); // sig = the baseline; basedAt = the freeze marker
+  if (!step.readOnly || !baseline.sig || !run.worktreePath) return { kind: "ok" };
   const head = await deps.git.headSha(run.worktreePath).catch(() => null);
   if (!head) return { kind: "ok" };
-  if (rs.baselineFrozenAt == null) {
+  if (baseline.basedAt == null) {
     // Not yet frozen. Freeze at the current HEAD the first pass this step's agent is `working`;
     // until then keep the baseline synced to HEAD so the prior step's trailing commits absorb.
     // Herdr flaky here defers only the FREEZE (treat as not-working), never the whole pass.
@@ -105,17 +132,17 @@ const readOnlyEvaluate: WatchEvaluator = async ({ deps, run, step, rs }) => {
     } catch (e) {
       if (!(e instanceof HerdrUnreachableError)) throw e;
     }
-    if (working) deps.store.upsertRunStep(run.id, step.name, { baselineSig: head, baselineFrozenAt: deps.now() });
-    else if (head !== rs.baselineSig) deps.store.upsertRunStep(run.id, step.name, { baselineSig: head });
+    if (working) deps.store.upsertWatchState(run.id, step.name, "read_only", { sig: head, basedAt: deps.now() });
+    else if (head !== baseline.sig) deps.store.upsertWatchState(run.id, step.name, "read_only", { sig: head });
     return { kind: "ok" };
   }
-  if (head === rs.baselineSig) return { kind: "ok" };
+  if (head === baseline.sig) return { kind: "ok" };
   return {
     kind: "trip",
     trippedWhat: "read-only contract",
     attentionReason: `${step.name} is read-only but committed (HEAD moved)`,
-    body: `${run.ticketKey}: the ${step.name} step is read-only — it must never edit or commit — but the branch HEAD moved from ${rs.baselineSig.slice(0, 8)} to ${head.slice(0, 8)} after its agent took over. A human should review; the agent violated the read-only contract. (A genuine step-done from this step will un-park and advance.)`,
-    detail: { step: step.name, baseline: rs.baselineSig, head },
+    body: `${run.ticketKey}: the ${step.name} step is read-only — it must never edit or commit — but the branch HEAD moved from ${baseline.sig.slice(0, 8)} to ${head.slice(0, 8)} after its agent took over. A human should review; the agent violated the read-only contract. (A genuine step-done from this step will un-park and advance.)`,
+    detail: { step: step.name, baseline: baseline.sig, head },
   };
 };
 
@@ -133,30 +160,28 @@ export function watchEvaluatorFor(kind: string): WatchEvaluator | undefined {
   return WATCH_EVALUATORS.get(kind);
 }
 
-/** Each watch kind's CLOCK columns, as a re-base patch. (With a future per-watch state table this
- *  collapses to a generic row reset; today the clocks live on run_steps columns.) */
-const WATCH_CLOCKS: Record<string, (now: number) => RunStepPatch> = {
-  budget: (now) => ({ startedAt: now }),
-  heartbeat: () => ({ progressSig: null, progressAt: null }),
-  read_only: () => ({ baselineSig: null, baselineFrozenAt: null }),
+/** Each watch kind's re-base: what a fresh clock means FOR IT. Writes the watch_state row (nulls
+ *  to clear — never a delete, so the legacy fallback can't resurrect a cleared clock). A plugin
+ *  watch with richer state re-bases via its own entry here (see registerWatchEvaluator's docs). */
+const WATCH_REBASE: Record<string, (deps: Deps, runId: number, step: string) => void> = {
+  budget: (deps, runId, step) => void deps.store.upsertWatchState(runId, step, "budget", { basedAt: deps.now() }),
+  heartbeat: (deps, runId, step) => void deps.store.upsertWatchState(runId, step, "heartbeat", { sig: null, basedAt: null }),
+  read_only: (deps, runId, step) => void deps.store.upsertWatchState(runId, step, "read_only", { sig: null, basedAt: null }),
 };
 
 /**
  * Re-base every armed watch's clocks for one engine seam, derived from the guards' `rebaseOn`
  * declarations — the RWR-18147 fix as data. Each seam names its trigger and this applies the right
- * subset: an "entry" clears all three; a "reply_resume" re-bases only the budget (the agent
+ * subset: an "entry" resets all three; a "reply_resume" re-bases only the budget (the agent
  * CONTINUES its pass — the frozen read-only baseline and the stall history must survive). Seam
  * bookkeeping (done / pass / dispatched_at / absent_at) stays at the seams — it is pass state,
- * not a watch clock. One upsert; a step with none of the declaring guards is a no-op.
+ * not a watch clock. A step with none of the declaring guards is a no-op.
  */
 export function applyWatchRebase(deps: Deps, runId: number, step: StepConfig, trigger: WatchRebaseTrigger): void {
-  let patch: RunStepPatch = {};
   for (const g of step.guards) {
     if (!g.rebaseOn?.includes(trigger)) continue;
-    const clocks = WATCH_CLOCKS[g.kind];
-    if (clocks) patch = { ...patch, ...clocks(deps.now()) };
+    WATCH_REBASE[g.kind]?.(deps, runId, step.name);
   }
-  if (Object.keys(patch).length > 0) deps.store.upsertRunStep(runId, step.name, patch);
 }
 
 /**

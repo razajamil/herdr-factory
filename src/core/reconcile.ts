@@ -1118,7 +1118,7 @@ async function resumeAfterHumanReply(deps: Deps, run: Run, belt: BeltRuntime, sr
   //    agent CONTINUES the same pass, so the frozen read-only baseline and the stall history
   //    survive. The pass is NOT bumped: the --pass stamp baked into its prompt's commands must
   //    stay valid.
-  deps.store.upsertRunStep(run.id, step, { done: false, absentAt: null });
+  deps.store.upsertRunStep(run.id, step, { done: false, startedAt: deps.now(), absentAt: null });
   applyWatchRebase(deps, run.id, stepByName(belt, step)!, "reply_resume");
   deps.store.updateRun(run.id, { phase: "running", step, attentionReason: null, focusPending: true });
   const prompt =
@@ -1258,10 +1258,12 @@ export async function bounceStep(
   //     "waiting" (target pane dead + layout pane unresolvable), later ticks route through the
   //     spawn branch + bounded layout wait instead of the budget watchdog reading the PRIOR pass's
   //     stale started_at and parking the run as "over budget (worker: gone)".
-  // (The target's watch clocks — startedAt included — were re-based by the "entry" rebase above.)
+  // (The target's WATCH clocks were re-based by the "entry" rebase above; startedAt here is the
+  // pass bookkeeping clock — the fresh layout-wait window for the undispatched rework pass.)
   deps.store.upsertRunStep(run.id, toStep, {
     pass: (deps.store.getRunStep(run.id, toStep)?.pass ?? 0) + 1,
     dispatchedAt: null,
+    startedAt: deps.now(),
     absentAt: null,
   });
   const notePath = writeBounceNote(run, fromStep, toStep, reason);
@@ -1713,7 +1715,10 @@ async function reconcileStep(deps: Deps, run: Run, belt: BeltRuntime, src: Sourc
       // machinery own the retry on later ticks, instead of the kept pane_id masking the pass as
       // dispatched and the budget watchdog parking it on a misleading "over budget (worker: gone)".
       const prevPass = deps.store.getRunStep(run.id, next.name)?.pass ?? 0;
-      deps.store.upsertRunStep(run.id, next.name, { done: false, absentAt: null, pass: prevPass + 1, dispatchedAt: null });
+      // startedAt here is the PASS bookkeeping clock (the layout-wait window for an undispatched
+      // pass, per-attempt dispatch timing) — the budget's own clock lives in watch_state and
+      // re-bases via applyWatchRebase below.
+      deps.store.upsertRunStep(run.id, next.name, { done: false, startedAt: deps.now(), absentAt: null, pass: prevPass + 1, dispatchedAt: null });
       applyWatchRebase(deps, run.id, next, "entry"); // budget/heartbeat/read-only clocks, per declaration
       deps.log("info", `${run.ticketKey}: ${step.name} done -> ${next.name}`);
       const res = await spawnStep(deps, run, belt, src, next.name);
@@ -1900,9 +1905,9 @@ async function reconcileAttention(deps: Deps, run: Run, belt: BeltRuntime, src: 
     if (step && rs?.done && STEP_WATCHDOG_ATTENTION.has(deps.store.lastAttentionReasonCode(run.id) ?? "")) {
       deps.store.updateRun(run.id, { phase: "running", attentionReason: null });
       // A read_only_violation park heals by ADVANCING the completed step. Clear its enforcement
-      // baseline so reconcileStep skips the read-only HEAD check (which would otherwise re-detect
-      // the same move and re-park before reaching the done-advance) — mirrors resumeRun.
-      if (step.readOnly) deps.store.upsertRunStep(run.id, run.step, { baselineSig: null, baselineFrozenAt: null });
+      // baseline so the pre-advance watch skips the read-only HEAD check (which would otherwise
+      // re-detect the same move and re-park before reaching the done-advance) — mirrors resumeRun.
+      if (step.readOnly) deps.store.upsertWatchState(run.id, run.step, "read_only", { sig: null, basedAt: null });
       deps.store.recordEvent({
         runId: run.id,
         repo: deps.config.repoName,
@@ -2031,7 +2036,7 @@ export async function resumeRun(deps: Deps, run: Run): Promise<{ ok: boolean; ph
     // gets its full bounded respawn budget back. Both derived from the step's guard declarations
     // (rebaseOn / resetOn), so a plugin watch resumes correctly for free.
     const step = stepByName(belt, run.step)!;
-    deps.store.upsertRunStep(run.id, run.step, { absentAt: null });
+    deps.store.upsertRunStep(run.id, run.step, { startedAt: deps.now(), absentAt: null });
     applyWatchRebase(deps, run.id, step, "resume");
     for (const g of guardsResetOn(step.guards, "resume")) deps.store.resetGuardCounter(run.id, step.name, g.kind);
     phase = "running";
@@ -2045,7 +2050,7 @@ export async function resumeRun(deps: Deps, run: Run): Promise<{ ok: boolean; ph
     // claim a fresh wait window + respawn budget, or reconcileClaiming would see the ancient
     // started_at and the spent budget and re-park on the same pass that resumed it.
     const first = firstStep(belt);
-    deps.store.upsertRunStep(run.id, first.name, { absentAt: null });
+    deps.store.upsertRunStep(run.id, first.name, { startedAt: deps.now(), absentAt: null });
     applyWatchRebase(deps, run.id, first, "resume"); // fresh wait/budget window for the resumed claim
     for (const g of guardsResetOn(first.guards, "resume")) deps.store.resetGuardCounter(run.id, first.name, g.kind);
     phase = "claiming";

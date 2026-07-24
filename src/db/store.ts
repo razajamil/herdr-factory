@@ -17,6 +17,7 @@ import type {
   SourceAuthToken,
   StepName,
   TransitionIntent,
+  WatchState,
   WorkItem,
   WorkState,
 } from "../types.ts";
@@ -526,7 +527,7 @@ export class Store {
       // Detach (keep) the timeline; the FK on events(run_id) permits NULL, so the rows survive.
       this.db.prepare(`UPDATE events SET run_id = NULL WHERE run_id IN (${ph})`).run(...ids);
       // Delete every run-scoped child row. Table names are a fixed internal list (never user input).
-      for (const table of ["run_steps", "run_products", "guard_counters", "transition_outbox", "evidence_uploads", "human_questions", "pending_signals", "intents"]) {
+      for (const table of ["run_steps", "run_products", "guard_counters", "transition_outbox", "evidence_uploads", "human_questions", "pending_signals", "intents", "watch_state"]) {
         this.db.prepare(`DELETE FROM ${table} WHERE run_id IN (${ph})`).run(...ids);
       }
       this.db.prepare(`DELETE FROM runs WHERE id IN (${ph})`).run(...ids);
@@ -856,6 +857,54 @@ export class Store {
   markStepDone(runId: number, step: StepName): void {
     this.upsertRunStep(runId, step, { done: true });
     telemetryEvent("store.run_step.done", { "run.id": runId, step });
+  }
+
+  // --- watch_state (per-watch clocks/signatures, v34) --------------------------
+  // One row per (run, step, watch) for the harness-evaluated watches. Evaluators and the re-base
+  // seams UPSERT (writing nulls to clear) — never delete — so the legacy-column fallback (for rows
+  // a draining old-code process touched) can't resurrect a deliberately-cleared clock. Rows die
+  // with the run (purge) only.
+
+  getWatchState(runId: number, step: string, watch: string): WatchState | undefined {
+    const row = this.db
+      .prepare("SELECT run_id AS runId, step, watch, sig, based_at AS basedAt, meta, updated_at AS updatedAt FROM watch_state WHERE run_id = ? AND step = ? AND watch = ?")
+      .get(runId, step, watch) as WatchState | undefined;
+    return row;
+  }
+
+  /** Every watch's state for a step — the obligations facts read. */
+  watchStatesForStep(runId: number, step: string): WatchState[] {
+    return this.db
+      .prepare("SELECT run_id AS runId, step, watch, sig, based_at AS basedAt, meta, updated_at AS updatedAt FROM watch_state WHERE run_id = ? AND step = ? ORDER BY watch")
+      .all(runId, step) as unknown as WatchState[];
+  }
+
+  /** Upsert a watch's state. Partial: only the provided fields change (null clears a field). */
+  upsertWatchState(runId: number, step: string, watch: string, patch: { sig?: string | null; basedAt?: number | null; meta?: string }): WatchState {
+    const t = this.now();
+    this.db
+      .prepare(
+        `INSERT INTO watch_state (run_id, step, watch, sig, based_at, meta, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(run_id, step, watch) DO UPDATE SET
+           sig = CASE WHEN ? THEN excluded.sig ELSE watch_state.sig END,
+           based_at = CASE WHEN ? THEN excluded.based_at ELSE watch_state.based_at END,
+           meta = CASE WHEN ? THEN excluded.meta ELSE watch_state.meta END,
+           updated_at = excluded.updated_at`,
+      )
+      .run(
+        runId,
+        step,
+        watch,
+        patch.sig ?? null,
+        patch.basedAt ?? null,
+        patch.meta ?? "{}",
+        t,
+        patch.sig !== undefined ? 1 : 0,
+        patch.basedAt !== undefined ? 1 : 0,
+        patch.meta !== undefined ? 1 : 0,
+      );
+    return this.getWatchState(runId, step, watch)!;
   }
 
   /** Increment (and return) a capped guard's counter, keyed (run, step, guard) in `guard_counters` so

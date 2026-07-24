@@ -1001,10 +1001,10 @@ describe("reconcile pipeline (work_to_pull_request belt)", () => {
     state.paneState = "idle"; // the read-only agent hasn't taken over yet (still spinning up)
     state.headSha = "sha-trailing"; // the PRIOR step's still-alive agent committed after handoff
     await reconcileRun(deps, store.getRun(run.id)!);
-    const rs = store.getRunStep(run.id, "review")!;
     expect(store.getRun(run.id)!.phase).toBe("running"); // NOT parked
-    expect(rs.baselineSig).toBe("sha-trailing"); // baseline advanced to absorb it
-    expect(rs.baselineFrozenAt).toBe(null); // still not frozen
+    const ws = store.getWatchState(run.id, "review", "read_only")!;
+    expect(ws.sig).toBe("sha-trailing"); // baseline advanced to absorb it (watch_state since v34)
+    expect(ws.basedAt).toBe(null); // still not frozen
   });
 
   it("read_only: the baseline FREEZES once the step's own agent is working (progressAt stamped)", async () => {
@@ -1016,7 +1016,7 @@ describe("reconcile pipeline (work_to_pull_request belt)", () => {
     store.upsertRunStep(run.id, "review", { baselineSig: "sha-baseline" });
     state.paneState = "working"; // the read-only agent has taken over
     await reconcileRun(deps, store.getRun(run.id)!);
-    expect(store.getRunStep(run.id, "review")!.baselineFrozenAt).toBe(5000); // frozen at now
+    expect(store.getWatchState(run.id, "review", "read_only")!.basedAt).toBe(5000); // frozen at now
     expect(store.getRun(run.id)!.phase).toBe("running"); // no park (no move since spawn)
   });
 
@@ -1312,13 +1312,14 @@ describe("reconcile pipeline (work_to_pull_request belt)", () => {
     await bounceStep(deps, store.getRun(run.id)!, belt, src, "fix", "the fix isn't proven");
     expect(store.getRun(run.id)!.step).toBe("fix");
     expect(store.getRunStep(run.id, "fix")!.done).toBe(false);
-    expect(store.getRunStep(run.id, "fix")!.progressSig).toBe(null); // the target's heartbeat clock reset
+    expect(store.getWatchState(run.id, "fix", "heartbeat")!.sig).toBe(null); // the target's heartbeat clock reset
     // The intermediate evidence step MUST be cleared too, or the forward re-run skips its re-capture
     // and the PR embeds stale, pre-fix evidence — and its frozen baseline must not survive into the
     // re-entry (a stale frozen baseline would false-park the re-captured pass as a violation).
     expect(store.getRunStep(run.id, "evidence")!.done).toBe(false);
-    expect(store.getRunStep(run.id, "evidence")!.baselineSig).toBe(null);
-    expect(store.getRunStep(run.id, "evidence")!.baselineFrozenAt).toBe(null);
+    const evBaseline = store.getWatchState(run.id, "evidence", "read_only")!;
+    expect(evBaseline.sig).toBe(null);
+    expect(evBaseline.basedAt).toBe(null);
   });
 
   it("after a bounce, fix re-completing runs the pipeline forward again (review re-runs, still not done)", async () => {
@@ -1580,9 +1581,9 @@ describe("reconcile pipeline (work_to_pull_request belt)", () => {
     setNow(1000 + 2701);
     await reconcileRun(deps, store.getRun(run.id)!);
     expect(store.getRun(run.id)!.phase).toBe("running");
-    const fix = store.getRunStep(run.id, "fix")!;
-    expect(fix.progressSig).toBe("sha1");
-    expect(fix.progressAt).toBe(1000 + 2701);
+    const heartbeat = store.getWatchState(run.id, "fix", "heartbeat")!;
+    expect(heartbeat.sig).toBe("sha1");
+    expect(heartbeat.basedAt).toBe(1000 + 2701);
     expect(calls.notify).toBe(0);
   });
 
@@ -2422,9 +2423,9 @@ describe("attention workflow — resume, parked slots, re-notification", () => {
     const got = store.getRun(run.id)!;
     expect(got.phase).toBe("running");
     expect(got.attentionReason).toBeNull();
-    const rs = store.getRunStep(run.id, "fix")!;
-    expect(rs.startedAt).toBe(1000); // budget clock restarted
-    expect(rs.progressSig).toBeNull(); // heartbeat restarted
+    expect(store.getRunStep(run.id, "fix")!.startedAt).toBe(1000); // wait/attempt clock restarted
+    expect(store.getWatchState(run.id, "fix", "budget")!.basedAt).toBe(1000); // budget clock restarted
+    expect(store.getWatchState(run.id, "fix", "heartbeat")!.sig).toBeNull(); // heartbeat restarted
 
     await reconcileRun(deps, store.getRun(run.id)!); // pane w1:p1 is alive → keeps gating, no attention
     expect(store.getRun(run.id)!.phase).toBe("running");
@@ -2692,7 +2693,7 @@ describe("human-reply resume — a stray step-done can never skip the reply", ()
     expect(got.step).toBe("fix"); // NOT auto-advanced on the stale done the moment the reply landed
     const rs = store.getRunStep(run.id, "fix")!;
     expect(rs.done).toBe(false); // cleared for the continuation
-    expect(rs.startedAt).toBe(1061); // budget clock re-based to the resume, not the pre-ask dispatch
+    expect(store.getWatchState(run.id, "fix", "budget")!.basedAt).toBe(1061); // budget clock re-based to the resume, not the pre-ask dispatch
     expect(calls.agentSend.at(-1)?.[1]).toContain("Human guidance has arrived");
 
     // Later passes keep waiting for the agent's own decision…

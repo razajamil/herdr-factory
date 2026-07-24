@@ -535,13 +535,15 @@ CREATE TABLE run_steps(                  -- one row per pipeline agent (migratio
   id INTEGER PRIMARY KEY AUTOINCREMENT, run_id INTEGER NOT NULL,
   step TEXT NOT NULL,                    -- belt step name (work/evidence/review/pr/custom)
   pane_id TEXT, session_id TEXT,         -- on-demand cross-agent query handles
-  progress_sig TEXT, progress_at INTEGER,   -- per-step commit heartbeat (heartbeat steps only)
-  baseline_sig TEXT, baseline_frozen_at INTEGER, -- the read-only guard's enforcement baseline (v28;
-                                         -- de-aliased from progress_sig, which read-only steps used
-                                         -- to borrow): tracks live HEAD — absorbing the prior step's
-                                         -- trailing handoff commits (RWR-18204) — until the step's
-                                         -- own agent is first observed working, then freezes; a HEAD
-                                         -- move past the freeze parks `read_only_violation`.
+  progress_sig TEXT, progress_at INTEGER,   -- LEGACY since v34 (frozen): the heartbeat clock lives
+                                         -- in watch_state('heartbeat'); these are read only as the
+                                         -- lazy fallback for rows a draining old-code process wrote.
+  baseline_sig TEXT, baseline_frozen_at INTEGER, -- LEGACY since v34 (frozen): the read-only
+                                         -- enforcement baseline lives in watch_state('read_only') —
+                                         -- sig tracks live HEAD, absorbing the prior step's trailing
+                                         -- handoff commits (RWR-18204), until the step's own agent
+                                         -- is first observed working (based_at = the freeze marker);
+                                         -- a HEAD move past the freeze parks `read_only_violation`.
   done INTEGER NOT NULL DEFAULT 0, started_at INTEGER, done_at INTEGER,
   bounces INTEGER NOT NULL DEFAULT 0,    -- SUPERSEDED (with capture_attempts) by guard_counters (v21),
   absent_at INTEGER,                     -- left unread. absent_at: pane first CONFIRMED absent (v10)
@@ -689,6 +691,19 @@ CREATE TABLE intents(                    -- the INTENT LEDGER (v29): one durable
   created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, -- Phase A consumes exactly once.
   resolved_at INTEGER,
   UNIQUE(kind, scope, dedup_key));
+
+CREATE TABLE watch_state(                -- per-watch clocks/signatures (v34): one row per
+  run_id INTEGER NOT NULL REFERENCES runs(id), -- (run, step, watch) for the harness-evaluated
+  step TEXT NOT NULL, watch TEXT NOT NULL,     -- watches (core/watches.ts). budget: based_at = the
+  sig TEXT, based_at INTEGER,            -- window's base (re-based at entry/dispatch/resume per
+  meta TEXT NOT NULL DEFAULT '{}',       -- GuardSpec.rebaseOn); heartbeat: sig/based_at = last-seen
+  updated_at INTEGER NOT NULL,           -- HEAD + when; read_only: sig = the baseline, based_at =
+  PRIMARY KEY (run_id, step, watch));    -- the freeze marker. A plugin watch stores state without a
+                                         -- migration. Re-bases WRITE NULL ROWS, never delete — the
+                                         -- legacy run_steps-column fallback (one release) must not
+                                         -- resurrect a cleared clock. run_steps.started_at remains
+                                         -- PASS bookkeeping (the layout-wait window + per-attempt
+                                         -- dispatch clock), distinct from the budget watch's clock.
 
 CREATE TABLE locks(name TEXT PRIMARY KEY, owner TEXT, acquired_at INTEGER, expires_at INTEGER);
 CREATE TABLE schema_version(version INTEGER);

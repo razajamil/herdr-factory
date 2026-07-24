@@ -495,6 +495,21 @@ export interface WorkDocInfo {
   kind: string; // e.g. "Jira ticket (JSON)", "markdown file"
 }
 
+/** One harness-evaluated watch's persisted state (`watch_state`, v34): its signature + clock, per
+ *  (run, step, watch). budget: basedAt = the budget window's base; heartbeat: sig/basedAt =
+ *  last-seen HEAD + when; read_only: sig = the enforcement baseline, basedAt = the freeze marker
+ *  (null while tracking). `meta` is watch-owned JSON — a plugin watch stores whatever it needs
+ *  without a migration. */
+export interface WatchState {
+  runId: number;
+  step: string;
+  watch: string;
+  sig: string | null;
+  basedAt: number | null;
+  meta: string;
+  updatedAt: number;
+}
+
 /** epoch-seconds clock, injected for testability. */
 export type Clock = () => number;
 export const systemClock: Clock = () => Math.floor(Date.now() / 1000);

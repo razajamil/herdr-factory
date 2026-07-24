@@ -669,17 +669,20 @@ async function spawnStepImpl(
   // dispatched_at (this pass's prompt has reached an agent — the reconciler's spawn branch keys on
   // it), and clear any pending absence confirmation — this pane is definitionally alive right now.
   deps.store.upsertRunStep(run.id, stepName, { paneId: result.paneId, startedAt: deps.now(), absentAt: null, dispatchedAt: deps.now() });
+  // The budget window is measured PER ATTEMPT (not cumulatively across crash-recovery re-spawns or
+  // the preceding layout wait) — re-base its watch clock alongside the dispatch bookkeeping above.
+  deps.store.upsertWatchState(run.id, stepName, "budget", { basedAt: deps.now() });
   // The pane came up — refund every counter guard that declares a dispatch-success reset (the
   // layout-wait respawn budget), so a FUTURE wait by this step (a re-entry after a bounce, a crash
   // respawn) starts with its full bounded-retry allowance. Derived from GuardSpec.resetOn.
   for (const g of guardsResetOn(step.guards, "dispatch")) deps.store.resetGuardCounter(run.id, stepName, g.kind);
   // read_only enforcement baseline: capture HEAD before the agent runs, so a later commit (a
-  // read-only-contract violation) is detectable as HEAD movement in reconcileStep. Starts UNFROZEN
-  // (baselineFrozenAt null): it tracks live HEAD — absorbing the prior step's trailing handoff
-  // commits — until this step's agent is first observed working (RWR-18204). Own columns since v28.
+  // read-only-contract violation) is detectable as HEAD movement in the watch harness. Starts
+  // UNFROZEN (basedAt null): it tracks live HEAD — absorbing the prior step's trailing handoff
+  // commits — until this step's agent is first observed working (RWR-18204). watch_state since v34.
   if (step.readOnly && worktree) {
     const head = await deps.git.headSha(worktree).catch(() => null);
-    if (head) deps.store.upsertRunStep(run.id, stepName, { baselineSig: head, baselineFrozenAt: null });
+    if (head) deps.store.upsertWatchState(run.id, stepName, "read_only", { sig: head, basedAt: null });
   }
   deps.store.updateRun(run.id, { paneId: result.paneId }); // latest active pane (reviewing/resolver reuse it)
   deps.store.recordEvent({
