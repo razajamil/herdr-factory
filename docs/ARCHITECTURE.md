@@ -234,7 +234,7 @@ out to `herdr …` and parses its JSON; it contains zero terminal/worktree logic
 - workspace **close / get / list**
 - tab **create / list**
 - pane **split / run / send-text / send-keys / list / read**
-- agent **start / list / status / send / focus / rename / read / wait**
+- agent **start / list / status / prompt / send-keys / focus / rename / read / wait**
 - pane **list / current** (incl. the `focused` flag — which pane the user is viewing)
 - desktop **notifications**
 
@@ -928,16 +928,16 @@ flowchart TD
     end
 
     todo["Jira: To Do (labelled)"] -->|"disp → herdr worktree create<br/>Jira REST → In Development"| wt["herdr worktree + workspace"]
-    wt -->|"disp → herdr agent send (spawn work)"| work
+    wt -->|"disp → herdr agent prompt (spawn work)"| work
     pr -->|"disp sees the PR open (non-draft) or merged<br/>disp → Jira REST → In Review"| human["reviewing<br/>human review (dispatcher-watched)"]
     human -->|"disp → herdr worktree remove<br/>· git branch -D"| done["done (merged / closed)"]
 
-    nudge -.->|"disp → herdr agent send (spawn next step)"| PIPE
+    nudge -.->|"disp → herdr agent prompt (spawn next step)"| PIPE
     tick -.->|"disp → gh pr checks · review threads"| human
     tick -.->|"disp → herdr notification show + source note<br/>(re-notifies hourly; `resume` un-parks)"| attention["attention<br/>(no claim slot)"]
 
     review -.->|"on-demand → herdr agent read work-pane"| work
-    pr -.->|"on-demand → herdr agent read / send prior-pane"| review
+    pr -.->|"on-demand → herdr agent read / prompt prior-pane"| review
 ```
 
 Every edge is labelled with the command(s) that propagate state across it, by actor:
@@ -946,7 +946,7 @@ Every edge is labelled with the command(s) that propagate state across it, by ac
   `bounce` / `ask-human` calls are *all* an agent issues to steer the pipeline (it also writes
   its handoff note first); the dispatcher does everything else.
 - **`disp →`** — run by the dispatcher (`core/reconcile`) over the herdr socket
-  (`herdr worktree …`, `herdr agent send`, `herdr notification show`), `gh`, and `git`,
+  (`herdr worktree …`, `herdr agent prompt`, `herdr notification show`), `gh`, and `git`,
   plus Jira REST for the status transitions (not a CLI).
 - **`on-demand →`** — optional cross-agent context pulls a later agent may make.
 
@@ -1011,7 +1011,7 @@ by what they actually need:
   `evidence` / `review` (derived from the primitive's guards; a `custom` step opts in); each step
   also has its own budget (the step ref's `budget_seconds`, else the primitive's default — `work`
   5400 / `evidence` 2400 / `review` 1800 / `pr` 3600 — else `step_budget_seconds`).
-- **Coordination:** on-demand `agent read` / `agent send` is agent-to-agent traffic
+- **Coordination:** on-demand `agent read` / `agent prompt` is agent-to-agent traffic
   *outside* the tick, so the dispatcher is no longer the sole coordinator and the DB
   timeline no longer captures every inter-agent interaction.
 - **Focus follows the active step.** `spawnStep` sets `run.focus_pending` instead of focusing
@@ -1051,8 +1051,8 @@ step (`spawnStep`):
    `steps[]` entry, resolved onto its `StepConfig`):
    - **Configured** (a pane the belt's layout built — see [§4](#4-herdr-ownership-boundary)): find
      that pane and require an agent
-     that is present **and idle** (agent-agnostic — claude *or* opencode), then `agent send`
-     the prompt + Enter. If the pane isn't up yet or its agent is still busy starting up,
+     that is present **and idle** (agent-agnostic — claude *or* opencode), then `agent prompt`
+     it (atomic submit + Enter). If the pane isn't up yet or its agent is still busy starting up,
      `spawnStep` returns `waiting` — the run stays in its phase and retries on later ticks
      (the wait is bounded by `layout_wait_seconds`, measured from the `run_steps` row's
      `started_at`). A **re-entry** (bounce rework, forward re-advance) re-prompts the step's own
@@ -1132,7 +1132,7 @@ cheapest-first, using herdr's agent-awareness:
 | Need | Mechanism | Cost / caveat |
 |---|---|---|
 | factual detail ("what did you try for X?") | `herdr agent read <prior-pane> --source recent`, or read the session transcript by its id | cheap; works even if the prior agent has exited |
-| intent ("*why* not handle Y?") | `agent send <prior-pane> "<q>"` → `agent wait --status idle` → `agent read` | needs the prior agent still alive; slow; prone to post-hoc confabulation |
+| intent ("*why* not handle Y?") | `agent prompt <prior-pane> "<q>"` → `agent wait --until idle` → `agent read` | needs the prior agent still alive; slow; prone to post-hoc confabulation |
 
 The example prompts tune this per step: **review** leans on the handoff note + session id
 for *factual* lookups only (to protect its independence); **pr** queries more freely since

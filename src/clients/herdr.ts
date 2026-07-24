@@ -259,11 +259,12 @@ export class HerdrClient {
   }
 
   /** Wait for `marker` in the pane's output, up to `timeoutMs` (blocking layout setup). Returns the
-   *  matched line, or null on timeout / no match. The exec budget outlasts herdr's own --timeout. */
+   *  matched line, or null on timeout / no match. The exec budget outlasts herdr's own --timeout.
+   *  (herdr 0.7.5 replaced the top-level `wait output` with `pane wait-output`.) */
   async waitOutput(paneId: string, marker: string, timeoutMs: number): Promise<string | null> {
     const j = await runJson<WaitOutputResp>(
       this.bin,
-      ["wait", "output", paneId, "--match", marker, "--timeout", String(timeoutMs)],
+      ["pane", "wait-output", paneId, "--match", marker, "--timeout", String(timeoutMs)],
       { allowFail: true, timeoutMs: timeoutMs + 30_000 },
     ).catch(() => ({}) as WaitOutputResp);
     return j.result?.matched_line ?? null;
@@ -328,8 +329,12 @@ export class HerdrClient {
     return (j.result?.panes ?? []).find((p) => p.tab_id === tabId)?.pane_id ?? null;
   }
 
+  /** Submit `text` as a prompt to the agent in `paneId` (types it and presses Enter, honoring
+   *  bracketed-paste). herdr 0.7.5 split the old `agent send` into logical `agent send-keys` (key
+   *  presses) and atomic `agent prompt` (prompt submission) — dispatching a step's instruction is
+   *  the latter. Fire-and-forget: no `--wait`, so it returns as soon as the prompt is submitted. */
   async agentSend(paneId: string, text: string): Promise<void> {
-    await run(this.bin, ["agent", "send", paneId, text], { allowFail: true });
+    await run(this.bin, ["agent", "prompt", paneId, text], { allowFail: true });
   }
 
   /** Focus the agent's pane (and its tab) so a worktree view follows the active step. */

@@ -1,7 +1,7 @@
 id = "herdr-factory"
 name = "herdr-factory layouts"
 version = "0.1.0"
-min_herdr_version = "0.7.0"
+min_herdr_version = "0.7.5"
 description = "Builds a per-belt herdr tab/pane layout into each newly-created worktree of a herdr-factory-managed repo (absorbed from herdr-plugin-workspace-manager)."
 platforms = ["linux", "macos"]
 
