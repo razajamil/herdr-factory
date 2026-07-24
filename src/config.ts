@@ -698,6 +698,18 @@ export const RepoConfigSchema = z
       }
       layoutIds.add(l.id);
     });
+    // Each layout's LABELED (tab, pane) targets — what a belt step's `tab`/`pane` resolves against
+    // at dispatch (herdr labels come from the titles). Untitled tabs/panes are unaddressable by
+    // label, so they contribute nothing here.
+    const layoutPaneTargets = new Map<string, Set<string>>(); // layout id → "tab\0pane"
+    for (const l of cfg.layouts) {
+      const targets = new Set<string>();
+      for (const t of l.tabs) {
+        if (!t.title) continue;
+        for (const p of t.panes) if (p.title) targets.add(`${t.title}\0${p.title}`);
+      }
+      layoutPaneTargets.set(l.id, targets);
+    }
     // Belt names unique; each belt.source references a configured work source; custom step names
     // unique within their belt; the per-belt pickup `label` matches its source's label semantics
     // and is unique per (source, label).
@@ -743,6 +755,30 @@ export const RepoConfigSchema = z
           ctx.addIssue({ code: "custom", message: `belt "${b.name}" layout_matching[${j}] references unknown layout "${r.layout}" (defined: ${[...layoutIds].join(", ") || "none"})`, path: ["belt", i, "layout_matching", j, "layout"] });
         }
       });
+      // Steps are ALLOCATED TO LAYOUT PANES AT LOAD: a step's tab/pane target must exist — as a
+      // labeled tab title + pane title — in the belt's `default_layout`, the layout every
+      // factory-claimed worktree gets (unless a matching rule intercepts). A target missing from
+      // the built layout is otherwise only discovered at runtime, as a layout-wait park after
+      // (1 + autoRespawnLimit) full wait windows — a misconfiguration should fail HERE, at
+      // save/reload, with the layout's actual panes in the message. Deliberately scoped:
+      //  - a belt with NO default_layout is skipped — its panes are provided outside the factory
+      //    (hand-built workspaces), which load-time validation can't prove either way;
+      //  - `layout_matching` targets are exempt — those rules commonly serve HAND-created
+      //    worktrees (branch patterns a factory claim never produces), whose layouts legitimately
+      //    omit the belt's step panes.
+      const defaultLayoutTargets = b.default_layout != null ? layoutPaneTargets.get(b.default_layout) : undefined;
+      if (defaultLayoutTargets) {
+        b.steps.forEach((s, j) => {
+          if (s.tab == null || s.pane == null) return;
+          if (defaultLayoutTargets.has(`${s.tab}\0${s.pane}`)) return;
+          const available = [...defaultLayoutTargets].map((k) => k.replace("\0", "/")).join(", ") || "(no labeled panes)";
+          ctx.addIssue({
+            code: "custom",
+            message: `belt "${b.name}" step "${s.name ?? s.type}" targets pane ${s.tab}/${s.pane}, but layout "${b.default_layout}" does not define it — its labeled panes are: ${available}. Fix the step's tab/pane, or add a pane titled "${s.pane}" to a tab titled "${s.tab}" in the layout.`,
+            path: ["belt", i, "steps", j, "pane"],
+          });
+        });
+      }
       // Step validation for EVERY belt (previously custom-only). Each step references a registered
       // primitive; resolve its descriptor and run the structural checks the reconciler relies on.
       const kept = b.steps.filter((s) => {

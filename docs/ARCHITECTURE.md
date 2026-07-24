@@ -1393,6 +1393,12 @@ about to revert. It's driven two ways:
   (tab, pane) target unique across one belt's steps (the first dispatch renames the pane to
   `<step>:<KEY>`, so a second step sharing it could never resolve its label and would burn its
   layout wait into a park — one agent pane per step),
+  **step→layout-pane allocation** — every step's tab/pane target must exist (as labeled tab +
+  pane titles) in the belt's `default_layout`, so a misallocated step fails at save/reload with
+  the layout's actual panes in the message instead of surfacing at runtime as a layout-wait park
+  (a belt with no `default_layout` is skipped — its panes come from outside the factory — and
+  `layout_matching` targets are exempt, since those rules commonly serve hand-created worktrees
+  whose layouts legitimately omit the step panes),
   `{{work_id}}` in `workspace_name`, and `match` / `config`-sourced `prompt_file` existence — all
   with readable errors. The work-source *clients* are constructed in `build-deps.ts`'s `buildDeps` via each
   type's registry descriptor (`descriptorFor(type).create(ctx)` — the ctx carries the env map,

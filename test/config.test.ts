@@ -1726,6 +1726,20 @@ describe("loadConfig — layouts (workspace-manager port)", () => {
       - { type: review, tab: review, pane: agent }
       - { type: pr,     tab: pr,     pane: agent }
 `;
+  // A belt whose steps target NO panes — for layout-SCHEMA tests whose deliberately-broken
+  // layouts would otherwise also trip the step→pane allocation check and drown the assertion.
+  const BELT_NO_PANES = `  - name: ship
+    source: jira
+    label: agent
+    default_layout: web
+    steps:
+      - { type: work }
+      - { type: review }
+      - { type: pr }
+`;
+  // The `web` layout provides every pane the BELT's steps target (the load-time allocation check
+  // rejects a config whose default layout doesn't); `hot` is a deliberately-minimal layout for
+  // hand-created hotfix worktrees — layout_matching targets are exempt from the allocation check.
   const LAYOUTS = `  - id: web
     setup: { command: pnpm i, blocking: true }
     tabs:
@@ -1733,6 +1747,12 @@ describe("loadConfig — layouts (workspace-manager port)", () => {
         panes:
           - { title: agent,  command: claude,  setup: true }
           - { title: editor, command: nvim, split: vertical, size: "30%" }
+      - title: review
+        panes:
+          - { title: agent, command: claude }
+      - title: pr
+        panes:
+          - { title: agent, command: claude }
       - title: dev
         panes:
           - { title: server, command: pnpm dev, size: 0.5 }
@@ -1754,10 +1774,11 @@ describe("loadConfig — layouts (workspace-manager port)", () => {
     // vertical → right; "30%" → { percent: 30 }
     expect(web.tabs[0]!.panes[1]!.split).toBe("right");
     expect(web.tabs[0]!.panes[1]!.size).toEqual({ percent: 30 });
-    // 0.5 fraction → percent 50; horizontal → down; 40 → cells
-    expect(web.tabs[1]!.panes[0]!.size).toEqual({ percent: 50 });
-    expect(web.tabs[1]!.panes[1]!.split).toBe("down");
-    expect(web.tabs[1]!.panes[1]!.size).toEqual({ cells: 40 });
+    // 0.5 fraction → percent 50; horizontal → down; 40 → cells (the `dev` tab — index 3 after the
+    // review/pr tabs the allocation check requires the fixture to define)
+    expect(web.tabs[3]!.panes[0]!.size).toEqual({ percent: 50 });
+    expect(web.tabs[3]!.panes[1]!.split).toBe("down");
+    expect(web.tabs[3]!.panes[1]!.size).toEqual({ cells: 40 });
     const belt = config.belts[0]!;
     expect(belt.defaultLayout).toBe("web");
     expect(belt.layoutMatching).toEqual([{ worktreePattern: "hotfix/*", layout: "hot" }]);
@@ -1780,20 +1801,47 @@ describe("loadConfig — layouts (workspace-manager port)", () => {
 
   it("rejects a pane that sets both ratio and size", () => {
     const bad = `  - id: web\n    tabs:\n      - panes:\n          - { command: a }\n          - { split: right, ratio: 0.5, size: "30%" }\n`;
-    setup(full(BELT_WEB_ONLY, bad));
+    setup(full(BELT_NO_PANES, bad));
     expect(() => loadConfig("demo")).toThrow(/either ratio or size/);
   });
 
   it("rejects more than one setup pane in a layout", () => {
     const bad = `  - id: web\n    setup: { command: x }\n    tabs:\n      - panes:\n          - { command: a, setup: true }\n          - { command: b, setup: true, split: right }\n`;
-    setup(full(BELT_WEB_ONLY, bad));
+    setup(full(BELT_NO_PANES, bad));
     expect(() => loadConfig("demo")).toThrow(/at most one pane/);
   });
 
   it("rejects an out-of-range percentage size", () => {
     const bad = `  - id: web\n    tabs:\n      - panes:\n          - { command: a }\n          - { split: right, size: "150%" }\n`;
-    setup(full(BELT_WEB_ONLY, bad));
+    setup(full(BELT_NO_PANES, bad));
     expect(() => loadConfig("demo")).toThrow(/between 0% and 100%/);
+  });
+
+  // ── step → layout-pane allocation (validated at load, not discovered as a runtime park) ──
+  it("rejects a step targeting a pane its belt's default layout does not define, naming the available panes", () => {
+    // The staging-cherry-pick incident: `pane: work` where the layout defines `agent` — this used
+    // to surface only at runtime, as a layout-wait park after four full wait windows.
+    setup(full(BELT_WEB_ONLY.replace("tab: main,   pane: agent", "tab: main,   pane: work")));
+    expect(() => loadConfig("demo")).toThrow(/step "work" targets pane main\/work, but layout "web" does not define it — its labeled panes are: main\/agent, main\/editor, review\/agent/);
+  });
+
+  it("a layout_matching rule's layout is EXEMPT from the allocation check (it may serve hand-made worktrees)", () => {
+    // BELT routes hotfix/* to the minimal `hot` layout, which defines none of the step panes —
+    // that must stay legal (factory claims never produce hotfix/* branches; humans do).
+    setup(full());
+    expect(() => loadConfig("demo")).not.toThrow();
+  });
+
+  it("a belt with no default_layout skips the allocation check (panes provided outside the factory)", () => {
+    setup(full(BELT_WEB_ONLY.replace("    default_layout: web\n", "")));
+    expect(() => loadConfig("demo")).not.toThrow();
+  });
+
+  it("an untitled pane cannot satisfy a step target (labels are what dispatch resolves)", () => {
+    // Tab `main` exists but its only pane is untitled — the step's main/agent target must fail.
+    const untitled = `  - id: web\n    tabs:\n      - title: main\n        panes:\n          - { command: claude }\n      - title: review\n        panes:\n          - { title: agent, command: claude }\n      - title: pr\n        panes:\n          - { title: agent, command: claude }\n`;
+    setup(full(BELT_WEB_ONLY, untitled));
+    expect(() => loadConfig("demo")).toThrow(/step "work" targets pane main\/agent, but layout "web" does not define it/);
   });
 
   it("the shipped example config parses against the schema (guards example drift)", () => {
