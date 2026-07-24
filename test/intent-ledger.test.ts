@@ -303,25 +303,7 @@ describe("agent_signal on the ledger (v31 cutover)", () => {
     expect(store.unconsumedPendingSignalForRun(run.id)!.id).toBe(sig.id); // still consumable
   });
 
-  it("a legacy pending_signals row is lazily converted to a ledger row on first read (old-server drain)", () => {
-    const { store, run } = makeStore();
-    // Simulate a row a draining OLD-code process wrote directly into the legacy table.
-    // @ts-expect-error reaching into the private db handle is deliberate here
-    const db = store.db as import("node:sqlite").DatabaseSync;
-    db.prepare(
-      `INSERT INTO pending_signals (run_id, repo, ticket_key, signal, step, to_step, payload, pass, created_at)
-       VALUES (?, 'r', 'K-1', 'bounce', 'review', 'fix', 'legacy findings', 3, 999)`,
-    ).run(run.id);
-    const converted = store.unconsumedPendingSignalForRun(run.id)!;
-    expect(converted).toMatchObject({ signal: "bounce", step: "review", toStep: "fix", payload: "legacy findings", pass: 3 });
-    expect(store.getIntent(converted.id)!.kind).toBe("agent_signal"); // it now lives on the ledger
-    const legacy = db.prepare("SELECT consumed_result FROM pending_signals WHERE run_id = ?").get(run.id) as { consumed_result: string };
-    expect(legacy.consumed_result).toContain("migrated");
-    // Second read comes straight from the ledger (no duplicate conversion).
-    expect(store.unconsumedPendingSignalForRun(run.id)!.id).toBe(converted.id);
-  });
-
-  it("migration v31 converts unconsumed legacy rows into waiting+handoff ledger rows and closes the old ones", () => {
+  it("migration v31 converts unconsumed legacy rows into waiting+handoff ledger rows; v35 drops the table", () => {
     const { DatabaseSync } = require("node:sqlite") as typeof import("node:sqlite");
     const db = new DatabaseSync(":memory:");
     db.exec("CREATE TABLE schema_version (version INTEGER NOT NULL)");
@@ -339,8 +321,8 @@ describe("agent_signal on the ledger (v31 cutover)", () => {
     const row = db.prepare("SELECT * FROM intents WHERE kind = 'agent_signal'").get() as Record<string, unknown>;
     expect(row).toMatchObject({ scope: "run:1", status: "waiting", handoff_marker: "signal", dedup_key: expect.stringMatching(/^legacy-/) });
     expect(JSON.parse(row.payload as string)).toMatchObject({ signal: "bounce", toStep: "fix", body: "pre-upgrade findings", pass: 2 });
-    const legacy = db.prepare("SELECT consumed_result FROM pending_signals").get() as { consumed_result: string };
-    expect(legacy.consumed_result).toContain("migrated to the intent ledger (v31)");
+    const tables = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as { name: string }[];
+    expect(tables.map((t) => t.name)).not.toContain("pending_signals");
   });
 });
 
@@ -437,62 +419,14 @@ describe("source_transition on the ledger (v33 cutover)", () => {
     expect(stale).toMatchObject({ toState: "in_development", lastError: "issue deleted" });
     store.markTransitionStaleHandled(stale.id);
     expect(store.unhandledStaleIntentForRun(2)).toBeUndefined(); // exactly once
-    // Legacy rows are closed — nothing left for an old-code flush to double-deliver.
-    const legacyOpen = db.prepare("SELECT COUNT(*) AS n FROM transition_outbox WHERE delivered_at IS NULL").get() as { n: number };
-    expect(legacyOpen.n).toBe(0);
-  });
-
-  it("drainLegacyTransitions converts a drain-window row with its clock and closes it", () => {
-    const { store, run, setNow } = makeStore();
-    // Simulate an old-code process writing directly into the legacy table post-upgrade.
-    // @ts-expect-error private handle, deliberate
-    const db = store.db as import("node:sqlite").DatabaseSync;
-    db.prepare(
-      `INSERT INTO transition_outbox (run_id, repo, work_source, ticket_key, to_state, to_status, attempts, next_attempt_at, last_error, created_at, updated_at)
-       VALUES (?, 'r', 'jira', 'K-1', 'in_development', '', 2, 5000, 'flaky', 100, 100)`,
-    ).run(run.id);
-    setNow(2000);
-    expect(store.drainLegacyTransitions("r")).toBe(1);
-    const converted = store.pendingTransitionsForRun(run.id);
-    expect(converted).toHaveLength(1);
-    expect(converted[0]).toMatchObject({ toState: "in_development", attempts: 2, nextAttemptAt: 5000, lastError: "flaky" });
-    expect(store.drainLegacyTransitions("r")).toBe(0); // closed — idempotent
-  });
-
-  it("a nudge-window enqueue can NOT slot ahead of an unconverted legacy row (per-run order survives)", () => {
-    // The drain-window inversion: an old-code process records in_development into the LEGACY table
-    // (source down, undelivered); before the next tick's Phase-0 drain, a step-done nudge enqueues
-    // in_review on the ledger. enqueueTransition must convert the run's legacy rows FIRST, so
-    // in_development takes the earlier FIFO slot and the gate blocks in_review behind it.
-    const { store, run } = makeStore();
-    // @ts-expect-error private handle, deliberate
-    const db = store.db as import("node:sqlite").DatabaseSync;
-    db.prepare(
-      `INSERT INTO transition_outbox (run_id, repo, work_source, ticket_key, to_state, to_status, attempts, next_attempt_at, last_error, created_at, updated_at)
-       VALUES (?, 'r', 'jira', 'K-1', 'in_development', '', 3, 9000, 'jira down', 100, 100)`,
-    ).run(run.id);
-    const inReview = store.enqueueTransition({ runId: run.id, repo: "r", workSource: "jira", ticketKey: "K-1", toState: "in_review" });
-    const pending = store.pendingTransitionsForRun(run.id);
-    expect(pending.map((t) => t.toState)).toEqual(["in_development", "in_review"]); // converted row holds the earlier slot
-    expect(pending[0]).toMatchObject({ attempts: 3, nextAttemptAt: 9000 }); // clock intact
-    expect(store.undeliveredTransitionBefore(run.id, inReview.id)).toBe(true); // the FIFO gate holds
-  });
-
-  it("the Phase-B claim veto sees an unconverted legacy write-back immediately", () => {
-    const { store, run } = makeStore();
-    // @ts-expect-error private handle, deliberate
-    const db = store.db as import("node:sqlite").DatabaseSync;
-    expect(store.pendingTransitionForKey("r", "jira", "K-1")).toBe(false);
-    db.prepare(
-      `INSERT INTO transition_outbox (run_id, repo, work_source, ticket_key, to_state, to_status, attempts, next_attempt_at, created_at, updated_at)
-       VALUES (?, 'r', 'jira', 'K-1', 'merged', '', 0, 100, 100, 100)`,
-    ).run(run.id);
-    expect(store.pendingTransitionForKey("r", "jira", "K-1")).toBe(true); // legacy union — no drain needed
+    // ...and the legacy table is gone (v35), so nothing can double-deliver from it.
+    const tables = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as { name: string }[];
+    expect(tables.map((t) => t.name)).not.toContain("transition_outbox");
   });
 });
 
 describe("watch_state (v34) — per-watch clocks", () => {
-  it("migration v34 backfills a mid-flight step's clocks; evaluator writes go to watch_state; legacy fallback only when no row exists", () => {
+  it("migration v34 backfills a mid-flight step's clocks onto watch_state (and v35 drops the source columns)", () => {
     const { DatabaseSync } = require("node:sqlite") as typeof import("node:sqlite");
     const db = new DatabaseSync(":memory:");
     db.exec("CREATE TABLE schema_version (version INTEGER NOT NULL)");
@@ -514,19 +448,22 @@ describe("watch_state (v34) — per-watch clocks", () => {
       { step: "work", watch: "budget", sig: null, based_at: 500 },
       { step: "work", watch: "heartbeat", sig: "sha-hb", based_at: 900 },
     ]);
+    // The columns those clocks came from are gone — watch_state is the only home now.
+    const cols = (db.prepare("PRAGMA table_info(run_steps)").all() as { name: string }[]).map((c) => c.name);
+    expect(cols).not.toContain("progress_sig");
+    expect(cols).not.toContain("baseline_frozen_at");
   });
 
-  it("a re-base writes a NULL row (never deletes), so the legacy fallback cannot resurrect a cleared clock", () => {
+  it("a re-base writes a NULL row (never deletes), so a cleared clock stays cleared", () => {
     const { store, run } = makeStore();
-    // Simulate a drain-window row: legacy columns set, no watch_state row → fallback reads legacy.
-    store.upsertRunStep(run.id, "review", { baselineSig: "sha-legacy", baselineFrozenAt: 42 });
     // (effectiveWatchClock is exercised through the evaluators in reconcile tests; here we pin the
     // store contract the no-resurrection rule rides on.)
     expect(store.getWatchState(run.id, "review", "read_only")).toBeUndefined();
+    store.upsertWatchState(run.id, "review", "read_only", { sig: "sha-old", basedAt: 42 });
     store.upsertWatchState(run.id, "review", "read_only", { sig: null, basedAt: null }); // a clear
     const ws = store.getWatchState(run.id, "review", "read_only")!;
     expect(ws.sig).toBeNull();
-    expect(ws.basedAt).toBeNull(); // the row EXISTS with nulls — fallback to "sha-legacy" is dead
+    expect(ws.basedAt).toBeNull(); // the row EXISTS with nulls — "sha-old" cannot come back
     // Partial upserts only touch provided fields.
     store.upsertWatchState(run.id, "review", "read_only", { sig: "sha-new" });
     expect(store.getWatchState(run.id, "review", "read_only")!).toMatchObject({ sig: "sha-new", basedAt: null });

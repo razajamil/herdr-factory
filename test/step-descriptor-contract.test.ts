@@ -174,7 +174,7 @@ describe("ProductCapability contract", () => {
 
   it("evidence enables the durable S3 upload outbox + the capture signals", () => {
     const c = productCapabilityFor("evidence");
-    expect(c.outbox).toBe("evidence_uploads");
+    expect(c.outbox).toBe("evidence_publish");
     expect(c.signals).toContain("capture-attempt");
     expect(c.signals).toContain("evidence-upload");
   });

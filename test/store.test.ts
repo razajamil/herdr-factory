@@ -59,7 +59,7 @@ describe("Store — belt admin (rename migration + delete purge)", () => {
     expect(purged).toBe(1);
     expect(store.getRun(run.id)).toBeUndefined();
     const childCount = (t: string) => (db.prepare(`SELECT COUNT(*) AS n FROM ${t} WHERE run_id = ?`).get(run.id) as { n: number }).n;
-    for (const t of ["run_steps", "run_products", "guard_counters", "transition_outbox", "human_questions", "pending_signals"]) {
+    for (const t of ["run_steps", "run_products", "guard_counters", "human_questions", "intents", "watch_state"]) {
       expect(childCount(t)).toBe(0);
     }
     // events survive, detached from the deleted run
@@ -104,12 +104,11 @@ describe("Store", () => {
     expect(fix.startedAt).not.toBeNull();
 
     // subsequent upserts patch in place (no duplicate row)
-    store.upsertRunStep(run.id, "fix", { sessionId: "sess-1", progressSig: "sha1", progressAt: 1234 });
+    store.upsertRunStep(run.id, "fix", { sessionId: "sess-1", dispatchedAt: 1234 });
     const got = store.getRunStep(run.id, "fix")!;
     expect(got.paneId).toBe("w1:p1"); // preserved
     expect(got.sessionId).toBe("sess-1");
-    expect(got.progressSig).toBe("sha1");
-    expect(got.progressAt).toBe(1234);
+    expect(got.dispatchedAt).toBe(1234);
 
     store.markStepDone(run.id, "fix");
     expect(store.getRunStep(run.id, "fix")!.done).toBe(true);
@@ -274,10 +273,17 @@ describe("Store", () => {
     // window (the runtime read falls back to the events log only when the column is NULL).
     const healthy = db.prepare("SELECT attention_reason_code AS c FROM runs WHERE ticket_key = 'OLD-2'").get() as { c: string | null };
     expect(healthy.c).toBeNull();
-    // v28: the read-only baseline columns are backfilled from the aliased heartbeat columns.
-    const rs = db.prepare("SELECT baseline_sig, baseline_frozen_at FROM run_steps WHERE run_id = 1").get() as { baseline_sig: string; baseline_frozen_at: number };
-    expect(rs.baseline_sig).toBe("sha-ro");
-    expect(rs.baseline_frozen_at).toBe(42);
+    // The step-clock chain end to end for an ancient DB: v28 de-aliases the read-only baseline out
+    // of the heartbeat columns, v34 lifts both onto watch_state, v35 drops the columns. What the
+    // step was mid-flight with must arrive intact on the far side of all three.
+    const ws = db.prepare("SELECT watch, sig, based_at FROM watch_state WHERE run_id = 1 ORDER BY watch").all() as Record<string, unknown>[];
+    expect(ws).toEqual([
+      { watch: "heartbeat", sig: "sha-ro", based_at: 42 },
+      { watch: "read_only", sig: "sha-ro", based_at: 42 },
+    ]);
+    const stepCols = (db.prepare("PRAGMA table_info(run_steps)").all() as { name: string }[]).map((c) => c.name);
+    expect(stepCols).not.toContain("progress_sig");
+    expect(stepCols).not.toContain("baseline_sig");
     expect(db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='work_items'").get()).toBeTruthy();
     expect(() => migrate(db)).not.toThrow(); // re-running is a no-op
   });
@@ -312,95 +318,6 @@ describe("Store", () => {
     expect(store.acquireLock("capture", "C", 100)).toBe(false); // B still holds
     store.releaseLock("capture", "B");
     expect(store.acquireLock("capture", "C", 100)).toBe(true);
-  });
-
-  describe("evidence-upload outbox", () => {
-    function seedRun(store: Store) {
-      return store.createRun({ repo: "r", workSource: "jira", belt: "ship", ticketKey: "K-EV", summary: "s", issueType: "Bug", branch: "fix/K-EV" });
-    }
-
-    it("enqueue sets the lease (not due until it elapses) and is idempotent per prefix", () => {
-      const { store, setNow } = makeStore(1000);
-      const run = seedRun(store);
-      const job = store.enqueueEvidenceUpload({ runId: run.id, repo: "r", ticketKey: "K-EV", keyPrefix: "p/A", evidenceDir: "/wt/ev" });
-      expect(job.nextAttemptAt).toBe(1000 + 300); // lease
-      expect(store.dueEvidenceUploads("r")).toHaveLength(0); // leased — not yet due
-      setNow(1300);
-      expect(store.dueEvidenceUploads("r").map((u) => u.id)).toEqual([job.id]);
-      // Re-enqueue the SAME prefix reopens the same row (no duplicate).
-      const again = store.enqueueEvidenceUpload({ runId: run.id, repo: "r", ticketKey: "K-EV", keyPrefix: "p/A", evidenceDir: "/wt/ev" });
-      expect(again.id).toBe(job.id);
-    });
-
-    it("a fresh prefix supersedes prior undelivered uploads for the run (re-capture)", () => {
-      const { store, setNow } = makeStore(1000);
-      const run = seedRun(store);
-      const a = store.enqueueEvidenceUpload({ runId: run.id, repo: "r", ticketKey: "K-EV", keyPrefix: "p/A", evidenceDir: "/wt/ev" });
-      const b = store.enqueueEvidenceUpload({ runId: run.id, repo: "r", ticketKey: "K-EV", keyPrefix: "p/B", evidenceDir: "/wt/ev" });
-      setNow(1300);
-      const due = store.dueEvidenceUploads("r").map((u) => u.id);
-      expect(due).toContain(b.id);
-      expect(due).not.toContain(a.id); // A abandoned
-      expect(store.getEvidenceUpload(a.id)!.abandonedAt).not.toBeNull();
-    });
-
-    it("recordEvidenceAttempt backs off + stamps kind; auth kind is SSO-stuck; delivered can't reopen", () => {
-      const { store, setNow } = makeStore(1000);
-      const run = seedRun(store);
-      const job = store.enqueueEvidenceUpload({ runId: run.id, repo: "r", ticketKey: "K-EV", keyPrefix: "p/A", evidenceDir: "/wt/ev" });
-      setNow(1300);
-      const after = store.recordEvidenceAttempt(job.id, "sso expired", "auth")!;
-      expect(after.attempts).toBe(1);
-      expect(after.errorKind).toBe("auth");
-      expect(after.nextAttemptAt).toBe(1300 + 60); // first backoff
-      expect(store.authStuckEvidenceUpload("r")).toBe(true);
-      // Deliver, then a late failure must NOT reopen it (guard).
-      store.markEvidenceDelivered(job.id);
-      expect(store.authStuckEvidenceUpload("r")).toBe(false);
-      store.recordEvidenceAttempt(job.id, "late", "transient");
-      expect(store.getEvidenceUpload(job.id)!.deliveredAt).not.toBeNull();
-      expect(store.pendingEvidenceUploads("r")).toHaveLength(0);
-    });
-
-    it("permanent-fail and teardown-abandon both remove a row from pending/due", () => {
-      const { store, setNow } = makeStore(1000);
-      const run = seedRun(store);
-      const perm = store.enqueueEvidenceUpload({ runId: run.id, repo: "r", ticketKey: "K-EV", keyPrefix: "p/A", evidenceDir: "/wt/ev" });
-      store.markEvidencePermanentFailed(perm.id, "bucket does not exist");
-      setNow(1300);
-      expect(store.dueEvidenceUploads("r")).toHaveLength(0);
-      expect(store.pendingEvidenceUploads("r")).toHaveLength(0);
-      // A second, still-pending upload gets dropped by teardown.
-      const live = store.enqueueEvidenceUpload({ runId: run.id, repo: "r", ticketKey: "K-EV", keyPrefix: "p/B", evidenceDir: "/wt/ev" });
-      expect(store.undeliveredEvidenceUploadsForRun(run.id).map((u) => u.id)).toEqual([live.id]);
-      expect(store.abandonEvidenceUploadsForRun(run.id, "torn down")).toBe(1);
-      expect(store.undeliveredEvidenceUploadsForRun(run.id)).toHaveLength(0);
-    });
-
-    it("retryEvidenceUploadsForRepo makes auth-stuck rows due now; leaves transient/terminal rows alone", () => {
-      const { store, setNow } = makeStore(1000);
-      // Distinct runs — one pending upload each (a fresh capture on the same run supersedes the prior).
-      const mkRun = (k: string) => store.createRun({ repo: "r", workSource: "jira", belt: "ship", ticketKey: k, branch: `fix/${k}` });
-      const auth = store.enqueueEvidenceUpload({ runId: mkRun("K-A").id, repo: "r", ticketKey: "K-A", keyPrefix: "p/A", evidenceDir: "/wt/ev" });
-      const transient = store.enqueueEvidenceUpload({ runId: mkRun("K-B").id, repo: "r", ticketKey: "K-B", keyPrefix: "p/B", evidenceDir: "/wt/ev" });
-      const delivered = store.enqueueEvidenceUpload({ runId: mkRun("K-C").id, repo: "r", ticketKey: "K-C", keyPrefix: "p/C", evidenceDir: "/wt/ev" });
-      setNow(1300);
-      store.recordEvidenceAttempt(auth.id, "sso expired", "auth"); // next_attempt_at pushed to 1300+60
-      store.recordEvidenceAttempt(transient.id, "timeout", "transient");
-      store.markEvidenceDelivered(delivered.id);
-      expect(store.getEvidenceUpload(auth.id)!.nextAttemptAt).toBe(1360);
-      expect(store.dueEvidenceUploads("r")).toHaveLength(0); // both pending rows are backing off
-
-      // Creds recovered: only the auth-stuck row is re-queued due-now (1350, still inside its own 1360
-      // backoff — proving the reset, not the backoff, is what makes it due). The transient row keeps
-      // its 1360 (not yet due), so the due list isolates the auth row.
-      setNow(1350);
-      expect(store.retryEvidenceUploadsForRepo("r")).toBe(1);
-      expect(store.getEvidenceUpload(auth.id)!.nextAttemptAt).toBe(1350);
-      expect(store.getEvidenceUpload(transient.id)!.nextAttemptAt).toBe(1360); // untouched (1300 + 60s backoff)
-      expect(store.getEvidenceUpload(delivered.id)!.deliveredAt).not.toBeNull(); // untouched
-      expect(store.dueEvidenceUploads("r").map((u) => u.id)).toEqual([auth.id]);
-    });
   });
 
   describe("source OAuth tokens (source_auth)", () => {

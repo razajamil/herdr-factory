@@ -3,7 +3,9 @@ import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createEvidencePublisher } from "../src/clients/evidence.ts";
-import { flushEvidenceUploads } from "../src/core/reconcile.ts";
+import { flushOutbox } from "../src/core/outbox.ts";
+import { ledgerFlow } from "../src/core/ledger.ts";
+import { EVIDENCE_PUBLISH_LEASE_SECONDS } from "../src/intents/kinds/evidence-publish.ts";
 import { createApp, type ServerContext } from "../src/server/app.ts";
 import { openDb } from "../src/db/index.ts";
 import { Store } from "../src/db/store.ts";
@@ -118,8 +120,8 @@ describe("command publisher", () => {
   });
 });
 
-// ── the outbox retries a command failure with the same backoff/notify semantics as S3 ──
-describe("evidence outbox with a real command publisher", () => {
+// ── the ledger retries a command failure with the same backoff/notify semantics as S3 ──
+describe("evidence publish with a real command publisher", () => {
   function setup(command: string[]) {
     let now = 2000;
     const store = new Store(openDb(":memory:"), () => now);
@@ -133,32 +135,44 @@ describe("evidence outbox with a real command publisher", () => {
       now: () => now,
     } as unknown as Deps;
     const run = store.createRun({ repo: "r", workSource: "jira", belt: "ship", ticketKey: "K-EV", branch: "fix/K-EV" });
-    const job = store.enqueueEvidenceUpload({ runId: run.id, repo: "r", ticketKey: "K-EV", keyPrefix: "HF-1/5-t", evidenceDir: captureDir() });
+    const job = store.enqueueIntent({
+      repo: "r",
+      kind: "evidence_publish",
+      scope: `run:${run.id}`,
+      runId: run.id,
+      ticketKey: "K-EV",
+      dedupKey: "HF-1/5-t",
+      payload: JSON.stringify({ keyPrefix: "HF-1/5-t", evidenceDir: captureDir() }),
+      causeScope: "publisher:command",
+      leaseUntil: now + EVIDENCE_PUBLISH_LEASE_SECONDS,
+      supersedeScope: true,
+    });
     return { deps, store, job, setNow: (n: number) => { now = n; } };
   }
 
-  it("failure → deferred (transient), retried after backoff (NOT permanent-failed)", async () => {
+  const dueNow = (store: Store, at: number) =>
+    store.listIntents("r", { kind: "evidence_publish", status: "pending" }).filter((i) => i.nextAttemptAt <= at);
+
+  it("failure → deferred (transient), retried after backoff (NOT permanently failed)", async () => {
     const fail = stub("fail.sh", 'echo "backend down" >&2\nexit 1');
     const { deps, store, job, setNow } = setup([fail]);
     setNow(2400); // past the enqueue lease
-    await flushEvidenceUploads(deps);
-    const row = store.getEvidenceUpload(job.id)!;
-    expect(row.deliveredAt).toBeNull();
-    expect(row.permanentFailedAt).toBeNull(); // transient — keeps retrying
-    expect(row.errorKind).toBe("transient");
+    await flushOutbox(deps, ledgerFlow(deps));
+    const row = store.getIntent(job.id)!;
+    expect(row.status).toBe("pending"); // transient — keeps retrying, not 'failed'
+    expect(row.errorClass).toBe("transient");
     expect(row.attempts).toBe(1);
     // Still inside the 60s backoff → not due; past it → due again (the retry).
-    expect(store.dueEvidenceUploads("r")).toHaveLength(0);
-    setNow(2400 + 61);
-    expect(store.dueEvidenceUploads("r")).toHaveLength(1);
+    expect(dueNow(store, 2400)).toHaveLength(0);
+    expect(dueNow(store, 2400 + 61)).toHaveLength(1);
   });
 
   it("success → delivered + evidence_uploaded event", async () => {
     const ok = stub("ok.sh", 'cd "$1" || exit 2\nfind . -type f | sed "s|^\\./||" | sort | while read f; do echo "https://cdn.example/$2/$f"; done');
     const { deps, store, job, setNow } = setup([ok]);
     setNow(2400);
-    await flushEvidenceUploads(deps);
-    expect(store.getEvidenceUpload(job.id)!.deliveredAt).not.toBeNull();
+    await flushOutbox(deps, ledgerFlow(deps));
+    expect(store.getIntent(job.id)!.status).toBe("delivered");
     expect(store.timeline("r", "K-EV").some((e) => e.type === "evidence_uploaded")).toBe(true);
   });
 });

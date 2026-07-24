@@ -3,16 +3,20 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-// Mock the publisher FACTORY only — the flush obtains its publisher via createEvidencePublisher, so a
+// Mock the publisher FACTORY only — the kind obtains its publisher via createEvidencePublisher, so a
 // fake publisher lets us drive delivery/probe outcomes. classifyError stays the REAL classifier so the
-// flush's error-kind branching (auth/transient/permanent) is exercised end to end.
+// kind's error-class branching (auth/transient/permanent) is exercised end to end.
 vi.mock("../src/clients/evidence.ts", async (orig) => {
   const actual = await orig<typeof import("../src/clients/evidence.ts")>();
   return { ...actual, createEvidencePublisher: vi.fn() };
 });
 
 import { createEvidencePublisher, classifyS3Error, type EvidencePublisher } from "../src/clients/evidence.ts";
-import { flushEvidenceUploads } from "../src/core/reconcile.ts";
+import { flushOutbox } from "../src/core/outbox.ts";
+import { ledgerFlow } from "../src/core/ledger.ts";
+import { EVIDENCE_PUBLISH_LEASE_SECONDS } from "../src/intents/kinds/evidence-publish.ts";
+import { MIGRATIONS, migrate } from "../src/db/migrate.ts";
+import { DatabaseSync } from "node:sqlite";
 import { openDb } from "../src/db/index.ts";
 import { Store } from "../src/db/store.ts";
 import type { Deps } from "../src/core/deps.ts";
@@ -40,12 +44,13 @@ function setup() {
     now: () => now,
   } as unknown as Deps;
   const run = store.createRun({ repo: "r", workSource: "jira", belt: "ship", ticketKey: "K-EV", branch: "fix/K-EV" });
-  const enqueue = (dir = evidenceDir, prefix = "p/A") =>
-    store.enqueueEvidenceUpload({ runId: run.id, repo: "r", ticketKey: "K-EV", keyPrefix: prefix, evidenceDir: dir });
-  return { deps, store, notify, evidenceDir, run, enqueue, setNow: (n: number) => { now = n; } };
+  return { deps, store, notify, evidenceDir, run, setNow: (n: number) => { now = n; } };
 }
 
-describe("flushEvidenceUploads", () => {
+// The evidence_publish LEDGER kind (v30 cutover) — the only path since the v35 contract phase
+// dropped the legacy `evidence_uploads` table and its drain-only flush flow. Driven through the
+// generic kernel; the module mock intercepts the kind's createEvidencePublisher import.
+describe("evidence_publish intent kind", () => {
   beforeEach(() => {
     publish.mockReset();
     // Default: creds still down, so the recovery-probe never re-queues unless a test opts in.
@@ -63,102 +68,6 @@ describe("flushEvidenceUploads", () => {
     } as EvidencePublisher);
   });
 
-  it("publishes a due job → delivered + evidence_uploaded event", async () => {
-    const { deps, store, enqueue, setNow } = setup();
-    const job = enqueue();
-    setNow(2400); // past the enqueue lease
-    publish.mockResolvedValueOnce({ files: ["shot.png"], urls: ["https://d.cf.net/p/A/shot.png"] });
-    await flushEvidenceUploads(deps);
-    expect(publish).toHaveBeenCalledOnce();
-    expect(store.getEvidenceUpload(job.id)!.deliveredAt).not.toBeNull();
-    expect(store.timeline("r", "K-EV").some((e) => e.type === "evidence_uploaded")).toBe(true);
-  });
-
-  it("auth failure defers (backoff) + notifies to `aws sso login`, then a later tick delivers", async () => {
-    const { deps, store, notify, enqueue, setNow } = setup();
-    const job = enqueue();
-    setNow(2400);
-    publish.mockRejectedValueOnce(authErr());
-    await flushEvidenceUploads(deps);
-    const afterFail = store.getEvidenceUpload(job.id)!;
-    expect(afterFail.deliveredAt).toBeNull();
-    expect(afterFail.errorKind).toBe("auth");
-    expect(store.authStuckEvidenceUpload("r")).toBe(true);
-    expect(notify).toHaveBeenCalledOnce();
-    expect(notify.mock.calls[0]![1]).toContain("aws sso login");
-
-    // SSO refreshed; the next due tick uploads.
-    setNow(2400 + 120); // past the 60s backoff
-    publish.mockResolvedValueOnce({ files: ["shot.png"], urls: [] });
-    await flushEvidenceUploads(deps);
-    expect(store.getEvidenceUpload(job.id)!.deliveredAt).not.toBeNull();
-    expect(store.authStuckEvidenceUpload("r")).toBe(false);
-  });
-
-  it("creds-recovery probe re-queues an auth-stuck upload due-now — delivers WITHIN the backoff window", async () => {
-    const { deps, store, enqueue, setNow } = setup();
-    const job = enqueue();
-    setNow(2400);
-    publish.mockRejectedValueOnce(authErr());
-    await flushEvidenceUploads(deps); // attempt 1 fails → auth-stuck, next_attempt_at pushed to 2460
-    expect(store.authStuckEvidenceUpload("r")).toBe(true);
-    expect(store.getEvidenceUpload(job.id)!.nextAttemptAt).toBe(2460);
-
-    // Only 5s later — still well inside the 60s backoff, so a plain flush would NOT retry. But creds
-    // are now live: the probe fires (gated on the stuck row), re-queues due-now, and this same pass
-    // uploads. No human action, no waiting out the backoff.
-    setNow(2405);
-    probeLiveness.mockResolvedValue({ auth: false, reason: "ok" });
-    publish.mockResolvedValueOnce({ files: ["shot.png"], urls: [] });
-    await flushEvidenceUploads(deps);
-    expect(probeLiveness).toHaveBeenCalledTimes(1);
-    expect(publish).toHaveBeenCalledTimes(2);
-    expect(store.getEvidenceUpload(job.id)!.deliveredAt).not.toBeNull();
-    expect(store.authStuckEvidenceUpload("r")).toBe(false);
-  });
-
-  it("does NOT probe on the happy path (no stuck upload)", async () => {
-    const { deps, enqueue, setNow } = setup();
-    enqueue();
-    setNow(2400);
-    publish.mockResolvedValueOnce({ files: ["shot.png"], urls: [] });
-    await flushEvidenceUploads(deps);
-    expect(probeLiveness).not.toHaveBeenCalled();
-  });
-
-  it("permanent (config) error → permanent-failed + evidence_upload_failed event + one notify", async () => {
-    const { deps, store, notify, enqueue, setNow } = setup();
-    const job = enqueue();
-    setNow(2400);
-    publish.mockRejectedValueOnce(permErr());
-    await flushEvidenceUploads(deps);
-    expect(store.getEvidenceUpload(job.id)!.permanentFailedAt).not.toBeNull();
-    expect(store.dueEvidenceUploads("r")).toHaveLength(0); // terminal — not retried
-    expect(store.timeline("r", "K-EV").some((e) => e.type === "evidence_upload_failed")).toBe(true);
-    expect(notify).toHaveBeenCalledOnce();
-  });
-
-  it("evidence dir gone (worktree torn down) → permanent-failed, no publish attempted", async () => {
-    const { deps, store, enqueue, evidenceDir, setNow } = setup();
-    rmSync(evidenceDir, { recursive: true, force: true });
-    const job = enqueue();
-    setNow(2400);
-    await flushEvidenceUploads(deps);
-    expect(publish).not.toHaveBeenCalled();
-    expect(store.getEvidenceUpload(job.id)!.permanentFailedAt).not.toBeNull();
-  });
-});
-
-// The evidence_publish LEDGER kind (v30 cutover) — the live path the CLI enqueues onto. Same fake
-// publisher (the module mock intercepts the kind's createEvidencePublisher import), driven through
-// the generic kernel instead of the legacy flow.
-import { flushOutbox } from "../src/core/outbox.ts";
-import { ledgerFlow } from "../src/core/ledger.ts";
-import { evidencePublishKind, EVIDENCE_PUBLISH_LEASE_SECONDS } from "../src/intents/kinds/evidence-publish.ts";
-import { MIGRATIONS, migrate } from "../src/db/migrate.ts";
-import { DatabaseSync } from "node:sqlite";
-
-describe("evidence_publish intent kind (the ledger cutover)", () => {
   const enqueueIntent = (store: Store, runId: number, dir: string, prefix = "p/A", now = 2000) =>
     store.enqueueIntent({
       repo: "r",
@@ -231,11 +140,12 @@ describe("evidence_publish intent kind (the ledger cutover)", () => {
     expect(store.getIntent(second.id)!.status).toBe("pending");
   });
 
-  it("migration v30 converts pending evidence_uploads rows (clocks intact) and closes the old ones", () => {
+  it("migration v30 converts pending evidence_uploads rows (clocks intact); v35 drops the table", () => {
     const db = new DatabaseSync(":memory:");
     // Build a REAL pre-v30 database by applying the chain up to v29, then seed a run + two old
     // rows: one auth-stuck mid-backoff (the state that must survive conversion exactly), one
-    // already delivered (must NOT convert).
+    // already delivered (must NOT convert). Then run the FULL chain — an old database upgrading
+    // straight past the contract phase must still land its backlog on the ledger before the drop.
     db.exec("CREATE TABLE schema_version (version INTEGER NOT NULL)");
     for (const m of MIGRATIONS.filter((m) => m.version <= 29)) {
       db.exec(m.sql);
@@ -265,8 +175,8 @@ describe("evidence_publish intent kind (the ledger cutover)", () => {
     });
     expect(JSON.parse(converted[0]!.payload as string)).toEqual({ keyPrefix: "p/A", evidenceDir: "/wt/ev" });
     expect((converted[0]!.seq as number) > 0).toBe(true);
-    // The old pending row is closed so a draining old-code flush finds nothing due.
-    const old = db.prepare("SELECT abandoned_at FROM evidence_uploads WHERE key_prefix = 'p/A'").get() as { abandoned_at: number | null };
-    expect(old.abandoned_at).not.toBeNull();
+    // ...and the legacy table itself is gone (v35), so nothing can read or write it again.
+    const tables = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as { name: string }[];
+    expect(tables.map((t) => t.name)).not.toContain("evidence_uploads");
   });
 });

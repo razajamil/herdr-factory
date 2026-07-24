@@ -535,15 +535,13 @@ CREATE TABLE run_steps(                  -- one row per pipeline agent (migratio
   id INTEGER PRIMARY KEY AUTOINCREMENT, run_id INTEGER NOT NULL,
   step TEXT NOT NULL,                    -- belt step name (work/evidence/review/pr/custom)
   pane_id TEXT, session_id TEXT,         -- on-demand cross-agent query handles
-  progress_sig TEXT, progress_at INTEGER,   -- LEGACY since v34 (frozen): the heartbeat clock lives
-                                         -- in watch_state('heartbeat'); these are read only as the
-                                         -- lazy fallback for rows a draining old-code process wrote.
-  baseline_sig TEXT, baseline_frozen_at INTEGER, -- LEGACY since v34 (frozen): the read-only
-                                         -- enforcement baseline lives in watch_state('read_only') —
-                                         -- sig tracks live HEAD, absorbing the prior step's trailing
-                                         -- handoff commits (RWR-18204), until the step's own agent
-                                         -- is first observed working (based_at = the freeze marker);
-                                         -- a HEAD move past the freeze parks `read_only_violation`.
+                                         -- NO watch clocks here: the heartbeat's progress signature
+                                         -- and the read-only enforcement baseline live in
+                                         -- watch_state (v34), keyed (run, step, watch). The frozen
+                                         -- progress_*/baseline_* columns dropped in v35.
+                                         -- started_at below is NOT a budget clock — it is the
+                                         -- layout-wait window + dispatch bookkeeping; the budget
+                                         -- window is watch_state('budget'), armed at dispatch.
   done INTEGER NOT NULL DEFAULT 0, started_at INTEGER, done_at INTEGER,
   bounces INTEGER NOT NULL DEFAULT 0,    -- SUPERSEDED (with capture_attempts) by guard_counters (v21),
   absent_at INTEGER,                     -- left unread. absent_at: pane first CONFIRMED absent (v10)
@@ -587,86 +585,23 @@ CREATE TABLE human_questions(            -- ask-human park: one pending question
                                          -- miss backoff, error escalation) lives on the intent
                                          -- ledger (kind `human_reply_poll`, one waiting row per
                                          -- pending question; the store's methods OVERLAY it onto
-                                         -- this shape). poll_attempts/poll_errors/next_poll_at
-                                         -- below are frozen legacy columns (unread by new code).
+                                         -- this shape, and createHumanQuestion arms the row). The
+                                         -- old poll_attempts/poll_errors/next_poll_at columns
+                                         -- dropped in v35 — the ledger is the clock's only home.
   id INTEGER PRIMARY KEY AUTOINCREMENT, run_id INTEGER NOT NULL REFERENCES runs(id),
   repo TEXT NOT NULL, work_source TEXT NOT NULL, ticket_key TEXT NOT NULL, step TEXT,
   question TEXT NOT NULL, status TEXT NOT NULL CHECK (status IN ('pending','answered')),
   external_id TEXT, external_created_at TEXT,              -- the source-native object (Jira/GitHub comment)
   answer TEXT, answer_external_id TEXT, answer_author TEXT,
-  poll_attempts INTEGER NOT NULL DEFAULT 0,                -- misses drive the poll backoff (v13)
-  next_poll_at INTEGER NOT NULL DEFAULT 0,                 -- 60s doubling, 5min cap (v13)
-  poll_errors INTEGER NOT NULL DEFAULT 0,                  -- CONSECUTIVE poll throws (reset on
-                                                           -- success); escalates past 20 (v14)
   created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, answered_at INTEGER);
 CREATE UNIQUE INDEX idx_human_questions_one_pending_run ON human_questions(run_id) WHERE status='pending';
 
-CREATE TABLE pending_signals(            -- LEGACY since v31: agent signals live on the intent
-                                         -- ledger as the `agent_signal` kind (waiting + an atomic
-                                         -- 'signal' handoff; the store's pending-signal methods are
-                                         -- ADAPTERS over ledger rows, so the signal machinery kept
-                                         -- its shapes). v31 converted the unconsumed backlog; a row
-                                         -- a draining old-code process writes is converted lazily
-                                         -- on first read. Drops in a contract migration.
-                                         -- Original design (v22) —
-  id INTEGER PRIMARY KEY AUTOINCREMENT,  -- the outbox pattern applied to the non-monotonic agent
-  run_id INTEGER NOT NULL REFERENCES runs(id),  -- signals. Persisted BEFORE the run lock is tried:
-  repo TEXT NOT NULL, ticket_key TEXT NOT NULL, -- an apply that loses the lock race (or crashes
-  signal TEXT NOT NULL CHECK (signal IN ('bounce','ask_human')), -- mid-way) is consumed by a later
-  step TEXT,                             -- reconcile pass instead of being dropped after the agent
-  to_step TEXT,                          -- was told to stop. step = the ISSUING step (stale-signal
-  payload TEXT NOT NULL,                 -- guard); to_step = a bounce's rework target.
-  created_at INTEGER NOT NULL,           -- At most one unconsumed intent per run (supersede-on-
-  consumed_at INTEGER,                   -- enqueue). consumed_result: applied | escalated |
-  consumed_result TEXT);                 -- superseded | rejected: <why>. step-done is NOT here —
-CREATE INDEX idx_pending_signals_unconsumed    -- its done flag is durable before the nudge.
-  ON pending_signals(run_id) WHERE consumed_at IS NULL;
-
-CREATE TABLE transition_outbox(          -- LEGACY since v33: write-backs live on the intent ledger
-                                         -- as the `source_transition` kind (FIFO per run scope,
-                                         -- dedup to_state:to_status, the stale two-phase as a
-                                         -- 'stale' handoff; the store's transition methods are
-                                         -- ADAPTERS, so deliverTransition / the FIFO gate / the
-                                         -- claim veto / effect ranks kept their exact code). v33
-                                         -- converted the backlog; drain-window rows convert at the
-                                         -- touch points (enqueueTransition per run, the claim veto
-                                         -- by union, the flow prePass repo-wide) so per-run order
-                                         -- survives the cutover. Drops in a contract migration.
-                                         -- Original design (v11) —
-  id INTEGER PRIMARY KEY AUTOINCREMENT, run_id INTEGER NOT NULL REFERENCES runs(id),
-  repo TEXT NOT NULL, work_source TEXT NOT NULL, ticket_key TEXT NOT NULL,
-  to_state TEXT NOT NULL CHECK (to_state IN ('todo','in_development','in_review','merged','aborted','done')),
-  to_status TEXT NOT NULL DEFAULT '',    -- belt-effect SOURCE-NATIVE status key ('' = canonical mapping
-                                         -- for to_state). to_state stays the canonical ANCHOR (its
-                                         -- CHECK untouched — WorkState vocab is unchanged); the source
-                                         -- delivers to_status when set (v27). See §7 effects.
-  attempts INTEGER NOT NULL DEFAULT 0, next_attempt_at INTEGER NOT NULL,  -- exponential backoff
-  last_error TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
-  delivered_at INTEGER,                  -- set once the source confirms (or reports a no-op)
-  stale_at INTEGER,                      -- delivery found the item GONE; stamped lock-free (v14)
-  stale_handled_at INTEGER,              -- the run-locked stale policy consumed it (v14)
-  UNIQUE(run_id, to_state, to_status));  -- enqueue idempotent across ticks; a custom status and a
-                                         -- canonical transition at the same anchor are distinct (v27)
-
-CREATE TABLE evidence_uploads(           -- LEGACY since v30: evidence publishes live on the intent
-                                         -- ledger as the `evidence_publish` kind (v30 converted
-                                         -- every pending row + closed the old ones; reads stay a
-                                         -- union for one release, then this table drops in a
-                                         -- contract migration). Original design (v16) — the
-  id INTEGER PRIMARY KEY AUTOINCREMENT,  -- upload analog of transition_outbox (durable, retried).
-  run_id INTEGER NOT NULL REFERENCES runs(id),  -- publisher-agnostic (s3|local|command): only the
-  repo TEXT NOT NULL, ticket_key TEXT NOT NULL, -- delivery fn behind EvidencePublisher differs.
-  key_prefix TEXT NOT NULL,              -- persisted so retry URLs stay stable (published up-front)
-  evidence_dir TEXT NOT NULL,            -- abs worktree path; gone ⇒ abandon
-  attempts INTEGER NOT NULL DEFAULT 0, next_attempt_at INTEGER NOT NULL,  -- backoff + enqueue LEASE
-  last_error TEXT, error_kind TEXT,      -- publisher.classifyError: auth|transient|permanent (auth: S3 only; drives SSO light)
-  notified_at INTEGER,                   -- SSO/permanent-fail notify throttle (per row, never the run)
-  permanent_failed_at INTEGER,           -- terminal: non-retryable config error / dir-gone
-  abandoned_at INTEGER,                  -- superseded by a re-capture, or dropped at teardown
-  created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, delivered_at INTEGER,
-  UNIQUE(run_id, key_prefix));           -- idempotent enqueue; a bounce re-captures with a fresh prefix
-CREATE INDEX idx_evidence_uploads_pending ON evidence_uploads(repo, next_attempt_at)
-  WHERE delivered_at IS NULL AND permanent_failed_at IS NULL AND abandoned_at IS NULL;
+-- DROPPED in v35 (the contract phase of the v29-v34 cutovers): pending_signals (v22),
+-- transition_outbox (v11) and evidence_uploads (v16) — the three outbox-shaped tables that each
+-- re-typed the same scheduling spine. v31/v33/v30 converted their live rows onto the ledger as
+-- agent_signal / source_transition / evidence_publish; the tables stayed one release as
+-- drain-window shims (unions, lazy drains) for rows a still-draining old-code process could
+-- write, then went. Their per-kind policy lives in src/intents/kinds/, not in columns.
 
 CREATE TABLE intents(                    -- the INTENT LEDGER (v29): one durable-intent substrate for
   id INTEGER PRIMARY KEY AUTOINCREMENT,  -- the deliver lane. A row is an obligation the engine owes
@@ -785,18 +720,19 @@ run-locked half consumes an unhandled stale intent **exactly once** at the top o
 Phase-A pass (`stale_handled_at`): an `in_development` stale — the claim write-back found the
 item deleted/closed, i.e. "don't do this work" — aborts the run promptly; a mid-flight stale
 (e.g. `in_review` — a PR may be up) parks it for `attention` with **no source note** (the item
-the note would go to is what's gone). Phase 0 then also flushes the **evidence-upload outbox**
-(`flushEvidenceUploads`, same due/backoff/lease machinery): every undelivered evidence upload is
+the note would go to is what's gone). Phase 0 then walks the **intent ledger** (`ledgerFlow`, the
+generic kernel — same due/backoff/lease machinery), whose `evidence_publish` kind carries the
+evidence media: every undelivered evidence upload is
 retried through the run's `EvidencePublisher` (`s3`|`local`|`command`, selected from
 `evidence.publisher`) until the backend accepts it, so an AWS SSO session expiring mid-run — or any
 transient backend outage — no longer ships a PR with broken evidence links (the `evidence-upload`
-CLI publishes the URLs + attempts inline up-front, then enqueues the bytes here). The flush is
+CLI publishes the URLs + attempts inline up-front, then enqueues the bytes here). The kind is
 publisher-agnostic: it drives `publisher.publish` / `publisher.classifyError`, and the SSO
 auto-resume is gated on the publisher exposing `probeLiveness` — only `s3` does, so `local`/`command`
 (no `auth` kind, never auth-stuck) skip it entirely. For `s3`, a persistent auth failure notifies the
 human to `aws sso login`; and when a row is auth-stuck the flush cheaply probes creds once (gated on a
 stuck row — the happy path never probes) and, the moment they're live again, resets every auth-stuck
-row due-now (`retryEvidenceUploadsForRepo`, mirroring the source-auth `retryTransitionsForSource`) so
+row due-now (`requeueIntentsByCause` on `publisher:<type>`, mirroring `retryTransitionsForSource`) so
 the same pass uploads it instead of waiting out the up-to-1h backoff — no manual retry, no waiting.
 A non-retryable error or a vanished capture dir is marked permanently failed —
 there's no source-stale two-phase, as evidence has no "gone at source". **Phase A** advances every active run one idempotent step, **in parallel
@@ -1007,7 +943,7 @@ by what they actually need:
   re-dispatches), `ask-human` (flips the phase), `resume` (un-parks) — use the waiting variant
   (`withRunLockWaiting`, ~15s bounded) because a concurrent reconcile from a stale snapshot would
   fight the mutation. **bounce and ask-human are additionally DURABLE**: the signal is persisted
-  as a `pending_signals` intent *before* the lock is attempted, so a lock that stays contended
+  as an `agent_signal` ledger intent *before* the lock is attempted, so a lock that stays contended
   past the bounded wait (a slow herdr subprocess can hold a run's reconcile for minutes) queues
   the signal instead of dropping it — the agent is told "recorded; applies on the next pass", and
   `reconcileRun` consumes any unconsumed intent at the top of each pass (`consumePendingSignal`,
@@ -1246,8 +1182,8 @@ resolves → parked `belt_missing`). The admin makes both edits clean:
   (including parked `attention`/`waiting_for_human` — they hold a worktree). Once idle,
   `removeRunWorktree` reaps any leaked worktree for its ended runs, then `purgeBeltRuns` deletes the
   belt's run rows and every run-referencing child row (`run_steps` / `run_products` /
-  `guard_counters` / `transition_outbox` / `evidence_uploads` / `human_questions` /
-  `pending_signals` — so no orphaned outbox intent survives to retry). The **events timeline is
+  `guard_counters` / `human_questions` / `intents` / `watch_state` — so no orphaned ledger intent
+  survives to retry, and no watch clock outlives its step). The **events timeline is
   kept**: with `PRAGMA foreign_keys = ON`, `events.run_id` (which `REFERENCES runs(id)`) is
   **detached to NULL** rather than deleted, so the audit rows survive the runs' deletion.
 
@@ -1853,7 +1789,8 @@ parametrized contract suite (`test/work-source-contract.test.ts`): `transition` 
 moved the work-doc shape onto the source (killing the last per-source-type switch in `step.ts`);
 a declarative `spec` plus the shared marker primitives (`HERDR_MARKER`/`bearsHerdrMarker`,
 blockquote-aware) landed in `core/deps.ts`; `askHuman`/`pollHumanReply` gained `StaleItemError`
-and poll-error escalation (`human_questions.poll_errors`). `MatchItem` opened from a closed
+and consecutive-poll-error escalation (a question's poll clock, since v32 a ledger
+`human_reply_poll` row). `MatchItem` opened from a closed
 union into a generic base + per-source convenience interfaces and type guards
 (`isJiraItem`/`isLocalMarkdownItem`/`isGithubIssuesItem`) for user `match.ts` files. Everything
 type-specific consolidated into the **source registry** (`sources/registry.ts` — one descriptor

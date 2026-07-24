@@ -2,7 +2,6 @@ import type { DatabaseSync } from "node:sqlite";
 import type {
   Clock,
   EventType,
-  EvidenceUpload,
   HumanQuestion,
   HumanQuestionPatch,
   Intent,
@@ -98,10 +97,6 @@ interface RunStepRow {
   step: string;
   pane_id: string | null;
   session_id: string | null;
-  progress_sig: string | null;
-  progress_at: number | null;
-  baseline_sig: string | null;
-  baseline_frozen_at: number | null;
   done: number;
   started_at: number | null;
   done_at: number | null;
@@ -117,10 +112,6 @@ function toRunStep(r: RunStepRow): RunStep {
     step: r.step as StepName,
     paneId: r.pane_id,
     sessionId: r.session_id,
-    progressSig: r.progress_sig,
-    progressAt: r.progress_at,
-    baselineSig: r.baseline_sig,
-    baselineFrozenAt: r.baseline_frozen_at,
     done: r.done !== 0,
     startedAt: r.started_at,
     doneAt: r.done_at,
@@ -160,43 +151,6 @@ function toWorkItem(r: WorkItemRow): WorkItem {
   };
 }
 
-interface TransitionIntentRow {
-  id: number;
-  run_id: number;
-  repo: string;
-  work_source: string;
-  ticket_key: string;
-  to_state: string;
-  to_status: string;
-  attempts: number;
-  next_attempt_at: number;
-  last_error: string | null;
-  created_at: number;
-  updated_at: number;
-  delivered_at: number | null;
-  stale_at: number | null;
-  stale_handled_at: number | null;
-}
-
-interface EvidenceUploadRow {
-  id: number;
-  run_id: number;
-  repo: string;
-  ticket_key: string;
-  key_prefix: string;
-  evidence_dir: string;
-  attempts: number;
-  next_attempt_at: number;
-  last_error: string | null;
-  error_kind: string | null;
-  notified_at: number | null;
-  permanent_failed_at: number | null;
-  abandoned_at: number | null;
-  created_at: number;
-  updated_at: number;
-  delivered_at: number | null;
-}
-
 interface SourceAuthRow {
   repo: string;
   source: string;
@@ -212,17 +166,6 @@ interface SourceAuthRow {
   updated_at: number;
 }
 
-/** Enqueue lease for an evidence upload: the CLI's inline attempt runs UNLOCKED in the agent process,
- *  concurrently with the server's Phase 0 flush. Setting next_attempt_at this far out at enqueue keeps
- *  the flush from claiming the row mid inline-upload; a failed inline attempt resets it to the 60s
- *  backoff so the server picks it up promptly, and it doubles as crash-recovery if the CLI dies mid-upload. */
-const EVIDENCE_UPLOAD_LEASE_SECONDS = 300;
-
-/** An evidence-upload row still owed to the backend: not delivered and not terminally closed
- *  (permanent config failure / abandoned at teardown or by a superseding re-capture). The pending
- *  predicate every evidence-upload query filters on — one spelling, not seven. */
-const EVIDENCE_PENDING_SQL = "delivered_at IS NULL AND permanent_failed_at IS NULL AND abandoned_at IS NULL";
-
 interface HumanQuestionRow {
   id: number;
   run_id: number;
@@ -237,15 +180,14 @@ interface HumanQuestionRow {
   answer: string | null;
   answer_external_id: string | null;
   answer_author: string | null;
-  poll_attempts: number;
-  poll_errors: number;
-  next_poll_at: number;
   created_at: number;
   updated_at: number;
   answered_at: number | null;
 }
 
-function toHumanQuestion(r: HumanQuestionRow): HumanQuestion {
+/** The DOMAIN half of a question. Its poll clock lives on the ledger (v32) and is overlaid by
+ *  withPollClock — the only place the three clock fields are ever produced. */
+function toHumanQuestion(r: HumanQuestionRow): Omit<HumanQuestion, "pollAttempts" | "pollErrors" | "nextPollAt"> {
   return {
     id: r.id,
     runId: r.run_id,
@@ -260,9 +202,6 @@ function toHumanQuestion(r: HumanQuestionRow): HumanQuestion {
     answer: r.answer,
     answerExternalId: r.answer_external_id,
     answerAuthor: r.answer_author,
-    pollAttempts: r.poll_attempts,
-    pollErrors: r.poll_errors,
-    nextPollAt: r.next_poll_at,
     createdAt: r.created_at,
     updatedAt: r.updated_at,
     answeredAt: r.answered_at,
@@ -326,38 +265,6 @@ function toIntent(r: IntentRow): Intent {
     createdAt: r.created_at,
     updatedAt: r.updated_at,
     resolvedAt: r.resolved_at,
-  };
-}
-
-interface PendingSignalRow {
-  id: number;
-  run_id: number;
-  repo: string;
-  ticket_key: string;
-  signal: string;
-  step: string | null;
-  to_step: string | null;
-  payload: string;
-  pass: number | null;
-  created_at: number;
-  consumed_at: number | null;
-  consumed_result: string | null;
-}
-
-function toPendingSignal(r: PendingSignalRow): PendingSignal {
-  return {
-    id: r.id,
-    runId: r.run_id,
-    repo: r.repo,
-    ticketKey: r.ticket_key,
-    signal: r.signal as PendingSignal["signal"],
-    step: r.step,
-    toStep: r.to_step,
-    payload: r.payload,
-    pass: r.pass,
-    createdAt: r.created_at,
-    consumedAt: r.consumed_at,
-    consumedResult: r.consumed_result,
   };
 }
 
@@ -527,7 +434,7 @@ export class Store {
       // Detach (keep) the timeline; the FK on events(run_id) permits NULL, so the rows survive.
       this.db.prepare(`UPDATE events SET run_id = NULL WHERE run_id IN (${ph})`).run(...ids);
       // Delete every run-scoped child row. Table names are a fixed internal list (never user input).
-      for (const table of ["run_steps", "run_products", "guard_counters", "transition_outbox", "evidence_uploads", "human_questions", "pending_signals", "intents", "watch_state"]) {
+      for (const table of ["run_steps", "run_products", "guard_counters", "human_questions", "intents", "watch_state"]) {
         this.db.prepare(`DELETE FROM ${table} WHERE run_id IN (${ph})`).run(...ids);
       }
       this.db.prepare(`DELETE FROM runs WHERE id IN (${ph})`).run(...ids);
@@ -827,10 +734,6 @@ export class Store {
     };
     if (patch.paneId !== undefined) set("pane_id", patch.paneId);
     if (patch.sessionId !== undefined) set("session_id", patch.sessionId);
-    if (patch.progressSig !== undefined) set("progress_sig", patch.progressSig);
-    if (patch.progressAt !== undefined) set("progress_at", patch.progressAt);
-    if (patch.baselineSig !== undefined) set("baseline_sig", patch.baselineSig);
-    if (patch.baselineFrozenAt !== undefined) set("baseline_frozen_at", patch.baselineFrozenAt);
     if (patch.startedAt !== undefined) set("started_at", patch.startedAt);
     if (patch.absentAt !== undefined) set("absent_at", patch.absentAt);
     if (patch.pass !== undefined) set("pass", patch.pass);
@@ -946,11 +849,8 @@ export class Store {
   // the flush flow's FIFO gate, the Phase-B claim veto, and fireEffect's rank scan are byte-
   // unchanged. The kind is deliveredBy+consumedBy "reconciler" (delivery needs the resolved
   // source/belt/auth machinery; the stale policy needs teardown/escalation), so the kernel's due
-  // walk never touches these rows. The legacy `transition_outbox` table's undelivered backlog was
-  // converted by v33; a row a still-draining old-code process writes around the upgrade is
-  // converted by drainLegacyTransitions (called from the flow's prePass — Phase 0, BEFORE Phase A
-  // can enqueue new transitions for the same run, so a converted row's FIFO slot always precedes
-  // the run's post-upgrade intents). The legacy table drops in a contract migration.
+  // walk never touches these rows. The legacy `transition_outbox` table — converted by v33, drained
+  // through one release, dropped in v35 — is gone; the ledger is the only storage.
 
   /** Map a ledger `source_transition` row onto the domain TransitionIntent shape. */
   private intentToTransition(i: Intent): TransitionIntent {
@@ -994,11 +894,6 @@ export class Store {
     toState: WorkState;
     toStatus?: string;
   }): TransitionIntent {
-    // Drain-window guard (one release): convert THIS run's legacy rows BEFORE enqueueing, so a
-    // nudge-driven intent can never take a FIFO slot ahead of a write-back a still-draining
-    // old-code process recorded first — the per-run in-order invariant must hold across the
-    // cutover, not just within one process's tick (mirrors agent_signal's read-site lazy drain).
-    this.convertLegacyTransitions(this.legacyTransitionRows({ runId: input.runId }));
     const toStatus = input.toStatus ?? "";
     const intent = this.enqueueIntent({
       repo: input.repo,
@@ -1126,9 +1021,7 @@ export class Store {
   }
 
   /** Does this work item have any undelivered status write-back? While it does, the item's
-   *  source status is known-stale — Phase B must not trust an "eligible" listing for it. Reads the
-   *  LEGACY table too (one release): a write-back a draining old-code process recorded mid-tick
-   *  must veto a claim NOW, not after the next Phase-0 drain converts it. */
+   *  source status is known-stale — Phase B must not trust an "eligible" listing for it. */
   pendingTransitionForKey(repo: string, source: string, key: string): boolean {
     const row = this.db
       .prepare(
@@ -1136,63 +1029,7 @@ export class Store {
          AND cause_scope = ? AND ticket_key = ? AND status = 'pending' LIMIT 1`,
       )
       .get(repo, `source:${source}`, key) as { x: number } | undefined;
-    if (row !== undefined) return true;
-    const legacy = this.db
-      .prepare("SELECT 1 AS x FROM transition_outbox WHERE repo = ? AND work_source = ? AND ticket_key = ? AND delivered_at IS NULL LIMIT 1")
-      .get(repo, source, key) as { x: number } | undefined;
-    return legacy !== undefined;
-  }
-
-  /** Live legacy transition rows (undelivered, or unhandled-stale) — the lazy-drain inputs. */
-  private legacyTransitionRows(scope: { repo?: string; runId?: number }): TransitionIntentRow[] {
-    const where = scope.runId != null ? "run_id = ?" : "repo = ?";
-    const bind = scope.runId != null ? scope.runId : scope.repo!;
-    return this.db
-      .prepare(
-        `SELECT * FROM transition_outbox WHERE ${where}
-         AND (delivered_at IS NULL OR (stale_at IS NOT NULL AND stale_handled_at IS NULL)) ORDER BY run_id, id`,
-      )
-      .all(bind) as unknown as TransitionIntentRow[];
-  }
-
-  /** Convert legacy rows onto the ledger (clock + stale posture intact), closing them. Uses
-   *  enqueueIntent DIRECTLY — enqueueTransition itself drains first, which would recurse. */
-  private convertLegacyTransitions(legacy: TransitionIntentRow[]): number {
-    for (const row of legacy) {
-      const converted = this.enqueueIntent({
-        repo: row.repo,
-        kind: "source_transition",
-        scope: `run:${row.run_id}`,
-        runId: row.run_id,
-        ticketKey: row.ticket_key,
-        dedupKey: `${row.to_state}:${row.to_status}`,
-        payload: JSON.stringify({ toState: row.to_state, toStatus: row.to_status, workSource: row.work_source }),
-        causeScope: `source:${row.work_source}`,
-      });
-      if (row.delivered_at === null) {
-        if (row.attempts > 0) {
-          this.db
-            .prepare("UPDATE intents SET attempts = ?, next_attempt_at = ?, last_error = ?, updated_at = ? WHERE id = ?")
-            .run(row.attempts, row.next_attempt_at, row.last_error, this.now(), converted.id);
-        }
-      } else {
-        this.markTransitionStale(converted.id, row.last_error ?? "item no longer exists at the source");
-      }
-      this.db
-        .prepare("UPDATE transition_outbox SET delivered_at = COALESCE(delivered_at, ?), stale_handled_at = COALESCE(stale_handled_at, CASE WHEN stale_at IS NOT NULL THEN ? END), last_error = 'migrated to the intent ledger', updated_at = ? WHERE id = ?")
-        .run(this.now(), this.now(), this.now(), row.id);
-    }
-    return legacy.length;
-  }
-
-  /** Lazy drain of the legacy transition_outbox (one release): convert any row a still-draining
-   *  old-code process wrote around the upgrade — undelivered rows to pending intents, unhandled
-   *  stale ones to resolved rows owing their 'stale' handoff — then close the legacy rows. Runs
-   *  in the transition flow's prePass (Phase 0) as the repo-wide backstop; the ORDER-critical
-   *  touch points drain inline (enqueueTransition per run, pendingTransitionForKey by union), so
-   *  a nudge landing between ticks can't slot ahead of an unconverted legacy row. */
-  drainLegacyTransitions(repo: string): number {
-    return this.convertLegacyTransitions(this.legacyTransitionRows({ repo }));
+    return row !== undefined;
   }
 
   // --- source OAuth tokens (auth.method: oauth) -----------------------------
@@ -1261,176 +1098,6 @@ export class Store {
     return Number(info.changes) > 0;
   }
 
-  // --- evidence-upload outbox -----------------------------------------------
-  // Durable S3 media upload, mirroring the transition outbox: an intent retried at Phase 0 with backoff
-  // until S3 accepts it (or a permanent config error stops it). Leaner than transitions — no
-  // stale two-phase columns; permanent_failed_at is the single terminal-failure state.
-
-  private toEvidenceUpload(r: EvidenceUploadRow): EvidenceUpload {
-    return {
-      id: r.id,
-      runId: r.run_id,
-      repo: r.repo,
-      ticketKey: r.ticket_key,
-      keyPrefix: r.key_prefix,
-      evidenceDir: r.evidence_dir,
-      attempts: r.attempts,
-      nextAttemptAt: r.next_attempt_at,
-      lastError: r.last_error,
-      errorKind: r.error_kind as EvidenceUpload["errorKind"],
-      notifiedAt: r.notified_at,
-      permanentFailedAt: r.permanent_failed_at,
-      abandonedAt: r.abandoned_at,
-      createdAt: r.created_at,
-      updatedAt: r.updated_at,
-      deliveredAt: r.delivered_at,
-    };
-  }
-
-  getEvidenceUpload(id: number): EvidenceUpload | undefined {
-    const row = this.db.prepare("SELECT * FROM evidence_uploads WHERE id = ?").get(id) as EvidenceUploadRow | undefined;
-    return row ? this.toEvidenceUpload(row) : undefined;
-  }
-
-  /** Record the INTENT to upload one capture's media. Idempotent per (run, key_prefix): re-enqueue of
-   *  the SAME prefix re-opens the row (the S3 upload is idempotent). A DIFFERENT prefix (a re-capture
-   *  after a bounce) supersedes prior undelivered rows for the run — only the latest handoff's URLs are
-   *  ever embedded, so retrying an older capture's bytes forever is waste. Sets the enqueue lease. */
-  enqueueEvidenceUpload(input: { runId: number; repo: string; ticketKey: string; keyPrefix: string; evidenceDir: string }): EvidenceUpload {
-    const t = this.now();
-    return tx(this.db, () => {
-      // Supersede prior undelivered captures for this run (different prefix).
-      this.db
-        .prepare(
-          `UPDATE evidence_uploads SET abandoned_at = ?, last_error = 'superseded by re-capture', updated_at = ?
-           WHERE run_id = ? AND key_prefix <> ? AND ${EVIDENCE_PENDING_SQL}`,
-        )
-        .run(t, t, input.runId, input.keyPrefix);
-      this.db
-        .prepare(
-          `INSERT INTO evidence_uploads (run_id, repo, ticket_key, key_prefix, evidence_dir, attempts, next_attempt_at, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?)
-           ON CONFLICT(run_id, key_prefix) DO UPDATE SET evidence_dir = excluded.evidence_dir, next_attempt_at = excluded.next_attempt_at,
-             delivered_at = NULL, permanent_failed_at = NULL, abandoned_at = NULL, updated_at = excluded.updated_at`,
-        )
-        .run(input.runId, input.repo, input.ticketKey, input.keyPrefix, input.evidenceDir, t + EVIDENCE_UPLOAD_LEASE_SECONDS, t, t);
-      const row = this.db
-        .prepare("SELECT * FROM evidence_uploads WHERE run_id = ? AND key_prefix = ?")
-        .get(input.runId, input.keyPrefix) as EvidenceUploadRow | undefined;
-      if (!row) throw new Error("enqueueEvidenceUpload: row vanished after upsert");
-      telemetryEvent("store.evidence_upload.enqueue", { repo: input.repo, "run.id": input.runId, "work.key": input.ticketKey });
-      return this.toEvidenceUpload(row);
-    });
-  }
-
-  /** Undelivered uploads due for a retry attempt (repo-scoped, ordered like the transition outbox). */
-  dueEvidenceUploads(repo: string, limit = 25): EvidenceUpload[] {
-    const rows = this.db
-      .prepare(
-        `SELECT * FROM evidence_uploads WHERE repo = ? AND ${EVIDENCE_PENDING_SQL}
-         AND next_attempt_at <= ? ORDER BY run_id, id LIMIT ?`,
-      )
-      .all(repo, this.now(), limit) as unknown as EvidenceUploadRow[];
-    return rows.map((r) => this.toEvidenceUpload(r));
-  }
-
-  /** Record a failed upload attempt: bump the counter, stamp the classified kind, push next_attempt_at
-   *  out (60s doubling, cap 1h). Guarded so a late failure can't reopen a row the other process (CLI vs
-   *  flush) already delivered/permanent-failed. */
-  recordEvidenceAttempt(id: number, error: string, kind: EvidenceUpload["errorKind"]): EvidenceUpload | undefined {
-    const t = this.now();
-    const current = this.getEvidenceUpload(id);
-    const attempts = (current?.attempts ?? 0) + 1;
-    const delay = backoffDelaySeconds(attempts, OUTBOX_BACKOFF_CAP_SECONDS);
-    this.db
-      .prepare(
-        `UPDATE evidence_uploads SET attempts = ?, next_attempt_at = ?, last_error = ?, error_kind = ?, updated_at = ?
-         WHERE id = ? AND delivered_at IS NULL AND permanent_failed_at IS NULL`,
-      )
-      .run(attempts, t + delay, error.slice(0, 500), kind, t, id);
-    telemetryEvent("store.evidence_upload.attempt_failed", { "evidence_upload.attempts": attempts, "evidence_upload.kind": kind ?? undefined });
-    return this.getEvidenceUpload(id);
-  }
-
-  markEvidenceDelivered(id: number): void {
-    const t = this.now();
-    this.db.prepare("UPDATE evidence_uploads SET delivered_at = ?, updated_at = ? WHERE id = ? AND delivered_at IS NULL").run(t, t, id);
-    const e = this.getEvidenceUpload(id);
-    telemetryEvent("store.evidence_upload.delivered", { repo: e?.repo, "run.id": e?.runId, "work.key": e?.ticketKey });
-  }
-
-  markEvidencePermanentFailed(id: number, reason: string): void {
-    const t = this.now();
-    this.db
-      .prepare("UPDATE evidence_uploads SET permanent_failed_at = ?, last_error = ?, error_kind = 'permanent', updated_at = ? WHERE id = ? AND delivered_at IS NULL")
-      .run(t, reason.slice(0, 500), t, id);
-    const e = this.getEvidenceUpload(id);
-    telemetryEvent("store.evidence_upload.permanent_failed", { repo: e?.repo, "run.id": e?.runId, "work.key": e?.ticketKey });
-  }
-
-  /** Stamp the notify throttle (SSO/permanent human alert already sent). */
-  markEvidenceNotified(id: number): void {
-    const t = this.now();
-    this.db.prepare("UPDATE evidence_uploads SET notified_at = ?, updated_at = ? WHERE id = ?").run(t, t, id);
-  }
-
-  /** Undelivered uploads for a run — teardown's drop input. */
-  undeliveredEvidenceUploadsForRun(runId: number): EvidenceUpload[] {
-    const rows = this.db
-      .prepare(`SELECT * FROM evidence_uploads WHERE run_id = ? AND ${EVIDENCE_PENDING_SQL} ORDER BY id`)
-      .all(runId) as unknown as EvidenceUploadRow[];
-    return rows.map((r) => this.toEvidenceUpload(r));
-  }
-
-  /** Best-effort drop at teardown: abandon any still-pending uploads (the worktree + evidence dir are
-   *  about to be removed). Returns how many were dropped so the caller can log the loss. */
-  abandonEvidenceUploadsForRun(runId: number, reason: string): number {
-    const t = this.now();
-    const info = this.db
-      .prepare(
-        `UPDATE evidence_uploads SET abandoned_at = ?, last_error = ?, updated_at = ?
-         WHERE run_id = ? AND ${EVIDENCE_PENDING_SQL}`,
-      )
-      .run(t, reason.slice(0, 500), t, runId);
-    return Number(info.changes);
-  }
-
-  /** All undelivered (still-retrying) uploads for a repo — the doctor snapshot (regardless of whether
-   *  each is currently due). */
-  pendingEvidenceUploads(repo: string): EvidenceUpload[] {
-    const rows = this.db
-      .prepare(`SELECT * FROM evidence_uploads WHERE repo = ? AND ${EVIDENCE_PENDING_SQL} ORDER BY id`)
-      .all(repo) as unknown as EvidenceUploadRow[];
-    return rows.map((r) => this.toEvidenceUpload(r));
-  }
-
-  /** Is an evidence upload currently stuck on an AUTH failure (expired SSO)? Drives the dashboard SSO
-   *  light (red) and the doctor stuck-upload check. */
-  authStuckEvidenceUpload(repo: string): boolean {
-    const row = this.db
-      .prepare(`SELECT 1 AS x FROM evidence_uploads WHERE repo = ? AND error_kind = 'auth' AND ${EVIDENCE_PENDING_SQL} LIMIT 1`)
-      .get(repo) as { x: number } | undefined;
-    return row !== undefined;
-  }
-
-  /** On AWS-creds RECOVERY (SSO re-login): make every auth-stuck upload due now, so the next Phase 0
-   *  flush lands it instead of waiting out the (up-to-1h) backoff it accrued while creds were expired.
-   *  Mirrors retryTransitionsForSource. Scoped to error_kind='auth' — transient/permanent rows keep
-   *  their own retry policy (a flaky-S3 backoff or a config error creds recovery can't fix). Returns
-   *  how many rows were re-queued. */
-  retryEvidenceUploadsForRepo(repo: string): number {
-    const t = this.now();
-    const info = this.db
-      .prepare(
-        `UPDATE evidence_uploads SET next_attempt_at = ?, updated_at = ?
-         WHERE repo = ? AND error_kind = 'auth' AND ${EVIDENCE_PENDING_SQL}`,
-      )
-      .run(t, t, repo);
-    const requeued = Number(info.changes);
-    if (requeued > 0) telemetryEvent("store.evidence_upload.creds_recovered", { repo, "evidence_upload.requeued": requeued });
-    return requeued;
-  }
-
   // --- pending agent signals (durable bounce/ask-human intents) -------------
   // The transition-outbox pattern applied to the non-monotonic agent signals: the intent is
   // persisted BEFORE the run lock is attempted, so a signal whose immediate apply loses the lock
@@ -1441,8 +1108,7 @@ export class Store {
   // handoff stamped atomically at enqueue; single-slot via latest-wins supersession). These
   // methods are the domain API the signal machinery keeps using — they adapt to/from the ledger
   // row, so signals.ts / consumePendingSignal never changed shape. The legacy `pending_signals`
-  // table is drained LAZILY for one release: a row a still-draining old-code process enqueues
-  // around the upgrade is converted to a ledger row on its first read (see below), then closed.
+  // table — converted by v31, drained through one release, dropped in v35 — is gone.
 
   /** Map a ledger `agent_signal` row back onto the domain PendingSignal shape. */
   private intentToPendingSignal(i: Intent): PendingSignal {
@@ -1470,19 +1136,6 @@ export class Store {
   }
 
   unconsumedPendingSignalForRun(runId: number): PendingSignal | undefined {
-    // Lazy drain: a legacy pending_signals row (written by a draining old-code process around the
-    // upgrade) is converted to a ledger row on first read, then closed — so there is exactly one
-    // id space past this point. Kept one release; the v31 migration converted the backlog.
-    const legacy = this.db
-      .prepare("SELECT * FROM pending_signals WHERE run_id = ? AND consumed_at IS NULL ORDER BY id DESC LIMIT 1")
-      .get(runId) as PendingSignalRow | undefined;
-    if (legacy) {
-      const l = toPendingSignal(legacy);
-      this.db
-        .prepare("UPDATE pending_signals SET consumed_at = ?, consumed_result = 'superseded: migrated to the intent ledger' WHERE run_id = ? AND consumed_at IS NULL")
-        .run(this.now(), runId);
-      return this.enqueuePendingSignal({ runId: l.runId, repo: l.repo, ticketKey: l.ticketKey, signal: l.signal, step: l.step, toStep: l.toStep, payload: l.payload, pass: l.pass });
-    }
     // status IN (waiting, pending): 'waiting' is the normal shape; 'pending' covers a
     // kernel-backstopped row (mis-created without the atomic handoff) so it is still consumable.
     const row = this.db
@@ -1856,16 +1509,20 @@ export class Store {
   // question, keyed q-<id>): attempts = consecutive poll ERRORS (reset by any successful poll),
   // state.pollAttempts = misses (drives the base backoff exponent), next_attempt_at = the poll
   // gate. The methods below OVERLAY the ledger clock onto the domain shape, so the reply loop in
-  // reconcileWaitingForHuman is unchanged. The legacy poll columns are frozen (unread); a pending
-  // question with no ledger row (written by a draining old-code process) gets one lazily. Polling
+  // reconcileWaitingForHuman is unchanged. The legacy poll columns dropped in v35, so the ledger
+  // row is the clock's only home: createHumanQuestion arms it, reads never create one. Polling
   // itself stays under the run lock — moving it onto the kernel's lock-free walk is a possible
   // follow-up, deliberately not taken with the storage cutover.
 
-  /** The question's ledger scheduling row (its poll clock), creating it lazily for a pending
-   *  question that predates the ledger (the old-code drain window). */
-  private humanPollIntent(q: { id: number; runId: number; repo: string; ticketKey: string; status: string }, createIfMissing = true): Intent | undefined {
-    const existing = this.intentByKey("human_reply_poll", `run:${q.runId}`, `q-${q.id}`);
-    if (existing || !createIfMissing || q.status !== "pending") return existing;
+  /** The question's ledger scheduling row (its poll clock). A pure lookup: the row is armed once,
+   *  by createHumanQuestion — reads never create one. */
+  private humanPollIntent(q: { id: number; runId: number }): Intent | undefined {
+    return this.intentByKey("human_reply_poll", `run:${q.runId}`, `q-${q.id}`);
+  }
+
+  /** Arm a pending question's poll clock — one `waiting` row the run-locked reply loop drives
+   *  (never the kernel). Called at creation; the clock's whole life is that row. */
+  private armHumanPollIntent(q: { id: number; runId: number; repo: string; ticketKey: string }): Intent {
     return this.enqueueIntent({
       repo: q.repo,
       kind: "human_reply_poll",
@@ -1875,15 +1532,16 @@ export class Store {
       dedupKey: `q-${q.id}`,
       payload: JSON.stringify({ questionId: q.id }),
       state: JSON.stringify({ pollAttempts: 0 }),
-      status: "waiting", // engine-scheduled: the run-locked reply loop drives it, never the kernel
+      status: "waiting",
     });
   }
 
-  /** Overlay the ledger clock onto the domain row (the shape every caller keeps reading). */
+  /** Overlay the ledger clock onto the domain row (the shape every caller keeps reading). The
+   *  clock has exactly one home now, so a question with no ledger row simply has no clock. */
   private withPollClock(row: HumanQuestionRow): HumanQuestion {
     const q = toHumanQuestion(row);
-    const intent = this.humanPollIntent(q, q.status === "pending");
-    if (!intent) return q; // answered pre-ledger: the frozen legacy columns are as good as any
+    const intent = this.humanPollIntent(q);
+    if (!intent) return { ...q, pollAttempts: 0, pollErrors: 0, nextPollAt: 0 };
     let pollAttempts = 0;
     try {
       pollAttempts = (JSON.parse(intent.state) as { pollAttempts?: number }).pollAttempts ?? 0;
@@ -1925,7 +1583,9 @@ export class Store {
          VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)`,
       )
       .run(input.runId, input.repo, input.workSource, input.ticketKey, input.step ?? null, input.question, t, t);
-    const q = this.getHumanQuestion(Number(info.lastInsertRowid)); // getHumanQuestion arms the poll row
+    const id = Number(info.lastInsertRowid);
+    this.armHumanPollIntent({ id, runId: input.runId, repo: input.repo, ticketKey: input.ticketKey });
+    const q = this.getHumanQuestion(id);
     if (!q) throw new Error("createHumanQuestion: row vanished after insert");
     telemetryEvent("store.human_question.create", { repo: q.repo, "run.id": q.runId, "question.id": q.id, "work.key": q.ticketKey, step: q.step ?? undefined });
     return q;
@@ -1977,7 +1637,8 @@ export class Store {
   recordHumanPollMiss(id: number): HumanQuestion {
     const q = this.getHumanQuestion(id);
     if (!q) throw new Error(`recordHumanPollMiss: no question ${id}`);
-    const intent = this.humanPollIntent(q)!;
+    const intent = this.humanPollIntent(q);
+    if (!intent) throw new Error(`recordHumanPollMiss: question ${id} has no poll clock`);
     const attempts = q.pollAttempts + 1;
     const delay = backoffDelaySeconds(attempts, HUMAN_POLL_BACKOFF_CAP_SECONDS);
     // A miss is a SUCCESSFUL poll that found no reply — it also resets the consecutive-error run.
@@ -1999,7 +1660,8 @@ export class Store {
   recordHumanPollError(id: number): HumanQuestion {
     const q = this.getHumanQuestion(id);
     if (!q) throw new Error(`recordHumanPollError: no question ${id}`);
-    const intent = this.humanPollIntent(q)!;
+    const intent = this.humanPollIntent(q);
+    if (!intent) throw new Error(`recordHumanPollError: question ${id} has no poll clock`);
     const errors = q.pollErrors + 1;
     // The error backoff STACKS on the miss exponent (attempts + errors) so a flapping source keeps
     // thinning out even while misses reset between throws.

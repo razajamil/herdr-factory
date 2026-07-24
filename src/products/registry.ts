@@ -39,8 +39,9 @@ export interface ProductCapability {
   /** Capability-scoped tokens injected into a step's prompt only when the step touches this product
    *  (universal tokens like @@KEY@@/@@WORK_DOC@@ stay always-injected in step.ts). */
   readonly tokens?: readonly string[];
-  /** Enables an existing durable outbox drained by the reconciler (evidence publish upload). */
-  readonly outbox?: "evidence_uploads";
+  /** Names the durable intent-ledger kind this product's async delivery rides on (the evidence
+   *  media publish), drained by the reconciler's Phase-0 kernel walk. */
+  readonly outbox?: "evidence_publish";
   /** Source lifecycle transition emitted when this product is produced (forward-only). */
   readonly effectOnProduce?: { readonly to: WorkState };
   readonly adoption?: AdoptionSpec;
@@ -60,7 +61,7 @@ export const PRODUCT_CAPABILITIES: readonly ProductCapability[] = [
   {
     product: "evidence",
     tokens: ["@@EVIDENCE_DIR@@", "@@EVIDENCE_UPLOAD_CMD@@", "@@CAPTURE_ATTEMPT_CMD@@"],
-    outbox: "evidence_uploads",
+    outbox: "evidence_publish",
     signals: ["capture-attempt", "evidence-upload"],
   },
   {

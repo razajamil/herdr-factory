@@ -286,6 +286,21 @@ function build(opts: { multi?: boolean } = {}) {
 
 const ticket = (key: string, type = "Bug"): Ticket => ({ key, summary: "Fix the thing", type });
 
+/** Queue an evidence media publish the way the CLI does — a ledger `evidence_publish` intent. */
+function enqueueEvidencePublish(store: Store, runId: number, keyPrefix: string, evidenceDir: string) {
+  return store.enqueueIntent({
+    repo: "demo",
+    kind: "evidence_publish",
+    scope: `run:${runId}`,
+    runId,
+    ticketKey: store.getRun(runId)!.ticketKey,
+    dedupKey: keyPrefix,
+    payload: JSON.stringify({ keyPrefix, evidenceDir }),
+    causeScope: "publisher:s3",
+    supersedeScope: true,
+  });
+}
+
 /** Seed an active run already parked at `phase`/`step`, with the active step's run_step spawned. */
 function seed(
   store: Store,
@@ -305,6 +320,10 @@ function seed(
   if (step) {
     const row = store.upsertRunStep(run.id, step, { paneId: "w1:p1" });
     store.upsertRunStep(run.id, step, { dispatchedAt: row.startedAt });
+    // ...and the budget clock a real dispatch arms alongside it (step.ts). Since v35 the watch_state
+    // row is the ONLY budget clock — started_at is layout-wait/dispatch bookkeeping, not a fallback —
+    // so a seeded step without this row is a step whose budget can never expire.
+    store.upsertWatchState(run.id, step, "budget", { basedAt: row.startedAt });
   }
   return store.getRun(run.id)!;
 }
@@ -969,7 +988,7 @@ describe("reconcile pipeline (work_to_pull_request belt)", () => {
     const run = seed(store, worktree, "RO-1", "running", "review");
     // baselineFrozenAt set ⇒ the baseline is FROZEN: the step's own agent has been observed working,
     // so a later HEAD move is attributable to THIS step, not the prior step's trailing commits.
-    store.upsertRunStep(run.id, "review", { baselineSig: "sha-baseline", baselineFrozenAt: 100 });
+    store.upsertWatchState(run.id, "review", "read_only", { sig: "sha-baseline", basedAt: 100 });
     state.headSha = "sha-moved"; // the read-only agent illicitly committed
     await reconcileRun(deps, store.getRun(run.id)!);
     const after = store.getRun(run.id)!;
@@ -983,7 +1002,8 @@ describe("reconcile pipeline (work_to_pull_request belt)", () => {
     shipBelt.steps[1] = stepCfg("review", { readOnly: true }); // read-only review, guard attached like production
     state.headSha = "sha-baseline";
     const run = seed(store, worktree, "RO-2", "running", "review");
-    store.upsertRunStep(run.id, "review", { baselineSig: "sha-baseline", done: true }); // finished, no commit
+    store.upsertRunStep(run.id, "review", { done: true }); // finished, no commit
+    store.upsertWatchState(run.id, "review", "read_only", { sig: "sha-baseline" });
     await reconcileRun(deps, store.getRun(run.id)!);
     const after = store.getRun(run.id)!;
     expect(after.phase).toBe("running");
@@ -998,7 +1018,7 @@ describe("reconcile pipeline (work_to_pull_request belt)", () => {
     shipBelt.steps[1] = stepCfg("review", { readOnly: true }); // read-only review, guard attached like production
     state.headSha = "sha-baseline";
     const run = seed(store, worktree, "RO-3", "running", "review");
-    store.upsertRunStep(run.id, "review", { baselineSig: "sha-baseline" }); // NOT frozen (baselineFrozenAt null)
+    store.upsertWatchState(run.id, "review", "read_only", { sig: "sha-baseline" }); // NOT frozen (basedAt null)
     state.paneState = "idle"; // the read-only agent hasn't taken over yet (still spinning up)
     state.headSha = "sha-trailing"; // the PRIOR step's still-alive agent committed after handoff
     await reconcileRun(deps, store.getRun(run.id)!);
@@ -1014,7 +1034,7 @@ describe("reconcile pipeline (work_to_pull_request belt)", () => {
     setNow(5000);
     state.headSha = "sha-baseline";
     const run = seed(store, worktree, "RO-4", "running", "review");
-    store.upsertRunStep(run.id, "review", { baselineSig: "sha-baseline" });
+    store.upsertWatchState(run.id, "review", "read_only", { sig: "sha-baseline" });
     state.paneState = "working"; // the read-only agent has taken over
     await reconcileRun(deps, store.getRun(run.id)!);
     expect(store.getWatchState(run.id, "review", "read_only")!.basedAt).toBe(5000); // frozen at now
@@ -1027,7 +1047,8 @@ describe("reconcile pipeline (work_to_pull_request belt)", () => {
     state.headSha = "sha-moved";
     const run = seed(store, worktree, "RO-5", "attention", "review", { attentionReason: "review is read-only but committed (HEAD moved)" });
     // frozen baseline + HEAD moved is what parked it; the step then genuinely finished (done).
-    store.upsertRunStep(run.id, "review", { paneId: "w1:p1", baselineSig: "sha-baseline", baselineFrozenAt: 100, done: true });
+    store.upsertRunStep(run.id, "review", { paneId: "w1:p1", done: true });
+    store.upsertWatchState(run.id, "review", "read_only", { sig: "sha-baseline", basedAt: 100 });
     store.recordEvent({ runId: run.id, repo: "demo", ticketKey: "RO-5", type: "attention", detail: { reason: "read_only_violation", step: "review" } });
     await reconcileRun(deps, store.getRun(run.id)!);
     const after = store.getRun(run.id)!;
@@ -1307,8 +1328,10 @@ describe("reconcile pipeline (work_to_pull_request belt)", () => {
     // guards declare, not a fixed column set).
     const belt: BeltRuntime = { name: "ship", beltType: "work_to_pull_request", source: "jira", priority: 1, active: true, watchPr: true, steps: [stepCfg("fix"), stepCfg("evidence", { readOnly: true }), stepCfg("review"), stepCfg("pr")] };
     const run = seed(store, worktree, "K-B6", "running", "review");
-    store.upsertRunStep(run.id, "fix", { paneId: "w1:pfix", done: true, progressSig: "sha-x", progressAt: 5 });
-    store.upsertRunStep(run.id, "evidence", { paneId: "w1:pev", done: true, baselineSig: "sha-x", baselineFrozenAt: 5 });
+    store.upsertRunStep(run.id, "fix", { paneId: "w1:pfix", done: true });
+    store.upsertWatchState(run.id, "fix", "heartbeat", { sig: "sha-x", basedAt: 5 });
+    store.upsertRunStep(run.id, "evidence", { paneId: "w1:pev", done: true });
+    store.upsertWatchState(run.id, "evidence", "read_only", { sig: "sha-x", basedAt: 5 });
     const src = deps.resolveSource("jira")!;
     await bounceStep(deps, store.getRun(run.id)!, belt, src, "fix", "the fix isn't proven");
     expect(store.getRun(run.id)!.step).toBe("fix");
@@ -1358,7 +1381,8 @@ describe("reconcile pipeline (work_to_pull_request belt)", () => {
     // fix + evidence completed on the first forward pass; evidence's budget clock (3600s) is ancient,
     // and its live layout pane is w1:pev (still tracked by herdr — the agent finished + is idle-at-prompt).
     store.upsertRunStep(run.id, "fix", { paneId: "w1:pfix", done: true });
-    store.upsertRunStep(run.id, "evidence", { paneId: "w1:pev", done: true, startedAt: 1000, progressSig: "sha-x" });
+    store.upsertRunStep(run.id, "evidence", { paneId: "w1:pev", done: true, startedAt: 1000 });
+    store.upsertWatchState(run.id, "evidence", "heartbeat", { sig: "sha-x" });
     state.tabPane = null; // the configured label no longer resolves — the first dispatch renamed the pane
     const src = deps.resolveSource("jira")!;
     await bounceStep(deps, store.getRun(run.id)!, shipBelt, src, "fix", "the evidence didn't prove the fix");
@@ -1552,7 +1576,7 @@ describe("reconcile pipeline (work_to_pull_request belt)", () => {
   it("fix step past the stall window but still working → extended (a live agent is never parked by a timer)", async () => {
     const { deps, store, state, worktree, calls, setNow } = build();
     const run = seed(store, worktree, "K-H1", "running", "fix");
-    store.upsertRunStep(run.id, "fix", { progressSig: "sha0", progressAt: 1000 });
+    store.upsertWatchState(run.id, "fix", "heartbeat", { sig: "sha0", basedAt: 1000 });
     state.headSha = "sha0"; // HEAD frozen → no new commits...
     state.paneState = "working"; // ...but the agent is actively working (long stretch between commits)
     setNow(1000 + 2701); // past stall_seconds
@@ -1564,7 +1588,7 @@ describe("reconcile pipeline (work_to_pull_request belt)", () => {
   it("fix step stalled AND idle (no commits, worker not working) → attention", async () => {
     const { deps, store, state, worktree, calls, setNow } = build();
     const run = seed(store, worktree, "K-H1b", "running", "fix");
-    store.upsertRunStep(run.id, "fix", { progressSig: "sha0", progressAt: 1000 });
+    store.upsertWatchState(run.id, "fix", "heartbeat", { sig: "sha0", basedAt: 1000 });
     state.headSha = "sha0"; // HEAD frozen → no new commits
     state.paneState = "idle"; // AND not working → genuinely stuck
     setNow(1000 + 2701); // past stall_seconds
@@ -1576,7 +1600,7 @@ describe("reconcile pipeline (work_to_pull_request belt)", () => {
   it("fix step commits advancing → heartbeat resets, stays running fix", async () => {
     const { deps, store, state, worktree, calls, setNow } = build();
     const run = seed(store, worktree, "K-H2", "running", "fix");
-    store.upsertRunStep(run.id, "fix", { progressSig: "sha0", progressAt: 1000 });
+    store.upsertWatchState(run.id, "fix", "heartbeat", { sig: "sha0", basedAt: 1000 });
     state.headSha = "sha1"; // HEAD moved → progress
     state.paneState = "working";
     setNow(1000 + 2701);
@@ -1685,12 +1709,13 @@ describe("reconcile pipeline (work_to_pull_request belt)", () => {
     const { deps, store, state, worktree } = build();
     const run = seed(store, worktree, "K-EVD", "reviewing", null, {});
     // An evidence upload never landed (SSO down through merge) — still pending at teardown.
-    store.enqueueEvidenceUpload({ runId: run.id, repo: "demo", ticketKey: "K-EVD", keyPrefix: "p/A", evidenceDir: join(worktree, ".memory/herdr-factory/evidence") });
-    expect(store.undeliveredEvidenceUploadsForRun(run.id)).toHaveLength(1);
+    enqueueEvidencePublish(store, run.id, "p/A", join(worktree, ".memory/herdr-factory/evidence"));
+    const pending = () => store.listIntents("demo", { kind: "evidence_publish", status: "pending", runId: run.id });
+    expect(pending()).toHaveLength(1);
     state.pr = { number: 42, state: "MERGED", url: "u" };
     await reconcileRun(deps, store.getRun(run.id)!);
     expect(store.getRun(run.id)!.phase).toBe("done");
-    expect(store.undeliveredEvidenceUploadsForRun(run.id)).toHaveLength(0); // dropped at teardown
+    expect(pending()).toHaveLength(0); // dropped at teardown
   });
 
   it("reviewing polls by PR number — a merge is still detected after the head branch is deleted", async () => {
@@ -2417,7 +2442,8 @@ describe("attention workflow — resume, parked slots, re-notification", () => {
   it("resume returns a step-parked run to running with fresh clocks and re-dispatches", async () => {
     const { deps, store, worktree, calls } = build();
     const run = seed(store, worktree, "K-A1", "attention", "fix", { attentionReason: "fix step over budget (worker: idle)" });
-    store.upsertRunStep(run.id, "fix", { startedAt: 1, progressSig: "old", progressAt: 1 });
+    store.upsertRunStep(run.id, "fix", { startedAt: 1 });
+    store.upsertWatchState(run.id, "fix", "heartbeat", { sig: "old", basedAt: 1 });
 
     const res = await resumeRun(deps, store.getRun(run.id)!);
     expect(res).toMatchObject({ ok: true, phase: "running" });
@@ -2852,7 +2878,7 @@ describe("runObligations — pending intents + armed watches, registry-derived",
     const run = seed(store, worktree, "K-OB1", "running", "fix");
     // An undelivered write-back + a pending evidence upload + a bounce already counted against review.
     store.enqueueTransition({ runId: run.id, repo: "demo", workSource: "jira", ticketKey: "K-OB1", toState: "in_development" });
-    store.enqueueEvidenceUpload({ runId: run.id, repo: "demo", ticketKey: "K-OB1", keyPrefix: "p1", evidenceDir: join(worktree, "ev") });
+    enqueueEvidencePublish(store, run.id, "p1", join(worktree, "ev"));
     store.bumpGuardCounter(run.id, "fix", "bounce_cap");
 
     const ob = runObligations(deps, store.getRun(run.id)!);
@@ -2877,7 +2903,7 @@ describe("runObligations — pending intents + armed watches, registry-derived",
     shipBelt.steps[1] = stepCfg("review", { readOnly: true }); // read-only review, guard attached like production
     const run = seed(store, worktree, "K-OB2", "waiting_for_human", "review");
     store.createHumanQuestion({ runId: run.id, repo: "demo", workSource: "jira", ticketKey: "K-OB2", step: "review", question: "q?" });
-    store.upsertRunStep(run.id, "review", { baselineSig: "sha-b", baselineFrozenAt: 77 });
+    store.upsertWatchState(run.id, "review", "read_only", { sig: "sha-b", basedAt: 77 });
 
     const ob = runObligations(deps, store.getRun(run.id)!);
     expect(ob.intents.humanQuestion).toMatchObject({ step: "review", posted: false });

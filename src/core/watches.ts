@@ -37,24 +37,15 @@ import type { StepConfig } from "../config.ts";
 import type { Run, RunStep, WatchRebaseTrigger } from "../types.ts";
 
 /**
- * A watch's effective clock: its `watch_state` row (v34), else — for a row a draining old-code
- * process touched, which has no watch row — the frozen legacy run_steps columns. A PRESENT row
- * wins unconditionally: re-bases write nulls rather than deleting, so the fallback can never
- * resurrect a deliberately-cleared clock. Exported for the obligations facts.
+ * A watch's effective clock: its `watch_state` row (v34), which since the v35 contract phase is the
+ * ONLY place a watch clock lives — the frozen run_steps columns the v34 drain window fell back to
+ * are gone. No row means no clock (the watch hasn't been armed, or a re-base deliberately cleared
+ * it — re-bases write nulls rather than deleting, so an armed watch always keeps its row). Each
+ * evaluator decides what a null clock means for ITS predicate. Exported for the obligations facts.
  */
 export function effectiveWatchClock(deps: Deps, rs: RunStep, kind: string): { sig: string | null; basedAt: number | null } {
   const ws = deps.store.getWatchState(rs.runId, rs.step, kind);
-  if (ws) return { sig: ws.sig, basedAt: ws.basedAt };
-  switch (kind) {
-    case "budget":
-      return { sig: null, basedAt: rs.startedAt };
-    case "heartbeat":
-      return { sig: rs.progressSig, basedAt: rs.progressAt };
-    case "read_only":
-      return { sig: rs.baselineSig, basedAt: rs.baselineFrozenAt };
-    default:
-      return { sig: null, basedAt: null };
-  }
+  return ws ? { sig: ws.sig, basedAt: ws.basedAt } : { sig: null, basedAt: null };
 }
 
 export interface WatchCtx {

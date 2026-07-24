@@ -1,5 +1,5 @@
 // The deliver-lane scheduling SPINE: the retry/notify arithmetic every durable-intent mechanism
-// shares, defined once. The outbox family (transition_outbox, evidence_uploads) and the
+// shares, defined once. The outbox family (the source write-backs, the evidence publishes) and the
 // human-question reply poll each re-typed the same 60s-doubling curve, and four notify throttles
 // re-implemented the same "fire when never-notified or past the window" check against the one
 // `attention_renotify_seconds` knob — this module is where that shape lives now.

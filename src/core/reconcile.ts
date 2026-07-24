@@ -5,7 +5,7 @@ import { createEvidencePublisher } from "../clients/evidence.ts";
 import { runEffect } from "../runtime/effect.ts";
 import { HerdrUnreachableError, type BeltRuntime, type Deps, type SourceRuntime } from "./deps.ts";
 import type { StepConfig } from "../config.ts";
-import type { BeltEffectTrigger, EvidenceUpload, GuardSpec, HumanQuestion, HumanReply, MatchItem, Outcome, PrInfo, PrSnapshot, Run, RunStep, Ticket, TransitionIntent, WorkState } from "../types.ts";
+import type { BeltEffectTrigger, GuardSpec, HumanQuestion, HumanReply, MatchItem, Outcome, PrInfo, PrSnapshot, Run, RunStep, Ticket, TransitionIntent, WorkState } from "../types.ts";
 import { EFFECT_PRODUCE_PRODUCTS, effectRank, outcomeToWorkState, StaleItemError, ticketOf, type TransitionContext } from "../types.ts";
 import { isUniqueViolation } from "../db/store.ts";
 import { notifyDue } from "../schedule.ts";
@@ -225,14 +225,6 @@ function sameTrigger(a: BeltEffectTrigger, b: BeltEffectTrigger): boolean {
 function transitionOutboxFlow(deps: Deps): OutboxFlow<TransitionIntent> {
   return {
     name: "transition outbox",
-    // Lazy drain of the legacy transition_outbox table (one release, post-v33): a row a
-    // still-draining old-code process wrote around the upgrade converts onto the ledger HERE —
-    // Phase 0, before Phase A can enqueue newer intents for the same run — so its FIFO slot
-    // precedes the run's post-upgrade transitions and per-run order survives the cutover.
-    prePass: async () => {
-      const drained = deps.store.drainLegacyTransitions(deps.config.repoName);
-      if (drained > 0) deps.log("info", `transition outbox: converted ${drained} legacy row(s) onto the intent ledger`);
-    },
     due: () => deps.store.dueTransitions(deps.config.repoName),
     attempt: async (intent) => {
       const src = deps.resolveSource(intent.workSource);
@@ -253,86 +245,11 @@ function transitionOutboxFlow(deps: Deps): OutboxFlow<TransitionIntent> {
   };
 }
 
-/**
- * LEGACY DRAIN ONLY (since v30): evidence publishes live on the intent ledger as the
- * `evidence_publish` kind (src/intents/kinds/evidence-publish.ts) — v30 converted every pending
- * `evidence_uploads` row and closed the old ones, so this flow finds nothing due in practice. It
- * stays registered for one release as the backstop for any row a still-draining old-code process
- * touched around the upgrade, then goes with the table's contract-phase drop.
- *
- * The evidence agent published deterministic URLs into its handoff immediately; this lands the
- * actual bytes in S3, retrying with backoff until AWS accepts them — so an expired SSO session
- * defers the upload instead of losing it (the PR #6541 bug). A creds/token (`auth`) failure that
- * keeps recurring notifies the human to `aws sso login` (throttled per row).
- */
-function evidenceUploadFlow(deps: Deps): OutboxFlow<EvidenceUpload> {
-  const repo = deps.config.repoName;
-  const ev = deps.config.evidence;
-  const publisher = ev ? createEvidencePublisher(ev, { currentLogin: () => deps.github.currentLogin() }) : undefined;
-  return {
-    name: "evidence upload",
-    // Auto-resume on creds recovery (S3 only — `local`/`command` have no `auth` kind, so no row is
-    // ever auth-stuck and this hook is a cheap boolean read). If an upload is stuck on expired
-    // creds, probe once (gated so the happy path never probes). The moment creds are live again,
-    // make every auth-stuck row due now so THIS pass uploads it — no human "retry" gesture, no
-    // waiting out the backoff. Mirrors the source-auth path's retryTransitionsForSource. A probe
-    // error is treated as still-down (conservative).
-    prePass: async () => {
-      if (!publisher?.probeLiveness || !deps.store.authStuckEvidenceUpload(repo)) return;
-      const probe = await publisher.probeLiveness().catch(() => ({ auth: true, reason: "probe failed" }));
-      if (!probe.auth) {
-        const requeued = deps.store.retryEvidenceUploadsForRepo(repo);
-        if (requeued > 0) deps.log("info", `evidence publish: creds recovered — re-queued ${requeued} stuck upload(s) for immediate retry`);
-      }
-    },
-    due: () => deps.store.dueEvidenceUploads(repo),
-    attempt: async (job) => {
-      if (!ev || !publisher) {
-        deps.store.markEvidencePermanentFailed(job.id, "evidence config removed");
-        return;
-      }
-      // Best-effort drop policy: the bytes live in the worktree, which teardown removes. If the dir is
-      // gone the publish can never land — stop retrying (this also covers the manual-teardown race).
-      if (!existsSync(job.evidenceDir)) {
-        deps.store.markEvidencePermanentFailed(job.id, "evidence dir gone (torn down before publish)");
-        deps.log("warn", `${job.ticketKey}: evidence publish dropped — worktree removed before it landed`);
-        return;
-      }
-      try {
-        const { files } = await publisher.publish({ dir: job.evidenceDir, prefix: job.keyPrefix });
-        deps.store.markEvidenceDelivered(job.id);
-        deps.store.recordEvent({ runId: job.runId, repo, ticketKey: job.ticketKey, type: "evidence_uploaded", detail: { files: files.length, prefix: job.keyPrefix, attempts: job.attempts, publisher: ev.publisher } });
-        deps.log("info", `${job.ticketKey}: evidence published (${files.length} file(s)) after ${job.attempts} retr${job.attempts === 1 ? "y" : "ies"}`);
-      } catch (e) {
-        const c = publisher.classifyError(e);
-        // Notify on the FIRST failure, then throttle re-notifies by attentionRenotifySeconds.
-        const shouldNotify = notifyDue(job.notifiedAt, deps.config.limits.attentionRenotifySeconds, deps.now());
-        if (c.kind === "permanent") {
-          deps.store.markEvidencePermanentFailed(job.id, c.reason);
-          deps.store.recordEvent({ runId: job.runId, repo, ticketKey: job.ticketKey, type: "evidence_upload_failed", detail: { reason: c.reason } });
-          if (shouldNotify) {
-            await deps.herdr.notify(`herdr-factory: ${job.ticketKey} evidence publish failed`, `Evidence publish can't proceed: ${c.reason}. Run \`herdr-factory --repo ${repo} doctor --deep\`; the published URLs won't resolve until it's fixed.`).catch(() => {});
-            deps.store.markEvidenceNotified(job.id);
-          }
-        } else {
-          const updated = deps.store.recordEvidenceAttempt(job.id, c.reason, c.kind);
-          deps.log("warn", `${job.ticketKey}: evidence publish deferred (attempt ${updated?.attempts}): ${c.reason}`);
-          if (c.kind === "auth" && shouldNotify) {
-            const profile = ev.publisher === "s3" ? ev.profile : undefined;
-            await deps.herdr.notify(`herdr-factory: AWS SSO expired`, `Evidence publish for ${job.ticketKey} is blocked on AWS creds — run \`aws sso login${profile ? ` --profile ${profile}` : ""}\`. It uploads automatically on the next tick.`).catch(() => {});
-            deps.store.markEvidenceNotified(job.id);
-          }
-        }
-      }
-    },
-  };
-}
-
 /** The Phase 0 outbox flows, in delivery order: status write-backs first (they gate claiming — the
- *  known-stale-eligibility veto — so they converge before anything else), then evidence uploads,
- *  then the intent ledger (the generic kernel the legacy flows migrate onto, kind by kind). */
+ *  known-stale-eligibility veto — so they converge before anything else), then the intent ledger
+ *  (the generic kernel every other durable intent now lives on). */
 function outboxFlows(deps: Deps): OutboxFlow<unknown>[] {
-  return [transitionOutboxFlow(deps), evidenceUploadFlow(deps), ledgerFlow(deps)];
+  return [transitionOutboxFlow(deps), ledgerFlow(deps)];
 }
 
 /** Retry every due undelivered transition intent (in per-run order, stopping a run's chain at its
@@ -340,11 +257,6 @@ function outboxFlows(deps: Deps): OutboxFlow<unknown>[] {
  *  capacity or the affected runs are parked/ended. */
 export async function flushTransitionOutbox(deps: Deps): Promise<void> {
   return flushOutbox(deps, transitionOutboxFlow(deps));
-}
-
-/** Retry every due evidence-upload intent (Phase 0, alongside the transition outbox). */
-export async function flushEvidenceUploads(deps: Deps): Promise<void> {
-  return flushOutbox(deps, evidenceUploadFlow(deps));
 }
 
 /**
@@ -1285,7 +1197,7 @@ export async function bounceStep(
 
 /**
  * Consume the run's unconsumed pending signal, if any — the durable half of the non-monotonic
- * agent signals (bounce / ask-human; see applySignal and the pending_signals table). MUST be
+ * agent signals (bounce / ask-human; see applySignal and the `agent_signal` ledger kind). MUST be
  * called under the run's lock; takes no locks itself. Applies the effect, stamps the intent with
  * its outcome, and returns the effect's result — or null when there was nothing to consume (the
  * common case, and the consume race: an intent enqueued by applySignal may be consumed by a tick
@@ -2163,12 +2075,15 @@ async function teardownImpl(deps: Deps, run: Run, outcome: Outcome, src: SourceR
 
   await removeRunWorktree(deps, run);
 
-  // Best-effort drop of any still-pending evidence upload: the worktree (and its evidence dir) is gone,
-  // so the bytes can't be uploaded anymore. Log the loss so it's visible rather than silent.
-  const dropped = deps.store.abandonEvidenceUploadsForRun(run.id, `run torn down (${outcome}) before upload landed`);
-  if (dropped > 0) deps.log("warn", `${run.ticketKey}: ${dropped} evidence upload(s) dropped at teardown — bytes never reached S3 (likely SSO was down through merge)`);
-  // Drop the run's live ledger intents whose kind dies with the run (external waits, and — as kinds
-  // cut over — anything not marked survivesTeardown; terminal write-backs must outlive the run).
+  // Still-pending evidence publishes die with the worktree (their bytes lived in the evidence dir
+  // just removed). The generic abandon below is what actually drops them — evidence_publish is not
+  // survivesTeardown — but count them first so the loss is logged in ITS terms, not as an opaque
+  // "N intents abandoned": this is the SSO-was-down-through-merge case, worth naming.
+  const droppedUploads = deps.store.listIntents(repo, { kind: "evidence_publish", status: "pending", runId: run.id }).length;
+  if (droppedUploads > 0)
+    deps.log("warn", `${run.ticketKey}: ${droppedUploads} evidence upload(s) dropped at teardown — bytes never reached S3 (likely SSO was down through merge)`);
+  // Drop the run's live ledger intents whose kind dies with the run (external waits, and anything
+  // else not marked survivesTeardown; terminal write-backs must outlive the run).
   const teardownKinds = INTENT_KINDS.filter((k) => !k.survivesTeardown).map((k) => k.kind);
   const droppedIntents = teardownKinds.length > 0 ? deps.store.abandonIntentsForRun(run.id, `run torn down (${outcome})`, teardownKinds) : 0;
   if (droppedIntents > 0) deps.log("warn", `${run.ticketKey}: ${droppedIntents} pending intent(s) abandoned at teardown`);

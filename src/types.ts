@@ -181,22 +181,15 @@ export type RunPatch = Partial<
 /** One agent step of a run's pipeline (fix/evidence/review/pr for work_to_pull_request), each in its
  *  own herdr pane. Its capped-guard counters (the bounce cap, the evidence capture cap) live in the
  *  generalized `guard_counters` table keyed (run, step, guard), NOT on this row — see Store's
- *  bumpGuardCounter/guardCounter/resetGuardCounter. */
+ *  bumpGuardCounter/guardCounter/resetGuardCounter. Likewise its watch CLOCKS (the heartbeat's
+ *  progress signature, the read-only baseline) live in `watch_state` keyed (run, step, watch)
+ *  since v34 — every watch owns its clock; the frozen columns here dropped in v35. */
 export interface RunStep {
   id: number;
   runId: number;
   step: StepName;
   paneId: string | null;
   sessionId: string | null; // the agent's claude session id (on-demand query handle)
-  progressSig: string | null; // last-seen branch HEAD (the commit-stall heartbeat; heartbeat steps only)
-  progressAt: number | null;
-  /** The read-only guard's enforcement baseline (read-only steps only; own columns since v28 — it
-   *  used to alias progress_sig, safe only via the config-level heartbeat/read_only exclusion).
-   *  TRACKS live HEAD until the step's own agent is first observed working, then freezes. */
-  baselineSig: string | null;
-  /** When the baseline froze (the step's agent was first observed working); null = still tracking,
-   *  absorbing the prior step's trailing handoff-window commits (RWR-18204). */
-  baselineFrozenAt: number | null;
   done: boolean;
   startedAt: number | null;
   doneAt: number | null;
@@ -217,10 +210,10 @@ export interface RunStep {
 
 /** Fields the reconciler may patch on a run step. */
 export type RunStepPatch = Partial<
-  Pick<RunStep, "paneId" | "sessionId" | "progressSig" | "progressAt" | "baselineSig" | "baselineFrozenAt" | "done" | "startedAt" | "absentAt" | "pass" | "dispatchedAt">
+  Pick<RunStep, "paneId" | "sessionId" | "done" | "startedAt" | "absentAt" | "pass" | "dispatchedAt">
 >;
 
-/** A durable agent-signal intent (`pending_signals`): bounce / ask-human persisted BEFORE the run
+/** A durable agent-signal intent (ledger kind `agent_signal`): bounce / ask-human persisted BEFORE the run
  *  lock is attempted, so a contended or crashed apply converges on a later tick instead of being
  *  dropped (the transition-outbox pattern applied to the non-monotonic signals). At most one
  *  unconsumed intent per run — enqueue supersedes. */
@@ -336,29 +329,6 @@ export interface TransitionIntent {
    *  staleHandledAt so one gone item never double-fires. */
   staleAt: number | null;
   staleHandledAt: number | null;
-}
-
-/** One capture's pending media publish — the durable evidence-upload outbox row (see migration v16),
- *  publisher-agnostic (s3 | local | command). URLs are published to the handoff/PR immediately
- *  (deterministic from `keyPrefix` + filenames for s3/local; from the command's stdout for `command`);
- *  the bytes are retried until the backend accepts them or a permanent config error stops it. */
-export interface EvidenceUpload {
-  id: number;
-  runId: number;
-  repo: string;
-  ticketKey: string;
-  keyPrefix: string; // persisted so retry URLs stay stable
-  evidenceDir: string; // absolute path in the worktree (gone ⇒ abandon)
-  attempts: number;
-  nextAttemptAt: number; // also the enqueue lease (CLI inline attempt vs Phase 0 flush)
-  lastError: string | null;
-  errorKind: "auth" | "transient" | "permanent" | null; // the publisher's classified kind of the last failure (auth: S3 only)
-  notifiedAt: number | null; // SSO/permanent notify throttle (per row, never the run)
-  permanentFailedAt: number | null; // non-retryable config error / dir-gone; stop retrying
-  abandonedAt: number | null; // superseded by a re-capture, or dropped at teardown
-  createdAt: number;
-  updatedAt: number;
-  deliveredAt: number | null;
 }
 
 /** Stored OAuth credentials for a work source configured with auth.method: oauth (migration v19).

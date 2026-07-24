@@ -795,6 +795,37 @@ export const MIGRATIONS: { version: number; sql: string }[] = [
           FROM run_steps WHERE started_at IS NOT NULL;
     `,
   },
+  {
+    version: 35,
+    // CONTRACT PHASE for the v29–v34 cutovers. Expand/contract discipline (§14): v29–v34 moved the
+    // deliver lane onto the intent ledger and the observe lane onto watch_state, but kept the legacy
+    // storage alive for ONE release as drain-window shims — a still-draining old-code process could
+    // still write a row, and new code read it (unions, lazy drains, frozen-column fallbacks). That
+    // release is deployed everywhere, so nothing writes these anymore and the reads go with them.
+    //
+    // The three outbox-shaped tables drop whole (their live rows converted in v30/v31/v33). The
+    // frozen COLUMNS drop too — a column no code reads is not free: it is a second place a clock
+    // can appear to live, which is exactly the aliasing v28/v34 spent two migrations undoing.
+    // human_questions keeps its domain half (question/answer/external ids); only the scheduling
+    // columns v32 moved to the ledger go. run_steps keeps started_at (still the layout-wait window
+    // + dispatch bookkeeping); only the watch clocks v34 moved to watch_state go.
+    //
+    // Plain DROP COLUMN, no table rebuild: none of these columns is indexed, PK, UNIQUE, or named
+    // in a CHECK or partial-index predicate, so SQLite (3.35+) drops them in place — verified
+    // against a real database, foreign_key_check and integrity_check clean.
+    sql: `
+      DROP TABLE transition_outbox;
+      DROP TABLE evidence_uploads;
+      DROP TABLE pending_signals;
+      ALTER TABLE human_questions DROP COLUMN poll_attempts;
+      ALTER TABLE human_questions DROP COLUMN poll_errors;
+      ALTER TABLE human_questions DROP COLUMN next_poll_at;
+      ALTER TABLE run_steps DROP COLUMN progress_sig;
+      ALTER TABLE run_steps DROP COLUMN progress_at;
+      ALTER TABLE run_steps DROP COLUMN baseline_sig;
+      ALTER TABLE run_steps DROP COLUMN baseline_frozen_at;
+    `,
+  },
 ];
 
 /** Apply pending migrations in a transaction. Idempotent. */
