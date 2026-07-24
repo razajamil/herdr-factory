@@ -4,6 +4,7 @@ import { describe, expect, it } from "vitest";
 import { STEP_DESCRIPTORS } from "../src/steps/registry.ts";
 import { PRODUCT_CAPABILITIES, productCapabilityFor } from "../src/products/registry.ts";
 import { SIGNAL_DESCRIPTORS, signalDescriptorFor } from "../src/signals/registry.ts";
+import { watchEvaluatorFor } from "../src/core/watches.ts";
 import type { ProductType } from "../src/types.ts";
 
 // The step-primitive contract suite — the analog of test/work-source-contract.test.ts for the
@@ -74,6 +75,11 @@ describe("StepDescriptor contract (per registered step primitive)", () => {
         expect(d.guards.some((g) => g.kind === "read_only")).toBe(declared);
       });
 
+      it("heartbeat precedes budget in guard order (the harness is first-trip-wins; stall diagnosis beats budget)", () => {
+        const kinds = d.guards.map((g) => g.kind);
+        if (kinds.includes("heartbeat")) expect(kinds.indexOf("heartbeat")).toBeLessThan(kinds.indexOf("budget"));
+      });
+
       it("a bounce emitter only makes sense with an evidence/gate posture (has a base prompt to bounce from)", () => {
         // Belt-composition resolves the actual target; here we just assert the emit-side shape.
         if (d.controls.bounce) expect(d.controls.bounce.toEarliestConsumerOf).toBe("bounce_feedback");
@@ -113,6 +119,18 @@ describe("StepDescriptor contract (per registered step primitive)", () => {
 
   it("the shipped primitives are exactly work/evidence/review/pr/custom", () => {
     expect(STEP_DESCRIPTORS.map((d) => d.name).sort()).toEqual(["custom", "evidence", "pr", "review", "work"]);
+  });
+
+  it("watch-harness declarations: every harness-evaluated kind has an evaluator; timers veto on working; read_only is pre-advance", () => {
+    // The kinds the harness walks — everything else is spawn-phase (layout_wait), signal-driven
+    // (capture_cap) or not a watchdog (exclusive_resource) and must NOT have an evaluator.
+    for (const kind of ["budget", "heartbeat", "read_only"]) expect(watchEvaluatorFor(kind)).toBeDefined();
+    for (const kind of ["layout_wait", "capture_cap", "exclusive_resource"]) expect(watchEvaluatorFor(kind)).toBeUndefined();
+    const byKind = new Map(STEP_DESCRIPTORS.flatMap((d) => d.guards).map((g) => [g.kind, g]));
+    expect(byKind.get("budget")!.vetoWhenWorking).toBe(true); // a LIVE agent is never parked by a timer
+    expect(byKind.get("heartbeat")!.vetoWhenWorking).toBe(true);
+    expect(byKind.get("read_only")!.vetoWhenWorking ?? false).toBe(false); // a working agent that committed still parks
+    expect(byKind.get("read_only")!.stage).toBe("pre_advance"); // a done-but-violating step parks, then heals via rescue
   });
 });
 

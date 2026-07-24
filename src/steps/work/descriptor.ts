@@ -15,6 +15,6 @@ export const workDescriptor: StepDescriptor = {
   ],
   produces: ["commits", "handoff"],
   controls: { posture: {} },
-  guards: [BUDGET_GUARD, HEARTBEAT_GUARD, LAYOUT_WAIT_GUARD],
+  guards: [HEARTBEAT_GUARD, BUDGET_GUARD, LAYOUT_WAIT_GUARD], // heartbeat first: on a double-trip the stall diagnosis wins (see guards.ts)
   effects: [], // belt_start→in_development is an engine default; no per-step effect needed
 };

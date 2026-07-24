@@ -1318,7 +1318,9 @@ export function loadConfig(repoName: string): Loaded {
       if (g.requiresProduct && !produces.includes(g.requiresProduct)) continue;
       guards.push(g);
     }
-    if (ref.heartbeat && !guards.some((g) => g.kind === "heartbeat")) guards.push(HEARTBEAT_GUARD);
+    // unshift, not push: the harness is first-trip-wins in guard order, and on a double-trip the
+    // stall diagnosis must win over the budget (see guards.ts) — mirrors the descriptors' order.
+    if (ref.heartbeat && !guards.some((g) => g.kind === "heartbeat")) guards.unshift(HEARTBEAT_GUARD);
     // A read-only posture ALWAYS carries the read_only guard: descriptor-declared postures
     // (evidence/review) bring it via d.guards above; a custom ref's `read_only: true` opt-in adds
     // it here — so the watchdog rescue routing (STEP_WATCHDOG_ATTENTION) is fully registry-derived.

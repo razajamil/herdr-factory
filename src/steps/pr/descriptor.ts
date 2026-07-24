@@ -18,6 +18,6 @@ export const prDescriptor: StepDescriptor = {
   ],
   produces: ["pull_request", "commits", "handoff"], // re-commits during the CI/bot round (heartbeat)
   controls: {},
-  guards: [BUDGET_GUARD, HEARTBEAT_GUARD, LAYOUT_WAIT_GUARD],
+  guards: [HEARTBEAT_GUARD, BUDGET_GUARD, LAYOUT_WAIT_GUARD], // heartbeat first: on a double-trip the stall diagnosis wins (see guards.ts)
   effects: [], // produce→in_review lives on the pull_request ProductCapability
 };

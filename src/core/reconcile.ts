@@ -11,7 +11,8 @@ import { isUniqueViolation } from "../db/store.ts";
 import { notifyDue } from "../schedule.ts";
 import { branchName } from "./branch.ts";
 import { firstStep, indexOfStep, materializeWork, MEMORY_DIR, nextStep, scrubCommittedMemoryDir, spawnStep, stepByName } from "./step.ts";
-import { BOUNCE_CAP, CAPTURE_CAP_GUARD, guardsResetOn, READ_ONLY_GUARD, STEP_DESCRIPTORS } from "../steps/registry.ts";
+import { BOUNCE_CAP, CAPTURE_CAP_GUARD, guardsResetOn, STEP_DESCRIPTORS } from "../steps/registry.ts";
+import { evaluateStepWatches } from "./watches.ts";
 import { PANE_ABSENCE_CONFIRM_SECONDS } from "../steps/engine-watches.ts";
 import { flushOutbox, type OutboxFlow } from "./outbox.ts";
 import { consumeIntentHandoffs, ledgerFlow } from "./ledger.ts";
@@ -961,16 +962,6 @@ async function reconcileClaiming(deps: Deps, run: Run, belt: BeltRuntime, src: S
   await fireEffect(deps, run, belt, src, { on: "enter", step: first.name }, "in_development");
 }
 
-/** Advance the active step's heartbeat when the branch HEAD moves; returns the fresh
- *  step row. A moving HEAD = real work, so it resets that step's stall clock. */
-async function trackStepProgress(deps: Deps, run: Run, step: string): Promise<RunStep> {
-  const s = deps.store.getRunStep(run.id, step)!;
-  if (!run.worktreePath) return s;
-  const sha = await deps.git.headSha(run.worktreePath);
-  if (!sha || sha === s.progressSig) return s;
-  return deps.store.upsertRunStep(run.id, step, { progressSig: sha, progressAt: deps.now() });
-}
-
 /** Park a run for human attention: flip phase, record the reason, fire a notification, and put
  *  the reason where the humans already look — the work source itself (Jira comment / local note). */
 async function escalateAttention(
@@ -1392,8 +1383,8 @@ const HUMAN_POLL_ERROR_ESCALATE = 20;
  *  human loop, config error — needs a human decision and is never auto-rescued. */
 // The union of every registered step primitive's guards whose `autoRescueOnDone` is true — a plugin
 // guard participates automatically, no edit to a literal Set. `read_only_violation` arrives via
-// READ_ONLY_GUARD on the read-only primitives (its enforcement stays inline in reconcileStep, keyed
-// on the posture; the guard is the declaration the rescue routing derives from). A completed
+// READ_ONLY_GUARD on the read-only primitives (its evaluate() lives in core/watches.ts, run by the
+// pre-advance watch harness; the guard is the declaration the rescue routing derives from). A completed
 // read-only step must never wedge forever on a commit it didn't make (RWR-18204: an evidence step
 // parked permanently after the PRIOR work step's still-alive agent committed a trailing lint fix).
 // source_item_stale / pr_closed / bounce_limit / human / config parks stay non-auto-rescued.
@@ -1638,41 +1629,17 @@ async function reconcileStep(deps: Deps, run: Run, belt: BeltRuntime, src: Sourc
   if (pr && pr.state === "CLOSED" && pr.number === run.prNumber) return prClosedAttention(deps, run, pr);
   const livePr = pr && pr.state !== "CLOSED" ? pr : null;
 
-  // read_only enforcement: a read-only step (review/evidence) must never edit or commit. HEAD
-  // movement while the step's OWN agent is running is a contract violation. The subtlety: the
-  // baseline is captured at spawn, but the PRIOR step's agent stays alive in its pane (kept for
-  // on-demand queries) and can keep committing AFTER its own step-done — those trailing commits
-  // must not be blamed on this step (RWR-18204: the work agent committed a lint fix 101s after
-  // evidence spawned, wedging the run in a read_only park for a commit evidence never made). So the
-  // baseline TRACKS live HEAD until this step's agent is first observed `working`, absorbing the
-  // handoff-window commits; once frozen (baselineFrozenAt stamped), any further HEAD move is the
-  // real violation. The baseline lives in its own columns (baseline_sig / baseline_frozen_at, v28 —
-  // it used to alias the heartbeat's progress_sig). Even the frozen violation is a BACKSTOP, not a
-  // veto: a genuine step-done un-parks it (STEP_WATCHDOG_ATTENTION).
-  if (step.readOnly && rs.baselineSig && run.worktreePath) {
-    const head = await deps.git.headSha(run.worktreePath).catch(() => null);
-    if (head) {
-      if (rs.baselineFrozenAt == null) {
-        // Not yet frozen. Freeze at the current HEAD the first pass this step's agent is `working`;
-        // until then keep the baseline synced to HEAD so the prior step's trailing commits absorb.
-        let working = false;
-        try {
-          working = rs.paneId != null && (await deps.herdr.paneState(rs.paneId)) === "working";
-        } catch (e) {
-          if (!(e instanceof HerdrUnreachableError)) throw e; // herdr flaky → treat as not-working, defer the freeze
-        }
-        if (working) deps.store.upsertRunStep(run.id, step.name, { baselineSig: head, baselineFrozenAt: deps.now() });
-        else if (head !== rs.baselineSig) deps.store.upsertRunStep(run.id, step.name, { baselineSig: head });
-      } else if (head !== rs.baselineSig) {
-        return escalateAttention(deps, run, {
-          reason: READ_ONLY_GUARD.escalationReason,
-          attentionReason: `${step.name} is read-only but committed (HEAD moved)`,
-          body: `${run.ticketKey}: the ${step.name} step is read-only — it must never edit or commit — but the branch HEAD moved from ${rs.baselineSig.slice(0, 8)} to ${head.slice(0, 8)} after its agent took over. A human should review; the agent violated the read-only contract. (A genuine step-done from this step will un-park and advance.)`,
-          detail: { step: step.name, baseline: rs.baselineSig, head },
-        });
-      }
-    }
+  // PRE-ADVANCE watches (the read-only contract, plus any plugin watch declaring the stage): run
+  // BEFORE the done-advance, so a completed-but-violating step still parks with its trail and
+  // heals through its declared rescue (advance via STEP_WATCHDOG_ATTENTION) instead of slipping
+  // through silently. The watch's policy — the tracks-until-working baseline (RWR-18204) — lives
+  // in its evaluator (core/watches.ts); the harness applies the declarations.
+  const pre = await evaluateStepWatches(deps, run, step, rs, "pre_advance");
+  if (pre.action === "park") {
+    return escalateAttention(deps, run, { reason: pre.reason, attentionReason: pre.attentionReason, body: pre.body, detail: pre.detail });
   }
+  if (pre.action === "defer") return;
+  if (pre.action === "extend") deps.log("info", pre.note);
 
   // Hand off to the reviewing watch the moment a live, review-ready PR is adopted — WITHOUT waiting
   // for step-done. Once the PR exists the run's job is to WATCH it (merge → teardown → done), and a
@@ -1759,47 +1726,20 @@ async function reconcileStep(deps: Deps, run: Run, belt: BeltRuntime, src: Sourc
     }
   }
 
-  // Not done — watchdog. Commit-HEAD heartbeat (steps that make commits), per-step budget, liveness.
-  const active = step.heartbeat ? await trackStepProgress(deps, run, step.name) : rs;
-  const stalled =
-    step.heartbeat &&
-    active.progressSig != null &&
-    active.progressAt != null &&
-    deps.now() - active.progressAt > deps.config.limits.stallSeconds;
-  const overBudget = active.startedAt != null && deps.now() - active.startedAt > step.budgetSeconds;
-
-  if (stalled || overBudget) {
-    let ws: string;
-    try {
-      ws = active.paneId ? await deps.herdr.paneState(active.paneId) : "gone";
-    } catch (e) {
-      if (e instanceof HerdrUnreachableError) {
-        // Can't judge the worker while herdr is unreachable — a false "gone" here would park a
-        // healthy run in attention. Defer the whole watchdog to a later tick.
-        deps.log("warn", `${run.ticketKey}: ${step.name} watchdog deferred — ${e.message}`);
-        return;
-      }
-      throw e;
-    }
-    // A worker that is still actively working is not stuck — extend regardless of budget OR stall.
-    // (Long-horizon policy: a LIVE agent is never parked by a timer; only a genuinely idle or dead
-    // one is. This is deliberately more permissive than the old budget-only extension — an agent
-    // doing a long stretch between commits, e.g. a big refactor or a slow build/test cycle, keeps
-    // going instead of being parked at the stall window. The trade: a working-but-wedged agent that
-    // never commits is no longer caught by the stall timer — the dead-pane/liveness recovery below
-    // and the operator remain its backstops.)
-    if (ws === "working") {
-      deps.log("info", `${run.ticketKey}: ${step.name} past ${stalled ? "stall window" : "budget"} but still working — extending`);
-      return;
-    }
-    await escalateAttention(deps, run, {
-      reason: stalled ? "step_stalled" : "step_budget",
-      attentionReason: `${step.name} step ${stalled ? "stalled" : "over budget"} (worker: ${ws})`,
-      body: stalled
-        ? `${step.name} step stalled ${Math.round(deps.config.limits.stallSeconds / 60)}min — no new commits (worker: ${ws}).`
-        : `${step.name} step over ${Math.round(step.budgetSeconds / 60)}min budget (worker: ${ws}).`,
-      detail: { step: step.name, worker: ws },
-    });
+  // Not done — the WATCHDOG-stage watches: the commit-stall heartbeat (which owns its progress
+  // tracking) and the per-step budget, in guard order (heartbeat first — the more specific
+  // diagnosis wins a double-trip), plus any plugin watchdog. The harness owns the declared
+  // working-pane veto (a LIVE agent is never parked by a timer — the trade being a
+  // working-but-wedged agent that never commits falls to the dead-pane recovery below and the
+  // operator) and defers the whole pass when herdr can't be asked.
+  const outcome = await evaluateStepWatches(deps, run, step, rs, "watchdog");
+  if (outcome.action === "defer") return;
+  if (outcome.action === "extend") {
+    deps.log("info", outcome.note);
+    return;
+  }
+  if (outcome.action === "park") {
+    await escalateAttention(deps, run, { reason: outcome.reason, attentionReason: outcome.attentionReason, body: outcome.body, detail: outcome.detail });
     return;
   }
 

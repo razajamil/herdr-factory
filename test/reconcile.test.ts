@@ -11,7 +11,7 @@ import { HerdrUnreachableError, type BeltRuntime, type Deps, type GitApi, type G
 import { SourceUnauthenticatedError } from "../src/auth/errors.ts";
 import { getAuthFailure, resetAuthGate } from "../src/auth/gate.ts";
 import type { Config, StepConfig } from "../src/config.ts";
-import { LAYOUT_WAIT_GUARD, READ_ONLY_GUARD } from "../src/steps/guards.ts";
+import { BUDGET_GUARD, HEARTBEAT_GUARD, LAYOUT_WAIT_GUARD, READ_ONLY_GUARD } from "../src/steps/guards.ts";
 import { runObligations } from "../src/core/obligations.ts";
 import type { FocusedPane, HumanAskInput, HumanPollInput, HumanReply, JiraMatchItem, LocalMarkdownMatchItem, Phase, PrInfo, PrSnapshot, ReviewSig, Ticket, WorkState } from "../src/types.ts";
 import { DEFAULT_AGENT_CONFIG, StaleItemError } from "../src/types.ts";
@@ -67,6 +67,16 @@ const stepCfg = (name: string, opts: Partial<StepConfig> = {}): StepConfig => {
   if (gathersEvidence) produces.push("evidence");
   const tab = Object.hasOwn(opts, "tab") ? opts.tab : name;
   const pane = Object.hasOwn(opts, "pane") ? opts.pane : "agent";
+  const readOnly = opts.readOnly ?? false;
+  // Mirror config.ts's resolveStep: the watch harness evaluates ATTACHED guards, so the budget /
+  // heartbeat / read-only watches exist here exactly as production resolution would attach them
+  // (heartbeat before budget — the stall diagnosis wins a double-trip).
+  const guards: StepConfig["guards"] = [
+    ...(heartbeat ? [HEARTBEAT_GUARD] : []),
+    BUDGET_GUARD,
+    ...(readOnly ? [READ_ONLY_GUARD] : []),
+    ...(tab && pane ? [LAYOUT_WAIT_GUARD] : []),
+  ];
   return {
     name,
     type: name === "fix" ? "work" : name,
@@ -78,11 +88,11 @@ const stepCfg = (name: string, opts: Partial<StepConfig> = {}): StepConfig => {
     opensPr,
     gathersEvidence,
     canBounceTo: name === "evidence" || name === "review" ? ["fix"] : [],
-    readOnly: false,
+    readOnly,
     requiresLayout: false,
     consumes: [],
     produces,
-    guards: tab && pane ? [LAYOUT_WAIT_GUARD] : [],
+    guards,
     effects: [],
     posture: {},
     ...opts,
@@ -953,7 +963,7 @@ describe("reconcile pipeline (work_to_pull_request belt)", () => {
 
   it("read_only enforcement: a FROZEN read-only step that moves HEAD (commits) parks for attention", async () => {
     const { deps, store, state, worktree, shipBelt } = build();
-    shipBelt.steps[1]!.readOnly = true; // make the review step read-only for this test
+    shipBelt.steps[1] = stepCfg("review", { readOnly: true }); // read-only review, guard attached like production
     state.headSha = "sha-baseline";
     const run = seed(store, worktree, "RO-1", "running", "review");
     // baselineFrozenAt set ⇒ the baseline is FROZEN: the step's own agent has been observed working,
@@ -969,7 +979,7 @@ describe("reconcile pipeline (work_to_pull_request belt)", () => {
 
   it("read_only step whose HEAD is unchanged advances normally", async () => {
     const { deps, store, state, worktree, shipBelt } = build();
-    shipBelt.steps[1]!.readOnly = true;
+    shipBelt.steps[1] = stepCfg("review", { readOnly: true }); // read-only review, guard attached like production
     state.headSha = "sha-baseline";
     const run = seed(store, worktree, "RO-2", "running", "review");
     store.upsertRunStep(run.id, "review", { baselineSig: "sha-baseline", done: true }); // finished, no commit
@@ -984,7 +994,7 @@ describe("reconcile pipeline (work_to_pull_request belt)", () => {
   // is absorbed into the baseline — never blamed on (nor wedging) the read-only step.
   it("read_only: a trailing commit while the step's agent is still starting up is ABSORBED, not parked", async () => {
     const { deps, store, state, worktree, shipBelt } = build();
-    shipBelt.steps[1]!.readOnly = true;
+    shipBelt.steps[1] = stepCfg("review", { readOnly: true }); // read-only review, guard attached like production
     state.headSha = "sha-baseline";
     const run = seed(store, worktree, "RO-3", "running", "review");
     store.upsertRunStep(run.id, "review", { baselineSig: "sha-baseline" }); // NOT frozen (baselineFrozenAt null)
@@ -999,7 +1009,7 @@ describe("reconcile pipeline (work_to_pull_request belt)", () => {
 
   it("read_only: the baseline FREEZES once the step's own agent is working (progressAt stamped)", async () => {
     const { deps, store, state, worktree, shipBelt, setNow } = build();
-    shipBelt.steps[1]!.readOnly = true;
+    shipBelt.steps[1] = stepCfg("review", { readOnly: true }); // read-only review, guard attached like production
     setNow(5000);
     state.headSha = "sha-baseline";
     const run = seed(store, worktree, "RO-4", "running", "review");
@@ -1012,7 +1022,7 @@ describe("reconcile pipeline (work_to_pull_request belt)", () => {
 
   it("read_only park HEALS: a step-done from the parked read-only step un-parks and advances (RWR-18204)", async () => {
     const { deps, store, state, worktree, shipBelt } = build();
-    shipBelt.steps[1]!.readOnly = true;
+    shipBelt.steps[1] = stepCfg("review", { readOnly: true }); // read-only review, guard attached like production
     state.headSha = "sha-moved";
     const run = seed(store, worktree, "RO-5", "attention", "review", { attentionReason: "review is read-only but committed (HEAD moved)" });
     // frozen baseline + HEAD moved is what parked it; the step then genuinely finished (done).
@@ -2857,8 +2867,7 @@ describe("runObligations — pending intents + armed watches, registry-derived",
 
   it("a waiting_for_human run reports its pending question; a read-only step reports its baseline", async () => {
     const { deps, store, worktree, shipBelt } = build();
-    shipBelt.steps[1]!.readOnly = true;
-    shipBelt.steps[1]!.guards = [...shipBelt.steps[1]!.guards, READ_ONLY_GUARD];
+    shipBelt.steps[1] = stepCfg("review", { readOnly: true }); // read-only review, guard attached like production
     const run = seed(store, worktree, "K-OB2", "waiting_for_human", "review");
     store.createHumanQuestion({ runId: run.id, repo: "demo", workSource: "jira", ticketKey: "K-OB2", step: "review", question: "q?" });
     store.upsertRunStep(run.id, "review", { baselineSig: "sha-b", baselineFrozenAt: 77 });

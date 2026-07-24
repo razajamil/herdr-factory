@@ -555,6 +555,15 @@ export interface GuardSpec {
    *  before the agent exists (no pane ⇒ no agent ⇒ no step-done), so it declares false and recovers
    *  via `autoRespawnLimit` instead. */
   autoRescueOnDone: boolean;
+  /** When the watch harness evaluates this guard (guards with a registered evaluator only):
+   *  "watchdog" (default) — only while the step is NOT done; "pre_advance" — before the
+   *  done-advance, so a violation parks even on a completed step and heals through its declared
+   *  rescue with a visible trail (the read-only contract) instead of slipping through silently. */
+  stage?: "pre_advance" | "watchdog";
+  /** The harness holds this guard's trip while the step's agent is actively `working` — a LIVE
+   *  agent is never parked by a timer (the long-horizon policy); herdr-unreachable defers the
+   *  whole pass rather than judging on stale data. */
+  vetoWhenWorking?: boolean;
   /** Bounded spawn-retry budget for a guard that trips BEFORE the step's agent exists (layout_wait).
    *  Each expired wait window re-arms the wait in place — and a run already parked by this guard is
    *  auto-un-parked and re-dispatched — up to this many times (counted in `guard_counters`, guard =
