@@ -23,7 +23,7 @@
 import type { Deps } from "./deps.ts";
 import { HerdrUnreachableError } from "./deps.ts";
 import type { StepConfig } from "../config.ts";
-import type { Run, RunStep } from "../types.ts";
+import type { Run, RunStep, RunStepPatch, WatchRebaseTrigger } from "../types.ts";
 
 export interface WatchCtx {
   deps: Deps;
@@ -131,6 +131,32 @@ const WATCH_EVALUATORS = new Map<string, WatchEvaluator>([
 
 export function watchEvaluatorFor(kind: string): WatchEvaluator | undefined {
   return WATCH_EVALUATORS.get(kind);
+}
+
+/** Each watch kind's CLOCK columns, as a re-base patch. (With a future per-watch state table this
+ *  collapses to a generic row reset; today the clocks live on run_steps columns.) */
+const WATCH_CLOCKS: Record<string, (now: number) => RunStepPatch> = {
+  budget: (now) => ({ startedAt: now }),
+  heartbeat: () => ({ progressSig: null, progressAt: null }),
+  read_only: () => ({ baselineSig: null, baselineFrozenAt: null }),
+};
+
+/**
+ * Re-base every armed watch's clocks for one engine seam, derived from the guards' `rebaseOn`
+ * declarations — the RWR-18147 fix as data. Each seam names its trigger and this applies the right
+ * subset: an "entry" clears all three; a "reply_resume" re-bases only the budget (the agent
+ * CONTINUES its pass — the frozen read-only baseline and the stall history must survive). Seam
+ * bookkeeping (done / pass / dispatched_at / absent_at) stays at the seams — it is pass state,
+ * not a watch clock. One upsert; a step with none of the declaring guards is a no-op.
+ */
+export function applyWatchRebase(deps: Deps, runId: number, step: StepConfig, trigger: WatchRebaseTrigger): void {
+  let patch: RunStepPatch = {};
+  for (const g of step.guards) {
+    if (!g.rebaseOn?.includes(trigger)) continue;
+    const clocks = WATCH_CLOCKS[g.kind];
+    if (clocks) patch = { ...patch, ...clocks(deps.now()) };
+  }
+  if (Object.keys(patch).length > 0) deps.store.upsertRunStep(runId, step.name, patch);
 }
 
 /**

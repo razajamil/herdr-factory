@@ -17,8 +17,8 @@ import type { GuardCounterReset, GuardSpec } from "../types.ts";
 // NOTE the declaration ORDER on descriptors: HEARTBEAT before BUDGET. The harness is
 // first-trip-wins in guard order, and when both windows have expired the stall diagnosis wins
 // (it names the more specific failure) — the ordering the pre-harness code hardcoded.
-export const BUDGET_GUARD: GuardSpec = { kind: "budget", escalationReason: "step_budget", autoRescueOnDone: true, vetoWhenWorking: true };
-export const HEARTBEAT_GUARD: GuardSpec = { kind: "heartbeat", escalationReason: "step_stalled", autoRescueOnDone: true, requiresProduct: "commits", vetoWhenWorking: true };
+export const BUDGET_GUARD: GuardSpec = { kind: "budget", escalationReason: "step_budget", autoRescueOnDone: true, vetoWhenWorking: true, rebaseOn: ["entry", "resume", "reply_resume"] };
+export const HEARTBEAT_GUARD: GuardSpec = { kind: "heartbeat", escalationReason: "step_stalled", autoRescueOnDone: true, requiresProduct: "commits", vetoWhenWorking: true, rebaseOn: ["entry", "resume"] };
 // The read-only posture's HEAD-move contract check (evidence/review, and a custom step declaring
 // read_only). Attached wherever posture.readOnly resolves true — on the descriptor here for the
 // shipped read-only primitives, pushed by config's resolveStep for a custom read_only ref — so the
@@ -26,7 +26,7 @@ export const HEARTBEAT_GUARD: GuardSpec = { kind: "heartbeat", escalationReason:
 // hand-added literal. Its rescue is autoRescueOnDone like the other agent-running watchdogs: the
 // park is a backstop against an agent that touched the tree, never a veto on a completed step
 // (RWR-18204 — a genuine step-done un-parks and ADVANCES, clearing the enforcement baseline).
-export const READ_ONLY_GUARD: GuardSpec = { kind: "read_only", escalationReason: "read_only_violation", autoRescueOnDone: true, stage: "pre_advance" };
+export const READ_ONLY_GUARD: GuardSpec = { kind: "read_only", escalationReason: "read_only_violation", autoRescueOnDone: true, stage: "pre_advance", rebaseOn: ["entry", "resume"] };
 export const LAYOUT_WAIT_GUARD: GuardSpec = { kind: "layout_wait", escalationReason: "layout_wait_timeout", autoRescueOnDone: false, autoRespawnLimit: 3, attachWhen: "layoutTarget", resetOn: ["dispatch", "resume"] };
 export const CAPTURE_CAP_GUARD: GuardSpec = { kind: "capture_cap", escalationReason: "capture_limit", autoRescueOnDone: true, resetOn: ["forward_entry", "resume"], cumulative: false, requiresProduct: "evidence", counterScope: "run+step+guard" };
 // A machine-global exclusive resource the step's agent holds while driving the app (the capture

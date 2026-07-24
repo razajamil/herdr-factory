@@ -12,7 +12,7 @@ import { notifyDue } from "../schedule.ts";
 import { branchName } from "./branch.ts";
 import { firstStep, indexOfStep, materializeWork, MEMORY_DIR, nextStep, scrubCommittedMemoryDir, spawnStep, stepByName } from "./step.ts";
 import { BOUNCE_CAP, CAPTURE_CAP_GUARD, guardsResetOn, STEP_DESCRIPTORS } from "../steps/registry.ts";
-import { evaluateStepWatches } from "./watches.ts";
+import { applyWatchRebase, evaluateStepWatches } from "./watches.ts";
 import { PANE_ABSENCE_CONFIRM_SECONDS } from "../steps/engine-watches.ts";
 import { flushOutbox, type OutboxFlow } from "./outbox.ts";
 import { consumeIntentHandoffs, ledgerFlow } from "./ledger.ts";
@@ -1114,9 +1114,12 @@ async function resumeAfterHumanReply(deps: Deps, run: Run, belt: BeltRuntime, sr
   //    step-done once the step is actually complete — the reply would be silently skipped.
   //  - fresh budget/absence clocks — the run may have waited on the human far past the step
   //    budget; without a re-base the next watchdog pass reads the pre-ask clock and re-parks the
-  //    freshly-resumed step. The pass is NOT bumped: the agent continues the same pass, and the
-  //    --pass stamp baked into its prompt's commands must stay valid.
-  deps.store.upsertRunStep(run.id, step, { done: false, startedAt: deps.now(), absentAt: null });
+  //    freshly-resumed step. The "reply_resume" rebase is deliberately NARROW (budget only): the
+  //    agent CONTINUES the same pass, so the frozen read-only baseline and the stall history
+  //    survive. The pass is NOT bumped: the --pass stamp baked into its prompt's commands must
+  //    stay valid.
+  deps.store.upsertRunStep(run.id, step, { done: false, absentAt: null });
+  applyWatchRebase(deps, run.id, stepByName(belt, step)!, "reply_resume");
   deps.store.updateRun(run.id, { phase: "running", step, attentionReason: null, focusPending: true });
   const prompt =
     `Human guidance has arrived for ${run.ticketKey} question #${q.id}. ` +
@@ -1243,7 +1246,10 @@ export async function bounceStep(
   //     re-capture the reworked change, not re-PR the pre-fix evidence). The bouncer (idxFrom) didn't
   //     step-done, so it's excluded; its clocks reset when the forward pass respawns it.
   for (let i = idxTo; i < idxFrom; i++) {
-    deps.store.upsertRunStep(run.id, belt.steps[i]!.name, { done: false, progressSig: null, progressAt: null, baselineSig: null, baselineFrozenAt: null });
+    deps.store.upsertRunStep(run.id, belt.steps[i]!.name, { done: false });
+    // A re-entry is opening for this step (now, for the target; at the forward re-advance, for an
+    // intermediate) — its watch clocks must not survive the prior pass (RWR-18147).
+    applyWatchRebase(deps, run.id, belt.steps[i]!, "entry");
   }
   // (2) Open the TARGET's next pass — it re-enters NOW, and its re-rendered prompt stamps the new
   //     pass into its commands so a stale step-done from the pre-bounce pass can't complete the
@@ -1252,10 +1258,10 @@ export async function bounceStep(
   //     "waiting" (target pane dead + layout pane unresolvable), later ticks route through the
   //     spawn branch + bounded layout wait instead of the budget watchdog reading the PRIOR pass's
   //     stale started_at and parking the run as "over budget (worker: gone)".
+  // (The target's watch clocks — startedAt included — were re-based by the "entry" rebase above.)
   deps.store.upsertRunStep(run.id, toStep, {
     pass: (deps.store.getRunStep(run.id, toStep)?.pass ?? 0) + 1,
     dispatchedAt: null,
-    startedAt: deps.now(),
     absentAt: null,
   });
   const notePath = writeBounceNote(run, fromStep, toStep, reason);
@@ -1707,7 +1713,8 @@ async function reconcileStep(deps: Deps, run: Run, belt: BeltRuntime, src: Sourc
       // machinery own the retry on later ticks, instead of the kept pane_id masking the pass as
       // dispatched and the budget watchdog parking it on a misleading "over budget (worker: gone)".
       const prevPass = deps.store.getRunStep(run.id, next.name)?.pass ?? 0;
-      deps.store.upsertRunStep(run.id, next.name, { done: false, startedAt: deps.now(), progressSig: null, progressAt: null, baselineSig: null, baselineFrozenAt: null, absentAt: null, pass: prevPass + 1, dispatchedAt: null });
+      deps.store.upsertRunStep(run.id, next.name, { done: false, absentAt: null, pass: prevPass + 1, dispatchedAt: null });
+      applyWatchRebase(deps, run.id, next, "entry"); // budget/heartbeat/read-only clocks, per declaration
       deps.log("info", `${run.ticketKey}: ${step.name} done -> ${next.name}`);
       const res = await spawnStep(deps, run, belt, src, next.name);
       if (res.status === "waiting") await handleLayoutWait(deps, run, belt, next);
@@ -2017,13 +2024,15 @@ export async function resumeRun(deps: Deps, run: Run): Promise<{ ok: boolean; ph
     deps.store.resetHumanPollBackoff(pendingQuestion.id);
     phase = "waiting_for_human";
   } else if (run.step && stepByName(belt, run.step)) {
-    // Fresh slate on human resume: reset the step budget clocks AND every counter guard that
-    // declares a resume refund (the flaky-capture cap, the layout-wait respawn budget) — a human
-    // just intervened, so a capture-cap park must not immediately re-park on the next attempt, and
-    // a layout-wait park gets its full bounded respawn budget back. Derived from the step's guard
-    // declarations (GuardSpec.resetOn), so a plugin guard's counter refunds correctly for free.
+    // Fresh slate on human resume: re-base every watch clock that declares a resume rebase
+    // (budget/heartbeat/read-only) AND reset every counter guard that declares a resume refund
+    // (the flaky-capture cap, the layout-wait respawn budget) — a human just intervened, so a
+    // capture-cap park must not immediately re-park on the next attempt, and a layout-wait park
+    // gets its full bounded respawn budget back. Both derived from the step's guard declarations
+    // (rebaseOn / resetOn), so a plugin watch resumes correctly for free.
     const step = stepByName(belt, run.step)!;
-    deps.store.upsertRunStep(run.id, run.step, { startedAt: deps.now(), progressSig: null, progressAt: null, baselineSig: null, baselineFrozenAt: null, absentAt: null });
+    deps.store.upsertRunStep(run.id, run.step, { absentAt: null });
+    applyWatchRebase(deps, run.id, step, "resume");
     for (const g of guardsResetOn(step.guards, "resume")) deps.store.resetGuardCounter(run.id, step.name, g.kind);
     phase = "running";
   } else if (belt.watchPr && run.prNumber) {
@@ -2036,7 +2045,8 @@ export async function resumeRun(deps: Deps, run: Run): Promise<{ ok: boolean; ph
     // claim a fresh wait window + respawn budget, or reconcileClaiming would see the ancient
     // started_at and the spent budget and re-park on the same pass that resumed it.
     const first = firstStep(belt);
-    deps.store.upsertRunStep(run.id, first.name, { startedAt: deps.now(), absentAt: null });
+    deps.store.upsertRunStep(run.id, first.name, { absentAt: null });
+    applyWatchRebase(deps, run.id, first, "resume"); // fresh wait/budget window for the resumed claim
     for (const g of guardsResetOn(first.guards, "resume")) deps.store.resetGuardCounter(run.id, first.name, g.kind);
     phase = "claiming";
   }

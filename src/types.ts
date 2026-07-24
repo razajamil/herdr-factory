@@ -539,6 +539,16 @@ export type GuardKind = "budget" | "heartbeat" | "read_only" | "capture_cap" | "
  *  awaited pane came up), or a human RESUME (the human judged the loop worth continuing). */
 export type GuardCounterReset = "forward_entry" | "dispatch" | "resume";
 
+/** The engine seams at which a watch's CLOCKS re-base (distinct from the counter resets above):
+ *  "entry" — a (re-)entry opened for the step: the forward advance into it, or a bounce that
+ *  rewinds to it / invalidates it as an intermediate (RWR-18147: a stale clock surviving a
+ *  re-entry parks the run before the step ever re-runs);
+ *  "resume" — a human resume of the step's park (the stale clocks are usually why it parked);
+ *  "reply_resume" — a human reply resuming the SAME pass: deliberately narrower — the budget
+ *  clock re-bases (the run may have waited far past it) but the read-only baseline stays frozen
+ *  and the stall clock keeps its history (the agent continues, it doesn't re-enter). */
+export type WatchRebaseTrigger = "entry" | "resume" | "reply_resume";
+
 /** A watchdog attached to a step. `budget`/`heartbeat`/`layout_wait` are clock/liveness guards;
  *  `read_only` is the HEAD-move contract check on a read-only posture; `capture_cap` is the only
  *  counter guard among the shipped set (`resetOn`/`cumulative` apply to counters). The bounce cap
@@ -574,6 +584,11 @@ export interface GuardSpec {
    *  reset calls from this (spawnStep's dispatch, reconcileStep's forward advance, resumeRun) —
    *  a plugin guard's counter participates in the right refunds by declaring, not by editing core. */
   resetOn?: readonly GuardCounterReset[];
+  /** Clock watches only: the engine seams at which this watch's clocks re-base, applied by
+   *  applyWatchRebase (core/watches.ts) at each seam — RWR-18147's hand-maintained re-base sites
+   *  as data. (The dispatch-time re-base of the budget/wait clock stays in spawnStep's bookkeeping
+   *  upsert — startedAt is also the layout-wait window and the per-attempt dispatch stamp.) */
+  rebaseOn?: readonly WatchRebaseTrigger[];
   cumulative?: boolean;
   /** Counter guards only: the storage key for the guard's counter — always the generalized
    *  (run, step, guard) row in `guard_counters`, so two capped guards on one step never collide. */

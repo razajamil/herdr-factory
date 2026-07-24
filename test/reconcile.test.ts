@@ -1301,19 +1301,24 @@ describe("reconcile pipeline (work_to_pull_request belt)", () => {
   it("bounce clears `done` on the target AND every completed step between it and the bouncer", async () => {
     const { deps, store, worktree } = build();
     // A 4-step belt (fix → evidence → review → pr) so there IS an intermediate step between the
-    // bouncer (review) and the target (fix).
-    const belt: BeltRuntime = { name: "ship", beltType: "work_to_pull_request", source: "jira", priority: 1, active: true, watchPr: true, steps: [stepCfg("fix"), stepCfg("evidence"), stepCfg("review"), stepCfg("pr")] };
+    // bouncer (review) and the target (fix). Evidence is read-only, as in production — its watch
+    // clock is the read-only BASELINE (the "entry" rebase clears exactly the clocks each step's
+    // guards declare, not a fixed column set).
+    const belt: BeltRuntime = { name: "ship", beltType: "work_to_pull_request", source: "jira", priority: 1, active: true, watchPr: true, steps: [stepCfg("fix"), stepCfg("evidence", { readOnly: true }), stepCfg("review"), stepCfg("pr")] };
     const run = seed(store, worktree, "K-B6", "running", "review");
-    store.upsertRunStep(run.id, "fix", { paneId: "w1:pfix", done: true });
-    store.upsertRunStep(run.id, "evidence", { paneId: "w1:pev", done: true, progressSig: "sha-x", progressAt: 5 });
+    store.upsertRunStep(run.id, "fix", { paneId: "w1:pfix", done: true, progressSig: "sha-x", progressAt: 5 });
+    store.upsertRunStep(run.id, "evidence", { paneId: "w1:pev", done: true, baselineSig: "sha-x", baselineFrozenAt: 5 });
     const src = deps.resolveSource("jira")!;
     await bounceStep(deps, store.getRun(run.id)!, belt, src, "fix", "the fix isn't proven");
     expect(store.getRun(run.id)!.step).toBe("fix");
     expect(store.getRunStep(run.id, "fix")!.done).toBe(false);
+    expect(store.getRunStep(run.id, "fix")!.progressSig).toBe(null); // the target's heartbeat clock reset
     // The intermediate evidence step MUST be cleared too, or the forward re-run skips its re-capture
-    // and the PR embeds stale, pre-fix evidence.
+    // and the PR embeds stale, pre-fix evidence — and its frozen baseline must not survive into the
+    // re-entry (a stale frozen baseline would false-park the re-captured pass as a violation).
     expect(store.getRunStep(run.id, "evidence")!.done).toBe(false);
-    expect(store.getRunStep(run.id, "evidence")!.progressSig).toBe(null); // heartbeat clock reset
+    expect(store.getRunStep(run.id, "evidence")!.baselineSig).toBe(null);
+    expect(store.getRunStep(run.id, "evidence")!.baselineFrozenAt).toBe(null);
   });
 
   it("after a bounce, fix re-completing runs the pipeline forward again (review re-runs, still not done)", async () => {
