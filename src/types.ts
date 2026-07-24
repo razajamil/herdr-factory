@@ -545,8 +545,10 @@ export interface InputSpec {
 }
 
 /** The watchdog kinds a step can attach. Each GuardSpec carries its own lifecycle so a flat set
- *  can't lose the load-bearing per-guard semantics. */
-export type GuardKind = "budget" | "heartbeat" | "read_only" | "capture_cap" | "layout_wait" | "exclusive_resource";
+ *  can't lose the load-bearing per-guard semantics. OPEN since the plugin surface landed: a plugin
+ *  watch declares its own kind (paired with registerWatchEvaluator — see core/watches.ts); the
+ *  `string & {}` keeps the shipped kinds autocompleting without closing the union. */
+export type GuardKind = "budget" | "heartbeat" | "read_only" | "capture_cap" | "layout_wait" | "exclusive_resource" | (string & {});
 
 /** The engine seams at which a guard's `guard_counters` row is cleared. Every trigger is an
  *  affirmative signal the counted failure mode is over: a fresh FORWARD pass into the step (never a

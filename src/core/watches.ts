@@ -15,11 +15,22 @@
 // spawn-phase, driven by handleLayoutWait; capture_cap: signal-driven; exclusive_resource: not a
 // watchdog) is simply not walked here.
 //
-// CONTRACT for an evaluate(): run-locked, read live state + its own watch columns, MAY update its
+// CONTRACT for an evaluate(): run-locked, read live state + its own watch_state row, MAY update its
 // own state (the heartbeat's progress tracking, the read-only baseline's track-until-frozen) —
 // NEVER run.phase (a trip verdict is how a watch parks; the CALLER applies it, so watches stay
 // import-free of the escalation machinery). `@@WORKER@@` in a trip's strings is substituted by the
 // harness with the pane state it resolved for the veto.
+//
+// ── Adding watch N+1 (the whole checklist) ───────────────────────────────────────────────────────
+//  1. a GuardSpec on the step descriptor(s) that arm it — kind, escalationReason, stage,
+//     vetoWhenWorking, rebaseOn/resetOn, autoRescueOnDone (rescue routing + resume refunds derive
+//     from these; a descriptor-declared autoRescueOnDone feeds STEP_WATCHDOG_ATTENTION)
+//  2. registerWatchEvaluator(kind, evaluate, { rebase? })  — the policy; state via watch_state
+//     (store.getWatchState/upsertWatchState — a plugin watch persists without a migration). The
+//     default rebase writes a null row (never a delete — see the no-resurrection rule).
+//  3. a harness case in the watch contract tests (test/step-descriptor-contract / reconcile suites)
+// Zero other core edits — the park, the rescue class, resume refunds, re-base seams and the
+// obligations facts all derive from the declaration.
 import type { Deps } from "./deps.ts";
 import { HerdrUnreachableError } from "./deps.ts";
 import type { StepConfig } from "../config.ts";
@@ -148,16 +159,33 @@ const readOnlyEvaluate: WatchEvaluator = async ({ deps, run, step, rs }) => {
 
 /** Evaluators by guard KIND. A GuardSpec on a step's guards + an evaluator here = a fully-wired
  *  watch: attach conditions, the park, the rescue class, resume refunds and the obligations facts
- *  all derive from the declaration. (A registration function for plugin kinds is the planned next
- *  step; today the map is closed over the shipped three.) */
+ *  all derive from the declaration. Extended by registerWatchEvaluator (the checklist above). */
 const WATCH_EVALUATORS = new Map<string, WatchEvaluator>([
   ["budget", budgetEvaluate],
   ["heartbeat", heartbeatEvaluate],
   ["read_only", readOnlyEvaluate],
 ]);
 
+const SHIPPED_WATCH_KINDS = new Set(WATCH_EVALUATORS.keys());
+
 export function watchEvaluatorFor(kind: string): WatchEvaluator | undefined {
   return WATCH_EVALUATORS.get(kind);
+}
+
+/**
+ * Register a plugin watch kind's policy: its evaluator, and optionally its re-base (what a fresh
+ * clock means for it — default: write a NULL watch_state row, the generic clear that honors the
+ * no-resurrection rule). Shipped kinds can't be overridden. Returns an unregister function (a test
+ * seam; production registrations live for the process). */
+export function registerWatchEvaluator(kind: string, evaluate: WatchEvaluator, opts: { rebase?: (deps: Deps, runId: number, step: string) => void } = {}): () => void {
+  if (SHIPPED_WATCH_KINDS.has(kind)) throw new Error(`watch kind "${kind}" is shipped and cannot be overridden`);
+  if (WATCH_EVALUATORS.has(kind)) throw new Error(`watch kind "${kind}" is already registered`);
+  WATCH_EVALUATORS.set(kind, evaluate);
+  WATCH_REBASE[kind] = opts.rebase ?? ((deps, runId, step) => void deps.store.upsertWatchState(runId, step, kind, { sig: null, basedAt: null }));
+  return () => {
+    WATCH_EVALUATORS.delete(kind);
+    delete WATCH_REBASE[kind];
+  };
 }
 
 /** Each watch kind's re-base: what a fresh clock means FOR IT. Writes the watch_state row (nulls

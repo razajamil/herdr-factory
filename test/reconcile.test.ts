@@ -12,6 +12,7 @@ import { SourceUnauthenticatedError } from "../src/auth/errors.ts";
 import { getAuthFailure, resetAuthGate } from "../src/auth/gate.ts";
 import type { Config, StepConfig } from "../src/config.ts";
 import { BUDGET_GUARD, HEARTBEAT_GUARD, LAYOUT_WAIT_GUARD, READ_ONLY_GUARD } from "../src/steps/guards.ts";
+import { applyWatchRebase, registerWatchEvaluator } from "../src/core/watches.ts";
 import { runObligations } from "../src/core/obligations.ts";
 import type { FocusedPane, HumanAskInput, HumanPollInput, HumanReply, JiraMatchItem, LocalMarkdownMatchItem, Phase, PrInfo, PrSnapshot, ReviewSig, Ticket, WorkState } from "../src/types.ts";
 import { DEFAULT_AGENT_CONFIG, StaleItemError } from "../src/types.ts";
@@ -2911,5 +2912,67 @@ describe("external_wait intents — fulfil and deadline through reconcileRun", (
     expect(got.phase).toBe("attention");
     expect(got.attentionReasonCode).toBe("external_wait_deadline");
     expect(got.attentionReason).toContain("security approval");
+  });
+});
+
+// The plugin surface (W4): a NEW watch = one GuardSpec + one registerWatchEvaluator call — the
+// park, the reason code, the veto, the entry re-base and the obligations facts all derive from the
+// declaration, with state in watch_state (no migration). This drives a synthetic watch through the
+// REAL reconciler end to end.
+describe("plugin watches — registerWatchEvaluator", () => {
+  const SENTINEL_GUARD = {
+    kind: "sentinel",
+    escalationReason: "sentinel_tripped",
+    autoRescueOnDone: true,
+    vetoWhenWorking: true,
+    rebaseOn: ["entry", "resume"],
+  } as const;
+
+  it("a registered watch parks through the harness with its declared reason, vetoes on working, and re-bases on entry", async () => {
+    const { deps, store, state, worktree, shipBelt } = build();
+    let armed = true; // the synthetic condition: trips while armed
+    const unregister = registerWatchEvaluator("sentinel", async ({ deps: d, run, step }) => {
+      d.store.upsertWatchState(run.id, step.name, "sentinel", { sig: "observed" }); // watch-owned state
+      return armed
+        ? { kind: "trip", trippedWhat: "sentinel", attentionReason: `${step.name} sentinel tripped (worker: @@WORKER@@)`, body: "the sentinel condition failed", detail: { step: step.name } }
+        : { kind: "ok" };
+    });
+    try {
+      shipBelt.steps[0]!.guards = [...shipBelt.steps[0]!.guards, SENTINEL_GUARD];
+      const run = seed(store, worktree, "K-PW1", "running", "fix");
+
+      // The declared veto holds the trip while the agent is actively working…
+      state.paneState = "working";
+      await reconcileRun(deps, store.getRun(run.id)!);
+      expect(store.getRun(run.id)!.phase).toBe("running");
+
+      // …and an idle agent parks with the DECLARED reason code (rescue routing + /obligations key).
+      state.paneState = "idle";
+      await reconcileRun(deps, store.getRun(run.id)!);
+      const parked = store.getRun(run.id)!;
+      expect(parked.phase).toBe("attention");
+      expect(parked.attentionReasonCode).toBe("sentinel_tripped");
+      expect(parked.attentionReason).toContain("sentinel tripped (worker: idle)");
+      expect(store.getWatchState(run.id, "fix", "sentinel")!.sig).toBe("observed");
+
+      // The default rebase (a generic null-row clear) fires from the declaration at the seams.
+      armed = false;
+      applyWatchRebase(deps, run.id, shipBelt.steps[0]!, "entry");
+      const ws = store.getWatchState(run.id, "fix", "sentinel")!;
+      expect(ws.sig).toBeNull();
+      expect(ws.basedAt).toBeNull();
+    } finally {
+      unregister();
+    }
+  });
+
+  it("shipped kinds cannot be overridden; duplicate registrations are rejected", async () => {
+    expect(() => registerWatchEvaluator("budget", async () => ({ kind: "ok" }))).toThrow(/shipped/);
+    const un = registerWatchEvaluator("once", async () => ({ kind: "ok" }));
+    try {
+      expect(() => registerWatchEvaluator("once", async () => ({ kind: "ok" }))).toThrow(/already registered/);
+    } finally {
+      un();
+    }
   });
 });

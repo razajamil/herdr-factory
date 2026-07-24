@@ -154,6 +154,14 @@ export function runObligations(deps: Deps, run: Run): RunObligations {
       case "exclusive_resource":
         facts.resource = g.resourceName ?? null;
         break;
+      default: {
+        // A plugin watch: surface its watch_state generically (sig + clock; richer facts live in
+        // the row's meta, which the watch owns).
+        const ws = rs ? deps.store.getWatchState(rs.runId, rs.step, g.kind) : undefined;
+        facts.sig = ws?.sig ?? null;
+        facts.basedAt = ws?.basedAt ?? null;
+        break;
+      }
     }
     return { kind: g.kind, escalationReason: g.escalationReason, rescue: guardRescueClass(g), facts };
   });
