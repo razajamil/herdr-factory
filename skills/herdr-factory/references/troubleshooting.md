@@ -1,0 +1,908 @@
+# Troubleshooting a herdr-factory
+
+Symptom → diagnosis → fix playbooks for a factory that is stuck, silent, parked, or slow.
+
+Answers these questions:
+
+- Nothing is being claimed — which gate is holding it?
+- This run is parked for attention. What raised it and how do I clear it?
+- The agent says it finished but the run hasn't moved.
+- I edited `config.yml` and nothing changed.
+- `doctor` is all green but the factory does nothing.
+- Where are the logs, and which log has the answer?
+- What can I safely read (or edit) in the SQLite DB?
+- Which nudge should I try, and which one destroys work?
+- How do I stop one run without throwing its work away?
+
+Everything below is verified against `src/`. Sibling references: config keys in
+[config-reference.md](./config-reference.md), engine mechanics in
+[architecture.md](./architecture.md), commands in [cli.md](./cli.md), layouts in
+[layouts.md](./layouts.md).
+
+---
+
+## 1. Triage — run these before theorising
+
+In order. Each step rules out a whole class of cause; stop when one produces a finding.
+
+| # | Command | Rules out / establishes |
+|---|---|---|
+| 1 | `herdr-factory --repo <r> doctor --deep` | Install, service, server liveness, config validity, source auth + live health, evidence publisher. `--repo` is a global option — `herdr-factory --repo <r> doctor` and `herdr-factory doctor --repo <r>` both work; without it, **zero** repo checks run (§5) |
+| 2 | `herdr-factory --repo <r> status` | Belts (priority + `INACTIVE`), sources, every active run with phase/step, live herdr pane state per run, per-step ✓/● ticks, plus `server:` / `supervisor:` lines. |
+| 3 | `curl -s 127.0.0.1:8765/health \| jq '.repos'` | **Is this repo being served, and is its tick loop alive?** `doctor` does not check either (§5). Look at `name`, `lastTickAt`, `tickStale`. |
+| 4 | `herdr-factory --repo <r> timeline <KEY>` | What the run actually did — the domain event log (`claimed`, `step_spawned`, `layout_wait_retry`, `bounced`, `attention`, `resumed`, `error`, …). |
+| 5 | `curl -s '127.0.0.1:8765/repos/<r>/obligations?key=<KEY>' \| jq` | **The single best "why is this run waiting"**: undelivered write-backs, pending evidence uploads, an unconsumed agent signal, the pending human question with its poll clock, live ledger rows, and every armed guard with live facts + its `rescue` class. Read-only, lock-free. No CLI equivalent — curl it. |
+| 6 | `herdr-factory --repo <r> logs 300` | Today's engine log: the claim-gate lines, watchdog deferrals, intent deferrals, lock-lost errors. Only today's file (§6). |
+| 7 | `herdr-factory --repo <r> eligible` | What each belt's source *would* offer right now (JSON, per-belt labels applied, `match` **not** applied). |
+
+Two facts that shape all triage: **the CLI reads config and the DB fresh on every invocation; the
+resident server does not** — so `doctor`/`status`/`eligible` can be perfectly green while the server
+runs stale config or isn't serving the repo at all (cross-check with `/health`). And the HTTP port is
+`HERDR_FACTORY_PORT` else `8765`, host always `127.0.0.1`, with Swagger UI at `/ui` and OpenAPI at
+`/doc`.
+
+### Symptom index
+
+| Symptom | Playbook |
+|---|---|
+| No runs start; `eligible` shows work | [2.1 nothing is being claimed](#21-nothing-is-being-claimed) |
+| A run sits in `attention` | [2.2 a run is parked](#22-a-run-is-parked-for-attention) → §3 table |
+| Phase `claiming`/`running` but no agent pane | [2.3 a step never starts](#23-a-step-never-starts--the-pane-never-appears) |
+| Agent finished; phase/step unchanged | [2.4 finished but not advancing](#24-the-agent-finished-but-the-run-didnt-advance) |
+| Same step re-runs over and over | [2.5 bounce loop](#25-a-step-keeps-getting-bounced) |
+| Phase `reviewing` forever | [2.6 stuck in reviewing](#26-a-run-is-stuck-in-reviewing) |
+| Phase `waiting_for_human` forever | [2.7 stuck waiting_for_human](#27-a-run-is-stuck-in-waiting_for_human) |
+| PR is open, nothing happens next | [2.8 PR opened, then silence](#28-the-pr-opened-but-nothing-happened-after) |
+| Evidence links 404 / never appeared | [2.9 evidence never published](#29-evidence-never-published--links-broken) |
+| Edited config.yml, no effect | [2.10 config changes not taking effect](#210-config-changes-arent-taking-effect) |
+| Server answers `/health`, nothing ticks | [2.11 wedged tick](#211-the-server-is-up-but-nothing-ticks-wedged-tick) |
+| One repo works, another is ignored | [2.12 a repo silently isn't served](#212-a-repo-silently-isnt-being-served) |
+| A source used to pick up work, now doesn't | [2.13 a source stopped picking up work](#213-a-source-stopped-picking-up-work) |
+| Everything is slow / throttled | [2.14 slow or rate limited](#214-everything-is-slow--rate-limited) |
+| I want to abandon a run but keep its work | [9.1 stopping a run without losing its work](#91-stopping-a-run-without-losing-its-work) |
+
+---
+
+## 2. Playbooks
+
+### 2.1 Nothing is being claimed
+
+**Means**: Phase B of the tick either never ran, or walked the belt list and skipped every item.
+Every skip except one is logged; walk the gates in the order the engine checks them.
+
+```sh
+herdr-factory --repo <r> logs 200          # the claim-gate lines
+herdr-factory --repo <r> eligible          # what the sources offer
+curl -s 127.0.0.1:8765/health | jq '.repos'
+```
+
+| # | Gate | Evidence | Fix |
+|---|---|---|---|
+| 1 | **The server isn't ticking this repo** | repo absent from `/health .repos[]`, or `tickStale: true` | §2.12 / §2.11 |
+| 2 | **Repo at its workspace cap** | `at capacity (3/3 working, 1 idle/parked)` — Phase B returns immediately | Raise `limits.max_active_workspaces` (default **3**), or tear down/finish a run. Parked and `waiting_for_human` runs, and an idle PR watch, hold **no** slot (see Q1b) |
+| 3 | **Per-tick admission cap** | claims stop at 10 in one pass | `limits.max_claims_per_tick` (default **10**); the rest come next tick. Rarely the real cause |
+| 4 | **Belt inactive** | `belt <name>: inactive — skipping (no new claims; in-flight runs continue)` | Set `active: true` on the belt (checked *before* polling) |
+| 5 | **Belt's source not configured** | `belt <name>: source "<s>" not configured — skipping` | Fix `belt.source` to a configured source `name` |
+| 6 | **Source at its own cap** | `belt <name>: source "<s>" at its concurrency cap (2) — skipping` | Per-source `max_active_workspaces` defaults to **2**, not 3 |
+| 7 | **Poll window not elapsed** | no poll line at all for that source this pass | Engages **only** when the source's `poll_interval_seconds` > `limits.tick_interval_seconds`. The last-poll time is **in-memory on the server**, so `herdr-factory --repo <r> tick` (one-shot) always polls — if the one-shot claims and the server doesn't, this is it |
+| 8 | **Source auth paused** | `<src>: work source not authenticated (<reason>) — pausing its claims + status write-backs until re-authenticated` | The poll throws, degrades to `[]`, no claims. `herdr-factory --repo <r> auth status`, `doctor --deep`. Auto-resumes the moment any call to that source succeeds |
+| 9 | **Source query failing (non-auth)** | `<src>: eligible query failed: …` | Also degrades to `[]` so one source can't starve others. `doctor --deep` names the real HTTP error |
+| 10 | **Nothing is eligible** | `eligible` prints `[]` for that belt | Source-side. github_issues: the trigger **label is consumed at `in_development`** — re-add it to retry an item; the label must exist in the repo (case matters in config, GitHub's namespace is case-insensitive). jira: `status.todo` name/board id/project key. local_markdown: folder contents. sentry: project slugs. See [work-sources.md](./work-sources.md) |
+| 11 | **Already claimed** | silent skip | Dedup is per **(repo, source, key)** — the same key in two sources is two independent runs |
+| 12 | **Undelivered write-back veto** | `<KEY>: skipping claim — a status write-back to "<src>" is still pending` | The item's eligibility is known-stale; this is the only thing stopping merged work being re-claimed and re-done. Fix the write-back (§8) — do **not** work around it |
+| 13 | **`match` rejected it** | **no log line at all** (a falsy `match` is a silent skip) | `eligible` lists items *before* `match` runs, so "listed but never claimed and no other log line" ⇒ the predicate said no. A predicate that *throws* logs `belt X: match predicate threw for KEY: …` |
+
+Belts are walked in `priority` order (lower first, ties keep config order); the first belt whose
+`match` accepts an item claims it.
+
+### 2.2 A run is parked for attention
+
+**Means**: `phase = 'attention'`. The routing key is `runs.attention_reason_code`.
+
+```sh
+herdr-factory --repo <r> status                                  # the parked runs
+herdr-factory --repo <r> timeline <KEY>                          # the `attention` event + its detail
+curl -s '127.0.0.1:8765/repos/<r>/obligations?key=<KEY>' | jq '.run, .watches'
+```
+
+`obligations` reports each armed guard's `rescue` class: `terminal-signal` (a genuine `step-done` or
+`bounce` un-parks it automatically on the next pass), `respawn` (bounded auto-retry),
+`human` (only `resume`/`teardown`), `none`. Then route by code using **§3**.
+
+While parked the operator is re-notified every `limits.attention_renotify_seconds` (default 3600)
+with ``<reason> — resume with `herdr-factory --repo <repo> resume <KEY>` or tear it down. (parked
+~Xmin)``. The `~Xmin` is measured from `updated_at`, which the re-notify itself bumps — after the
+first hour it reports roughly the renotify window, **not** total park duration. Use the `attention`
+event's timestamp in the timeline for real park age.
+
+`attention_reason_code` is **never cleared** — only trust it while `phase = 'attention'`.
+
+### 2.3 A step never starts / the pane never appears
+
+**Means**: the step's prompt was never dispatched to an agent. `run_steps.dispatched_at IS NULL`.
+
+```sh
+herdr-factory --repo <r> logs 200 | grep -E 'waiting for layout pane|re-arming the wait|worktree'
+herdr-factory --repo <r> timeline <KEY>       # worktree_created · layout_applied · layout_apply_failed · layout_wait_retry
+curl -s '127.0.0.1:8765/repos/<r>/obligations?key=<KEY>' | jq '.watches.guards'
+```
+
+Branches:
+
+| Finding | Meaning | Fix |
+|---|---|---|
+| Phase `claiming`, no `worktree_created` event | herdr never created the worktree | `herdr-factory doctor --deep` (`herdr (daemon responds)`); `herdr workspace list` by hand; check `repo.path` is the **main** checkout |
+| `layout_apply_failed` event, or no `layout_applied` at all | the per-belt layout never got built — usually the factory isn't linked as a herdr plugin | `herdr plugin link ~/.local/share/herdr-factory`. Nothing in `doctor` checks this. See [layouts.md](./layouts.md) |
+| `<KEY>: <step> waiting for layout pane <tab>/<pane> (Ns/600s)` | the configured tab/pane title does not exist in the running layout, or its agent isn't **idle** | Fix the step's `tab`/`pane` (set together, or both omitted) to match the layout's real titles. Config load validates step→pane allocation only against `default_layout` |
+| `… not up after Ns — re-arming the wait (retry i/3)` | the bounded respawn budget is being spent | Wall-clock bound before a park is `(1 + 3) × layout_wait_seconds` = 40 min at defaults. The counter is **shared** between the in-place re-arm and the post-park rescue |
+| Parked `layout_wait_timeout` | budget spent | Fix the layout, then `resume` (refunds the 3 credits) |
+| A pane exists and is `working` | a fresh pane must be `idle`; a reused pane that is `working` is never queued into | Let it finish, or `resume` after it goes idle |
+| Step has **no** `tab`/`pane` | the step spawns its own dedicated pane via `agentStart` — layout-wait never applies, and a busy dedicated pane is not deferred (the message queues) | If no pane appears at all: the agent binary isn't on the **service** PATH (§5, last row) |
+
+### 2.4 The agent finished but the run didn't advance
+
+**Means**: `step-done` was rejected, or the advance is gated on something else.
+
+```sh
+herdr-factory --repo <r> timeline <KEY> | grep -E 'step_done|signal_rejected|attention'
+herdr-factory --repo <r> logs 100
+```
+
+| Branch | Signature | Fix |
+|---|---|---|
+| Wrong pass | `stale step-done for pass N — the <step> step is on pass M; finish the current pass and run its own step-done command` | The step was re-entered (bounce/re-advance) and the pane holds an old prompt. Read the freshly rendered `.memory/herdr-factory/prompt-<step>.md` and run **its** command |
+| Not the active step | `"X" is not the run's active step ("Y") — signal ignored` | Signal the step the run is actually on |
+| Already recorded | `step "X" is already recorded done — nothing to do` | Benign; the advance happens on the next pass |
+| Run was busy | `<KEY>: busy (nudge in flight) — skipped this pass` | Self-heals next tick |
+| `rs.done = 1` but phase `attention` | a watchdog parked it just before/after the signal | If the code has `rescue: terminal-signal`, the next pass un-parks and advances automatically. Otherwise `resume` |
+| PR step, draft PR | `prReadyForReview` needs a **live non-draft** (or MERGED) PR at the belt's terminal PR-opening step | Mark the PR ready for review, or let the step's own `step-done` gate it |
+| Read-only step committed | parked `read_only_violation` at the `pre_advance` stage — the advance is blocked *before* it happens | §3 |
+| One extra tick before the visible change | the last step of a non-`watch_pr` belt advances into `teardown("completed")`; a merged PR at the terminal step goes `running → reviewing → (next pass) teardown` | Normal |
+
+`resume` does **not** clear `run_steps.done` (only a human-reply resume does), so resuming a run
+whose step is already done advances it on the following pass.
+
+### 2.5 A step keeps getting bounced
+
+**Means**: a later step keeps rejecting the work and rewinding to an earlier one.
+
+```sh
+herdr-factory --repo <r> timeline <KEY> | grep bounced        # detail: fromStep, toStep, bounces, notePath
+# and read the feedback the bouncer wrote:
+cat <worktree>/.memory/herdr-factory/feedback-<toStep>.md
+ls  <worktree>/.memory/herdr-factory/feedback-*-addressed-pass*.md
+```
+
+- The counter is `guard_counters.bounce_cap` keyed on the bounce **TARGET** step (Q6). Cap is
+  `belt.max_bounces ?? limits.max_bounces` (default **6**; `0` disables bouncing); exceeding it parks
+  `bounce_limit`, which is human-only.
+- A bounce rewinds **every** completed step between the target and the bouncer (so an intermediate
+  evidence step really re-captures), re-bases their clocks, and bumps the target's `pass`.
+- Fix the *cause*, not the cap: the feedback files say what the reviewer keeps rejecting. Usually the
+  target repo lacks the guidance/skills the shipped prompts defer to
+  ([target-repo.md](./target-repo.md)) or the review prompt is over-strict
+  ([prompts.md](./prompts.md)). `resume` from a `bounce_limit` park refunds `bounce_cap` for **every**
+  belt step, but that just buys another 6 rounds of the same loop unless something changed.
+
+### 2.6 A run is stuck in `reviewing`
+
+**Means**: usually **not** stuck. `reviewing` has **no time limit** (there is no `watch_hours`), and
+a PR with nothing actionable does zero herdr calls and holds **no** slot by design.
+
+```sh
+gh pr view <n> --json isDraft,mergeable,statusCheckRollup,reviewDecision
+herdr-factory --repo <r> timeline <KEY> | grep -E 'pr_opened|resolver_woken'
+```
+
+The watch wakes a resolver agent only when `unresolved > 0 || failing > 0` **and** the review
+signature differs from the recorded one.
+
+| Branch | Signature | Fix |
+|---|---|---|
+| Nothing actionable | no unresolved threads, no failing checks | Correct. It waits for a human to merge or close |
+| Actionable but no `resolver_woken` | the signature already matches `run_products.signature` (round considered handled), or `wakeResolver` found no pane to use | `resume` — it clears `lastThreadSig` + `resolverActive`, so the next tick re-wakes the resolver |
+| `resolver idle — PR #n watch no longer holds a slot` | the resolver pane went idle; the round is handed back to watching | Normal |
+| PR merged, run still active | teardown happens on the **next** pass | Wait one tick |
+| PR closed | parks `pr_closed` | Reopen the PR then `resume`, or `teardown` |
+
+### 2.7 A run is stuck in `waiting_for_human`
+
+**Means**: a question is posted at the source and the reply poll hasn't found an answer.
+
+```sh
+herdr-factory --repo <r> timeline <KEY> | grep -E 'human_question|human_reply'
+curl -s '127.0.0.1:8765/repos/<r>/obligations?key=<KEY>' | jq '.intents.humanQuestion'
+herdr-factory --repo <r> logs 100 | grep 'waiting for human reply'
+```
+
+Poll backoff is `min(60 × 2^(misses-1), 300)` seconds — log line
+`waiting for human reply to question #N (next poll in Xs)`.
+
+| Branch | Signature | Fix |
+|---|---|---|
+| Never posted | `human_questions.external_id IS NULL`; log `human question #N post deferred: …`, then `human question #N still not posted: …` each pass (`question recorded; posting deferred:` is the ask-human command's own output, not a log line) | The engine re-posts every pass. Fix source auth/permissions; the question text is in the DB and in `.memory/herdr-factory/human-question-<step>.md` |
+| Reply exists but wasn't seen | the poll matches on `externalId` + `externalCreatedAt` | Reply as a **new comment** on the item (not an edit of the question), then wait one poll window |
+| Parked `human_poll_failing` | 20 consecutive poll **throws** (auth failures don't count) | `doctor --deep` the source, then `resume` (fresh window, error run cleared) |
+| Parked `human_wait_missing_question` | phase says waiting, no pending question row | Fix `run.step` or `teardown` |
+| Pending question with **no** `human_reply_poll` intent (Q9 `poll_intent_id IS NULL`) | the clock's only home is missing: `nextPollAt` reads 0, so it polls every pass and the miss bookkeeping throws — you see a repeating `error` event `recordHumanPollMiss: question N has no poll clock` | A real human reply still lands and resolves it. Otherwise `teardown` and re-claim; `resume` cannot re-arm a missing clock |
+| PR merged while parked | merge outranks the park — the run tears down `merged` | Normal |
+
+A run parked out of the human loop with its question still pending returns to `waiting_for_human`
+on `resume` (with the backoff reset), not to `running` — resuming to `running` would orphan the reply.
+
+### 2.8 The PR opened but nothing happened after
+
+**Means**: the `running → reviewing` handoff didn't fire, or fired and there is nothing to do.
+
+```sh
+herdr-factory --repo <r> timeline <KEY> | grep -E 'pr_opened|torn_down'
+sqlite3 "$DB" "SELECT * FROM run_products WHERE run_id = <id>;"
+```
+
+- Handoff fires on **PR adoption** at the belt's **terminal** PR-opening step — not on `step-done`.
+  A **draft** PR keeps the `step-done` gate; a MERGED PR always hands off.
+- No `pr_opened` event + no `run_products` row ⇒ the PR was never adopted: the step's `opens_pr`
+  isn't set, or the PR's head branch doesn't match the run's branch (adoption uses `prForBranch` on
+  first sighting, then `prByNumber`). A **closed** PR is only acted on when it is *ours*
+  (`pr.number === run.prNumber`), so a stale closed PR on a reused branch can't disturb a fresh attempt.
+- No step on the belt produces `pull_request` (no `pr` step) ⇒ the derived `watchPr` is false (it is
+  **not** a config key — `steps.some(… produces "pull_request")` in `src/config.ts`), so the last
+  step's `step-done` completes the run (`completed`) and no review watch exists. Add a `pr` step to
+  get one. Otherwise it's §2.6.
+
+### 2.9 Evidence never published / links broken
+
+**Means**: the URLs were printed up front (they are deterministic for `s3`/`local`) but the bytes
+never landed, or the publish intent is stuck.
+
+```sh
+herdr-factory --repo <r> doctor --deep      # `evidence publisher (<p>)` + `evidence uploads`
+curl -s '127.0.0.1:8765/repos/<r>/intents?kind=evidence_publish' | jq
+herdr-factory --repo <r> timeline <KEY> | grep -E 'evidence_uploaded|evidence_upload_failed'
+```
+
+| Branch | Signature | Fix |
+|---|---|---|
+| AWS SSO expired | `doctor`: `<n> stuck — AWS SSO/creds expired; run \`aws sso login[ --profile <p>]\``; intent `error_class = 'auth'` | `aws sso login[ --profile <p>]`. Recovery is automatic (the publish kind's pre-pass probes liveness and re-queues: `evidence publish: creds recovered — re-queued N stuck upload(s) for immediate retry`). To force it: `POST /repos/<r>/intents/recover` `{"causeScope":"publisher:s3"}` |
+| Permanent failure | `error_class = 'permanent'`, event `evidence_upload_failed`, notify `herdr-factory: <key> evidence publish failed`, amber `⚠` on the TUI dashboard row. **The run is untouched — this is never a park** | `doctor --deep` shows the real reason (bucket/region/access-denied/command exit) |
+| Transient retrying | `<n> pending — retrying (last: …)`, notify is deliberately **silent** | Backoff is 60 s doubling to a 3600 s cap and **never gives up** |
+| Dropped at teardown | `<KEY>: N evidence upload(s) dropped at teardown — bytes never reached S3 (likely SSO was down through merge)` | Unrecoverable; the worktree is gone. Fix creds before the next run |
+| Worktree removed first | intent failed with `evidence dir gone (torn down before publish)` | Same |
+| No files | `evidence-upload: no files in the evidence dir — nothing to publish` | The capture step wrote nothing; see the capture prompt/skill |
+| `command` publisher, no links | `publish command printed no URLs to stdout (expected one public URL per file)` | The command must print one absolute URL per line (scheme required); `command` cannot pre-compute URLs, so links only appear after a success |
+
+Note `doctor`'s `evidence uploads` count **saturates at 100**, and the row it labels `last:` is
+actually the **oldest** of the returned rows.
+
+### 2.10 Config changes aren't taking effect
+
+**Means**: the resident server holds the config it built at boot (or at the last `/reload`). The CLI
+builds fresh config every invocation — that asymmetry is the trap.
+
+```sh
+herdr-factory --repo <r> doctor           # does the file even load?
+herdr-factory reload                      # then read the response body
+curl -s 127.0.0.1:8765/health | jq '.repos[].name'
+```
+
+| Branch | Signature | Fix |
+|---|---|---|
+| Never reloaded | `/health` shows the repo but behaviour is old | `herdr-factory reload` (server-wide; re-runs `loadRepos()`) |
+| No server | `no server running — config is read fresh on the next serve start (try herdr-factory start)` | `herdr-factory start` |
+| Reload refused for this repo | `failures[]` contains `not reloaded: belt <detail> still has work — rename via the TUI (it migrates the runs) or tear the work down first` | The **old** Deps keep running. Rename the belt via the TUI belt-apply flow (it migrates `runs.belt`) — [install-and-operate.md](./install-and-operate.md) — or tear the in-flight runs down |
+| Reload failed for this repo | `failures[]` contains the load error | Fix the config; the server keeps serving the previous build (or none) |
+| Config edited in a different config dir | CLI sees it, server doesn't | `HERDR_FACTORY_CONFIG_DIR` / `HERDR_FACTORY_STATE_ROOT` / `HERDR_FACTORY_PORT` are **not** baked into the launchd plist / systemd unit — only `HERDR_CHANNEL`, `HERDR_FACTORY_AUTO_UPDATE`, `HERDR_FACTORY_TELEMETRY` and the `OTEL_*` keys are. If you export them in your shell your CLI reads a **different config dir and DB** than the service. Symptom: `herdr-factory runs` is empty while the dashboard shows live runs |
+| Env/PATH change | a newly installed tool, or a changed `HERDR_CHANNEL` | Re-run `herdr-factory install` — the service PATH and the passthrough env are captured at install time |
+| In-flight runs unaffected | expected | `belt.active: false` gates **new claims only**; step/budget changes apply at the next step (re-)entry |
+
+### 2.11 The server is up but nothing ticks (wedged tick)
+
+**Means**: `/health` answers 200 but no repo's `last_tick_at` advances. **`doctor` does NOT catch
+this** — its `server` row is a liveness ping only.
+
+```sh
+curl -s 127.0.0.1:8765/health | jq '.repos'          # tickStale per repo
+sqlite3 "$DB" "SELECT name, datetime(last_tick_at,'unixepoch'), unixepoch()-last_tick_at AS age FROM repos;"
+sqlite3 "$DB" "SELECT name, owner, datetime(expires_at,'unixepoch') FROM locks WHERE name LIKE 'tick:%';"
+tail -50 ~/.local/state/herdr-factory/logs/supervisor.err.log
+```
+
+- `tickStale` threshold is `max(10 × tick_interval_seconds, 900)` seconds — **at least 15 min** —
+  baselined against `max(lastTickAt, serverStartedAt)` so a fresh boot isn't flagged.
+- `touchTick` runs at the end of every completed pass, on **both** exits of Phase B (including the
+  at-capacity early return) — but **not** if Phase A throws outside its per-run catch. A repo whose
+  `last_tick_at` freezes while others advance is the signature.
+- The supervisor (`ensure-up`, every 60 s) restarts a stale-but-answering server exactly as it would
+  a dead one, logging `tick loop stale for <repos> — restarting wedged server`, and the restart is
+  what stops the wedged holder's lock heartbeat so its locks expire. So a wedge should self-heal
+  within ~a minute; if it doesn't, the supervisor isn't loaded or `ensure-up` is erroring → read the
+  supervisor log, then `herdr-factory restart` by hand.
+- Repeating `another tick already running — skipping` with a `tick:<repo>` lock whose owner pid is
+  gone: an expired lock is stolen automatically on the next acquire. Only delete the row by hand if
+  `expires_at` is still in the future and the pid is definitely dead — with the server stopped (§8).
+
+### 2.12 A repo silently isn't being served
+
+**Means**: `loadRepos()` runs only at `serve` start and on `/reload`. A repo whose `buildDeps` throws
+is collected into `failures` and is **silently absent from the tick loop**. Both directions of drift
+are invisible to `doctor`, which reads its **own** freshly-built config, not the server's.
+
+```sh
+curl -s 127.0.0.1:8765/health | jq -r '.repos[].name'
+ls ~/.config/herdr-factory/repos
+herdr-factory reload            # the response lists failures[]
+```
+
+- **Repo added/fixed after boot**: `doctor` says `config loads + sources buildable ✓` while the
+  server has never heard of it. Fix: `herdr-factory reload`.
+- **Repo the server dropped at boot**: you fixed the file, `doctor` is green, and the server is
+  still running without it. Fix: `herdr-factory reload` (or `restart`).
+- `/reload` can also **refuse** a repo (§2.10) — read `failures[]`, don't assume "saved · reloaded"
+  in the TUI means the server took it.
+- There is **no per-repo enable/disable**. `repos.enabled` exists in the schema and is read nowhere.
+  To stop a repo: remove its folder under `<configDir>/repos/`, or set `active: false` on its belts
+  (which gates new claims only).
+
+### 2.13 A source stopped picking up work
+
+```sh
+herdr-factory --repo <r> auth status
+herdr-factory --repo <r> doctor --deep | sed -n '/^repo /,$p'
+herdr-factory --repo <r> eligible
+curl -s '127.0.0.1:8765/repos/<r>/intents?kind=source_transition&status=pending' | jq
+curl -s '127.0.0.1:8765/repos/<r>/status?refresh=1' | jq '.sources'   # auth: {state: ok|down|na, detail?, account?}; the S3/creds light is .evidenceSso
+```
+
+| Branch | Signature | Fix |
+|---|---|---|
+| Auth paused | log `… pausing its claims + status write-backs until re-authenticated`; `doctor --deep` source row fails | Fix the credential in `<configDir>/repos/<r>/env` (per-repo only; process env is **not** consulted for declared secrets, and an empty value counts as missing). Auto-resumes on the next successful call. Note `doctor`'s shallow `auth <name>` row reports ✓ for a present-but-**rejected** credential — only `--deep` exercises it |
+| Rate limited | HTTP 429/403 + `Retry-After` honoured, retries then backoff | §2.14 |
+| Stale write-backs blocking items | pending `source_transition` rows for those keys | §8; each blocked key logs `skipping claim — a status write-back … is still pending` |
+| Trigger label consumed | github_issues consumes the pickup label at `in_development` | Re-add the label to retry that issue |
+| Item wearing an in-flight state label | github_issues skips it (belt-and-braces over run dedup) | Strip the stale state label |
+| Poll window | see §2.1 gate 7 | — |
+| Source renamed in config | every in-flight run parks `source_missing` | Source names are append-only. Restore the old `name`, then `resume` |
+
+### 2.14 Everything is slow / rate limited
+
+**Means**: usually correct pacing, not a fault. Check the buckets before touching anything.
+
+| Bucket / cap | Value |
+|---|---|
+| Jira (all calls) · Sentry (all calls) | 5/s burst 10 · 3/s burst 6, per client instance |
+| GitHub REST reads · mutations | 5/s burst 10 · ~60/min **and** ≤500/hr, both process-wide |
+| `tick_interval_seconds` · `reconcile_concurrency` | 60 (the level backstop; agent nudges are the edge path) · 8 |
+| `dueTransitions` / `dueIntents` batch | LIMIT **25** per pass — a large backlog drains over several ticks |
+| `herdr agent list` | memoized 5 s (`paneAlive`/`paneState` can force a fresh read) |
+| Subprocess · HTTP timeouts | 60 s (herdr worktree ops 180 s) · 30 s (Jira media 120 s) — a hung CLI can never wedge a tick |
+
+Diagnostics: log lines `transition deferred (attempt N, retry in Ms)`; telemetry histogram
+`herdr_factory.rate_limit.wait_ms` labelled by host; `http.retry_after_honored` events. GitHub's
+5,000/hr primary limit is deliberately **not** enforced locally (the `gh` CLI and your own tooling
+spend the same budget) — primary exhaustion shows up as fast failures into the poll/outbox backoffs.
+
+If a whole repo feels slow, check the tick isn't being skipped (§2.11) and that no single step is
+holding all the workspace slots (Q1b).
+
+---
+
+## 3. The attention / park reason table
+
+`escalateAttention` always: sets `phase='attention'` + `attention_reason` + `attention_reason_code`,
+records an `attention` event, renames the run's pane to `⚠ ATTENTION <KEY>`, fires a herdr notify,
+and (unless `skipSourceNote`) posts a note on the work item ending
+``Resume with: herdr-factory --repo <repo> resume <KEY>``.
+
+| `attention_reason_code` | Raised by | Reason text the user sees | Auto-rescue | How to clear |
+|---|---|---|---|---|
+| `step_budget` | `budget` watch (watchdog stage) | `<step> step over budget (worker: <paneState>)` | **yes** — a genuine `step-done` **or** `bounce` from the parked step | `resume <KEY>` (re-bases the budget clock, refunds capture/layout counters, nudges an idle pane). Raise the step's `budget_seconds` if it parks repeatedly. A `working` pane is never parked by a timer — the trip is held as `extend` |
+| `step_stalled` | `heartbeat` watch, only on steps producing `commits` | `<step> step stalled (worker: <paneState>)` | **yes** | No new commits for `limits.stall_seconds` (default 2700) while the pane isn't `working`. Same fix as budget |
+| `read_only_violation` | `read_only` watch, **`pre_advance`** stage | `<step> is read-only but committed (HEAD moved)` | **yes** — a `step-done` also clears the enforcement baseline | Inspect `detail.baseline` → `detail.head`. If the commit was legitimate/foreign, `step-done` or `resume` (which re-bases `read_only`) clears it. The baseline *tracks* HEAD until this step's own agent is first seen `working`, so a prior step's trailing commit should not park it |
+| `capture_limit` | capture-attempt counter past `limits.max_capture_attempts` (5) | `capture attempt N over cap (C) on <step>` | **yes** | `resume` refunds `capture_cap`. Real cause is usually a flaky app or an undemonstrable change — fix the app or bounce the work back |
+| `layout_wait_timeout` | layout wait after `1 + 3` windows | `<step>: layout pane <tab>/<pane> never became available` | **respawn** (bounded, limit 3, counter shared with the in-place re-arm) | §2.3. `resume` refunds the respawn budget |
+| `bounce_limit` | bounce past `belt.max_bounces ?? limits.max_bounces` | `bounced to <toStep> N× (max M)` | **no** | Human decision. `resume` refunds `bounce_cap` **belt-wide**; otherwise `teardown` |
+| `pr_closed` | the `pr` step or the `reviewing` watch | `PR #n closed without merging` | **no** (but a later **merge** still tears the run down) | Reopen the PR then `resume` (returns to `reviewing` with the thread signature cleared), or `teardown` |
+| `source_item_stale` | mid-flight stale write-back, or the human-reply loop | `work item gone at the source (<why>)` / `work item gone while waiting for a human reply (<why>)` | **no**; `skipSourceNote` (nothing to post to) | Mid-flight: `resume` to continue anyway (a PR may exist) or `teardown`. Human-loop variant: `teardown` — resuming just re-parks after the next poll. A **pre-work** `in_development` stale never parks: the run is aborted with `teardown("abandoned")` |
+| `belt_missing` | per-run pass, belt not resolvable | `belt "<name>" not configured` | **no** | Re-add the belt name (or use the TUI belt-rename, which migrates `runs.belt` — [install-and-operate.md](./install-and-operate.md)), then `resume`. `resume` itself refuses while the belt is missing: `belt "X" is not configured — re-add it or tear the run down` |
+| `source_missing` | per-run pass, source not resolvable | `work source "<name>" not configured` | **no** | Re-add the source under its old `name` (names are append-only), then `resume` |
+| `unknown_step` | phase dispatch | `step "<s>" is not in belt "<b>"` | **no** | Restore the step name in the belt, or `teardown`. A `resume` with an invalid `run.step` falls back to `claiming` |
+| `human_reply_unknown_step` | human-reply resume | `human reply arrived for unknown step "<s>"` | **no** | Restore the step name and `resume`; the reply file is already in the worktree |
+| `human_wait_missing_question` | the human-reply loop | `waiting_for_human without a pending question` | **no** | DB inconsistency. Fix `run.step` or `teardown` |
+| `human_poll_failing` | 20 consecutive poll **throws** | `reply polling has failed N times in a row` | **no** | `doctor --deep`, then `resume` (fresh window, error run cleared) |
+| `external_wait_deadline` | an `external_wait` intent's deadline | `external wait expired[: <note>]` | **no** (payload `on_deadline: "ignore"` opts out of parking) | `POST /repos/<r>/intents/<id>/fulfil` late, or `resume` / `teardown` |
+| *(a plugin guard's reason)* | a registered `GuardSpec` + evaluator | evaluator-defined | per its `autoRescueOnDone` / `autoRespawnLimit` | `obligations` reports the derived `rescue` class |
+
+**What is NOT a park** (common misreadings):
+
+- **A source that can't authenticate** → *pause + throttled notify*. Its claims and write-backs are
+  held; it auto-resumes the moment any call to that source succeeds.
+- **A permanently-failing evidence upload** → *notify + the amber `⚠ problem` flag on the dashboard
+  row*. The run is untouched and completes normally.
+- **The `capture` lock** → `capture_lock` exists as a guard reason string, but `exclusive_resource`
+  **never parks** (rescue class `none`). A blocked evidence agent just waits at `capture-lock
+  acquire` (up to 1 h). A **layout apply failure** likewise doesn't park — it surfaces later as
+  `layout_wait_timeout`.
+
+---
+
+## 4. `doctor` failure → remediation
+
+Condensed; `⚠` (amber) never fails the exit code, `✗` sets exit 1.
+
+| Row ✗/⚠ | Detail | Fix |
+|---|---|---|
+| `node runtime >= 26` | `v24.x is too old` | Invoke via the `herdr-factory` launcher shim (it re-execs the vendored Node), or re-run `install.sh` ([install-and-operate.md](./install-and-operate.md)) |
+| `auto-update` ⚠ | `last update FAILED — <reason>` / `reset to <ref> skipped — checkout has uncommitted changes` / `behind <ref>` / `updated but <warning>` | In `~/.local/share/herdr-factory`: `git fetch && git status`, then commit/stash/discard local edits (the updater refuses to hard-reset over them); `herdr-factory update` to retry; stable channel with no release tags needs a tag or `HERDR_CHANNEL=main herdr-factory install`; read `<state>/logs/supervisor.err.log` |
+| `auto-update` ✗ | exec error on `@{u}` | `git branch --set-upstream-to=origin/main main` in the app checkout |
+| `supervisor service` ✗ | `not loaded — run \`herdr-factory install\`` | `herdr-factory install`; verify `launchctl list \| grep herdr-factory` / `systemctl --user status herdr-factory.timer` |
+| `server` ✗ | `not running (run \`herdr-factory start\`)` / `registered but not responding` | `herdr-factory start` (`serve` for foreground debugging) / `herdr-factory restart`; check `<state>/server.json` pid+port, `lsof -i :8765`, `HERDR_FACTORY_PORT`; delete a stale `server.json` if the pid is gone |
+| `database` ✗ | `not initialized yet (created on the first serve)` | Any `--repo` command creates + migrates it (including `doctor --repo`, so a second run shows ✓ with no other action) |
+| `git`/`herdr`/`gh`/`claude` ✗ | opaque `command -v` failure | Install the tool, then **re-run `herdr-factory install`** — the checks resolve against the **service** PATH, frozen at install time |
+| `herdr (daemon responds)` ✗ | exec failed/timed out | Start the herdr app; `herdr workspace list` by hand; check `HERDR_BIN_PATH`; confirm `herdr plugin link ~/.local/share/herdr-factory` |
+| `gh (authenticated)` ✗ | `gh auth status` non-zero | `gh auth login`; for github_issues the token also needs push/issues:write |
+| `config loads + sources buildable` ✗ | `no config for repo "<n>" at <path>` | `ls ~/.config/herdr-factory/repos`; the repo name **is** the directory name; scaffold with `herdr-factory init` |
+| … ✗ | `invalid config for repo …:\n  <path>: <msg>` | Edit the reported dotted path. See [config-reference.md](./config-reference.md) |
+| … ✗ | `repo.path "<p>" is not a git checkout (no .git)` / `looks like a linked worktree (.git is a file); herdr needs the MAIN checkout` | Point `repo.path` at the primary clone |
+| … ✗ | `belt "<b>": match not found: <abs>` / `prompt_file not found` / `must \`export default\` a function` | Relative paths resolve against the **config folder**, not the repo; a match module must `export default (ctx) => boolean` — one `MatchContext` argument (`{ item, source }`), **not** the item itself, so destructure: `({ item }) => item.labels.includes("x")` |
+| … ✗ | `violates the prompt contract` | Fix the tokens; see [prompts.md](./prompts.md). Only `prompt_file_source: config` prompts are validated at load |
+| `git origin resolved` ✗ | `no origin — set repo.github or add a git remote` | Add the remote or set `repo.github: owner/name` |
+| `auth <n>` ✗ | `set JIRA_EMAIL + JIRA_API_TOKEN in the repo env` / `set SENTRY_AUTH_TOKEN in the repo env` / `GitHub auth missing — set GITHUB_TOKEN in the repo env, or authenticate the gh CLI` | Add to `<configDir>/repos/<r>/env` (`chmod 600`). An empty value counts as missing |
+| `source <n>` ✗ | jira `Jira rejected the credentials (HTTP 401\|403)`; HTTP 400/404 from the board query | Regenerate the API token (`JIRA_EMAIL` is the account **email**; Jira is api_token-only); verify the numeric board id, project key and exact `status.todo` name |
+| `source <n>` ✗ | `github_issues: trigger label "<l>" does not exist in <repo>` / `issues are disabled` / `no push/write access` | `gh label create '<l>' --repo <owner/name>` or fix the belt's `label`; enable Issues; `gh auth refresh -s repo` |
+| `source <n>` ✗ | sentry `cannot reach organization` / `project … not reachable`; `local_markdown folder does not exist` | Fix `organization`/`base_url`/the project **slug** or token scope; `mkdir -p <folder>` |
+| `evidence publisher (s3)` ✗ | `AWS SSO/credentials expired or unresolved` / `bucket does not exist` / `wrong region` / `access denied — credentials lack s3:PutObject` / `timed out reaching S3` | `aws sso login[ --profile <p>]` · fix `bucket` · set `region` to the bucket's real region · grant `s3:PutObject` on `arn:aws:s3:::<bucket>/herdr-factory/*` · retry |
+| `evidence publisher (local)` ✗ | `resident server not reachable at 127.0.0.1:<port>` / `served bytes did not match the probe` | `herdr-factory start` · another process is serving `<state>/evidence`, or two factories share a state root |
+| `evidence publisher (command)` ✗ | `could not run: spawn … ENOENT` / `exited <code>` / `printed no URLs to stdout` / `timed out after <n>s` | Absolute path + `chmod +x` · run it by hand · print one absolute URL per line · raise `evidence.timeout_seconds` |
+| `evidence uploads` ✗ | `<n> stuck — AWS SSO/creds expired` | §2.9 |
+
+The `s3` deep probe **writes one tiny object by design** (`…/.herdr-doctor`) and leaves it behind.
+
+---
+
+## 5. What `doctor` does not check
+
+Each with the by-hand check.
+
+| Gap | By-hand check |
+|---|---|
+| **A wedged tick loop reads as healthy.** The `server` row is a liveness ping; `/health`'s per-repo `lastTickAt`/`tickStale` is ignored | `curl -s 127.0.0.1:8765/health \| jq '.repos'` (§2.11) |
+| **Only ONE repo is ever checked** — the `--repo` value. Without `--repo`, **zero** repo checks run (the README's "each repo" is wrong) | Loop `ls ~/.config/herdr-factory/repos` and run `doctor --repo` for each |
+| **The TUI Doctor tab never runs the repo group** — config validity, source health, secrets and evidence are invisible there | "The TUI doctor is green" proves nothing; run `herdr-factory --repo <r> doctor --deep` |
+| **It doesn't check the repo is *served*** — and it reads its own fresh config, not the server's | §2.12 |
+| **The agent CLI check is hardcoded to `claude`** — the configured `agent.command` (e.g. `opencode`) is never probed, and `agent.flags` are never validated | `command -v <your agent>` under the **service** PATH, and run the exact `agent.command + flags` by hand |
+| **No agent-CLI *authentication* check** — presence ≠ logged in ≠ has quota | Start the agent interactively once and confirm it answers |
+| **No herdr plugin / layout check** — without `herdr plugin link`, per-belt layouts silently never apply | `herdr plugin list`; then look for `layout_applied` in a run's timeline (§2.3) |
+| **The service PATH is frozen at `herdr-factory install` time** | macOS: `plutil -extract EnvironmentVariables.PATH raw ~/Library/LaunchAgents/com.herdr-factory.server.plist`. Linux: `grep '^Environment="PATH=' ~/.config/systemd/user/herdr-factory.service`. A tool installed later is invisible to `serve` even though your shell finds it — re-run `install`. A PATH lacking `/bin` breaks the probe itself (`spawn sh ENOENT` on every row) |
+| **No DB integrity/schema check** — `database` is `existsSync` only | `PRAGMA integrity_check;` `PRAGMA foreign_key_check;` `SELECT * FROM schema_version ORDER BY version;` |
+| **Live auth rejection is invisible in shallow mode**, and the in-memory auth gate is never read | `doctor --deep`; `curl -s '.../repos/<r>/status?refresh=1'` |
+| **Nothing about stuck/parked runs**; and only `evidence_publish` intents are surfaced (transitions, reply polls, `waiting`/`failed` rows are ignored) | `status`, `timeline <KEY>`, `GET /repos/<r>/obligations?key=<KEY>`, `GET /repos/<r>/intents` (the last two are HTTP-only — no CLI equivalent) |
+| **No writability/disk checks**, and `aws` presence is never checked despite every S3 remediation telling you to run `aws sso login` | `df -h`; `command -v aws` |
+| **`repo.github` vs real origin mismatch is never flagged** — `repo.github` unconditionally wins, so a stale value silently sends PRs at the wrong repo while the row prints ✓ | Compare with `git -C <repo.path> remote get-url origin` |
+| **`evidence uploads` can crash the whole command** (it isn't wrapped in the error-catching helper): a locked/corrupt DB makes `doctor` print no groups at all | If `doctor` exits with a bare error and no output, suspect the DB |
+
+Also: shallow mode is **not** side-effect-free despite its own comment — it spawns subprocesses,
+hits loopback HTTP, and with `--repo` creates/migrates the DB, creates state+log dirs, and
+**imports every belt's `match` module** (arbitrary user code).
+
+---
+
+## 6. Logs
+
+| File / stream | Contents |
+|---|---|
+| `<state>/<repo>/logs/<YYYY-MM-DD>.log` | **All per-repo engine work**: reconcile passes, claim gates, spawns, watch parks, intent deferrals, auth-gate transitions, lock-lost errors, teardown. Line format `<ISO ts> [<LEVEL>] <msg>`. Also mirrored to the stderr of whichever process ran it |
+| `<state>/logs/supervisor.out.log`, `supervisor.err.log` | macOS only: `ensure-up` decisions (`server healthy on :<port>`, restart reasons, `self-update: …`). **Not** the resident server's own output — the supervisor spawns `serve` detached with `stdio: "ignore"`, so its `[server:*]` lifecycle lines (`repo "X": failed to load …`, `reload refused`) go to /dev/null. Run `herdr-factory serve` in the foreground to see them |
+| `journalctl --user -u herdr-factory.service` | Linux equivalent — the systemd unit sets no output redirection, so nothing lands in `<state>/logs` |
+| stdout of a foreground `herdr-factory serve` / `run` | Everything, live |
+| SQLite `events` table | The domain timeline — `herdr-factory --repo <r> timeline <KEY>` or `GET /repos/<r>/timeline?key=` |
+| `<worktree>/.memory/herdr-factory/` | `prompt-<step>.md` (the exact rendered prompt), `handoff-<step>.md`, `feedback-<step>.md`, `feedback-<step>-addressed-pass<N>.md`, `human-question-<step>.md`, `human-replies/question-<id>.md`, `task.md`, `ticket.json`, `evidence/` |
+| `<state>/update-status.json` | The last auto-update attempt — first thing to read for "why is this box behind" |
+
+`<state>` = `HERDR_FACTORY_STATE_ROOT` or `~/.local/state/herdr-factory`.
+`herdr-factory --repo <r> logs [n]` tails **today's** file only (default 50 lines) and prints
+`no log for today at <file>` when absent — read older days directly.
+
+**Symptom → which log**
+
+| Symptom | Log |
+|---|---|
+| Repo isn't picking up work | repo log: `at capacity`, poll skips, auth-pause lines |
+| Nothing happens at all / stale ticks | supervisor log + `/health` `tickStale` |
+| A step never advances | repo log + `GET /repos/<r>/obligations?key=<KEY>` |
+| Status not moving in Jira/GitHub | repo log `transition deferred …` + `GET /intents?kind=source_transition` |
+| Evidence links broken | repo log `evidence publish` lines + `doctor --deep` + TUI amber |
+| Duplicate agents in one worktree | repo log, grep `lock … lost mid-hold` (error level) |
+| Box behind on code | `update-status.json` + supervisor `self-update:` lines + `doctor`'s `auto-update` row |
+
+**Grep-able lines that pin a state** (exact substrings):
+
+```
+at capacity (                              # Phase B returned early
+claimed N; working X/Y, idle/parked Z      # end of a normal pass
+another tick already running — skipping    # tick lock held
+busy (nudge in flight) — skipped this pass # run lock held by a nudge
+inactive — skipping (no new claims         # belt.active: false
+at its concurrency cap (                   # per-source cap
+skipping claim — a status write-back       # the known-stale-eligibility veto
+work source not authenticated (            # source paused
+waiting for layout pane                    # layout wait, inside the window
+not up after Ns — re-arming the wait       # layout wait, spending a respawn credit
+awaiting step-done                         # dispatched, waiting on the agent
+past ... but still working — extending     # vetoWhenWorking held a timer trip
+watchdog deferred                          # herdr unreachable; never parks on uncertainty
+pane ... not listed — confirming before re-spawn / pane gone (confirmed twice) — re-spawning
+resolver idle — PR #n watch no longer holds a slot
+transition deferred (attempt N, retry in Ms) / intent deferred (attempt N)
+effect → X skipped (would move backward
+lock ... lost mid-hold                     # ERROR: two reconcilers may share a target
+```
+
+---
+
+## 7. State inspection (read-only)
+
+One SQLite file per **machine**, shared by every repo. `runs`, `events`, `intents`, `work_items`,
+`human_questions` and `source_auth` carry a `repo` column; the run-scoped children (`run_steps`,
+`run_products`, `guard_counters`, `watch_state`) and `locks` do **not** — scope those by joining
+`runs` (as Q6–Q8 do).
+
+```sh
+DB="${HERDR_FACTORY_STATE_ROOT:-$HOME/.local/state/herdr-factory}/herdr-factory.db"
+```
+
+It is a **normal SQLite 3 file** — the stock `sqlite3` CLI works. Caveats:
+
+- `sqlite3 -readonly "$DB"` **fails when the `-shm` sidecar is absent** (idle DB, server stopped):
+  `Error: in prepare, unable to open database file (14)`. Use `sqlite3 "$DB" "<SELECT>"` (the
+  pragmatic default — a SELECT mutates no rows) or `sqlite3 "file:$DB?immutable=1" "<SELECT>"`
+  (only safe when nothing is writing). Prelude: `.mode box` `.headers on` `.timeout 5000`.
+- All timestamps are epoch **seconds** — wrap with `datetime(col,'unixepoch')`.
+- `PRAGMA foreign_keys = ON` is set by the engine (hand `DELETE`s cascade-block), and WAL is required
+  by the multi-process access model: never run `VACUUM`, `PRAGMA journal_mode=DELETE`, or `.recover`.
+- **Never diagnose from these dead columns**: `runs.worker_done`, `runs.review_done`,
+  `runs.review_pane`, `runs.progress_sig`, `runs.progress_at`, `run_steps.bounces`,
+  `run_steps.capture_attempts`, `repos.enabled`.
+- **Never trust PR numbers or resolver state from `herdr-factory runs` or `status.finished`** — that
+  read doesn't join `run_products`, so `prNumber` is missing and `resolverActive` is always true.
+  Query `run_products` (Q1).
+
+**Q1 — what's in flight** (the correct run read joins `run_products`)
+
+```sql
+SELECT r.id, r.repo, r.work_source, r.belt, r.ticket_key, r.phase, r.step,
+       rp.number AS pr, COALESCE(rp.active,0) AS resolver_active,
+       r.attention_reason_code, r.attention_reason,
+       datetime(r.created_at,'unixepoch') AS created,
+       datetime(r.updated_at,'unixepoch') AS updated, r.branch, r.worktree_path
+FROM runs r
+LEFT JOIN run_products rp ON rp.run_id = r.id AND rp.product = 'pull_request'
+WHERE r.ended_at IS NULL ORDER BY r.repo, r.created_at;
+```
+
+**Q1b — occupancy vs `max_active_workspaces`** (mirrors the engine's own count)
+
+```sql
+SELECT r.repo, r.work_source, COUNT(*) AS occupying
+FROM runs r
+LEFT JOIN run_products rp ON rp.run_id = r.id AND rp.product = 'pull_request'
+WHERE r.ended_at IS NULL
+  AND r.phase NOT IN ('attention','waiting_for_human')
+  AND NOT (r.phase = 'reviewing' AND COALESCE(rp.active,0) = 0)
+GROUP BY r.repo, r.work_source;
+```
+
+**Q2 — why is this run parked**
+
+```sql
+SELECT id, ticket_key, phase, step, attention_reason_code, attention_reason,
+       datetime(attention_notified_at,'unixepoch') AS last_notified
+FROM runs WHERE phase = 'attention' AND ended_at IS NULL ORDER BY updated_at;
+
+SELECT id, datetime(ts,'unixepoch') AS ts, json_extract(detail,'$.reason') AS reason, detail
+FROM events WHERE run_id = :runId AND type = 'attention' ORDER BY id DESC LIMIT 5;
+```
+
+**Q3 — this run's timeline** (`timeline <KEY>` shows only the latest run for the key; the second
+query includes earlier runs and detached admin rows)
+
+```sql
+SELECT e.id, datetime(e.ts,'unixepoch') AS ts, e.type, e.detail
+FROM events e
+WHERE e.run_id = (SELECT id FROM runs WHERE repo = :repo AND ticket_key = :key
+                  ORDER BY id DESC LIMIT 1)
+ORDER BY e.id;
+
+SELECT id, run_id, datetime(ts,'unixepoch') AS ts, type, detail
+FROM events WHERE repo = :repo AND ticket_key = :key ORDER BY id;
+```
+
+**Q4 — stuck / backed-off intents**
+
+```sql
+SELECT id, kind, scope, ticket_key, status, attempts, error_class,
+       datetime(next_attempt_at,'unixepoch') AS next_attempt,
+       next_attempt_at - unixepoch() AS due_in_sec,
+       lease_until, handoff_marker, consumed_at,
+       substr(COALESCE(last_error,''),1,160) AS last_error
+FROM intents WHERE repo = :repo AND status IN ('pending','waiting')
+ORDER BY kind, scope, seq;
+```
+
+FIFO blockage — the #1 cause of "my status write-back never fired":
+
+```sql
+SELECT later.id AS blocked_id, earlier.id AS blocker_id, earlier.status,
+       earlier.error_class, earlier.attempts, earlier.last_error
+FROM intents later
+JOIN intents earlier ON earlier.kind = later.kind AND earlier.scope = later.scope
+ AND earlier.seq < later.seq AND earlier.status IN ('pending','waiting')
+WHERE later.kind = 'source_transition' AND later.status = 'pending';
+```
+
+**Q5 — held locks**
+
+```sql
+SELECT name, owner, datetime(expires_at,'unixepoch') AS expires,
+       expires_at - unixepoch() AS ttl_left_sec,
+       CASE WHEN expires_at <= unixepoch() THEN 'EXPIRED (stealable)' ELSE 'held' END AS state
+FROM locks ORDER BY name;
+```
+
+**Q6 — bounce (and every capped-guard) count per step**
+
+```sql
+SELECT r.ticket_key, r.belt, gc.step, gc.guard, gc.count,
+       datetime(gc.updated_at,'unixepoch') AS updated
+FROM guard_counters gc JOIN runs r ON r.id = gc.run_id
+WHERE r.ended_at IS NULL ORDER BY gc.guard, gc.count DESC;
+```
+
+`guard` ∈ `bounce_cap` (keyed on the bounce **target** step) · `capture_cap` · `layout_wait`.
+The DB holds only the count — the caps live in config (`max_bounces` 6, `max_capture_attempts` 5,
+layout respawn limit 3).
+
+**Q7 — step timings; then every step still awaiting its first dispatch (the layout-wait suspects)**
+
+```sql
+SELECT rs.step, rs.pass, rs.done,
+       datetime(rs.started_at,'unixepoch')    AS started,
+       datetime(rs.dispatched_at,'unixepoch') AS dispatched,
+       datetime(rs.done_at,'unixepoch')       AS done_at,
+       COALESCE(rs.done_at, unixepoch()) - rs.started_at AS elapsed_sec,
+       rs.pane_id, rs.absent_at
+FROM run_steps rs WHERE rs.run_id = :runId ORDER BY rs.id;
+
+SELECT r.ticket_key, rs.step, rs.pass, unixepoch() - rs.started_at AS waited_sec
+FROM run_steps rs JOIN runs r ON r.id = rs.run_id
+WHERE r.ended_at IS NULL AND rs.dispatched_at IS NULL AND rs.done = 0;
+```
+
+`run_steps.started_at` is **pass bookkeeping** (the layout-wait window + per-attempt dispatch clock),
+**not** the budget clock.
+
+**Q8 — live watch clocks** (the real budget / stall / read-only windows)
+
+```sql
+SELECT r.ticket_key, ws.step, ws.watch, ws.sig,
+       datetime(ws.based_at,'unixepoch') AS based_at,
+       unixepoch() - ws.based_at AS age_sec
+FROM watch_state ws JOIN runs r ON r.id = ws.run_id
+WHERE r.ended_at IS NULL ORDER BY ws.run_id, ws.step, ws.watch;
+```
+
+Compare `age_sec` for `budget` against the step's `budget_seconds`, and for `heartbeat` against
+`limits.stall_seconds`. `read_only` with `based_at IS NOT NULL` = the baseline is **frozen** (only a
+HEAD move after that trips); `NULL` = still tracking. Rows are never deleted — `sig IS NULL AND
+based_at IS NULL` means "deliberately cleared", not "absent".
+
+**Q9 — human questions and their poll clocks**
+
+```sql
+SELECT hq.id, hq.run_id, hq.ticket_key, hq.step, hq.status,
+       hq.external_id IS NOT NULL AS posted,
+       i.id AS poll_intent_id, i.attempts AS poll_errors,
+       json_extract(i.state,'$.pollAttempts') AS poll_misses,
+       datetime(i.next_attempt_at,'unixepoch') AS next_poll,
+       substr(hq.question,1,100) AS question
+FROM human_questions hq
+LEFT JOIN intents i ON i.kind = 'human_reply_poll'
+  AND i.scope = 'run:'||hq.run_id AND i.dedup_key = 'q-'||hq.id
+WHERE hq.status = 'pending' ORDER BY hq.id;
+```
+
+**Q10 — last tick per repo** (the wedged-tick signal)
+
+```sql
+SELECT name AS repo, datetime(last_tick_at,'unixepoch') AS last_tick,
+       unixepoch() - last_tick_at AS tick_age_sec FROM repos;
+```
+
+**Q11 — recent failures across the whole repo**
+
+```sql
+SELECT datetime(ts,'unixepoch') AS ts, repo, run_id, ticket_key, type, detail FROM events
+WHERE repo = :repo
+  AND type IN ('error','attention','stale','signal_rejected','evidence_upload_failed',
+               'layout_apply_failed','intent_deadline') ORDER BY id DESC LIMIT 40;
+```
+
+### Safe to hand-edit vs never
+
+Prefer the supported surfaces — they take the right locks and record events. Anything below assumes
+`herdr-factory stop` first; writing while `serve` runs bypasses the `tick:`/`run:` locks.
+
+**Tolerable by hand** (idempotent, the engine re-derives):
+
+- `DELETE FROM locks WHERE name = 'capture' AND expires_at <= unixepoch();` — an already-expired
+  row. Prefer `herdr-factory capture-lock release capture <owner>`.
+- `UPDATE intents SET next_attempt_at = unixepoch() WHERE id = ?;` — exactly what
+  `POST /repos/<r>/intents/<id>/retry` does. Prefer the endpoint.
+- `UPDATE work_items SET status = 'todo' WHERE …;` — the internal ledger is a best-effort label
+  (`local_markdown` / `sentry` only), any→any by design.
+- `SELECT`s, `PRAGMA integrity_check`, `PRAGMA foreign_key_check`.
+
+**Never by hand**
+
+| Don't | Why | Instead |
+|---|---|---|
+| `UPDATE runs SET phase = …` | phase changes are coupled to pane spawn/rename, watch re-bases, counter refunds, focus and events; a hand flip orphans or double-spawns an agent | `resume` |
+| `UPDATE runs SET ended_at = …` / `DELETE FROM runs` / `INSERT INTO runs` | skips teardown effects and worktree removal, orphans `run_steps` (no FK) while FK-blocking on `events`/`intents`; an insert must go through the active-ticket race arbiter + branch/worktree creation | `teardown` / `claim` |
+| `UPDATE run_steps SET done = 1` | skips pass validation, the clock re-base, the watchdog rescue, and records no `step_done` event | `step-done <key> <step>` |
+| `UPDATE run_steps SET pass = …` / `dispatched_at = …` | `pass` is the anti-replay stamp already baked into rendered prompts; desyncing it silently rejects every real signal | never |
+| `DELETE FROM watch_state` | the contract is "re-bases write NULLs, never delete"; deleting loses the read-only freeze marker | `resume` |
+| `UPDATE intents SET status='delivered'` on a `source_transition` | the source's status of record permanently diverges and eligibility can re-claim merged work | fix auth and let it retry, or `teardown` |
+| `INSERT INTO intents` / `UPDATE intents SET consumed_at = …` | you'd have to set `seq` yourself or the FIFO gate mis-orders; erasing a handoff silently skips the abort/park decision the run-locked pass still owes | `POST /repos/<r>/intents` (only `external_wait`); otherwise let the next pass consume it |
+| `DELETE FROM events` | the audit record; belt purges deliberately detach (`run_id = NULL`) instead of deleting | never |
+| `UPDATE runs SET belt = …` | belt renames must move active and historical rows atomically under the tick lock with a Deps reload, or every run parks `belt_missing` | the TUI belt-apply flow ([install-and-operate.md](./install-and-operate.md)) |
+| touching `source_auth` | holds live tokens | `auth status` |
+
+---
+
+## 8. Locks and the outbox
+
+### Locks
+
+All three live in one `locks` table (`name`, `owner`, `acquired_at`, `expires_at`, epoch seconds).
+`acquireLock` **steals an expired holder unconditionally**; `releaseLock`/`extendLock` are
+**owner-scoped** (a release with the wrong owner is a silent no-op).
+
+| Lock | Owner | TTL | Symptom when stuck | Safe fix |
+|---|---|---|---|---|
+| `tick:<repo>` | `pid:<pid>:<seq>` | `max(tick_interval × 2, 300)` s | repo stops reconciling; `another tick already running — skipping` every pass | Nothing — an expired lock is stolen on the next acquire. If `expires_at` is in the future but the pid is dead, wait out the TTL or `herdr-factory restart` (which stops the holder's heartbeat). Delete the row only with the server stopped |
+| `run:<id>` | `pid:<pid>:<seq>` | 300 s | one run never advances while others do; `<KEY>: busy (nudge in flight) — skipped this pass` every tick; nudges answer `run busy — retry … in a moment` | Expires within 300 s of the holder dying |
+| `capture` | the run's **ticket key** | 1200 s | an evidence agent hangs at `capture-lock acquire` (it polls every 5 s for up to **1 h**), blocking every other evidence step on the machine | `herdr-factory capture-lock release capture <that exact owner>` — the release is owner-scoped, so pass the owner from Q5. A manual acquire with no owner argument is the literal `worker`, which the engine's ticket-key-scoped backstop release will never clear. Self-heals after 20 min |
+
+`tick:` and `run:` are heartbeat-extended every `max(5s, TTL/3)` while the holder lives, so **TTL
+expiry means the holder process is dead**, never "slow". A holder whose extend fails logs
+`lock <key> lost mid-hold (owner <owner>) — a concurrent holder may be reconciling the same target`
+at **error** level — the one lock line worth alerting on, because two reconcilers may be driving one
+target: restart the server and check the worktree for duplicate agents. After a hard `SIGKILL` of
+`serve`, up to ~5 min of runs are skipped while locks expire — which is why shutdown has an 18 s
+graceful window.
+
+### The intent ledger (outbox)
+
+An **intent** is one durable, retried side effect on the `intents` table. Five kinds:
+
+| kind | What it is | Ordering | Survives teardown |
+|---|---|---|---|
+| `source_transition` | a status write-back to the work source | **fifo** per run | **yes** (Phase B's claim veto depends on it) |
+| `evidence_publish` | upload a captured evidence dir | latest-wins | no |
+| `agent_signal` | a durable `bounce` / `ask-human` from an agent | latest-wins | no |
+| `human_reply_poll` | the reply-poll clock for one pending question | independent | no |
+| `external_wait` | an externally fulfilled wait (the only kind you may create) | independent | no |
+
+Retry/backoff: `min(60 × 2^(attempts-1), cap)` → 60s, 120s, 240s, 480s, 960s, 1920s, 3600s, …
+Cap is 3600 s for transitions and evidence, 300 s for reply polls. **An outbox intent never gives up
+on its own.** At most **25** rows are attempted per pass, so a backlog drains over several ticks.
+
+Two behaviours explain most "it never fired": **the FIFO gate is checked against the DB**, so an
+earlier sibling in the same `(kind, scope)` blocks a later one *even while it is merely backed off*
+(one transition stuck on auth holds every later transition for that run — Q4's blockage query finds
+it); and **a row with an unconsumed handoff is deliberately not delivered** — it is in the run's
+court, waiting for the next run-locked pass (`handoff_at IS NOT NULL AND consumed_at IS NULL`).
+
+A permanently failing intent surfaces as: a throttled herdr notification (only `evidence_publish`
+implements notify today); the repo log line `<key>: <kind> intent deferred (attempt N): <error>`; the
+amber `⚠` problem flag on the TUI dashboard row (evidence only, and only once `error_class` is set —
+a never-attempted row is deliberately not a problem); `doctor`'s `evidence uploads` row; and the
+`obligations` endpoint (`GET /repos/<r>/obligations?key=<KEY>` — HTTP only, there is no `obligations`
+CLI command).
+
+Retrying:
+
+```sh
+curl -s -X POST 127.0.0.1:8765/repos/<r>/intents/<id>/retry            # skip the backoff
+curl -s -X POST 127.0.0.1:8765/repos/<r>/intents/<id>/fulfil \
+     -H 'content-type: application/json' -d '{"result":{}}'            # resolve an external_wait
+curl -s -X POST 127.0.0.1:8765/repos/<r>/intents/recover \
+     -H 'content-type: application/json' -d '{"causeScope":"publisher:s3"}'
+```
+
+- `retry` only touches `status='pending'` rows — a `failed`/`abandoned` row **cannot** be retried
+  this way; the engine re-opens it on the next natural trigger.
+- **AWS SSO recovery path**: `aws sso login[ --profile <p>]`, then either wait (the publish kind's
+  pre-pass probes liveness and re-queues automatically) or force it with
+  `intents/recover {"causeScope":"publisher:s3"}`. Cause strings are `source:<sourceName>` and
+  `publisher:s3|local|command`. Note `resume` does **not** make a backed-off upload due now — no
+  shipped kind opts into that.
+- A source-auth recovery re-queues that source's held write-backs automatically the moment any call
+  to it succeeds.
+
+---
+
+## 9. Escalating nudges — least to most destructive
+
+| # | Action | What it does |
+|---|---|---|
+| 1 | `herdr-factory reload` | Re-reads every repo's config into the running server. No run is touched. Can refuse a repo (read `failures[]`) |
+| 2 | `herdr-factory --repo <r> tick` | Forces one reconcile pass now (via the server if up, else in-process under the tick lock). Level-triggered: it can only do what the next tick would have done anyway |
+| 3 | `herdr-factory --repo <r> step-done <KEY> <step>` | Records the step complete, exactly as the agent would. Validated against the belt, the active step, and the `--pass` stamp. Un-parks a `rescue: terminal-signal` watchdog park. **Only use it if the work really is finished** |
+| 4 | `herdr-factory --repo <r> resume <KEY>` | Un-parks an `attention` run back to `running`/`reviewing`/`claiming`/`waiting_for_human`: re-bases the step's watch clocks, refunds resume-scoped counters (capture, layout respawns, and — on a `bounce_limit` park — the bounce budget belt-wide), clears `lastThreadSig`/`resolverActive` for a PR watch, and nudges an idle pane to continue. Does **not** clear `run_steps.done`. Refuses while the belt is missing |
+| 5 | `POST /repos/<r>/intents/<id>/retry` | Makes one backed-off ledger row due now. Touches only that row's schedule |
+| 6 | `herdr-factory restart` | Graceful `POST /shutdown` + SIGTERM, SIGKILL only after 18 s (outlasting the server's 15 s in-flight-tick drain), then re-spawn. In-flight runs survive; their agents keep working; locks the dead process held expire. This is the fix for a wedged tick |
+| 7 | `herdr-factory --repo <r> teardown <KEY>` | **Destructive.** Fires the terminal write-back, then removes the herdr worktree, closes the workspace, `rm -rf`s the worktree path and **deletes the branch (`git branch -D`)**. Any uncommitted or unpushed work in that worktree is gone, and pending evidence uploads are abandoned (logged as `N evidence upload(s) dropped at teardown`). The run ends with an outcome; re-claiming the item starts a fresh run on a fresh branch |
+
+Only `teardown` destroys anything. `belt apply` (the TUI belt rename/delete flow —
+[install-and-operate.md](./install-and-operate.md)) can also purge runs and clean worktrees — treat it
+as equally destructive.
+
+### 9.1 Stopping a run without losing its work
+
+**There is no non-destructive per-run cancel or pause.** Nothing in the CLI or the HTTP API suspends
+one run and keeps its worktree:
+
+| what people reach for | what it actually does |
+|---|---|
+| `belt.active: false` (+ `reload`) | Gates **new claims only** — the claim loop skips the belt before polling and logs `belt <b>: inactive — skipping (no new claims; in-flight runs continue)`. Every in-flight run on that belt keeps reconciling, keeps its agent, keeps its worktree |
+| `herdr-factory stop` | Stops the engine machine-wide. **Already-running worker agents keep running** in their panes, unsupervised; nothing advances until you `start` again. Not a per-run control |
+| `resume` / `bounce` / `step-done` | Move a run *along* the belt. None of them ends it |
+| `teardown` | The only way to end a run — and it is destructive (row 7 above) |
+
+So "stop this one run" always means `teardown`, and teardown (`src/core/reconcile.ts`, `teardownImpl`
+→ `removeRunWorktree`) removes the herdr workspace, `rm -rf`s the worktree directory, `git worktree
+prune`s, and runs `git branch -D <run branch>` in the main checkout. **Uncommitted work, unpushed
+commits, and un-uploaded evidence bytes are gone.** The *remote* branch is never touched — which is
+the whole rescue. It also fires the terminal write-back first: a manual `teardown` is always outcome
+`abandoned` ⇒ work state `aborted`, so the source item moves too (for `local_markdown` that means the
+file is never re-listed). Re-claiming the item later starts a fresh run on a fresh branch.
+
+**Before you tear down a run whose work matters:**
+
+```sh
+# 1. Find the run's worktree + branch (worktree_path is NOT in `status`, `runs`, or `obligations`).
+DB="${HERDR_FACTORY_STATE_ROOT:-$HOME/.local/state/herdr-factory}/herdr-factory.db"
+sqlite3 "$DB" "SELECT id, ticket_key, phase, step, branch, worktree_path
+               FROM runs WHERE repo='<r>' AND ticket_key='<KEY>' AND ended_at IS NULL;"
+
+# (No sqlite? `git -C <repo.path> worktree list` shows the same path/branch pairs.)
+WT=<worktree_path>; BR=<branch>
+
+# 2. See what would be lost.
+git -C "$WT" status --porcelain          # uncommitted
+git -C "$WT" log --oneline @{u}..        # unpushed (fails if the branch was never pushed)
+
+# 3. Preserve it. Pushing is the durable option — the remote branch survives teardown.
+git -C "$WT" add -A && git -C "$WT" commit -m "wip: $BR before teardown"
+git -C "$WT" push -u origin "$BR"
+
+# 4. Only now:
+herdr-factory --repo <r> teardown <KEY>
+```
+
+If you can't push (no remote, secrets in the tree), copy the files out instead — but copy, don't move,
+and expect the copy to be a **plain directory, not a git worktree**: a linked worktree's `.git` is a
+file pointing into `<main checkout>/.git/worktrees/<name>`, which teardown prunes, so the copy's
+history link dangles afterwards. Bundle the history first if you need it:
+
+```sh
+git -C "$WT" bundle create ~/rescue-<KEY>.bundle --all   # history, portable
+cp -a "$WT" ~/rescue-<KEY>                               # working tree, incl. .memory/herdr-factory/
+```
+
+`.memory/herdr-factory/` holds the run's task doc, feedback files and un-uploaded evidence — copy it
+if you care about the agent's reasoning trail, because pending `evidence_publish` intents are
+abandoned at teardown (`N evidence upload(s) dropped at teardown`).
+
+To stop the *belt* from picking up more while you sort this out, set `belt.active: false` and
+`herdr-factory reload` — remembering it does nothing to the run in front of you.

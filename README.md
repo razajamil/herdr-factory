@@ -15,7 +15,7 @@ Merged PRs come out the other end.
 [Markdown briefs](#markdown-briefs--work-without-a-ticket) ·
 [GitHub issues](#github-issues--label-an-issue-get-a-pr) ·
 [Sentry errors](#sentry--fix-production-errors) · [The belts](#the-belts) ·
-[Highlights](#highlights) · [Reference](#reference)
+[Highlights](#highlights) · [Agent skill](#the-agent-skill) · [Reference](#reference)
 
 </div>
 
@@ -85,7 +85,9 @@ curl -fsSL <url>/install.sh | sh -s -- --uninstall
 
 The factory ships with a full TUI for configuration and monitoring — run `herdr-factory` with no
 arguments to open it (live dashboard · config editor · doctor). Everything below can be done from
-there; the steps show the underlying files.
+there; the steps show the underlying files. Or hand the setup to your coding agent:
+`herdr-factory skill install` installs an [agent skill](#the-agent-skill) that runs the whole
+interview, validates the result, and can debug the factory later.
 
 ### 1. Add your Jira credentials
 
@@ -451,6 +453,10 @@ brief's front-matter). Route bugs to one belt and stories to another, programmat
   finished but whose media upload is still retrying on expired AWS creds shows an amber `⚠` on that
   row. The server also exposes a local HTTP API (`127.0.0.1:8765`) with an OpenAPI spec at `/doc`
   and Swagger UI at `/ui`.
+- **An agentic interface.** `herdr-factory skill install` gives your coding agent an
+  [agent skill](#the-agent-skill) — it runs the config interview for a repo, answers questions about the
+  engine, and triages a stuck run from the same source-verified reference the maintainers use. Installed
+  as a symlink into the checkout, so auto-update keeps it honest.
 - **Observable.** Set `HERDR_FACTORY_TELEMETRY=1` for OpenTelemetry traces and metrics; a local
   Grafana stack ships via `docker-compose.telemetry.yml` (see [`docs/TELEMETRY.md`](docs/TELEMETRY.md)).
 
@@ -1079,6 +1085,7 @@ herdr-factory capture-lock acquire|release <resource> [owner]       # machine-gl
 # scaffold a repo config from inside the repo (name defaults to --repo, else the checkout dir)
 herdr-factory [--repo <name>] init [--source jira|github_issues|local_markdown|sentry] [--path <dir>] [--force]
 herdr-factory --repo <name> prompts eject [--step <name>] [--force]  # copy the shipped prompt pack into repos/<name>/prompts/ to edit
+herdr-factory skill install [--into <dir>] [--copy|--symlink] [--force]  # install the agent skill (see The agent skill)
 
 # the machine-wide server + supervisor (no --repo)
 herdr-factory serve | ensure-up [--restart] | restart | reload | update | provision-node
@@ -1169,6 +1176,38 @@ cursor.
 
 The TUI renders through opentui's native core, which needs FFI — the launcher adds the flags and
 resolves the same vendored Node the engine uses, so there's nothing to set up.
+
+## The agent skill
+
+The factory ships an **agent skill** — the same documentation you're reading, restructured as an
+operating manual for a coding agent. Install it once and your agent can set the factory up for a repo,
+answer questions about the engine, and debug a stuck run without you reading any of this:
+
+```sh
+herdr-factory skill install               # → ~/.claude/skills/herdr-factory (symlinked to the checkout)
+herdr-factory skill install --into .      # → ./.claude/skills/herdr-factory (copied, so you can commit it)
+```
+
+The default install is a **symlink into the running checkout**, so auto-update keeps the skill in
+lock-step with the engine it documents — the same guarantee the [editor schema](#editor-schema) gets.
+`--into <checkout>` copies it instead, for a team that wants the skill version-controlled next to the
+code (re-run with `--force` after a factory update to refresh the copy).
+
+Then just ask, in your repo:
+
+```
+> set up herdr-factory for this repo
+> why is RWR-1234 parked?
+> add an evidence step to the bugs belt
+```
+
+The skill runs a config **interview** — asking only what it can't infer from your checkout, then
+validating with `doctor --deep` before it hands back — and loads one per-topic reference on demand: the
+config schema with every load-time rejection, the four work sources, belt composition, layouts, the
+prompt contract, the CLI, paste-ready recipes, what your target repo should document, the engine's
+internals, installing/operating the factory, and a symptom → diagnosis → fix playbook. It's `SKILL.md` +
+`references/` under [`skills/herdr-factory/`](skills/herdr-factory/) — plain Markdown, so an agent
+harness with no skill mechanism can be pointed at the folder directly.
 
 ## Files on disk
 

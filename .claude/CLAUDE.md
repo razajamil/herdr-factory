@@ -43,3 +43,14 @@ npm run schema        # regenerate the committed config.schema.json after schema
   behavior.
 - After changing the config zod schema, run `npm run schema` (a test guards the
   committed `config.schema.json` against drift).
+- `skills/herdr-factory/` is the shipped **agent skill** — the user-facing
+  operating manual (`SKILL.md` + `references/`), installed into a user's agent
+  config by `herdr-factory skill install` and symlinked to this checkout, so a
+  merge here reaches every installed skill on the next auto-update. It restates
+  facts that live in source: config keys and defaults, load-time error text, step
+  primitive declarations, prompt tokens, CLI flags, attention reason codes. When
+  you change any of those, update the matching reference file in the same commit —
+  a stale skill gives users confidently wrong answers, which is worse than no
+  skill. `references/config-reference.md` tracks the zod schema; `troubleshooting.md`
+  tracks the attention reason codes and doctor checks; `cli.md` tracks the commander
+  definitions.

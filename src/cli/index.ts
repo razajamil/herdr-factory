@@ -6,6 +6,7 @@ import { configJsonSchema, configSchemaPath, evidenceKeyPrefix, globalDbPath, is
 import { descriptorFor } from "../sources/registry.ts";
 import { stepDescriptorFor } from "../steps/registry.ts";
 import { ejectPrompts, UnknownPromptStepError } from "../prompts-eject.ts";
+import { installSkill, SkillBundleMissingError, SkillDestinationExistsError } from "../skill-install.ts";
 import { createEvidencePublisher, enumerateEvidenceFiles, resolveGithubUsername } from "../clients/evidence.ts";
 import { baseGroups, repoGroup, type DoctorGroup } from "../doctor.ts";
 import { openDb } from "../db/index.ts";
@@ -485,6 +486,46 @@ program
       if ([...result.written, ...result.skipped].some((f) => f.entry.slug === "resolver")) {
         console.log(`\nresolver.md is the PR-watch resolver prompt — a reference copy; it isn't wired via a belt step's prompt_file.`);
       }
+    } catch (e) {
+      fail(e);
+    }
+  }));
+
+program
+  .command("skill <action>")
+  .description(
+    "agent skill: `install` puts the shipped herdr-factory skill where a coding agent finds it — ~/.claude/skills/ by default (symlinked to this checkout, so auto-update keeps it current), or a target repo's .claude/skills/ with --into",
+  )
+  .option("--into <dir>", "install into a repo checkout (<dir>/.claude/skills/) instead of ~/.claude/skills/ — copied, so it can be committed")
+  .option("--copy", "copy the bundle instead of symlinking it (a frozen snapshot; won't track auto-updates)")
+  .option("--symlink", "symlink the bundle even for --into (tracks this checkout; not committable)")
+  .option("--force", "replace a destination that already exists")
+  .action(cliAction("skill", (action: string, opts: { into?: string; copy?: boolean; symlink?: boolean; force?: boolean }) => {
+    try {
+      if (action !== "install") fail(`unknown skill action "${action}" — use: install`);
+      if (opts.copy && opts.symlink) fail("skill install: pass either --copy or --symlink, not both");
+      let result;
+      try {
+        result = installSkill({
+          into: opts.into,
+          mode: opts.copy ? "copy" : opts.symlink ? "symlink" : undefined,
+          force: opts.force,
+        });
+      } catch (e) {
+        if (e instanceof SkillDestinationExistsError || e instanceof SkillBundleMissingError) fail(e.message);
+        throw e;
+      }
+      if (result.action === "current") {
+        console.log(`Skill already installed at ${result.dest} → ${result.source}`);
+      } else {
+        const verb = result.action === "replaced" ? "Replaced" : "Installed";
+        const how = result.mode === "symlink" ? `symlink → ${result.source}` : `${result.files.length} file${result.files.length === 1 ? "" : "s"} copied from ${result.source}`;
+        console.log(`${verb} the herdr-factory skill at ${result.dest} (${how})`);
+      }
+      if (result.mode === "copy") {
+        console.log(`Re-run with --force after a factory update to refresh the copy (a symlink install tracks the checkout automatically).`);
+      }
+      console.log(`\nAsk your agent to "set up herdr-factory for this repo" — the skill runs the config interview, answers questions about the engine, and diagnoses a stuck factory.`);
     } catch (e) {
       fail(e);
     }
