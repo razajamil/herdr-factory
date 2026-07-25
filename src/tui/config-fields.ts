@@ -13,8 +13,9 @@ import { existsSync } from "node:fs";
 import { basename, isAbsolute, join } from "node:path";
 import type { Document } from "yaml";
 import { SOURCE_DESCRIPTORS, descriptorFor } from "../sources/registry.ts";
-import { STEP_DESCRIPTORS } from "../steps/registry.ts";
+import { STEP_DESCRIPTORS, stepDescriptorFor } from "../steps/registry.ts";
 import type { SourceType } from "../types.ts";
+import { layoutTargets, renameLayoutId, renamePaneTitle, renameSummary, renameTabTitle } from "./layout-refs.ts";
 import type { ChooseFn, ConfirmFn } from "./types.ts";
 
 export type Path = (string | number)[];
@@ -43,7 +44,11 @@ export type FieldDesc =
   | { kind: "group"; label: string; node: object; expanded: boolean; indent?: number; moveUp?: () => void; moveDown?: () => void }
   // `clearable`: blanking the field DELETES its key (vs. the default, which skips empties so a
   // required field can't be accidentally lost) — the only way to unset an optional scalar in place.
-  | { kind: "text"; label: string; path?: Path; env?: string; masked?: boolean; placeholder?: string; numeric?: boolean; clearable?: boolean; indent?: number }
+  // `renameRefs`: this field holds a NAME other config rows reference (a layout id, a tab/pane
+  // title). When the typed value differs from what's in the draft, the flush hands the (from, to)
+  // pair here so every belt/step reference is repointed in the same edit; returns a status line, or
+  // null when nothing referenced the old name. See layout-refs.ts.
+  | { kind: "text"; label: string; path?: Path; env?: string; masked?: boolean; placeholder?: string; numeric?: boolean; clearable?: boolean; indent?: number; renameRefs?: (from: string, to: string) => string | null }
   | { kind: "enum"; label: string; value: string; choices: string[]; apply: (next: string) => void; indent?: number }
   | { kind: "bool"; label: string; value: boolean; apply: (next: boolean) => void; indent?: number }
   | { kind: "ref"; label: string; value: string; choices: string[]; apply: (next: string) => void; indent?: number }
@@ -317,11 +322,25 @@ export function buildDescriptors(draft: Document, rebuild: () => void, ctx: Fiel
   // default_layout / layout_matching (in the belt section). Nested two levels deep: layout → tabs →
   // panes. The panel border/title labels the section, so no top-level header row here. ──
   if (section === "layouts") {
+    // Renaming a layout id / tab title / pane title REPOINTS every belt + step that referenced the
+    // old name (see layout-refs.ts), so the belts panel never has to be hand-synced against this one.
+    // The layout id and tab title are re-read from the draft when the rename runs (not captured at
+    // build time): the flush applies every typed edit before propagating, so renaming a layout AND
+    // one of its tabs in a single pass resolves against the names the draft now holds.
+    const layoutIdAt = (i: number) => String(draft.getIn(["layouts", i, "id"]) ?? "");
+    const tabTitleAt = (i: number, j: number) => String(draft.getIn(["layouts", i, "tabs", j, "title"]) ?? "");
     layouts.forEach((l, i) => {
       const tabs: any[] = Array.isArray(l?.tabs) ? l.tabs : [];
       d.push({ kind: "group", label: `${layoutIds[i]} [${tabs.length} tab${tabs.length === 1 ? "" : "s"}]`, node: node(["layouts", i]), expanded: isOpen(["layouts", i]), indent: 0, ...mover(["layouts"], i, layouts.length) });
       if (!isOpen(["layouts", i])) return;
-      d.push({ kind: "text", label: "id", path: ["layouts", i, "id"], placeholder: "app-dev", indent: 1 });
+      d.push({
+        kind: "text",
+        label: "id",
+        path: ["layouts", i, "id"],
+        placeholder: "app-dev",
+        indent: 1,
+        renameRefs: (from, to) => renameSummary("layout", from, to, renameLayoutId(draft, from, to)),
+      });
 
       // setup — an OPTIONAL layout-level command run once in the single `setup: true` pane before the
       // rest of the tabs spawn. Modelled as an add/remove block (flushInputs never deletes keys, so a
@@ -340,7 +359,15 @@ export function buildDescriptors(draft: Document, rebuild: () => void, ctx: Fiel
         const panes: any[] = Array.isArray(t?.panes) ? t.panes : [];
         d.push({ kind: "group", label: `${tabTitles[j]} (${panes.length} pane${panes.length === 1 ? "" : "s"})`, node: node(["layouts", i, "tabs", j]), expanded: isOpen(["layouts", i, "tabs", j]), indent: 1, ...mover(["layouts", i, "tabs"], j, tabs.length) });
         if (!isOpen(["layouts", i, "tabs", j])) return;
-        d.push({ kind: "text", label: "title", path: ["layouts", i, "tabs", j, "title"], placeholder: "work (a step's `tab` matches this)", clearable: true, indent: 2 });
+        d.push({
+          kind: "text",
+          label: "title",
+          path: ["layouts", i, "tabs", j, "title"],
+          placeholder: "work (a step's `tab` matches this)",
+          clearable: true,
+          indent: 2,
+          renameRefs: (from, to) => renameSummary("tab", from, to, renameTabTitle(draft, layoutIdAt(i), from, to)),
+        });
 
         // panes[] — each a herdr pane. The `title` is what a step's `pane` matches; an agent pane
         // (command: claude/opencode/…) is the one the step's prompt gets delivered to.
@@ -349,7 +376,15 @@ export function buildDescriptors(draft: Document, rebuild: () => void, ctx: Fiel
           const base: Path = ["layouts", i, "tabs", j, "panes", k];
           d.push({ kind: "group", label: paneTitles[k]!, node: node(base), expanded: isOpen(base), indent: 2, ...mover(["layouts", i, "tabs", j, "panes"], k, panes.length) });
           if (!isOpen(base)) return;
-          d.push({ kind: "text", label: "title", path: [...base, "title"], placeholder: "agent (a step's `pane` matches this)", clearable: true, indent: 3 });
+          d.push({
+            kind: "text",
+            label: "title",
+            path: [...base, "title"],
+            placeholder: "agent (a step's `pane` matches this)",
+            clearable: true,
+            indent: 3,
+            renameRefs: (from, to) => renameSummary("pane", from, to, renamePaneTitle(draft, layoutIdAt(i), tabTitleAt(i, j), from, to)),
+          });
           d.push({ kind: "text", label: "command", path: [...base, "command"], placeholder: "claude", clearable: true, indent: 3 });
           d.push({ kind: "bool", label: "setup", value: p?.setup === true, indent: 3, apply: (next) => { draft.setIn([...base, "setup"], next); rebuild(); } });
           // split — optional; a leading "(unset)" clears it (a tab's first pane ignores split anyway).
@@ -421,6 +456,17 @@ export function buildDescriptors(draft: Document, rebuild: () => void, ctx: Fiel
     });
     d.push({ kind: "action", label: "+ add layout_matching rule", indent: 1, run: () => { addToArray(["belt", i, "layout_matching"], { worktree_pattern: "", layout: layoutIds[0] ?? "" }); open(["belt", i, "layout_matching", rules.length]); rebuild(); } });
 
+    // Step→pane allocation choices. A step's tab/pane must name a LABELED pane of the belt's
+    // `default_layout` — the layout every factory-claimed worktree gets, and the one the loader
+    // validates each step's target against — so once a default_layout is picked, `tab` and `pane`
+    // below become pick-lists over that layout's real tabs/panes (choose a tab, then one of ITS
+    // panes) and allocating a step never needs a trip to the layouts panel [4]. With no
+    // default_layout there is nothing to enumerate (those panes come from outside the factory — a
+    // hand-built workspace, or a layout_matching layout the loader deliberately exempts), so the
+    // rows stay free text.
+    const beltLayout = b?.default_layout == null ? undefined : layouts.find((l) => String(l?.id ?? "") === String(b.default_layout));
+    const targets = layoutTargets(beltLayout);
+
     // steps[] — an ordered list of step-primitive references. `type` picks the primitive; a `custom`
     // step's prompt_file is its whole body (required), an engine-prompted step's is an optional augment.
     const stepNames = steps.map((s, j) => String(s?.name ?? s?.type ?? `step${j}`));
@@ -430,10 +476,64 @@ export function buildDescriptors(draft: Document, rebuild: () => void, ctx: Fiel
       if (!isOpen(["belt", i, "steps", j])) return;
       d.push({ kind: "enum", label: "type", value: stType, choices: STEP_TYPE_CHOICES, indent: 2, apply: (next) => { if (next !== stType) { draft.setIn(["belt", i, "steps", j, "type"], next); rebuild(); } } });
       d.push({ kind: "text", label: "name", path: ["belt", i, "steps", j, "name"], placeholder: `${stType} (defaults to type)`, indent: 2 });
-      // evidence runs ONLY when tab+pane target an existing layout agent; without them it's skipped.
-      const layoutHint = stType === "evidence" ? "(evidence runs only if tab+pane set; else skipped)" : "(optional; set with the other)";
-      d.push({ kind: "text", label: "tab", path: ["belt", i, "steps", j, "tab"], placeholder: layoutHint, clearable: true, indent: 2 });
-      d.push({ kind: "text", label: "pane", path: ["belt", i, "steps", j, "pane"], placeholder: layoutHint, clearable: true, indent: 2 });
+      // tab/pane — the layout pane this step is dispatched to (both-or-neither). A requiresLayout
+      // step (evidence) is SKIPPED entirely without one, which is easy to do by accident — say so.
+      const requiresLayout = stepDescriptorFor(stType)?.controls.posture?.requiresLayout === true;
+      const tabCur = st?.tab == null ? null : String(st.tab);
+      const paneCur = st?.pane == null ? null : String(st.pane);
+      if (requiresLayout && !(tabCur && paneCur)) {
+        d.push({ kind: "header", label: `↳ no tab/pane ⇒ this ${stType} step is SKIPPED (it only runs in a layout pane)`, level: 2, indent: 2 });
+      }
+      if (targets.length > 0) {
+        // Move both keys together, so the both-or-neither invariant can't be broken from here.
+        const setTarget = (tab: string | null, pane: string | null) => {
+          for (const [key, v] of [["tab", tab], ["pane", pane]] as const) {
+            if (v == null) draft.deleteIn(["belt", i, "steps", j, key]);
+            else draft.setIn(["belt", i, "steps", j, key], v);
+          }
+          rebuild();
+        };
+        // A value the layout doesn't define (a hand-edit, or a default_layout switch) stays in the
+        // list, so it's visible as the current value and can be cycled away from deliberately.
+        const withCur = (choices: string[], cur: string | null) => (cur == null || choices.includes(cur) ? choices : [cur, ...choices]);
+        const panesOf = (title: string | null) => targets.find((t) => t.tab === title)?.panes ?? [];
+        // Panes this belt's OTHER steps already sit in — the loader rejects two steps sharing one
+        // (the first dispatch relabels the pane), so the auto-pick below steps around them.
+        const claimed = new Set(steps.filter((_, k) => k !== j).map((s) => `${String(s?.tab ?? "")}\0${String(s?.pane ?? "")}`));
+        d.push({
+          kind: "enum",
+          label: "tab",
+          value: tabCur ?? "(unset)",
+          choices: withCur(["(unset)", ...targets.map((t) => t.tab)], tabCur),
+          indent: 2,
+          apply: (next) => {
+            if (next === "(unset)") return setTarget(null, null); // clears the pair
+            // Keep the pane when the chosen tab has one by that title; else land on its first
+            // unclaimed pane, so a single pick leaves a complete target the loader accepts.
+            const panes = panesOf(next);
+            const free = panes.find((p) => !claimed.has(`${next}\0${p}`));
+            setTarget(next, paneCur && panes.includes(paneCur) ? paneCur : (free ?? panes[0] ?? paneCur));
+          },
+        });
+        d.push({
+          kind: "enum",
+          label: "pane",
+          value: paneCur ?? "(unset)",
+          choices: withCur(["(unset)", ...panesOf(tabCur)], paneCur), // the SELECTED tab's panes
+          indent: 2,
+          apply: (next) => (next === "(unset)" ? setTarget(null, null) : setTarget(tabCur, next)),
+        });
+      } else {
+        // Free text: no default_layout, or one whose tabs/panes are untitled — herdr addresses a pane
+        // by title, so an untitled one is unreachable and there is nothing to offer.
+        const layoutHint = beltLayout
+          ? `layout "${String(b.default_layout)}" has no titled panes — title a tab + pane in [4]`
+          : requiresLayout
+            ? "(runs only if tab+pane set; else skipped)"
+            : "(optional; set with the other)";
+        d.push({ kind: "text", label: "tab", path: ["belt", i, "steps", j, "tab"], placeholder: layoutHint, clearable: true, indent: 2 });
+        d.push({ kind: "text", label: "pane", path: ["belt", i, "steps", j, "pane"], placeholder: layoutHint, clearable: true, indent: 2 });
+      }
       d.push({ kind: "text", label: "prompt_file", path: ["belt", i, "steps", j, "prompt_file"], placeholder: stType === "custom" ? "prompts/step.md (required)" : "(optional augment)", clearable: true, indent: 2 });
       d.push(optionalSource(["belt", i, "steps", j, "prompt_file_source"], st?.prompt_file_source, draft, rebuild, 2));
       // Referenced-file assist: a `config`-sourced prompt_file is existence-checked on save. Offer to

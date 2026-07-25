@@ -207,6 +207,226 @@ layouts:
   });
 });
 
+// ── step → layout-pane allocation: with a default_layout picked, a step's tab/pane are pick-lists
+// over THAT layout's real tabs/panes (and the pane list follows the chosen tab), so allocating a step
+// never means flipping back to the layouts panel to recall a title. ──
+describe("config-fields: step tab/pane pick from the belt's default_layout", () => {
+  const allocDoc = (step = "{ type: work, tab: work, pane: agent }") =>
+    parseDocument(`work_sources: []
+belt:
+  - name: b
+    source: s
+    default_layout: app-dev
+    steps: [${step}]
+layouts:
+  - id: app-dev
+    tabs:
+      - title: work
+        panes: [{ title: agent, command: claude }, { title: server, command: mise run dev }]
+      - title: review
+        panes: [{ title: agent, command: claude }]
+      - title: logs
+        panes: [{ command: tail -f log }]
+`);
+  /** The step's tab/pane rows (belt + step 0 expanded), by label. */
+  const rowFor = (d: Document, label: "tab" | "pane"): FieldDesc => {
+    const f = beltStepFields(d).find((x) => x.label === label);
+    if (!f) throw new Error(`expected a ${label} row`);
+    return f;
+  };
+  const enumFor = (d: Document, label: "tab" | "pane"): Extract<FieldDesc, { kind: "enum" }> => {
+    const f = rowFor(d, label);
+    if (f.kind !== "enum") throw new Error(`expected the ${label} row to be a pick-list, got ${f.kind}`);
+    return f;
+  };
+
+  it("offers the layout's titled tabs (an untitled-pane tab is unaddressable, so it's not offered)", () => {
+    expect(enumFor(allocDoc(), "tab").choices).toEqual(["(unset)", "work", "review"]);
+  });
+
+  it("offers only the SELECTED tab's panes", () => {
+    expect(enumFor(allocDoc(), "pane").choices).toEqual(["(unset)", "agent", "server"]);
+    expect(enumFor(allocDoc("{ type: work, tab: review, pane: agent }"), "pane").choices).toEqual(["(unset)", "agent"]);
+  });
+
+  it("picking a tab keeps a pane that tab has", () => {
+    const d = allocDoc("{ type: work, tab: work, pane: agent }");
+    enumFor(d, "tab").apply("review");
+    expect(d.getIn(["belt", 0, "steps", 0, "tab"])).toBe("review");
+    expect(d.getIn(["belt", 0, "steps", 0, "pane"])).toBe("agent");
+  });
+
+  it("picking a tab lands on its first pane when the current one isn't in it (target stays complete)", () => {
+    const d = allocDoc("{ type: work, tab: work, pane: server }");
+    enumFor(d, "tab").apply("review");
+    expect(d.getIn(["belt", 0, "steps", 0, "pane"])).toBe("agent");
+    // …and the loader's step→pane allocation check has nothing to complain about.
+    const issues = RepoConfigSchema.safeParse(d.toJS()).error?.issues ?? [];
+    expect(issues.filter((i) => i.path.includes("pane"))).toEqual([]);
+  });
+
+  it("steps around a pane a sibling step already claims (one agent pane per step)", () => {
+    // step 0 sits in work/agent, so allocating step 1 to the `work` tab lands it on work/server.
+    const d = allocDoc("{ type: work, tab: work, pane: agent }, { type: review }");
+    const expanded = new WeakSet<object>();
+    expanded.add(d.getIn(["belt", 0]) as object);
+    expanded.add(d.getIn(["belt", 0, "steps", 1]) as object);
+    const tab = buildDescriptors(d, () => {}, ctx(), expanded, "belt").find((f) => f.kind === "enum" && f.label === "tab");
+    if (tab?.kind !== "enum") throw new Error("expected the tab pick-list");
+    tab.apply("work");
+    expect(d.getIn(["belt", 0, "steps", 1, "pane"])).toBe("server");
+  });
+
+  it("(unset) on either row clears the pair (tab/pane are both-or-neither)", () => {
+    for (const label of ["tab", "pane"] as const) {
+      const d = allocDoc();
+      enumFor(d, label).apply("(unset)");
+      expect(d.getIn(["belt", 0, "steps", 0, "tab"])).toBeUndefined();
+      expect(d.getIn(["belt", 0, "steps", 0, "pane"])).toBeUndefined();
+    }
+  });
+
+  it("picking a pane leaves the tab alone", () => {
+    const d = allocDoc();
+    enumFor(d, "pane").apply("server");
+    expect(d.getIn(["belt", 0, "steps", 0, "tab"])).toBe("work");
+    expect(d.getIn(["belt", 0, "steps", 0, "pane"])).toBe("server");
+  });
+
+  it("keeps a target the layout no longer defines as the current value, so it can be cycled away from", () => {
+    const d = allocDoc("{ type: work, tab: gone, pane: ghost }");
+    expect(enumFor(d, "tab").choices).toEqual(["gone", "(unset)", "work", "review"]);
+    expect(enumFor(d, "tab").value).toBe("gone");
+    expect(enumFor(d, "pane").choices).toEqual(["ghost", "(unset)"]); // no tab match ⇒ no pane list
+  });
+
+  it("falls back to free text with no default_layout (the panes come from outside the factory)", () => {
+    const d = parseDocument(`work_sources: []
+belt: [{ name: b, source: s, steps: [{ type: work }] }]
+layouts: [{ id: app-dev, tabs: [{ title: work, panes: [{ title: agent }] }] }]
+`);
+    for (const label of ["tab", "pane"] as const) {
+      const f = rowFor(d, label);
+      if (f.kind !== "text") throw new Error(`expected a free-text ${label} row`);
+      expect(f.clearable).toBe(true);
+    }
+  });
+
+  it("falls back to free text when the belt's layout has no titled panes at all", () => {
+    const d = parseDocument(`work_sources: []
+belt: [{ name: b, source: s, default_layout: bare, steps: [{ type: work }] }]
+layouts: [{ id: bare, tabs: [{ panes: [{ command: claude }] }] }]
+`);
+    const f = rowFor(d, "tab");
+    if (f.kind !== "text") throw new Error("expected a free-text tab row");
+    expect(f.placeholder).toContain("no titled panes");
+  });
+
+  it("warns that a requiresLayout step (evidence) is skipped while its tab/pane are unset", () => {
+    const skipped = beltStepFields(allocDoc("{ type: evidence }")).find((f) => f.kind === "header" && f.label.includes("SKIPPED"));
+    expect(skipped).toBeDefined();
+    const allocated = beltStepFields(allocDoc("{ type: evidence, tab: work, pane: agent }")).find((f) => f.kind === "header" && f.label.includes("SKIPPED"));
+    expect(allocated).toBeUndefined();
+  });
+});
+
+// ── renaming a layout id / tab title / pane title repoints every belt + step that referenced the old
+// name, so section [5] never has to be hand-synced against section [4]. ──
+describe("config-fields: a layout rename repoints its belt references", () => {
+  const doc = () =>
+    parseDocument(`work_sources: []
+belt:
+  - name: b
+    source: s
+    default_layout: app-dev
+    layout_matching: [{ worktree_pattern: "hotfix/*", layout: app-dev }]
+    steps:
+      - { type: work, tab: work, pane: agent }
+      - { type: review, tab: work, pane: reviewer }
+      - { type: pr }
+layouts:
+  - id: app-dev
+    tabs:
+      - title: work
+        panes: [{ title: agent, command: claude }, { title: reviewer, command: claude }]
+`);
+  /** A layouts-section `title`/`id` text row, identified by its exact path. */
+  const nameRow = (d: Document, path: (string | number)[]): Extract<FieldDesc, { kind: "text" }> => {
+    const open = [["layouts", 0], ["layouts", 0, "tabs", 0], ["layouts", 0, "tabs", 0, "panes", 0], ["layouts", 0, "tabs", 0, "panes", 1]];
+    const f = layoutFields(d, open).find((x) => x.kind === "text" && JSON.stringify(x.path) === JSON.stringify(path));
+    if (f?.kind !== "text") throw new Error(`expected a text row at ${path.join(".")}`);
+    return f;
+  };
+  const steps = (d: Document) => (d.toJS() as any).belt[0].steps;
+
+  it("renaming a layout id repoints default_layout AND every layout_matching rule", () => {
+    const d = doc();
+    const msg = nameRow(d, ["layouts", 0, "id"]).renameRefs!("app-dev", "web");
+    expect(d.getIn(["belt", 0, "default_layout"])).toBe("web");
+    expect(d.getIn(["belt", 0, "layout_matching", 0, "layout"])).toBe("web");
+    expect(msg).toContain("repointed 2 references");
+  });
+
+  it("renaming a tab title repoints every step allocated to that tab", () => {
+    const d = doc();
+    const msg = nameRow(d, ["layouts", 0, "tabs", 0, "title"]).renameRefs!("work", "code");
+    expect(steps(d).map((s: any) => s.tab)).toEqual(["code", "code", undefined]);
+    expect(msg).toContain("repointed 2 references");
+  });
+
+  it("renaming a pane title repoints only the steps aimed at THAT pane", () => {
+    const d = doc();
+    nameRow(d, ["layouts", 0, "tabs", 0, "panes", 1, "title"]).renameRefs!("reviewer", "review-agent");
+    expect(steps(d).map((s: any) => s.pane)).toEqual(["agent", "review-agent", undefined]);
+  });
+
+  it("resolves a tab/pane rename against the layout's CURRENT id (both renamed in one pass)", () => {
+    const d = doc();
+    // The flush applies typed values before propagating, so the id row's own value has already moved.
+    d.setIn(["layouts", 0, "id"], "web");
+    nameRow(d, ["layouts", 0, "id"]).renameRefs!("app-dev", "web");
+    nameRow(d, ["layouts", 0, "tabs", 0, "title"]).renameRefs!("work", "code");
+    expect(d.getIn(["belt", 0, "default_layout"])).toBe("web");
+    expect(steps(d)[0].tab).toBe("code");
+  });
+
+  it("keeps a renamed tab's step targets loadable (the whole point: an unsynced rename fails to save)", () => {
+    const d = parseDocument(`repo: { path: /tmp/x, base_ref: origin/main }
+work_sources: [{ type: local_markdown, name: s, local_markdown: { folder: /tmp/briefs } }]
+belt: [{ name: b, source: s, default_layout: app-dev, steps: [{ type: work, tab: work, pane: agent }] }]
+layouts: [{ id: app-dev, tabs: [{ title: work, panes: [{ title: agent, command: claude }] }] }]
+`);
+    expect(RepoConfigSchema.safeParse(d.toJS()).success).toBe(true);
+    // The rename alone (what a flush writes) leaves the step aimed at a pane the layout no longer
+    // defines — the loader's allocation check rejects it…
+    d.setIn(["layouts", 0, "tabs", 0, "title"], "code");
+    expect(RepoConfigSchema.safeParse(d.toJS()).success).toBe(false);
+    // …and the propagation the flush queues alongside it puts the config back in a loadable state.
+    nameRow(d, ["layouts", 0, "tabs", 0, "title"]).renameRefs!("work", "code");
+    expect(RepoConfigSchema.safeParse(d.toJS()).success).toBe(true);
+  });
+
+  it("reports nothing when no belt referenced the old name", () => {
+    const d = doc();
+    expect(nameRow(d, ["layouts", 0, "tabs", 0, "panes", 0, "title"]).renameRefs!("agent", "worker")).toContain("repointed 1");
+    // A second layout nobody points at: renaming its tab moves nothing, so there's no status line.
+    const other = parseDocument("work_sources: []\nbelt: []\nlayouts: [{ id: solo, tabs: [{ title: t, panes: [{ title: p }] }] }]\n");
+    expect(nameRow(other, ["layouts", 0, "tabs", 0, "title"]).renameRefs!("t", "t2")).toBeNull();
+  });
+
+  it("leaves an AMBIGUOUS step reference alone (another layout the belt uses defines the same target)", () => {
+    const d = doc();
+    // The belt also matches `hotfix/*` onto a second layout that defines work/agent — which layout
+    // step 0 meant can't be known, so the rename skips it (and says so) rather than guessing.
+    d.setIn(["belt", 0, "layout_matching", 0, "layout"], "hotfix");
+    d.addIn(["layouts"], d.createNode({ id: "hotfix", tabs: [{ title: "work", panes: [{ title: "agent" }] }] }));
+    const msg = nameRow(d, ["layouts", 0, "tabs", 0, "title"]).renameRefs!("work", "code");
+    expect(steps(d).map((s: any) => s.tab)).toEqual(["work", "code", undefined]); // step 1 (work/reviewer) is unique to app-dev
+    expect(msg).toContain("repointed 1 reference");
+    expect(msg).toContain("1 left alone");
+  });
+});
+
 const sentryDoc = () =>
   parseDocument(`work_sources:
   - type: sentry

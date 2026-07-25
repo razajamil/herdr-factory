@@ -1147,7 +1147,14 @@ cursor.
   the same annotated placeholders) and opens it for editing, so a zero-repo install bootstraps its
   first repo entirely in the TUI. Adding a belt offers a **pipeline preset** — *ticket → PR*
   (work → review → pr, with the pickup `label` seeded for a label-driven source) or a *custom
-  pipeline* — and `+ add step` defaults to `work`. When a step's `config`-sourced `prompt_file` or a
+  pipeline* — and `+ add step` defaults to `work`. Steps are **allocated to layout panes by picking,
+  not typing**: once a belt has a `default_layout`, each step's `tab` and `pane` become pick-lists over
+  that layout's real tabs and panes — the pane list follows the chosen tab, and choosing a tab lands on
+  one of its panes, so the both-or-neither pair is always complete and `[4]`/`[5]` never need
+  cross-referencing (with no `default_layout` there's nothing to enumerate, so they stay free text).
+  Renaming a layout id, tab title, or pane title in `[4]` **repoints every belt and step that
+  referenced it** and reports what moved — the one case it won't guess is a target two of the same
+  belt's layouts both define (left alone, and flagged). When a step's `config`-sourced `prompt_file` or a
   belt's `match` names a file that doesn't exist yet, the editor offers to **create it with a
   commented stub** so the save it just set up can't fail on a missing reference; the optional
   `guidelines-prompt.md` is editable inline as a multiline buffer. Credentials appear as masked,

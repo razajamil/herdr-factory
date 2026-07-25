@@ -43,6 +43,13 @@ interface RowRef {
   setHighlighted: (on: boolean) => void;
 }
 
+/** A rename a flush turned up (a layout id / tab / pane title whose typed value differs from the
+ *  draft's): run it to repoint every belt/step reference and get back a status line (null = nothing
+ *  referenced the old name). Flushes COLLECT these and the editor runs them once every panel has
+ *  committed its text — running one mid-flush would let a not-yet-flushed row holding the OLD name
+ *  write it straight back over the propagation. */
+type PendingRename = () => string | null;
+
 /** Shared state + callbacks the editor hands to each accordion panel. The panels own their own row
  *  list and highlight; everything below is common (one draft, one env map, one collapse WeakSet). */
 interface PanelCtx {
@@ -53,6 +60,8 @@ interface PanelCtx {
   secretSet: (envKey: string, v: string) => void;
   /** Commit every panel's typed edits into the draft/env before a structural rebuild. */
   flushAll: () => void;
+  /** Run the renames a panel-local flush collected (repoint references + rebuild + report). */
+  propagateRenames: (pending: PendingRename[]) => void;
   markUnsaved: () => void;
   setStatus: (content: string, fg: string) => void;
   /** Make section `n` the active + sole-expanded panel (used by mouse clicks). */
@@ -64,7 +73,8 @@ interface FieldPanel {
   outer: BoxRenderable;
   /** Rebuild rows from the current draft, preserving the highlighted index. */
   render: () => void;
-  flushInputs: () => void;
+  /** Commit this panel's typed edits; returns the renames they imply for the caller to propagate. */
+  flushInputs: () => PendingRename[];
   /** Focus this panel's scroll and re-apply its highlight. */
   focusInto: () => void;
   setExpanded: (on: boolean) => void;
@@ -262,10 +272,12 @@ function createFieldPanel(
     scroll.scrollChildIntoView(focusRows[browseIndex]!.container.id);
   }
 
-  /** Commit this panel's visible text fields into the draft (so nothing is lost on rebuild/save). */
-  function flushInputs(): void {
+  /** Commit this panel's visible text fields into the draft (so nothing is lost on rebuild/save),
+   *  returning the reference-repointing renames the new values imply (see PendingRename). */
+  function flushInputs(): PendingRename[] {
     const draft = ctx.getDraft();
-    if (!draft) return;
+    if (!draft) return [];
+    const renames: PendingRename[] = [];
     for (const r of focusRows) {
       if (r.desc.kind !== "text" || !r.input) continue;
       const d = r.desc;
@@ -283,14 +295,22 @@ function createFieldPanel(
         continue;
       }
       const value = d.numeric && Number.isFinite(Number(t)) ? Number(t) : t;
+      // A referenced NAME that actually changed (a layout id / tab / pane title): queue the
+      // propagation. Deferred, not run here — see PendingRename.
+      const from = String(draft.getIn(d.path!) ?? "");
+      if (d.renameRefs && from !== "" && from !== String(value)) {
+        const propagate = d.renameRefs;
+        renames.push(() => propagate(from, String(value)));
+      }
       draft.setIn(d.path!, value);
     }
+    return renames;
   }
 
   // Expand/collapse a group. View-only (doesn't touch the config), so it flushes this panel's edits
   // and re-renders it without marking unsaved. Group nodes live in exactly one panel.
   function toggleGroup(node: object): void {
-    flushInputs();
+    ctx.propagateRenames(flushInputs());
     if (ctx.expandedNodes.has(node)) ctx.expandedNodes.delete(node);
     else ctx.expandedNodes.add(node);
     render();
@@ -307,7 +327,8 @@ function createFieldPanel(
   }
 
   function moveHighlight(target: number, edit: boolean): void {
-    flushInputs();
+    // A rename here rebuilds every panel (focusRows is replaced), so re-read it below — never cache.
+    ctx.propagateRenames(flushInputs());
     if (focusRows.length === 0) return;
     setHighlight(target);
     const row = focusRows[browseIndex];
@@ -560,7 +581,20 @@ export function createConfigEditor(renderer: CliRenderer, modals: EditorModals):
   const activePanel = () => panels.find((p) => p.section === activeSection);
 
   function flushAll(): void {
-    for (const p of panels) p.flushInputs();
+    const pending: PendingRename[] = [];
+    for (const p of panels) pending.push(...p.flushInputs());
+    propagateRenames(pending);
+  }
+
+  /** Repoint the references a rename left behind (a layout id / tab / pane title the belts point at),
+   *  then re-render so the belts panel shows the new names, and say what moved. Runs only after every
+   *  panel has flushed, so no stale row can write the old name back over the propagation. */
+  function propagateRenames(pending: PendingRename[]): void {
+    if (pending.length === 0) return;
+    const moved = pending.map((r) => r()).filter((m): m is string => m != null);
+    if (moved.length === 0) return; // renamed, but nothing referenced the old name
+    rebuildAll();
+    setStatus(`● ${moved.join(" · ")} — ^S to save`, theme.status.warn);
   }
 
   // Regenerate rows across ALL panels after a STRUCTURAL change (add/remove/type-switch/reorder) —
@@ -602,6 +636,7 @@ export function createConfigEditor(renderer: CliRenderer, modals: EditorModals):
     secretGet,
     secretSet,
     flushAll,
+    propagateRenames: (pending) => propagateRenames(pending),
     markUnsaved,
     setStatus,
     focusSection: (n) => focusSection(n),

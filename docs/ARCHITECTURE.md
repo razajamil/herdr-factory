@@ -1334,7 +1334,10 @@ about to revert. It's driven two ways:
   the layout's actual panes in the message instead of surfacing at runtime as a layout-wait park
   (a belt with no `default_layout` is skipped — its panes come from outside the factory — and
   `layout_matching` targets are exempt, since those rules commonly serve hand-created worktrees
-  whose layouts legitimately omit the step panes),
+  whose layouts legitimately omit the step panes; the TUI editor mirrors this rule as *pick-lists* —
+  a step's tab/pane are chosen from the belt's `default_layout`, and renaming a layout id / tab /
+  pane title repoints every belt + step reference in the same edit, so this check fires on
+  hand-edits, not on the editor's own output — `src/tui/layout-refs.ts`),
   `{{work_id}}` in `workspace_name`, and `match` / `config`-sourced `prompt_file` existence — all
   with readable errors. The work-source *clients* are constructed in `build-deps.ts`'s `buildDeps` via each
   type's registry descriptor (`descriptorFor(type).create(ctx)` — the ctx carries the env map,
