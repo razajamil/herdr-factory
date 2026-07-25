@@ -12,6 +12,23 @@ right, an earlier step reworks — until the evidence and the change agree. Reac
 `@@STEP_DONE_CMD@@` is not the goal; proving the change is. Weak, ambiguous, partial, or illegible
 evidence is a **bounce or a recapture — never a pass**.
 
+## Follow this repo's own guidance first
+
+How this app is run, signed into, and driven is the **repo's** knowledge, not this prompt's. Before
+you capture anything, read its `CLAUDE.md` / `AGENTS.md` (including nested, directory-level ones),
+its agent skills and commands (e.g. a `playwright-cli` / browser-automation or dev-server skill
+under `.claude/`), `CONTRIBUTING.md`, and its runbooks under `docs/`, and **prefer what they say
+over the generic advice below** — the dev-server and seed/reset commands, the test accounts and
+personas, and the capture tooling (how to drive the browser, viewport and resolution, video and
+screenshot settings, selectors, any auth shortcut). Where the repo is silent, the defaults below
+apply.
+
+The factory's protocol is not overridable by repo guidance: the capture slot lock, the
+capture-attempt signal, the publish command, staying read-only (no commits — the engine parks the
+run if this branch's HEAD moves), and the per-criterion verdict / pass-or-bounce decision below are
+all ours. If repo guidance conflicts with them, follow this prompt and record the conflict in your
+handoff.
+
 ## Do
 1. **Derive the test plan first — before you touch the app.** You cannot prove a change you haven't
    defined; capturing before you know what you're looking for is why evidence ends up aimless.
@@ -29,8 +46,8 @@ evidence is a **bounce or a recapture — never a pass**.
      response, a log line), run `@@STEP_DONE_CMD@@`, and skip the capture. "It's just backend/config"
      is not by itself a reason to skip — most such changes still have an observable effect.
 2. **Set up the right environment — and the right account.** The change is only proven if you drive
-   it in the state the item assumes. Follow the repo's own conventions here — read its `CLAUDE.md` /
-   `AGENTS.md`, runbooks, and skills for:
+   it in the state the item assumes. Follow the repo's own conventions here (see above) — its
+   `CLAUDE.md` / `AGENTS.md`, runbooks, and skills for:
    - **How to run it deterministically:** the correct dev-server command, ports, required env, and
      any seed / reset / fixture step that puts data into a known state.
    - **Who to sign in as:** the documented test credentials / seeded accounts, and **which persona,
@@ -46,19 +63,23 @@ evidence is a **bounce or a recapture — never a pass**.
 3. **Capture the change, not the app.** Acquire the shared capture slot
    (`@@CAPTURE_LOCK_ACQUIRE_CMD@@`) and, at the start of each capture attempt, signal it with
    `@@CAPTURE_ATTEMPT_CMD@@` (the engine caps runaway re-capture loops). With the app running in the
-   state above, drive it with `playwright-cli` and capture into `@@EVIDENCE_DIR@@/`. Then stop the
+   state above, drive it and capture into `@@EVIDENCE_DIR@@/` — with the repo's own capture tooling
+   if it documents one (a `playwright-cli`/browser skill and its settings), else `playwright-cli`
+   directly. Then stop the
    server and **always** release the lock (`@@CAPTURE_LOCK_RELEASE_CMD@@`), even if capture
    failed. `@@EVIDENCE_DIR@@` is scratch — **never commit it.** Make the capture *prove* the change:
    - Work from your test plan as a **shot list**: each beat is one deliberate action and the criterion
      it proves. Do one legible action at a time, wait for content to settle (no loading-spinner
-     dead-time), and use a **wide, deterministic desktop viewport** (≈1920×1080) so the *whole app
-     is in frame* — never a cropped or zoomed-in region. Don't improvise or wander the UI.
+     dead-time), and use a **wide, deterministic desktop viewport** — the one the repo's capture
+     guidance specifies, else ≈1920×1080 — so the *whole app is in frame*, never a cropped or
+     zoomed-in region. Don't improvise or wander the UI.
    - **Show the contrast.** Capture a **before** state as well as the **after** so the difference is
      unmistakable — use the repro in `@@MEMORY_DIR@@/attachments/` as the "before" when one exists.
    - Record a short **video** of each interaction (trigger → result) end to end, plus a still **PNG**
-     for each criterion. Capture the **full browser window** at a legible desktop resolution — record
-     at the viewport's native size (don't let the tool downscale it) so text stays readable, and never
-     a cropped or magnified slice. If the surface isn't a browser UI (CLI/API/service), capture the real
+     for each criterion. Capture the **full browser window** at a legible desktop resolution — where
+     the repo's capture guidance sets a recording size, use it; otherwise record at the viewport's
+     native size (don't let the tool downscale it) so text stays readable — and never a cropped or
+     magnified slice. If the surface isn't a browser UI (CLI/API/service), capture the real
      observable output instead — terminal session, API response, log — not a forced browser shot.
    - **Never capture secrets** — real passwords, tokens, session URLs, or customer PII — into assets;
      these get published. If a take is flaky or aimless, **re-record it** within the same attempt: a

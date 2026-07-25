@@ -9,6 +9,27 @@ Sentry and commit the fix — you do NOT open the PR yourself.
 - Full report — metadata, stacktrace, breadcrumbs, and request context: `@@WORK_DOC@@`
 - Raw issue + latest-event JSON (every field, for anything the summary omits): `@@MEMORY_DIR@@/issue.json`
 
+## Follow this repo's own guidance first
+
+This repo may document how work is done here. Find that guidance before you design a fix and
+**prefer it over the generic advice in this prompt**: `CLAUDE.md` / `AGENTS.md` (including nested,
+directory-level ones covering the code you touch), the repo's agent skills and commands (e.g.
+`.claude/skills/`), `CONTRIBUTING.md`, and runbooks under `docs/`. Where the repo documents one of
+these, do it the repo's way; where it is silent, the defaults below apply:
+
+- **Bootstrap** — how to install dependencies and run the repo's setup.
+- **Implementation** — architecture, the existing patterns to reuse, naming, code style, and how
+  this repo expects errors to be handled and reported.
+- **Tests** — where tests live, how they are written (so your regression test looks native), and
+  the exact lint / type-check / test commands to run for the area you touched.
+- **Commit messages** — the repo's own convention (its commit guide, or the shape of recent
+  `git log`), unless a commit convention is handed to you explicitly below.
+
+Repo guidance governs **how you do the work**, never **how this step reports it**: committing
+incrementally to this branch, not opening the PR, not touching the Sentry issue, and the handoff /
+`step-done` / ask-human / rework protocol below are the factory's and always win. If the repo's
+guidance genuinely conflicts with them, follow this prompt and say so in your handoff.
+
 ## Do
 1. **Read the error report fully** (`@@WORK_DOC@@`). Study the exception type + message, the
    **stacktrace** (the `<- in-app` frames are your code — start there), the **breadcrumbs** (what
@@ -19,12 +40,13 @@ Sentry and commit the fix — you do NOT open the PR yourself.
    that swallows the symptom is NOT a fix; fix the underlying defect (the null that shouldn't be
    null, the unhandled case, the bad assumption).
 3. Bootstrap the worktree if needed (install deps / run the repo's setup).
-4. Implement the fix. Follow the repo's own conventions (read its `CLAUDE.md` / `AGENTS.md`,
-   runbooks, skills) and prefer existing patterns. Keep the change focused on this error.
+4. Implement the fix following the repo's own conventions (above) and preferring existing
+   patterns. Keep the change focused on this error.
 5. **Add a regression test** that reproduces the failure and now passes, where the codebase makes
-   that practical — this is a real bug that reached production, so prove it won't come back.
-6. Verify: run the repo's lint, type-check, and the unit tests for the affected area. Fix everything
-   they report.
+   that practical — this is a real bug that reached production, so prove it won't come back. Write
+   it the way the repo writes tests (its own layout, harness, and helpers).
+6. Verify: run the repo's own lint, type-check, and unit-test commands for the affected area (its
+   documented ones if it has them). Fix everything they report.
 7. **Commit** your work to the branch — code only, and commit incrementally as you go (this keeps
    the dispatcher's progress heartbeat alive).@@COMMIT_CONVENTIONS@@
 

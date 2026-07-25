@@ -101,7 +101,10 @@ function commitConventionsBlock(deps: Deps): string {
   }
   text = text.trim();
   if (!text) return "";
-  return `\n\n**Commit-message conventions** (this repo's own — apply them to every commit message):\n\n${text}`;
+  return (
+    `\n\n**Commit-message conventions** (configured for this repo — apply them to every commit message; ` +
+    `where they disagree with a convention the repo's own docs suggest, these win):\n\n${text}`
+  );
 }
 
 // --- @@PR_OPTIONS@@ / @@PR_AUTOMATED_ROUND@@: the belt-level `pr:` behavior block ----------------
@@ -381,6 +384,12 @@ function scaffold(
     `\n\n## You are an agent in a herdr-factory belt\n` +
     `You are the **${step.name}** step of the **${belt.name}** belt. The belt runs these steps in order: ${seq}. ` +
     `Each step is a separate agent in its own herdr pane; you hand work forward via a handoff note (and can query earlier agents directly).\n` +
+    // Precedence, stated once for EVERY step (custom steps included, whose prompt is entirely the
+    // user's): the target repo's own docs/skills own the craft, this prompt owns the belt protocol.
+    `The target repo's own instructions — its \`CLAUDE.md\` / \`AGENTS.md\`, agent skills, \`CONTRIBUTING.md\`, runbooks — govern **how** you do the work: ` +
+    `prefer them over generic advice, and fall back to this prompt where they are silent. They never override the factory protocol described here ` +
+    `(the posture this prompt gives you, the handoff note, \`step-done\`, asking a human, sending work back for rework, and the work item's status — which the dispatcher owns). ` +
+    `If the two genuinely conflict, follow this prompt and note the conflict in your handoff.\n` +
     inputs +
     readOnlyNote +
     `\n## Asking a human for guidance\n` +

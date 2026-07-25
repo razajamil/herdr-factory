@@ -764,7 +764,8 @@ describe("@@PR_TEMPLATE@@ + @@COMMIT_CONVENTIONS@@ (end-to-end render of the shi
 
 describe("belt-level pr: behavior block (end-to-end render of the shipped pr prompt)", () => {
   const shippedPr = readFileSync(new URL("../src/prompts/pr.md", import.meta.url), "utf8");
-  // A verbatim copy of pr.md from BEFORE the pr: block existed — the byte-identity ground truth.
+  // pr.md written as it was BEFORE the pr: block existed (literal step 2, no @@PR_OPTIONS@@) — the
+  // byte-identity ground truth; its prose tracks pr.md, only the pr: tokenization is held back.
   const legacyPr = readFileSync(new URL("./fixtures/pr-prompt.legacy.md", import.meta.url), "utf8");
 
   const renderPr = async (pr: BeltRuntime["pr"]) => {

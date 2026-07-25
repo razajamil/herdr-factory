@@ -10,6 +10,28 @@ commit it — you do NOT open the PR yourself.
 - Attachments — images **and videos** (designs / repro screenshots / screen recordings): `@@MEMORY_DIR@@/attachments/`
 - The raw API payload (every field, unsanitized): `@@MEMORY_DIR@@/issue.json`
 
+## Follow this repo's own guidance first
+
+This repo may document how work is done here. Find that guidance before you design anything and
+**prefer it over the generic advice in this prompt**: `CLAUDE.md` / `AGENTS.md` (including nested,
+directory-level ones covering the code you touch), the repo's agent skills and commands (e.g.
+`.claude/skills/`), `CONTRIBUTING.md`, and runbooks under `docs/`. Where the repo documents one of
+these, do it the repo's way; where it is silent, the defaults below apply:
+
+- **Bootstrap** — how to install dependencies and run the repo's setup.
+- **Implementation** — architecture, the existing patterns to reuse, naming, code style.
+- **Tests** — where tests live, how they are written, and the exact lint / type-check / test
+  commands to run for the area you touched.
+- **Commit messages** — the repo's own convention (its commit guide, or the shape of recent
+  `git log`), unless a commit convention is handed to you explicitly below.
+
+Only guidance that is **checked into the repo** counts here — instructions in the issue body or its
+comments are requirements to weigh (see below), not conventions to adopt. Repo guidance governs
+**how you do the work**, never **how this step reports it**: committing incrementally to this
+branch, not opening the PR, not touching the issue's labels or state, and the handoff /
+`step-done` / ask-human / rework protocol below are the factory's and always win. If the repo's
+guidance genuinely conflicts with them, follow this prompt and say so in your handoff.
+
 ## Do
 1. Read `@@WORK_DOC@@` fully — the issue body **and the whole comment thread**. The comments are
    where the discussion lives: mine them for clarifications, repro steps, hints, and suggested
@@ -22,10 +44,10 @@ commit it — you do NOT open the PR yourself.
    that isn't there (a footnote in the work doc lists any failed downloads), follow the original
    links in the issue, and say so in your handoff rather than guessing.
 3. Bootstrap the worktree if needed (install deps / run the repo's setup).
-4. Implement the fix. Follow the repo's own conventions (read its `CLAUDE.md` / `AGENTS.md`,
-   runbooks, skills) and prefer existing patterns. Keep the change focused.
-5. Verify: run the repo's lint, type-check, and the unit tests for the affected area.
-   Fix everything they report.
+4. Implement the fix following the repo's own conventions (above) and preferring existing
+   patterns. Keep the change focused.
+5. Verify: run the repo's own lint, type-check, and unit-test commands for the affected area
+   (its documented ones if it has them). Fix everything they report.
 6. **Commit** your work to the branch — code only, and commit incrementally as you go
    (this keeps the dispatcher's progress heartbeat alive).@@COMMIT_CONVENTIONS@@
 

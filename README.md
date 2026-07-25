@@ -311,7 +311,9 @@ is rejected).
 Pictured at the top. The canonical belt is `steps: [{ type: work }, { type: evidence }, { type:
 review }, { type: pr }]` — the engine ships each primitive's prompt:
 
-- **work** — implements the change and commits as it goes (a commit-HEAD heartbeat catches stalls).
+- **work** — implements the change and commits as it goes (a commit-HEAD heartbeat catches stalls),
+  following the target repo's own guidelines/skills for setup, patterns, and how its tests are run
+  (see [Prompts](#prompts)).
 - **evidence** _(opt-in)_ — derives a test plan from the work item's acceptance criteria, then films
   the running app to prove each one. It follows the repo's own skills/runbooks for the dev-server
   workflow **and** the login/test account so it exercises the flow as the right persona, drives
@@ -325,9 +327,10 @@ review }, { type: pr }]` — the engine ships each primitive's prompt:
   completed verdict, pass or fail). This station runs only when
   the belt's layout provides its pane (`tab` + `pane` in config; see [Layouts](#layouts)) — without one the belt is simply
   work → review → pr.
-- **review** — a strict read-only gate with fresh eyes: it never edits or commits (if it commits, the
-  run parks — read-only is enforced), it either passes the work forward or **bounces back to work**.
-  Keeping all rework in the work step is deliberate.
+- **review** — a strict read-only gate with fresh eyes, judging against the repo's own review
+  standards (its checklist / review skill / engineering docs) when it has them: it never edits or
+  commits (if it commits, the run parks — read-only is enforced), it either passes the work forward
+  or **bounces back to work**. Keeping all rework in the work step is deliberate.
 - **pr** — pushes the branch, opens the PR with the evidence URLs embedded, and drives the
   automated round (CI green, bot comments addressed).
 
@@ -955,6 +958,21 @@ syntax, and the validation rules — is documented in [`docs/PROMPTS.md`](docs/P
 `prompt_file_source` says where it's read from and **defaults to `config`** = the repo's config
 folder (checked at load); set it to `repo` = the target repo's checkout, read from the run's
 **worktree at render time**, so prompts can live version-controlled next to the code.
+
+**The shipped prompts defer to the target repo.** Every built-in base prompt (`work`, `evidence`,
+`review`, `pr`, and the PR `resolver`) tells its agent to look for the target repo's own instructions
+first — its `CLAUDE.md` / `AGENTS.md` (including nested, directory-level ones), agent skills and
+commands under `.claude/`, `CONTRIBUTING.md`, runbooks under `docs/` — and to **prefer them over the
+prompt's generic advice**, falling back to the shipped defaults only where the repo is silent. The
+deference is deliberately scoped to *how the work is done*: setup and dev-server commands, patterns
+and code style, where tests live and which lint/type-check/test commands count, review standards,
+capture tooling (browser skill, viewport, recording size), test accounts and personas, and the PR
+description shape. It never extends to the factory's **flow** — a gate's read-only posture,
+committing incrementally, the handoff note, `step-done` / ask-human / bounce, who owns the work
+item's status, `conventions.commits`, or the belt's own [`pr:` policy](#belt--1) all win over
+anything the repo documents, and the handover scaffold states that precedence on every step (custom
+steps included). So a repo that ships a `playwright-cli` skill or a review checklist gets its own
+conventions used; a repo that ships none behaves exactly as before.
 
 **User-overridable prompt packs — the base-prompt resolution chain.** `prompt_file` _augments_ the
 shipped base; a **prompt pack** _replaces_ it. Drop a file named for the primitive's slug

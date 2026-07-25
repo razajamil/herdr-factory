@@ -43,6 +43,23 @@ their neighbour steps directly; they refer to prior/next work only through `@@HA
 `@@HANDOFF_OUT@@` and the `@@STEPS@@` sequence, so a step reads correctly in any belt order.
 Write your own prompts the same way.
 
+## Repo guidance vs. the prompt — the precedence rule
+
+The shipped base prompts (and the scaffold, so every `custom` step too) tell the agent to find the
+**target repo's own** instructions — `CLAUDE.md` / `AGENTS.md` including nested ones, agent skills
+and commands under `.claude/`, `CONTRIBUTING.md`, runbooks under `docs/` — and prefer them over the
+prompt's own generic advice, falling back to the prompt where the repo is silent. That deference
+covers *how the work is done*: bootstrap and dev-server commands, patterns and code style, test
+layout and the lint/type-check/test commands, review standards, capture tooling and viewport, test
+personas, PR description shape.
+
+It stops at the **flow**. A repo document never overrides a read-only step's posture, incremental
+commits (the heartbeat depends on them), the handoff note, `step-done` / ask-human / bounce, who
+owns the work item's status, `conventions.commits`, or the belt's `pr:` policy — the scaffold says
+so explicitly, and an agent that hits a genuine conflict is told to follow the prompt and record it
+in its handoff. Write your own `prompt_file` the same way: defer on craft, keep the engine's
+protocol authoritative.
+
 ## `prompt_file` and `prompt_file_source`
 
 A step's `prompt_file` is a path to a Markdown file. `prompt_file_source` says where it is

@@ -13,8 +13,9 @@ import type { ProductType } from "../src/types.ts";
 // step at evidence that was never captured.
 
 const prompt = (rel: string) => readFileSync(fileURLToPath(new URL(`../src/prompts/${rel}`, import.meta.url)), "utf8");
-// Verbatim copies of pr.md / github_issues/pr.md as they were BEFORE the belt-level `pr:` block —
-// the trustworthy ground truth for the byte-identity check below.
+// Copies of pr.md / github_issues/pr.md written as they were BEFORE the belt-level `pr:` block —
+// literal step 2, no @@PR_OPTIONS@@ — the trustworthy ground truth for the byte-identity check
+// below. Their prose tracks the shipped prompts; only the pr: tokenization is held back.
 const legacyPrompt = (rel: string) => readFileSync(fileURLToPath(new URL(`./fixtures/${rel}`, import.meta.url)), "utf8");
 
 const step = (name: string, produces: ProductType[], consumes: ProductType[] = []) => ({
