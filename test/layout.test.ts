@@ -250,6 +250,17 @@ describe("applyLayout", () => {
     ]);
   });
 
+  it("gives two same-kind agent panes distinct names (herdr rejects a duplicate)", async () => {
+    const rec: string[] = [];
+    await applyLayout(
+      stubDeps(rec),
+      { workspaceId: "w5", rootTabId: "T0" },
+      { id: "pair", tabs: [{ title: "work", panes: [agentPane("work"), { ...agentPane("pr"), split: "right" }] }] },
+    );
+    const names = rec.filter((r) => r.startsWith("agentAdopt")).map((r) => /name=(\S+)/.exec(r)![1]);
+    expect(names).toEqual(["claude-w5", "claude-w5-2"]);
+  });
+
   it("starts an agent pane's configured agent, with its args, name and timeout", async () => {
     const rec: string[] = [];
     await applyLayout(
@@ -345,8 +356,18 @@ describe("deriveAgentName — herdr's [a-z][a-z0-9_-]{0,31} rule", () => {
     expect(deriveAgentName("claude", "w3G")).toBe("claude-w3g");
     expect(deriveAgentName("claude", "w5")).toBe("claude-w5");
   });
-  it("strips anything herdr would reject and stays within 32 chars", () => {
-    const name = deriveAgentName("opencode", "workspace:with/odd-chars-and-a-very-long-id");
-    expect(name).toMatch(/^[a-z][a-z0-9_-]{0,31}$/);
+  it("disambiguates within one build — a layout with two claude panes must not reuse a name", () => {
+    // herdr refuses a duplicate live agent name outright, so the second pane's `agent start` would
+    // fail. A `work` + `pr` claude pair in one layout hits this immediately.
+    const taken: string[] = [];
+    for (const _ of [1, 2, 3]) taken.push(deriveAgentName("claude", "w5", taken));
+    expect(taken).toEqual(["claude-w5", "claude-w5-2", "claude-w5-3"]);
+  });
+  it("strips anything herdr would reject and stays within 32 chars, suffix included", () => {
+    const long = deriveAgentName("opencode", "workspace:with/odd-chars-and-a-very-long-id");
+    expect(long).toMatch(/^[a-z][a-z0-9_-]{0,31}$/);
+    const collided = deriveAgentName("opencode", "workspace:with/odd-chars-and-a-very-long-id", [long]);
+    expect(collided).toMatch(/^[a-z][a-z0-9_-]{0,31}$/);
+    expect(collided.endsWith("-2")).toBe(true);
   });
 });

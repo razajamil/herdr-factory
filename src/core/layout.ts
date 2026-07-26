@@ -269,6 +269,7 @@ async function applyLayoutImpl(deps: Deps, target: LayoutTarget, layout: LayoutC
     }
   }
 
+  const agentNames: string[] = []; // herdr requires uniqueness among live agents — see deriveAgentName
   for (const { pane, paneId } of built) {
     if (!pane.agent) continue;
     // An agent is started INTO the pane's shell, so setup running in that same pane must be finished
@@ -278,7 +279,7 @@ async function applyLayoutImpl(deps: Deps, target: LayoutTarget, layout: LayoutC
       await awaitSetup(deps, layout, setup.statusPath, paneId);
       setupSettled = true;
     }
-    await startAgent(deps, layout, pane.agent, paneId, target.workspaceId);
+    await startAgent(deps, layout, pane.agent, paneId, target.workspaceId, agentNames);
   }
 
   if (setup && !setupSettled) deps.log("info", `layout "${layout.id}": setup is running in ${setupPaneId ?? "its pane"} (not blocking)`);
@@ -286,7 +287,7 @@ async function applyLayoutImpl(deps: Deps, target: LayoutTarget, layout: LayoutC
 
 /** Start (and optionally prompt) one pane's agent. Never throws: a failed agent doesn't invalidate
  *  the layout that is already built, so it warns, notifies, and lets the rest of the build stand. */
-async function startAgent(deps: Deps, layout: LayoutConfig, agent: LayoutAgent, paneId: string, workspaceId: string): Promise<void> {
+async function startAgent(deps: Deps, layout: LayoutConfig, agent: LayoutAgent, paneId: string, workspaceId: string, taken: string[]): Promise<void> {
   // `agent start` refuses a pane that isn't at an available shell prompt, and a freshly created pane
   // isn't there yet: the shell is still sourcing rc files (mise/asdf activation, prompt setup), and a
   // setup pane has to finish its command and exec back to a prompt first. Poll for that state rather
@@ -294,7 +295,8 @@ async function startAgent(deps: Deps, layout: LayoutConfig, agent: LayoutAgent, 
   if (!(await awaitShellPrompt(deps, paneId))) {
     deps.log("warn", `layout "${layout.id}": ${paneId} is not back at a shell prompt after ${SHELL_READY_TIMEOUT_MS}ms; starting ${agent.kind} anyway`);
   }
-  const name = agent.name ?? deriveAgentName(agent.kind, workspaceId);
+  const name = agent.name ?? deriveAgentName(agent.kind, workspaceId, taken);
+  taken.push(name);
   const ok = await deps.herdr.agentAdopt(paneId, {
     name,
     kind: agent.kind,
@@ -316,13 +318,21 @@ async function startAgent(deps: Deps, layout: LayoutConfig, agent: LayoutAgent, 
   }
 }
 
-/** A herdr-legal agent name (`[a-z][a-z0-9_-]{0,31}`) for a pane whose config didn't pick one. Derived
- *  from the kind + workspace so two worktrees running the same agent don't collide — herdr requires
- *  the name to be unique among LIVE agents. */
-export function deriveAgentName(kind: string, workspaceId: string): string {
+/** A herdr-legal agent name (`[a-z][a-z0-9_-]{0,31}`) for a pane whose config didn't pick one.
+ *
+ *  Derived from the kind + workspace so two worktrees running the same agent don't collide — herdr
+ *  requires the name to be unique among LIVE agents. `taken` disambiguates WITHIN one build, which a
+ *  layout hits as soon as it has two panes of the same kind (a `work` and a `pr` claude pane in one
+ *  tab): without it the second `agent start` would be refused outright. */
+export function deriveAgentName(kind: string, workspaceId: string, taken: readonly string[] = []): string {
   const clean = (s: string) => s.toLowerCase().replaceAll(/[^a-z0-9]/g, "");
-  const base = `${clean(kind) || "agent"}-${clean(workspaceId)}`;
-  return base.slice(0, 32).replace(/-+$/, "");
+  const base = `${clean(kind) || "agent"}-${clean(workspaceId)}`.slice(0, 32).replace(/-+$/, "");
+  if (!taken.includes(base)) return base;
+  for (let n = 2; ; n++) {
+    const suffix = `-${n}`;
+    const candidate = base.slice(0, 32 - suffix.length) + suffix;
+    if (!taken.includes(candidate)) return candidate;
+  }
 }
 
 /** Poll `pane process-info` until the pane's shell owns the foreground alone — the state
