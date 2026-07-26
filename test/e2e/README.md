@@ -242,7 +242,12 @@ the local server up on `:8000`. The tier filter defaults to `scripted`, so `--ti
 model scenarios and only those; a scenario always runs as the tier it declares. Preflight fails fast
 and says which of the two prerequisites is missing rather than letting a scenario time out.
 
-One design question is open rather than covered: a belt that mixes layout panes with dedicated-pane
-steps loses its layout, because the first dedicated spawn adds a tab before the hook runs and the hook
-requires a fresh single-tab workspace. Scenarios work around it by giving every step a pane; the fix
-(reject at config load / make the hook tolerant / hold the first dedicated spawn) is a product call.
+One design question is open rather than covered, and it is narrower than it first looked: a belt with
+`default_layout` whose **first** step has no `tab`/`pane` never gets its layout. The dedicated spawn for
+that step is a new tab, issued as one socket call from the running engine, while the hook is an
+out-of-process command that needs ~300–400ms to boot — so it loses, sees 2 tabs, and declines on its
+freshness gate. Every later targeted step then burns its layout-wait budget and parks blaming herdr.
+Reverse the order and everything works, including untargeted later steps. Measured both ways with a
+throwaway probe scenario; documented in the skill's `layouts.md`. The fix (reject `steps[0]` without a
+target at config load / hold that first dedicated spawn until the hook has decided / make the hook
+tolerant of factory-owned tabs) is a product call, so scenarios give every step a pane for now.

@@ -185,6 +185,33 @@ Then: no target → wait. A **fresh** target whose state isn't `idle` → wait. 
 
 The repo/belt/step `agent:` block governs the panes the factory **spawns** (a step with no `tab`/`pane`). A LAYOUT pane names its own agent — `agent: <kind>` + `agent_args` — so the layout owns the harness for the panes it builds. See [belts-and-steps.md](./belts-and-steps.md).
 
+### Mixing layout panes with dedicated panes — the FIRST step decides
+
+A belt may mix targeted and untargeted steps, and config load allows it (the targeting checks skip any
+step without `tab`/`pane`). But the **first** step is special, and getting it wrong silently costs the
+whole layout:
+
+| belt shape (with `default_layout`) | what happens |
+|---|---|
+| `steps[0]` **targets** a layout pane | the step waits for its pane, the hook builds the layout, everything resolves — later untargeted steps get their own dedicated tab, harmlessly |
+| `steps[0]` has **no** `tab`/`pane` | the layout is **never built**, and every later targeted step burns its layout-wait budget and parks with `layout_wait_timeout` |
+
+Why: a claim creates the worktree and dispatches `steps[0]` in the same reconcile flow. An untargeted
+step spawns a *dedicated pane*, which is a new **tab** (`herdr tab create`) — one socket call from a
+running process. The layout hook is an out-of-process plugin command that has to boot Node, load
+config and query herdr (~300–400 ms), and its very first look at the workspace then sees 2 tabs, so
+gate 7 declines: `workspace <id> is not a fresh 1-tab/1-pane workspace; skipping`. Nothing coordinates
+the two — the engine never waits on the hook, and the hook never learns why it lost.
+
+What it looks like when it bites: no `layout_applied` event, an extra tab named after the step,
+`layout_wait_retry` events, then an attention park whose message asks *"is the herdr layout for this
+worktree running?"* — pointing at herdr when the cause is the belt's own first step. The only place the
+real reason appears is `herdr plugin log list --plugin herdr-factory`.
+
+**Fix:** give `steps[0]` a `tab`/`pane` in the layout. If the first step genuinely wants a dedicated
+pane, the belt shouldn't declare `default_layout` — or that step should be moved after one that targets
+the layout.
+
 ---
 
 ## Layout selection
@@ -271,9 +298,9 @@ Also: `herdr plugin enable|disable herdr-factory`. `doctor` checks **none** of t
 4. not a linked worktree → `main checkout — never touch`
 5. no configured repo whose `resolve(repo.path)` equals `resolve(repo_root)` → `no factory repo config for <repoRoot>` (a repo whose `config.yml` currently fails to load is silently skipped here)
 6. no layout resolves → `no layout matches <checkoutPath>`
-7. not fresh → `workspace <id> is not a fresh 1-tab/1-pane workspace; skipping`
+7. not fresh → `workspace <id> is not a fresh 1-tab/1-pane workspace; skipping`. Two ways to hit this that don't look like "not fresh": a belt whose **first** step has no `tab`/`pane` — its dedicated pane is a new TAB, created before the hook's snapshot, so the layout is never built (see *Mixing layout panes with dedicated panes* under Step → pane targeting); and a herdr that doesn't report `tab_count`/`pane_count`, which reads as `null !== 1` and silently declines **every** build.
 8. already claimed → `layout already applied for <checkoutPath>; skipping`
-9. no root tab / pane resolvable → releases the claim and throws `layout hook: no tab found for workspace <id>` / `layout hook: no root pane found for tab <tabId>`
+9. no root TAB resolvable → releases the claim and throws `layout hook: no tab found for workspace <id>`. The root **pane** is only *measured* (its box sizes `cells` panes; `layout.apply` rebuilds the tab rather than splitting from it), so an unresolvable one is not fatal — cell sizes fall back to even splits.
 
 On success: records a `layout_applied` event and logs `layout hook: built "<id>" into <checkoutPath>` to `<state>/<repo>/logs/<YYYY-MM-DD>.log`. On a throw: releases the claim (so a transient failure can retry), records `layout_apply_failed` `{layout, workspaceId, error}`, exits 1.
 
