@@ -726,6 +726,20 @@ describe("@@PR_TEMPLATE@@ + @@COMMIT_CONVENTIONS@@ (end-to-end render of the shi
     return readFileSync(join(worktree, MEMORY_DIR, `prompt-${step.name}.md`), "utf8");
   };
 
+  it("the on-demand query routes name herdr commands that EXIST (0.7.5 removed `agent send`)", async () => {
+    // This scaffold is baked into every step prompt, so a renamed herdr subcommand here hands every
+    // agent an instruction that errors out — invisible until one of them tries to use it.
+    const { deps, store, worktree, shipBelt } = build();
+    const run = seed(store, worktree, "K-QP", "running", "review");
+    const prior = store.upsertRunStep(run.id, "fix", { paneId: "w1:pfix", sessionId: "sess-9" });
+    await renderStepPrompt(deps, run, shipBelt, deps.resolveSource("jira")!, shipBelt.steps[1]!, prior);
+    const body = readFileSync(join(worktree, MEMORY_DIR, "prompt-review.md"), "utf8");
+    expect(body).toContain("herdr agent read w1:pfix --source recent");
+    expect(body).toContain('herdr agent prompt w1:pfix "<question>"');
+    expect(body).toContain("herdr agent wait w1:pfix --until idle"); // the answer needs its turn to end
+    expect(body).not.toMatch(/herdr agent send [^-]/); // `agent send` is gone; `send-keys` is what's left
+  });
+
   it("no template ⇒ the pr prompt keeps today's summary+testing-notes wording and injects nothing", async () => {
     const body = await renderStep("pr");
     expect(body).toContain("a clear\n   summary + testing notes)."); // base wording intact

@@ -89,7 +89,7 @@ Notes:
 - `runs`/`status` pad columns with `padEnd` and never truncate them — long keys just push columns right (`status`'s trailing summary is the one exception: it is cut at 50 chars). Parse by splitting on whitespace, not fixed offsets.
 - `auth status`'s only valid action is `status`; anything else exits 1 with `unknown auth action "<x>" — use: status`.
 - Secrets are read only from `<configDir>/repos/<name>/env` (`KEY=value`, `#` comments). There is no global secrets file.
-- `doctor` resolves `git`/`herdr`/`gh`/`claude` against the **installed service's PATH** parsed out of the plist/unit, not your shell's PATH — so it can report `✗` for a tool your shell runs fine. Full check-by-check remediation is in [troubleshooting.md](./troubleshooting.md).
+- `doctor` resolves `git`/`herdr`/`gh`/`claude` against the **installed service's PATH** parsed out of the plist/unit, not your shell's PATH — so it can report `✗` for a tool your shell runs fine. The `herdr` check also runs `herdr --version` and enforces the floor in `herdr-plugin.toml` (`>= 0.7.5`), reporting `v<x> is too old — the factory needs >= 0.7.5 (run \`herdr update\`)`; `--deep` adds the running server's protocol compatibility (`v0.7.5, protocol 17`). Full check-by-check remediation is in [troubleshooting.md](./troubleshooting.md).
 
 ### Operate
 
@@ -341,10 +341,12 @@ Sequence for a first repo: `init` → `doctor --repo <r> --deep` → `run --foll
 | `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` / `..._METRICS_ENDPOINT` | per-signal override, used verbatim | — |
 | `OTEL_SERVICE_NAME` · `OTEL_METRIC_EXPORT_INTERVAL` · `OTEL_RESOURCE_ATTRIBUTES` | service name · export interval in ms · resource attrs | `herdr-factory` · `10000` · — |
 | `HERDR_FROM_INSTALLER` | set ⇒ `install` suppresses its onboarding pointer line | unset |
-| `HERDR_FACTORY_LAYOUT_STATE_DIR` | overrides the layout-hook idempotency dir | `<stateRoot>/layout-hook` |
+| `HERDR_FACTORY_LAYOUT_STATE_DIR` | overrides the layout-hook idempotency dir (claims, the decided cache, setup status files) | `<stateRoot>/layout-hook` |
+| `HERDR_FACTORY_FOCUS_HOOK` | `0` drops the `workspace.focused` layout trigger entirely — for a herdr build whose in-app worktree creation does emit `worktree.created` (see [layouts.md](./layouts.md)) | enabled |
 | `HERDR_FACTORY_TUI_TIMING` | `1` appends startup timings to `/tmp/herdr-factory-tui-startup.log` | unset |
 | `OPENTUI_LIBC` | auto-set to `musl` when musl is detected | unset |
 | `HERDR_PLUGIN_EVENT_JSON` · `HERDR_PLUGIN_EVENT` | the layout hook's only input (herdr sets these) | — |
+| `HERDR_SOCKET_PATH` | where the factory finds herdr's socket for `layout.apply` (herdr injects it into every plugin command); falls back to `$XDG_CONFIG_HOME/herdr[/sessions/$HERDR_SESSION]/herdr.sock` | injected by herdr |
 
 **The propagation trap.** Two different allowlists exist, and they don't match:
 

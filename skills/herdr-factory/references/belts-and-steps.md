@@ -96,13 +96,23 @@ autonomous task — do not pause to ask for confirmation.`
 Pane targeting (`src/core/step.ts`):
 
 - **`tab` + `pane` set** — the factory resolves, in order: the recorded live `pane_id`; then a pane
-  matching the configured `tab`/`pane` *titles* (must be `idle`); then a pane already renamed
-  `<step>:<KEY>` (a re-entry whose id was lost). No target ⇒ the step waits and the `layout_wait`
-  guard runs. On first dispatch the pane is **renamed to `<step>:<KEY>`**. The factory **never spawns
-  its own pane when `tab`+`pane` are set** — the layout must supply it.
-- **no `tab`/`pane`** — the factory starts a **dedicated agent** in the worktree with
-  `[agent.command, ...agent.flags, prompt]` and `HERDR_FACTORY_TICKET=<KEY>`. There is no
-  `layout_wait` bound on this path; a busy dedicated pane just queues the message.
+  matching the configured `tab`/`pane` *titles* (must be `idle`). That label stays valid for the pane's
+  whole life — run state is published as display METADATA (`<step>:<KEY>` as the agent name, an
+  `⚠ ATTENTION` title when parked, `hf_step`/`hf_key`/`hf_state` tokens), never by renaming the pane. A
+  third tier still matches a pane renamed `<step>:<KEY>` by pre-metadata code, as a drain-window shim.
+  No target ⇒ the step waits and the `layout_wait` guard runs. The factory **never spawns its own pane
+  when `tab`+`pane` are set** — the layout must supply it, and config-load rejects a target pane that
+  starts no agent.
+- **no `tab`/`pane`** — the factory creates a tab (carrying `HERDR_FACTORY_TICKET=<KEY>`), waits for its
+  shell prompt, then has herdr start the harness in it (`agent start --kind --pane`, blocking until the
+  agent is ready for input) with `[agent.command, ...agent.flags, prompt]`. There is no `layout_wait`
+  bound on this path; a busy dedicated pane just queues the message.
+
+**Submission is confirmed.** `herdr agent prompt` is atomic (it types and presses Enter), and the
+factory asks herdr to observe the agent react (`--wait --until working`). An unconfirmed submission —
+keystrokes dropped into an agent that wasn't listening — counts as **not dispatched**: the pass stays
+undispatched and retries under the layout wait, instead of starting the step's budget clock against an
+agent that never got the work.
 
 Finishing is always the same protocol: write `handoff-<step>.md`, then run the rendered `step-done`
 command. Signals carry `--pass N`; a `step-done` minted in an earlier pass is rejected with

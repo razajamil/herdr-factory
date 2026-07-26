@@ -403,7 +403,12 @@ function scaffold(
       `- Read its handoff note first: \`${MEMORY_DIR}/handoff-${prior.step}.md\`.\n` +
       `- That agent ran in herdr pane \`${prior.paneId}\` (claude session \`${prior.sessionId ?? "?"}\`). ` +
       `If the handoff note isn't enough, query it on demand: \`herdr agent read ${prior.paneId} --source recent\`, ` +
-      `read its session transcript, or ask it directly with \`herdr agent send ${prior.paneId} "<question>"\`.\n`
+      `read its session transcript, or ask it directly — ` +
+      // `agent prompt`, NOT the `agent send` this used to name: herdr 0.7.5 split that into `send-keys`
+      // (key presses) and `prompt` (atomic submission), so the old command errors out. Asking is a
+      // three-step round trip because the answer only exists once that agent's turn ends.
+      `\`herdr agent prompt ${prior.paneId} "<question>"\`, then \`herdr agent wait ${prior.paneId} --until idle\` ` +
+      `and \`herdr agent read ${prior.paneId} --source recent\` to collect the answer.\n`
     : "\n\n## Input\nThis is the first step of the belt — start from the work item.\n";
   // A read-only gate whose posture isn't described by an engine base prompt (a `custom` step —
   // enginePrompt is undefined) is told, by the engine, that it must not commit. The engine ENFORCES

@@ -910,9 +910,10 @@ export const RepoConfigSchema = z
           ctx.addIssue({ code: "custom", message: `belt "${b.name}" has duplicate step name "${name}" (name defaults to type — give one an explicit unique name)`, path: ["belt", i, "steps", j, "name"] });
         }
         stepNames.add(name);
-        // Two steps of one belt must not target the same layout pane: the first dispatch renames
-        // the pane to `<step>:<KEY>`, so the second step's label lookup can never resolve — it
-        // would burn its whole layout-wait budget and park the run. One agent pane per step.
+        // Two steps of one belt must not target the same layout pane: they would share ONE agent, so
+        // the second step's prompt would land in a conversation still carrying the first step's
+        // context — and the dispatcher would defer it for as long as that agent stays `working`,
+        // burning the layout-wait budget and parking the run. One agent pane per step.
         if (s.tab && s.pane && !stepSkipped(d, s)) {
           const paneKey = `${s.tab}\0${s.pane}`;
           const owner = paneTargets.get(paneKey);

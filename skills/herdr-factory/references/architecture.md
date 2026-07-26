@@ -423,6 +423,7 @@ Inside the state root:
 |---|---|
 | `herdr-factory.db` | **the single global SQLite DB** — every repo's runs, events, intents, locks, watch state |
 | `<repoName>/logs/<YYYY-MM-DD>.log` | all per-repo engine work: passes, claims, spawns, parks, intent deferrals, teardowns |
+| `layout-hook/` | the layout hook's own state: `applied/<sha1>` claims (one per worktree), `decided/<workspaceId>` (focus-event cache, cleared at herdr startup), `setup/<token>.status` (a build's setup exit code, reaped after a day) |
 | `logs/supervisor.out.log`, `logs/supervisor.err.log` | `ensure-up` decisions and the launchd-started server's stdout (macOS; Linux goes to journald) |
 | `server.json` | `{pid, port, version, startedAt}` — the advertised server; a malformed file reads as "no server" |
 | `update-status.json` | the last self-update attempt: channel, outcome, head/target, `behind`, `dirtySkip`, `warning` |
