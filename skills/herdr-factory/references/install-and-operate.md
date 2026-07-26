@@ -314,7 +314,7 @@ imported on first activation — you may see ` loading...` or ` failed to load: 
 
 | Tab | For | Notes |
 |---|---|---|
-| **Dashboard** | watch and drive live work: per repo → per belt → a step-progress table of active runs and eligible items | auto-refreshes every 3 s; banner `● server up · v<version> · uptime <d>`, plus ` · ⚠ <update warning>` in amber when the last auto-update wants attention. Server down ⇒ the banner reads ``⚠ server not running — start it with `herdr-factory serve` `` and each repo becomes a `<repo>   (server down)` row |
+| **Dashboard** | watch and drive live work: per repo → per belt → a **kanban board** of active runs and eligible items | auto-refreshes every 3 s; banner `● server up · v<version> · uptime <d>`, plus ` · ⚠ <update warning>` in amber when the last auto-update wants attention. Server down ⇒ the banner reads ``⚠ server not running — start it with `herdr-factory serve` `` and each repo becomes a `<repo>   (server down)` row |
 | **Config** | the five-section config editor over `~/.config/herdr-factory/repos/<name>/config.yml` + its `env` file, with a `+ new repo…` wizard | edits a YAML `Document`, so comments and formatting survive |
 | **Doctor** | the machine-wide health checks | see the caveat at the end of this section |
 
@@ -333,17 +333,45 @@ Global (`src/tui/index.ts`):
 | `q` | quit (not while a text input has focus) |
 | `Ctrl-C` | quit |
 
-Dashboard, on the highlighted row (`src/tui/dashboard.ts`) — every mutating action goes through a
-confirm modal, and the result lands on the bottom action line:
+#### The board
+
+Each belt renders as a kanban board (`src/tui/kanban.ts`): a `ready` column of eligible-but-unclaimed
+items, then one column per belt step, with every work item a card in the column of the step it is
+currently on (a run past its last step — a PR watch — stays under that step). A card reads
+`<icon> <KEY> <summary>` plus compact right-aligned meta (`#<pr>` and how long it has been in this
+step); a trailing amber `⚠` means a stuck background job. Cards are the only thing colored, and only
+on the icon — a card's key and summary always stay in the normal text hierarchy. A legend line above
+the board (titled ` Board `) spells the common icons out:
+
+| icon | state | means |
+|---|---|---|
+| `○` | ready | eligible at the source, nothing has claimed it |
+| `◐` | starting | claiming (worktree/pane being set up) |
+| `●` | working | a belt step's agent is live |
+| `◆` | in review | `reviewing` — the token-free PR watch |
+| `?` | waiting on you | `waiting_for_human` — parked on a question |
+| `⚠` | attention | the engine's needs-a-human park (stalled / over budget / asked a human) |
+| `✗` | failed | terminal `abandoned` / `timeout` / `closed` outcome |
+| `✓` | done | the step is finished (`tearing_down` / `done`) |
+
+The board is responsive: it fits as many columns side by side as 20 columns each allows and wraps the
+rest onto further shelves, so a narrow terminal degrades to stacked lanes rather than truncating. A
+resize re-lays it immediately. Runs whose belt no longer exists appear in one full-width
+`unassigned (no belt)` lane. The highlighted card's ⚠ detail (attention reason / stuck upload) is
+printed on the action line while it is highlighted.
+
+Dashboard, on the highlighted card or row (`src/tui/dashboard.ts`) — every mutating action goes through
+a confirm modal, and the result lands on the bottom action line:
 
 | key | action | applies to |
 |---|---|---|
-| `↑` / `↓` | move the highlight | all rows |
-| `↵` | open the ticket's timeline | run rows |
-| `d` | **repo** row → repo detail (AWS SSO, per-source auth, per-belt steps/health/eligible counts); **run** row → full work-item detail (overview + step progress + timeline) | repo, run |
-| `t` | run one reconcile tick on that row's repo — `Run a reconcile tick on "<repo>"?` | any row |
-| `c` | claim the item — picks the belt automatically when the source has exactly one, otherwise asks | eligible rows |
-| `x` | tear the run down — `Tear down "<key>" (removes its worktree)?` | run rows |
+| `↑` / `↓` | move the highlight, staying in the same column where one is available | all cards/rows |
+| `←` / `→` | move to the card in the neighbouring column, on the same line | cards |
+| `↵` | open the ticket's timeline | run cards |
+| `d` | **repo** row → repo detail (AWS SSO, per-source auth, per-belt steps/health/eligible counts); **run** card → full work-item detail (overview + step progress + timeline) | repo, run |
+| `t` | run one reconcile tick on that row's repo — `Run a reconcile tick on "<repo>"?` | any card/row |
+| `c` | claim the item — picks the belt automatically when the source has exactly one, otherwise asks | `ready` cards |
+| `x` | tear the run down — `Tear down "<key>" (removes its worktree)?` | run cards |
 | `r` | refresh now | anywhere |
 
 Config editor (`src/tui/config-editor.ts`). Sections: `[1] Repos` (a left-hand list) and an accordion of
@@ -365,9 +393,10 @@ submit, `Esc` cancel) · multiline editor, e.g. `guidelines-prompt.md` (`^S` sav
 scrollable info panes such as a timeline (`↑↓`/wheel scroll, `Esc` or `q` close). Clicking the backdrop
 dismisses any of them.
 
-**It is fully mouse-navigable.** Click a tab to switch; click a row to select it (click an already-
-highlighted run row again to open its timeline); click a panel to focus its section; click a chooser
-option or a `[y] yes` / `[n] no` to answer a modal; the wheel scrolls any scroll box. Rows tint on hover
+**It is fully mouse-navigable.** Click a tab to switch; click a row — or a single kanban card, resolved
+from the click's column — to select it (click an already-highlighted run again to open its timeline);
+click a panel to focus its section; click a chooser option or a `[y] yes` / `[n] no` to answer a modal;
+the wheel scrolls any scroll box. Rows tint on hover (on the board, just the card under the pointer)
 and the pointer switches to an I-beam over text inputs.
 
 **What `^S` does** (`save()` in `src/tui/config-editor.ts`): flush every panel's typed values → write any

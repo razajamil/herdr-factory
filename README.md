@@ -450,11 +450,13 @@ brief's front-matter). Route bugs to one belt and stories to another, programmat
   supervisor restarts it if it's down, wedged, or outdated; auto-update ships new code (and new
   Node runtimes) within ~a minute of a push, draining gracefully before restart.
 - **A control room.** Running `herdr-factory` with no arguments opens a full-screen TUI —
-  live dashboard, a schema-validated config editor, and doctor. The dashboard's job table flags a
-  run whose background work is stuck even when its steps read _done_ — e.g. an evidence step that
-  finished but whose media upload is still retrying on expired AWS creds shows an amber `⚠` on that
-  row. The server also exposes a local HTTP API (`127.0.0.1:8765`) with an OpenAPI spec at `/doc`
-  and Swagger UI at `/ui`.
+  live dashboard, a schema-validated config editor, and doctor. The dashboard is a **kanban board per
+  belt**: the belt's steps are the columns, every work item is a card in the column of the step it is
+  on, and its state rides on a single icon (`○` ready · `●` working · `◆` in review · `?` waiting on
+  you · `⚠` attention · `✓` done) rather than on the color of the whole row. A card also flags work
+  whose background job is stuck even when its steps read _done_ — e.g. an evidence step that finished
+  but whose media upload is still retrying on expired AWS creds carries an amber `⚠`. The server also
+  exposes a local HTTP API (`127.0.0.1:8765`) with an OpenAPI spec at `/doc` and Swagger UI at `/ui`.
 - **An agentic interface.** `herdr-factory skill install` gives your coding agent an
   [agent skill](#the-agent-skill) — it runs the config interview for a repo, answers questions about the
   engine, and triages a stuck run from the same source-verified reference the maintainers use. Installed

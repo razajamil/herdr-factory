@@ -264,7 +264,7 @@ herdr-factory --repo <r> timeline <KEY> | grep -E 'evidence_uploaded|evidence_up
 | Branch | Signature | Fix |
 |---|---|---|
 | AWS SSO expired | `doctor`: `<n> stuck — AWS SSO/creds expired; run \`aws sso login[ --profile <p>]\``; intent `error_class = 'auth'` | `aws sso login[ --profile <p>]`. Recovery is automatic (the publish kind's pre-pass probes liveness and re-queues: `evidence publish: creds recovered — re-queued N stuck upload(s) for immediate retry`). To force it: `POST /repos/<r>/intents/recover` `{"causeScope":"publisher:s3"}` |
-| Permanent failure | `error_class = 'permanent'`, event `evidence_upload_failed`, notify `herdr-factory: <key> evidence publish failed`, amber `⚠` on the TUI dashboard row. **The run is untouched — this is never a park** | `doctor --deep` shows the real reason (bucket/region/access-denied/command exit) |
+| Permanent failure | `error_class = 'permanent'`, event `evidence_upload_failed`, notify `herdr-factory: <key> evidence publish failed`, amber `⚠` on the run's TUI dashboard card. **The run is untouched — this is never a park** | `doctor --deep` shows the real reason (bucket/region/access-denied/command exit) |
 | Transient retrying | `<n> pending — retrying (last: …)`, notify is deliberately **silent** | Backoff is 60 s doubling to a 3600 s cap and **never gives up** |
 | Dropped at teardown | `<KEY>: N evidence upload(s) dropped at teardown — bytes never reached S3 (likely SSO was down through merge)` | Unrecoverable; the worktree is gone. Fix creds before the next run |
 | Worktree removed first | intent failed with `evidence dir gone (torn down before publish)` | Same |
@@ -418,8 +418,8 @@ and (unless `skipSourceNote`) posts a note on the work item ending
 
 - **A source that can't authenticate** → *pause + throttled notify*. Its claims and write-backs are
   held; it auto-resumes the moment any call to that source succeeds.
-- **A permanently-failing evidence upload** → *notify + the amber `⚠ problem` flag on the dashboard
-  row*. The run is untouched and completes normally.
+- **A permanently-failing evidence upload** → *notify + the amber `⚠` problem flag on the run's
+  dashboard card*. The run is untouched and completes normally.
 - **The `capture` lock** → `capture_lock` exists as a guard reason string, but `exclusive_resource`
   **never parks** (rescue class `none`). A blocked evidence agent just waits at `capture-lock
   acquire` (up to 1 h). A **layout apply failure** likewise doesn't park — it surfaces later as
@@ -806,7 +806,7 @@ court, waiting for the next run-locked pass (`handoff_at IS NOT NULL AND consume
 
 A permanently failing intent surfaces as: a throttled herdr notification (only `evidence_publish`
 implements notify today); the repo log line `<key>: <kind> intent deferred (attempt N): <error>`; the
-amber `⚠` problem flag on the TUI dashboard row (evidence only, and only once `error_class` is set —
+amber `⚠` problem flag on the run's TUI dashboard card (evidence only, and only once `error_class` is set —
 a never-attempted row is deliberately not a problem); `doctor`'s `evidence uploads` row; and the
 `obligations` endpoint (`GET /repos/<r>/obligations?key=<KEY>` — HTTP only, there is no `obligations`
 CLI command).
