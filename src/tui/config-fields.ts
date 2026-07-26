@@ -14,7 +14,7 @@ import { basename, isAbsolute, join } from "node:path";
 import type { Document } from "yaml";
 import { SOURCE_DESCRIPTORS, descriptorFor } from "../sources/registry.ts";
 import { STEP_DESCRIPTORS, stepDescriptorFor } from "../steps/registry.ts";
-import type { SourceType } from "../types.ts";
+import { HERDR_AGENT_KINDS, type SourceType } from "../types.ts";
 import { layoutTargets, renameLayoutId, renamePaneTitle, renameSummary, renameTabTitle } from "./layout-refs.ts";
 import type { ChooseFn, ConfirmFn } from "./types.ts";
 
@@ -369,8 +369,9 @@ export function buildDescriptors(draft: Document, rebuild: () => void, ctx: Fiel
           renameRefs: (from, to) => renameSummary("tab", from, to, renameTabTitle(draft, layoutIdAt(i), from, to)),
         });
 
-        // panes[] — each a herdr pane. The `title` is what a step's `pane` matches; an agent pane
-        // (command: claude/opencode/…) is the one the step's prompt gets delivered to.
+        // panes[] — each a herdr pane. The `title` is what a step's `pane` matches; a pane with an
+        // `agent` KIND is the one a step's prompt gets delivered to (herdr starts that agent as part
+        // of the build). `command` is for everything else — dev servers, editors, tails.
         const paneTitles = panes.map((p, k) => String(p?.title ?? `pane${k}`));
         panes.forEach((p, k) => {
           const base: Path = ["layouts", i, "tabs", j, "panes", k];
@@ -385,7 +386,34 @@ export function buildDescriptors(draft: Document, rebuild: () => void, ctx: Fiel
             indent: 3,
             renameRefs: (from, to) => renameSummary("pane", from, to, renamePaneTitle(draft, layoutIdAt(i), tabTitleAt(i, j), from, to)),
           });
-          d.push({ kind: "text", label: "command", path: [...base, "command"], placeholder: "claude", clearable: true, indent: 3 });
+          // agent / command are mutually exclusive (an agent is started INTO the pane's shell, so a
+          // command occupying it would collide), so the editor offers exactly one: picking an agent
+          // kind drops any command and hides its row, rather than letting the user compose a config
+          // that won't load. The agent's companion keys only appear once a kind is chosen.
+          const agentKind = typeof p?.agent === "string" ? p.agent : "(none)";
+          d.push({
+            kind: "enum",
+            label: "agent",
+            value: agentKind,
+            choices: ["(none)", ...HERDR_AGENT_KINDS],
+            indent: 3,
+            apply: (next) => {
+              if (next === "(none)") {
+                for (const k2 of ["agent", "agent_name", "agent_args", "prompt", "agent_timeout_ms", "prompt_timeout_ms"]) draft.deleteIn([...base, k2]);
+              } else {
+                draft.setIn([...base, "agent"], next);
+                draft.deleteIn([...base, "command"]);
+                draft.deleteIn([...base, "persist"]);
+              }
+              rebuild();
+            },
+          });
+          if (agentKind === "(none)") {
+            d.push({ kind: "text", label: "command", path: [...base, "command"], placeholder: "mise run dev (an agent pane picks an `agent` instead)", clearable: true, indent: 3 });
+          } else {
+            d.push({ kind: "text", label: "agent_args", path: [...base, "agent_args"], placeholder: "--dangerously-skip-permissions (a YAML list)", clearable: true, indent: 3 });
+            d.push({ kind: "text", label: "agent_name", path: [...base, "agent_name"], placeholder: "lowercase, unique — derived when empty", clearable: true, indent: 3 });
+          }
           d.push({ kind: "bool", label: "setup", value: p?.setup === true, indent: 3, apply: (next) => { draft.setIn([...base, "setup"], next); rebuild(); } });
           // split — optional; a leading "(unset)" clears it (a tab's first pane ignores split anyway).
           const splitCur = p?.split == null ? "(unset)" : String(p.split);
@@ -393,10 +421,10 @@ export function buildDescriptors(draft: Document, rebuild: () => void, ctx: Fiel
           d.push({ kind: "text", label: "size", path: [...base, "size"], placeholder: '"40%", a 0<n<1 fraction, or cells', clearable: true, indent: 3 });
           d.push({ kind: "action", label: "‹ remove pane ›", indent: 3, run: () => { void ctx.confirm(`Remove pane "${paneTitles[k]}"?`).then((ok) => { if (ok) { draft.deleteIn(base); rebuild(); } }); } });
         });
-        d.push({ kind: "action", label: "+ add pane", indent: 2, run: () => { draft.addIn(["layouts", i, "tabs", j, "panes"], draft.createNode({ title: uniqueName("pane", paneTitles), command: "" })); open(["layouts", i, "tabs", j, "panes", panes.length]); rebuild(); } });
+        d.push({ kind: "action", label: "+ add pane", indent: 2, run: () => { draft.addIn(["layouts", i, "tabs", j, "panes"], draft.createNode({ title: uniqueName("pane", paneTitles), agent: "claude" })); open(["layouts", i, "tabs", j, "panes", panes.length]); rebuild(); } });
         d.push({ kind: "action", label: "‹ remove tab ›", indent: 2, run: () => { void ctx.confirm(`Remove tab "${tabTitles[j]}"?`).then((ok) => { if (ok) { draft.deleteIn(["layouts", i, "tabs", j]); rebuild(); } }); } });
       });
-      d.push({ kind: "action", label: "+ add tab", indent: 1, run: () => { draft.addIn(["layouts", i, "tabs"], draft.createNode({ title: uniqueName("tab", tabTitles), panes: [{ title: "agent", command: "claude" }] })); open(["layouts", i, "tabs", tabs.length]); rebuild(); } });
+      d.push({ kind: "action", label: "+ add tab", indent: 1, run: () => { draft.addIn(["layouts", i, "tabs"], draft.createNode({ title: uniqueName("tab", tabTitles), panes: [{ title: "agent", agent: "claude" }] })); open(["layouts", i, "tabs", tabs.length]); rebuild(); } });
       d.push({ kind: "action", label: "‹ remove layout ›", indent: 1, run: () => { void ctx.confirm(`Remove layout "${layoutIds[i]}"?`).then((ok) => { if (ok) { draft.deleteIn(["layouts", i]); rebuild(); } }); } });
     });
     d.push({
@@ -404,7 +432,7 @@ export function buildDescriptors(draft: Document, rebuild: () => void, ctx: Fiel
       label: "+ add layout",
       indent: 0,
       run: () => {
-        addToArray(["layouts"], { id: uniqueName("layout", layoutIds), tabs: [{ title: "work", panes: [{ title: "agent", command: "claude" }] }] });
+        addToArray(["layouts"], { id: uniqueName("layout", layoutIds), tabs: [{ title: "work", panes: [{ title: "agent", agent: "claude" }] }] });
         open(["layouts", layouts.length]);
         rebuild();
       },

@@ -1,6 +1,10 @@
-import { describe, it, expect } from "vitest";
-import { globMatch, resolveBeltLayout, buildPlan, splitRatioArg, clampRatio, applyLayout } from "../src/core/layout.ts";
-import type { BeltConfig, LayoutConfig } from "../src/config.ts";
+import { describe, it, expect, afterEach } from "vitest";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { globMatch, resolveBeltLayout, tabTree, splitRatio, clampRatio, applyLayout, deriveAgentName, HAND_BACK } from "../src/core/layout.ts";
+import type { BeltConfig, LayoutAgent, LayoutConfig, LayoutPane, LayoutTab } from "../src/config.ts";
+import type { LayoutNode } from "../src/types.ts";
 import type { Deps } from "../src/core/deps.ts";
 
 // A minimal resolved belt (only the fields resolveBeltLayout reads matter).
@@ -27,8 +31,8 @@ describe("globMatch", () => {
 
 describe("resolveBeltLayout", () => {
   const layouts: LayoutConfig[] = [
-    { id: "web", tabs: [{ panes: [{ setup: false }] }] },
-    { id: "hot", tabs: [{ panes: [{ setup: false }] }] },
+    { id: "web", tabs: [{ panes: [{ persist: true, env: {}, setup: false }] }] },
+    { id: "hot", tabs: [{ panes: [{ persist: true, env: {}, setup: false }] }] },
   ];
   it("first layout_matching rule whose glob matches the branch wins", () => {
     const b = belt({ defaultLayout: "web", layoutMatching: [{ worktreePattern: "hotfix/*", layout: "hot" }] });
@@ -52,62 +56,63 @@ describe("resolveBeltLayout", () => {
   });
 });
 
-describe("buildPlan", () => {
-  const layout: LayoutConfig = {
-    id: "web",
-    setup: { command: "mise run setup", blocking: true },
-    tabs: [
-      {
-        title: "main",
-        panes: [
-          { title: "agent", command: "claude", setup: true },
-          { title: "editor", command: "nvim", split: "right", setup: false },
-        ],
-      },
-      {
-        title: "dev",
-        panes: [
-          { title: "server", setup: false },
-          { title: "logs", split: "down", setup: false },
-        ],
-      },
-    ],
-  };
+describe("tabTree — a configured tab becomes herdr's declarative pane tree", () => {
+  const pane = (over: Partial<LayoutPane> = {}): LayoutPane => ({ persist: true, env: {}, setup: false, ...over });
 
-  it("reuses the root tab/pane, splits later panes from the previous, runs setup before its command", () => {
-    expect(buildPlan(layout, "/work")).toEqual([
-      { kind: "reuseTab", tab: "t0", title: "main" },
-      { kind: "renamePane", pane: "t0p0", title: "agent" },
-      { kind: "runSetup", pane: "t0p0", command: "mise run setup", blocking: true },
-      { kind: "run", pane: "t0p0", command: "claude" },
-      { kind: "split", pane: "t0p1", from: "t0p0", direction: "right", ratio: undefined, size: undefined, cwd: "/work" },
-      { kind: "renamePane", pane: "t0p1", title: "editor" },
-      { kind: "run", pane: "t0p1", command: "nvim" },
-      { kind: "createTab", tab: "t1", pane: "t1p0", title: "dev", cwd: "/work" },
-      { kind: "renamePane", pane: "t1p0", title: "server" },
-      { kind: "split", pane: "t1p1", from: "t1p0", direction: "down", ratio: undefined, size: undefined, cwd: "/work" },
-      { kind: "renamePane", pane: "t1p1", title: "logs" },
-    ]);
+  it("nests panes exactly as the sequential splits did: [a, b, c] ⇒ a | (b | c)", () => {
+    const tab: LayoutTab = { title: "main", panes: [pane({ title: "agent" }), pane({ title: "editor", split: "right" }), pane({ title: "logs", split: "down" })] };
+    expect(tabTree(tab, { cwd: "/work" })).toEqual({
+      type: "split",
+      direction: "right",
+      ratio: 0.5, // unsized ⇒ herdr's even split
+      first: { type: "pane", label: "agent", cwd: "/work" },
+      second: {
+        type: "split",
+        direction: "down",
+        ratio: 0.5,
+        first: { type: "pane", label: "editor", cwd: "/work" },
+        second: { type: "pane", label: "logs", cwd: "/work" },
+      },
+    });
   });
 
-  it("a blocking setup precedes the first createTab (no later tab spawns until it finishes)", () => {
-    const steps = buildPlan(layout);
-    const setupIdx = steps.findIndex((s) => s.kind === "runSetup");
-    const firstCreate = steps.findIndex((s) => s.kind === "createTab");
-    expect(setupIdx).toBeGreaterThanOrEqual(0);
-    expect(firstCreate).toBeGreaterThanOrEqual(0);
-    expect(setupIdx).toBeLessThan(firstCreate);
+  it("a single-pane tab is a bare leaf, carrying its label/cwd/env", () => {
+    expect(tabTree({ panes: [pane({ title: "only", env: { HERDR_FACTORY_TICKET: "K-1" } })] }, { cwd: "/w" })).toEqual({
+      type: "pane",
+      label: "only",
+      cwd: "/w",
+      env: { HERDR_FACTORY_TICKET: "K-1" },
+    });
+  });
+
+  it("inverts a % size into the FIRST side's kept share", () => {
+    const tree = tabTree({ panes: [pane(), pane({ split: "right", size: { percent: 30 } })] });
+    expect(tree).toMatchObject({ type: "split", ratio: 0.7 });
+  });
+
+  it("resolves a fixed `cells` size against the box actually being split", () => {
+    // 200x50 tab: a 50-cell-wide pane 1 leaves 150/200 = 0.75 for pane 0. Pane 2 then splits off
+    // PANE 1 (a 50-col box, not the whole tab), so its 30 cells leave 20/50 = 0.4 — exactly what the
+    // old runner computed by measuring the from-pane after each split.
+    const tab: LayoutTab = { panes: [pane(), pane({ split: "right", size: { cells: 50 } }), pane({ split: "right", size: { cells: 30 } })] };
+    const tree = tabTree(tab, { box: { cols: 200, rows: 50 } });
+    expect(tree).toMatchObject({ ratio: 0.75, second: { ratio: 0.4 } });
+  });
+
+  it("a `cells` size with no measured box falls back to an even split (never a degenerate pane)", () => {
+    expect(tabTree({ panes: [pane(), pane({ split: "down", size: { cells: 10 } })] })).toMatchObject({ ratio: 0.5 });
   });
 });
 
-describe("splitRatioArg / clampRatio", () => {
-  it("inverts a pane size into the from-pane's kept share", () => {
-    expect(splitRatioArg(undefined, undefined, undefined)).toBeUndefined();
-    expect(splitRatioArg(0.3, undefined, undefined)).toBe(0.3); // legacy ratio passes through
-    expect(splitRatioArg(undefined, { percent: 30 }, undefined)).toBe(0.7);
-    expect(splitRatioArg(undefined, { cells: 50 }, 200)).toBe(0.75);
-    expect(splitRatioArg(undefined, { cells: 300 }, 200)).toBe(0.01); // cell size ≥ extent → clamp
-    expect(splitRatioArg(undefined, { cells: 40 }, undefined)).toBeUndefined(); // no extent → herdr default
+describe("splitRatio / clampRatio", () => {
+  const pane = (over: Partial<LayoutPane> = {}): LayoutPane => ({ persist: true, env: {}, setup: false, ...over });
+  it("inverts a pane size into the first side's kept share", () => {
+    expect(splitRatio(pane(), undefined)).toBeUndefined();
+    expect(splitRatio(pane({ ratio: 0.3 }), undefined)).toBe(0.3); // legacy ratio passes through
+    expect(splitRatio(pane({ size: { percent: 30 } }), undefined)).toBe(0.7);
+    expect(splitRatio(pane({ size: { cells: 50 } }), 200)).toBe(0.75);
+    expect(splitRatio(pane({ size: { cells: 300 } }), 200)).toBe(0.01); // cell size >= extent -> clamp
+    expect(splitRatio(pane({ size: { cells: 40 } }), undefined)).toBeUndefined(); // unmeasurable
   });
   it("clampRatio keeps ratios inside (0, 1)", () => {
     expect(clampRatio(0.5)).toBe(0.5);
@@ -117,55 +122,231 @@ describe("splitRatioArg / clampRatio", () => {
   });
 });
 
-describe("applyLayout", () => {
-  // A deps stub whose herdr records the herdr commands the runner issues, in order.
-  function stubDeps(rec: string[]): Deps {
-    const herdr = {
-      tabRename: async (id: string, label: string) => void rec.push(`tabRename ${id} ${label}`),
-      tabCreate: async (ws: string, opts: { label?: string; cwd?: string }) => {
-        rec.push(`tabCreate ${ws} label=${opts.label ?? ""} cwd=${opts.cwd ?? ""}`);
-        return { tabId: "TAB", paneId: "PANE" };
-      },
-      paneSplit: async (from: string, opts: { direction: string; ratio?: number; cwd?: string }) => {
-        rec.push(`paneSplit ${from} ${opts.direction} ratio=${opts.ratio ?? ""}`);
-        return "SPLIT";
-      },
-      paneRename: async (id: string, label: string) => void rec.push(`paneRename ${id} ${label}`),
-      paneRun: async (id: string, cmd: string) => void rec.push(`paneRun ${id} ${cmd}`),
-      paneExtent: async () => 200,
-      waitOutput: async () => 'HERDR_FACTORY_SETUP_DONE_x 0',
-    };
-    return { config: { repoName: "demo" }, herdr, sleep: async () => {}, uid: () => "uid1", log: () => {} } as unknown as Deps;
+describe("tabTree — pane commands and agent panes", () => {
+  const pane = (over: Partial<LayoutPane> = {}): LayoutPane => ({ persist: true, env: {}, setup: false, ...over });
+  /** The script a pane runs, unwrapped from its login-shell argv. */
+  function script(node: LayoutNode): string | undefined {
+    const leaf = node.type === "pane" ? node : undefined;
+    const argv = leaf?.command;
+    if (!argv) return undefined;
+    expect(argv.slice(0, 2)).toEqual(["sh", "-c"]);
+    const rest = argv[2]!.replace(`exec ${'"${SHELL:-/bin/sh}"'} -lic `, "");
+    return rest.slice(1, -1).replaceAll(`'\\''`, "'");
   }
 
-  it("issues herdr commands in plan order, inverts a % size, runs blocking setup before the command", async () => {
+  it("runs a command as the pane's PROCESS, in the user's login shell, then hands the pane back", () => {
+    // Not typed into the shell: it can't race a shell that isn't listening and leaves no scrollback.
+    // Login+interactive because that is what a typed command used to get — .zshrc PATH setup (mise,
+    // asdf, nvm) has to keep applying.
+    const tree = tabTree({ panes: [pane({ title: "editor", command: "nvim" })] });
+    expect(script(tree)).toBe(`nvim; ${HAND_BACK}`);
+    expect((tree as unknown as { command: string[] }).command[2]).toContain('exec "${SHELL:-/bin/sh}" -lic ');
+  });
+
+  it("persist: false lets the pane close with its command", () => {
+    expect(script(tabTree({ panes: [pane({ command: "just build", persist: false })] }))).toBe("just build");
+  });
+
+  it("a plain pane gets no command at all — herdr's own shell is enough", () => {
+    expect(script(tabTree({ panes: [pane({ title: "shell" })] }))).toBeUndefined();
+  });
+
+  it("an agent pane is created as a bare shell (herdr starts the agent into it afterwards)", () => {
+    const tree = tabTree({ panes: [pane({ title: "agent", agent: { kind: "claude", args: [] } })] });
+    expect(script(tree)).toBeUndefined();
+    expect(tree).toEqual({ type: "pane", label: "agent" });
+  });
+
+  it("the setup pane records its exit status right after setup, before its own command", () => {
+    const tab: LayoutTab = { panes: [pane({ command: "npm run dev", setup: true })] };
+    const s = script(tabTree(tab, { setup: { command: "npm ci", statusPath: "/state/s.status" } }))!;
+    expect(s).toBe(`npm ci; printf '%s' "$?" > '/state/s.status'; npm run dev; ${HAND_BACK}`);
+    expect(s.indexOf("npm ci")).toBeLessThan(s.indexOf("/state/s.status"));
+    expect(s.indexOf("/state/s.status")).toBeLessThan(s.indexOf("npm run dev"));
+  });
+
+  it("an agent pane that also runs setup still ends at a prompt (agent start needs one)", () => {
+    const tab: LayoutTab = { panes: [pane({ agent: { kind: "claude", args: [] }, setup: true })] };
+    const s = script(tabTree(tab, { setup: { command: "npm ci", statusPath: "/s" } }))!;
+    expect(s.startsWith("npm ci; ")).toBe(true);
+    expect(s.endsWith(HAND_BACK)).toBe(true);
+  });
+
+  it("carries the pane's env and survives a command containing quotes", () => {
+    const tree = tabTree({ panes: [pane({ command: `echo 'it'"'"'s fine'`, env: { PORT: "3000" } })] }, { cwd: "/w" });
+    expect(tree).toMatchObject({ env: { PORT: "3000" }, cwd: "/w" });
+    expect((tree as unknown as { command: string[] }).command[2]).toContain(`'\\''`); // escaped, not lost
+  });
+});
+
+describe("applyLayout", () => {
+  const tmps: string[] = [];
+  afterEach(() => {
+    delete process.env.HERDR_FACTORY_STATE_ROOT;
+    for (const d of tmps) rmSync(d, { recursive: true, force: true });
+    tmps.length = 0;
+  });
+
+  /** A deps stub recording the herdr calls the runner issues, in order. layoutApply answers with one
+   *  pane id per leaf, in tree order — which is how the runner maps configured panes to real ids. */
+  function stubDeps(rec: string[], over: Partial<Record<string, unknown>> = {}): Deps {
+    let tab = 0;
+    const herdr = {
+      tabArea: async () => ({ cols: 200, rows: 50 }),
+      layoutApply: async (o: { workspaceId?: string; tabId?: string; tabLabel?: string; root: LayoutNode }) => {
+        const leaves: string[] = [];
+        const walk = (n: LayoutNode, path: string): void => {
+          if (n.type === "pane") return void leaves.push(`t${tab}${path}`);
+          walk(n.first, `${path}a`);
+          walk(n.second, `${path}b`);
+        };
+        walk(o.root, "");
+        rec.push(`layoutApply tab=${o.tabId ?? ""} ws=${o.workspaceId ?? ""} label=${o.tabLabel ?? ""}`);
+        return { tabId: `TAB${tab++}`, paneIds: leaves };
+      },
+      paneAtShellPrompt: async () => true,
+      agentAdopt: async (id: string, o: { name: string; kind: string; args?: readonly string[]; timeoutMs?: number }) => {
+        rec.push(`agentAdopt ${id} name=${o.name} kind=${o.kind} args=${(o.args ?? []).join(" ")} timeout=${o.timeoutMs ?? ""}`);
+        return true;
+      },
+      agentOpenPrompt: async (target: string, text: string, o: { settleTimeoutMs?: number } = {}) => {
+        rec.push(`agentOpenPrompt ${target} "${text}" settle=${o.settleTimeoutMs ?? ""}`);
+        return true;
+      },
+      reportPaneDisplay: async (id: string, d: { tokens?: Record<string, string | null> }) => {
+        rec.push(`display ${id} ${JSON.stringify(d.tokens ?? {})}`);
+      },
+      notify: async (title: string) => void rec.push(`notify ${title}`),
+      ...over,
+    };
+    return { config: { repoName: "demo" }, herdr, sleep: async () => {}, now: () => Math.floor(Date.now() / 1000), uid: () => "uid1", log: () => {} } as unknown as Deps;
+  }
+
+  const agentPane = (title: string, over: Partial<LayoutAgent> = {}): LayoutPane => ({
+    title,
+    persist: true,
+    env: {},
+    setup: false,
+    agent: { kind: "claude", args: [], ...over },
+  });
+
+  it("builds each tab in ONE call: tab 0 rebuilds+relabels, later tabs are appended", async () => {
     const rec: string[] = [];
     const layout: LayoutConfig = {
       id: "web",
-      setup: { command: "setup.sh", blocking: true },
       tabs: [
-        {
-          title: "main",
-          panes: [
-            { title: "agent", command: "claude", setup: true },
-            { title: "editor", command: "nvim", split: "right", size: { percent: 30 }, setup: false },
-          ],
-        },
-        { title: "dev", panes: [{ title: "server", command: "pnpm dev", setup: false }] },
+        { title: "main", panes: [agentPane("agent"), { title: "editor", command: "nvim", persist: true, env: {}, setup: false, split: "right", size: { percent: 30 } }] },
+        { title: "dev", panes: [{ title: "server", command: "pnpm dev", persist: true, env: {}, setup: false }] },
       ],
     };
     await applyLayout(stubDeps(rec), { workspaceId: "W", rootTabId: "T0", rootPaneId: "P0", cwd: "/work" }, layout);
     expect(rec).toEqual([
-      "tabRename T0 main",
-      "paneRename P0 agent",
-      `paneRun P0 ( setup.sh ) ; printf 'HERDR_FACTORY_SETUP_DONE_%s %s\\n' 'uid1' "$?"`,
-      "paneRun P0 claude",
-      "paneSplit P0 right ratio=0.7", // 30% new pane ⇒ from pane keeps 0.7
-      "paneRename SPLIT editor",
-      "paneRun SPLIT nvim",
-      "tabCreate W label=dev cwd=/work",
-      "paneRename PANE server",
-      "paneRun PANE pnpm dev",
+      // tab_id and workspace_id are mutually exclusive; tab_label names the tab either way, so there
+      // is no follow-up `tab rename`. Commands ride IN the tree, so no `pane run` at all.
+      "layoutApply tab=T0 ws= label=main",
+      "layoutApply tab= ws=W label=dev",
+      // Then the agents, after their pane is confirmed to be at a shell prompt.
+      "agentAdopt t0a name=claude-w kind=claude args= timeout=60000",
     ]);
+  });
+
+  it("starts an agent pane's configured agent, with its args, name and timeout", async () => {
+    const rec: string[] = [];
+    await applyLayout(
+      stubDeps(rec),
+      { workspaceId: "W", rootTabId: "T0", cwd: "/work" },
+      {
+        id: "solo",
+        tabs: [{ title: "main", panes: [agentPane("agent", { kind: "opencode", name: "rev-1", args: ["--yolo"], startTimeoutMs: 90_000 })] }],
+      },
+    );
+    expect(rec).toContain("agentAdopt t0 name=rev-1 kind=opencode args=--yolo timeout=90000");
+  });
+
+  it("submits a pane's opening prompt, waiting only when a prompt timeout is configured", async () => {
+    const rec: string[] = [];
+    await applyLayout(
+      stubDeps(rec),
+      { workspaceId: "W", rootTabId: "T0" },
+      { id: "p", tabs: [{ title: "t", panes: [agentPane("a", { prompt: "read TASK.md" })] }] },
+    );
+    expect(rec).toContain(`agentOpenPrompt t0 "read TASK.md" settle=`);
+
+    const rec2: string[] = [];
+    await applyLayout(
+      stubDeps(rec2),
+      { workspaceId: "W", rootTabId: "T0" },
+      { id: "p", tabs: [{ title: "t", panes: [agentPane("a", { prompt: "go", promptTimeoutMs: 120_000 })] }] },
+    );
+    expect(rec2).toContain(`agentOpenPrompt t0 "go" settle=120000`);
+  });
+
+  it("a failed agent warns + notifies but leaves the built layout standing", async () => {
+    const rec: string[] = [];
+    const deps = stubDeps(rec, { agentAdopt: async () => false });
+    await applyLayout(deps, { workspaceId: "W", rootTabId: "T0" }, { id: "p", tabs: [{ title: "t", panes: [agentPane("a")] }] });
+    expect(rec).toContain("notify herdr-factory: agent did not start");
+  });
+
+  it("waits for the setup status file, reporting progress on the pane, before starting its agent", async () => {
+    // Setup's completion is read from the status FILE its own script writes — no terminal scraping, so
+    // it can't be missed because a marker scrolled away, wrapped, or was echoed by the shell early.
+    const root = mkdtempSync(join(tmpdir(), "hf-state-"));
+    tmps.push(root);
+    process.env.HERDR_FACTORY_STATE_ROOT = root;
+    // Stand in for the pane's script having finished: the status is already recorded when the runner
+    // looks (`uid1` is the stubbed build token).
+    const statusPath = join(root, "layout-hook", "setup", "uid1.status");
+    mkdirSync(join(root, "layout-hook", "setup"), { recursive: true });
+    writeFileSync(statusPath, "0");
+
+    const rec: string[] = [];
+    await applyLayout(
+      stubDeps(rec),
+      { workspaceId: "W", rootTabId: "T0" },
+      { id: "p", setup: { command: "npm ci", blocking: false }, tabs: [{ title: "t", panes: [{ ...agentPane("a"), setup: true }] }] },
+    );
+    // The pane is flagged while setup runs, and the token is cleared once it exits 0 — and the agent
+    // is only started after that (herdr can't start one in a pane that is still running a command).
+    expect(rec).toContain(`display t0 {"hf_setup":"running"}`);
+    expect(rec).toContain(`display t0 {"hf_setup":null}`);
+    expect(rec.indexOf(`display t0 {"hf_setup":null}`)).toBeLessThan(rec.findIndex((r) => r.startsWith("agentAdopt")));
+    expect(existsSync(statusPath)).toBe(false); // consumed, so a later build can't read a stale status
+  });
+
+  it("reports a failed setup on the pane and notifies, without failing the build", async () => {
+    const root = mkdtempSync(join(tmpdir(), "hf-state-"));
+    tmps.push(root);
+    process.env.HERDR_FACTORY_STATE_ROOT = root;
+    mkdirSync(join(root, "layout-hook", "setup"), { recursive: true });
+    writeFileSync(join(root, "layout-hook", "setup", "uid1.status"), "127");
+
+    const rec: string[] = [];
+    await applyLayout(
+      stubDeps(rec),
+      { workspaceId: "W", rootTabId: "T0" },
+      { id: "p", setup: { command: "npm ci", blocking: true }, tabs: [{ title: "t", panes: [{ ...agentPane("a"), setup: true }] }] },
+    );
+    expect(rec).toContain(`display t0 {"hf_setup":"failed-127"}`);
+    expect(rec).toContain("notify herdr-factory: layout setup failed");
+    expect(rec.some((r) => r.startsWith("agentAdopt"))).toBe(true); // the layout still stands
+  });
+
+  it("fails loudly when herdr builds a different number of panes than planned", async () => {
+    const rec: string[] = [];
+    const deps = stubDeps(rec, { layoutApply: async () => ({ tabId: "TAB0", paneIds: ["only-one"] }) });
+    const layout: LayoutConfig = { id: "web", tabs: [{ title: "t", panes: [agentPane("a"), agentPane("b")] }] };
+    await expect(applyLayout(deps, { workspaceId: "W", rootTabId: "T0" }, layout)).rejects.toThrow(/built 1 panes for tab 0, expected 2/);
+  });
+});
+
+describe("deriveAgentName — herdr's [a-z][a-z0-9_-]{0,31} rule", () => {
+  it("builds a name from the kind + workspace, so two worktrees don't collide", () => {
+    expect(deriveAgentName("claude", "w3G")).toBe("claude-w3g");
+    expect(deriveAgentName("claude", "w5")).toBe("claude-w5");
+  });
+  it("strips anything herdr would reject and stays within 32 chars", () => {
+    const name = deriveAgentName("opencode", "workspace:with/odd-chars-and-a-very-long-id");
+    expect(name).toMatch(/^[a-z][a-z0-9_-]{0,31}$/);
   });
 });

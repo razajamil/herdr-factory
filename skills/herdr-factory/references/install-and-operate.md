@@ -27,7 +27,7 @@ supervisor service. Everything the factory **drives** is yours to install and au
 
 | You provide | Why the factory needs it | Where to get it | Checked by |
 |---|---|---|---|
-| **`herdr`** | worktrees, workspaces, tabs/panes, agent lifecycle — the entire execution substrate | **https://herdr.dev**. **Nothing in this skill bundle and nothing in `install.sh` installs it** | `doctor` → `herdr` (presence); `--deep` → `herdr (daemon responds)`, which runs `herdr workspace list` |
+| **`herdr` ≥ 0.7.5** | worktrees, workspaces, tabs/panes, agent lifecycle — the entire execution substrate | **https://herdr.dev** (`herdr update` to upgrade). **Nothing in this skill bundle and nothing in `install.sh` installs it** | `doctor` → `herdr`, which runs `herdr --version` and enforces the **0.7.5 floor** read from `herdr-plugin.toml`'s `min_herdr_version` (`v<x> is too old — the factory needs >= 0.7.5 (run \`herdr update\`)`); `--deep` → `herdr (daemon responds)`, which additionally checks `herdr status server`'s `compatible:` line and runs `herdr workspace list`, reporting `v0.7.5, protocol 17` |
 | **An agent CLI** | the thing that does the work in each pane: `claude` · `opencode` · `codex` · `pi` · … (a pane's `command` defaults to `claude`) | the vendor | `doctor` checks **`claude` unconditionally**, even when your panes run `opencode`/`codex` — a ✗ there is cosmetic for a non-claude setup, and a ✓ proves nothing about the harness you actually configured |
 | **`gh`, authenticated** | PR discovery, CI/review polling, `github_issues` writes | `gh auth login` after install | `doctor` → `gh` (presence); `--deep` → `gh (authenticated)`, which runs `gh auth status` |
 | **`git`** | branch cleanup, heartbeats, base refs | usually already present | `doctor` → `git` |

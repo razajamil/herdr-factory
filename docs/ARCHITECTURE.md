@@ -164,7 +164,7 @@ herdr-factory/
   .node-version              exact Node pin (26.x) — drives the vendored-runtime provisioning
   src/
     cli/index.ts          commander program; routes via server (else in-process), dispatches
-    cli/layout-hook.ts    lean herdr-event entry (the worktree.created layout hook) — kept out of index.ts
+    cli/layout-hook.ts    lean herdr-hook entry (worktree/workspace events + the one-shot [[startup]] hook) — kept out of index.ts
     build-deps.ts         buildDeps(repo) — shared by the server + every command's local path
     resolve.ts            pure resolveSourceName / resolveActiveRun (throw, not exit; CLI+server)
     config.ts             env map (repos/<name>/env: loadEnvMap/saveEnvValues) + repos/<name>/config.yml
@@ -192,13 +192,14 @@ herdr-factory/
                           re-provisions Node / re-installs deps when .node-version / the lockfile change
       provision.ts        vendored-Node download + SHA-256 verify + atomic `current` flip
     db/{index,migrate,store,tx}.ts
-    clients/{exec,http,herdr,jira,jira-source,local-markdown-source,
+    clients/{exec,http,herdr,herdr-socket,jira,jira-source,local-markdown-source,
              github-issues,github-issues-source,github-budget,github,git,sentry,sentry-source}.ts
     sources/registry.ts      the source REGISTRY: one descriptor per type (zod configSchema /
       + sources/<type>/descriptor.ts   resolveConfig / create / secrets manifest / TUI fields) —
                              the single edit surface for adding source N+1 (checklist in its header)
     core/{deps,branch,step,watch,reconcile}.ts
-    core/{layout,layout-match,layout-hook}.ts   layout subsystem: plan+runner / pure matching / herdr event hook (§4)
+    core/{layout,layout-match,layout-hook}.ts   layout subsystem: tree builder+runner / pure matching / herdr event+startup hooks (§4)
+    core/pane-display.ts     display-only pane metadata (what the operator sees on a run's pane) — never a rename
     runtime/effect.ts        the shared Effect ManagedRuntime (also hosts the OTel layer)
     telemetry/…              OpenTelemetry spans/metrics (no-op unless HERDR_FACTORY_TELEMETRY)
     tui/…                    the opentui TUI (Dashboard · Config editor · Doctor)
@@ -232,26 +233,51 @@ out to `herdr …` and parses its JSON; it contains zero terminal/worktree logic
 - worktree **create / open / remove** (incl. deleting the checkout dir + git
   worktree registration)
 - workspace **close / get / list**
-- tab **create / list**
-- pane **split / run / send-text / send-keys / list / read**
-- agent **start / list / status / prompt / send-keys / focus / rename / read / wait**
+- tab **create / rename / list**
+- pane **run / list / read / close / layout / process-info** (+ display-only **report-metadata**)
+- agent **start / list / status / prompt / focus / read / wait** — note `agent start` ADOPTS an
+  existing pane (herdr 0.7.5): the factory creates the pane, herdr brings the harness up in it and
+  blocks until it is ready for input
 - pane **list / current** (incl. the `focused` flag — which pane the user is viewing)
 - desktop **notifications**
+
+**One exception to "via the CLI": `layout.apply`.** herdr exposes it on its socket API but not its
+CLI, and it is what makes a layout build atomic — a whole tab's pane tree (splits, ratios, labels,
+cwds, envs) in ONE call that answers with the pane ids. `src/clients/herdr-socket.ts` is a minimal
+request/response client (one call per connection, hard timeout, no subscriptions) used for that alone;
+everything else still shells out. The boundary is unchanged in substance — herdr still performs every
+split and spawn — only the transport differs for this one call.
 
 **Layouts** — the tab/pane arrangement a worktree comes up with — are applied by **herdr-factory
 itself** (absorbed from the workspace-manager plugin). It registers as a herdr plugin
 (`herdr-plugin.toml`) and handles `worktree.created` / `workspace.created` / `workspace.focused`; on
 the event it matches the new worktree's repo root to a repo config, picks the layout (a
 factory-claimed worktree uses its owning run's belt; a hand-created one walks the repo's belts), and
-*builds* it by issuing herdr `tab create` / `pane split` / `pane run` — herdr still performs every
-split and spawn. The hook is idempotent (a per-checkout-path filesystem claim + a fresh 1-tab/1-pane
+*builds* it: **one `layout.apply` per tab** hands herdr the tab's whole declarative pane tree
+(`tabTree` — splits, ratios, labels, cwd, env, and each pane's `command` as ARGV) and gets the created
+pane ids back. Applying with a `tab_id` REBUILDS that tab (herdr builds the replacement first, then
+closes the old one, and `tab_label` names it — so no follow-up `tab rename`); applying with a
+`workspace_id` appends one. The rebuild re-ids the tab, which is safe because layouts are built into a
+freshly-created 1-pane worktree before any pane id is recorded, and steps resolve panes by label.
+Afterwards, only what a tree can't express: the layout's `setup` command (its script records its own
+exit status to a status FILE the runner polls) and then, per pane, its agent
+(`agent start --kind --pane`, which blocks until herdr has detected the agent and marked it ready for
+input — preceded by polling `pane process-info` until the pane's shell is actually idle, since herdr
+refuses a pane that isn't). A failed setup or agent is reported (log + pane token + notification) but
+never tears down the built layout.
+The hook is idempotent (a per-checkout-path filesystem claim + a fresh 1-tab/1-pane
 guard + a per-workspace "decided" cache) and sits behind a **lean entry** (`src/cli/layout-hook.ts`,
 routed by `bin/herdr-factory`) that lazy-loads the heavy graph, so the constantly-firing focus event
-stays cheap. Modules: `src/core/layout-match.ts` (pure matching), `layout.ts` (plan + runner),
-`layout-hook.ts` (the event handler).
+stays cheap. A one-shot **`[[startup]]` hook** (same lean entry, `--startup`) owns the per-server-session
+state hygiene the event path used to pay for on every firing: reaping claims whose worktree vanished
+while herdr was down, and clearing the "decided" cache, whose keys are workspace ids the next herdr
+server recycles. Modules: `src/core/layout-match.ts` (pure matching), `layout.ts` (tree builder +
+runner), `layout-hook.ts` (the event + startup handlers).
 
 A belt step then simply *targets* a resulting pane via its own `tab`/`pane` (from its `steps[]`
-entry). herdr-factory **waits** for a targeted pane to come up (re-arming an expired
+entry); that pane declares its own agent (`agent: claude` + `agent_args`) so the build brings one up
+there (config-load rejects a step whose target pane starts no agent at all — see [§10](#10-config)).
+herdr-factory **waits** for a targeted pane to come up (re-arming an expired
 `layout_wait_seconds` window a bounded number of times, then escalating to `attention` —
 [§8](#8-step-agent-model)) and only spawns a pane itself for steps that have **no** tab/pane
 configured — except `evidence`, which never spawns its own: with no tab/pane that step is
@@ -314,15 +340,44 @@ reverse-engineered during the bash prototype.
     **memoized ~5s** (one `herdr agent list` answers a whole tick's liveness questions instead of
     O(active runs) subprocess spawns); `paneAlive`/`paneState` accept `{fresh:true}` to bypass
     the memo, and `agentStart` invalidates it.
-  - `agentStart({workspaceId, cwd, argv}) → paneId` where
+  - `agentStart({workspaceId, cwd, argv, name, kind, env}) → paneId` where
     **`argv = [command, ...flags, prompt]`** (first token is the executable — the configured
-    `agent.command`, default `claude`; the `herdr agent start <name>` kind is derived from
-    argv[0]'s basename via `agentKindForArgv`, so a non-claude harness is detected). The harness is
-    the resolved [`agent:` config](../README.md#agent-optional) (step over belt over repo over
-    the default `claude --dangerously-skip-permissions`), threaded through `StepConfig.agent`.
+    `agent.command`, default `claude`). herdr 0.7.5's `agent start` ADOPTS an existing pane, so this
+    is two steps: `tab create` (carrying the cwd + the env that used to ride on `agent start`, incl.
+    herdr's `HERDR_AGENT` foreground hint), then `agent start <name> --kind <k> --pane <id>`, which
+    blocks until the harness is ready for input — retiring the old "sleep and hope the shell is up"
+    guesswork. A failed adoption CLOSES the pane it created and answers null. The kind comes from
+    argv[0]'s basename (`agentKindForArgv`) or an explicit `agent.kind`; a harness herdr can't adopt
+    (absolute path, wrapper script) is typed into the pane instead (`spawnStrategyForArgv`). The
+    harness is the resolved [`agent:` config](../README.md#agent-optional) (step over belt over repo
+    over the default `claude --dangerously-skip-permissions`), threaded through `StepConfig.agent`.
+  - `agentAdopt(pane, {name, kind, args, timeoutMs}) → ready?` — the same bring-up into a pane that
+    already exists: how a LAYOUT pane's `agent:` kind is started during the build. `agentOpenPrompt`
+    submits such a pane's optional opening `prompt:` (waiting for the agent to SETTLE only when
+    `prompt_timeout_ms` is set — the opposite question from `agentSend`'s "did it start?").
+  - `paneAtShellPrompt(pane)` — one `pane process-info` sample of "is this pane's shell idle?", which
+    `agent start` requires; the layout runner and the dedicated-spawn path both poll it instead of
+    sleeping a fixed guess. The predicate is subtle: a shell sourcing rc files keeps its OWN process
+    group, so the pane is only idle once the shell is the single foreground process (`isAtShellPrompt`).
+  - **herdr's agent NAME is not a label**: it must match `[a-z][a-z0-9_-]{0,31}` and be unique among
+    live agents (`invalid_agent_name` otherwise), so a run's `<step>:<KEY>` can never be one —
+    `agentNameFor` derives a legal name and the readable identity is display metadata.
+  - `layoutApply({workspaceId, tabId | tabLabel, root}) → {tabId, paneIds}` — a whole tab's pane tree
+    in one socket call (see §4); `tabArea(pane)` measures the TAB once (`pane layout`'s `layout.area`)
+    so `cells` sizes convert to exact ratios as the tree is walked.
   - `paneByLabel(ws, tabLabel, paneLabel)`, `paneAlive(pane)` (any agent present),
-    `paneRun(pane, cmd)`, `agentSend(pane, text)`, `paneSendKeys(pane, "Enter")`,
-    `agentRename(pane, "<step>:KEY")`, `notify(title, body)`
+    `paneRun(pane, cmd)`, `paneClose(pane)`, `notify(title, body)`
+  - `agentSend(pane, text, {confirm}) → landed?` — `herdr agent prompt` is ATOMIC (it types and
+    presses Enter itself; callers must not send their own Enter). Under `confirm` it waits for herdr
+    to observe the agent react (`--wait --until working|blocked`) and answers false when the
+    submission stalled — i.e. the keystrokes were dropped. That verdict is what keeps a lost prompt
+    from looking like a successful dispatch (§8).
+  - `reportPaneDisplay(pane, {agentName, title, tokens})` — DISPLAY-ONLY pane metadata
+    (`pane report-metadata`), the channel that replaced renaming panes to convey run state. See
+    `core/pane-display.ts`: the pane's real `label` stays whatever the layout built (so a step's
+    `pane:` target keeps resolving for the pane's whole life) while the operator still sees
+    `<step>:<KEY>`, an `⚠ ATTENTION <KEY>` title on a park, and `hf_step`/`hf_key`/`hf_state` tokens
+    a user's `[ui.sidebar]` rows and herdr's agent-view queries can render, style and filter on.
   - `agentFocus(pane)` (bring a pane + its tab to the front) and `focusedPane() →
     {paneId, workspaceId, tabId, label}` (the one globally-focused pane, from `pane list`'s
     `focused` flag — herdr exposes no focus-change event to subscribe to, so it's polled)
@@ -1003,11 +1058,16 @@ step (`spawnStep`):
    - **Configured** (a pane the belt's layout built — see [§4](#4-herdr-ownership-boundary)): find
      that pane and require an agent
      that is present **and idle** (agent-agnostic — claude *or* opencode), then `agent prompt`
-     it (atomic submit + Enter). If the pane isn't up yet or its agent is still busy starting up,
+     it (atomic submit + Enter). The submission is **confirmed**: herdr reports whether it actually
+     moved the agent, and an unconfirmed one is treated as `waiting` — the pass stays undispatched and
+     retries, instead of starting the step's budget clock against an agent that never got the work.
+     If the pane isn't up yet or its agent is still busy starting up,
      `spawnStep` returns `waiting` — the run stays in its phase and retries on later ticks
      (the wait is bounded by `layout_wait_seconds`, measured from the `run_steps` row's
      `started_at`). A **re-entry** (bounce rework, forward re-advance) re-prompts the step's own
-     pane via its recorded id (the first dispatch renamed it away from the configured label) — and
+     pane via its recorded id — the durable handle, preferred because it survives anything else
+     re-labelling the pane; the configured label itself now stays valid for the pane's whole life
+     (run state is published as display metadata, not by renaming the pane — §5) — and
      defers the same way while that pane is actively `working` (mid-answer to an on-demand
      agent-send question, or human-driven), rather than queueing the prompt into a foreign turn
      and starting the budget clock under someone else's work. An expired window is **re-armed in place** up to the layout-wait guard's
@@ -1019,9 +1079,11 @@ step (`spawnStep`):
      pane is genuinely never coming up. It **never** spawns
      its own pane when a tab/pane is configured — so the user's auto-spawned layout (setup
      commands, dev servers, agent startup) can settle before work begins.
-   - **Not configured** (no tab/pane): `agent start` a dedicated claude pane — the only path
-     that creates a pane.
-   On dispatch: rename `<step>:<KEY>`; record the pane on the `run_steps` row (and as
+   - **Not configured** (no tab/pane): create a dedicated pane (a new tab) and adopt the harness
+     into it — the only path that creates a pane. The prompt rides in on the argv, and the adoption
+     blocks until the agent is ready for input, so nothing is typed into a shell that isn't listening.
+   On dispatch: publish `<step>:<KEY>` as the pane's display name (metadata, never a rename); record
+     the pane on the `run_steps` row (and as
    `run.pane_id`, the latest active pane) and reset `started_at` (now the per-step budget
    clock); set `run.focus_pending` so the worktree view can follow the active step (§7,
    *Focus follows the active step* — applied later, never stealing focus from another worktree).
@@ -1114,9 +1176,11 @@ the budget watchdog reading the prior pass's stale clock and parking it as "over
 (worker: gone)".
 
 **Attention is a workflow, not a dead end.** On escalation, `escalateAttention` flips the phase,
-records the event, fires a notification, **relabels the run's active pane** to `⚠ ATTENTION
-<KEY>` (herdr's `agent_status` is owned by the agent's own lifecycle hook and can't be set
-externally, so the label is the persistent cue), and **posts the reason to the work source**
+records the event, fires a notification, **flags the run's active pane** with an `⚠ ATTENTION
+<KEY>` title + an `hf_state=attention` token (herdr's `agent_status` is owned by the agent's own
+lifecycle hook and can't be set externally, so a display cue is the persistent signal — published as
+metadata so the pane's real label, which a step's `pane:` target resolves by, is never touched), and
+**posts the reason to the work source**
 (`postNote` — a Jira comment / local note, including the ready-made resume command). While
 parked, the run **re-notifies every `attention_renotify_seconds`** (default 1h) and — for a
 belt with a PR — keeps polling for a merge (which still tears it down). The operator
@@ -1330,7 +1394,8 @@ about to revert. It's driven two ways:
   `<step>:<KEY>`, so a second step sharing it could never resolve its label and would burn its
   layout wait into a park — one agent pane per step),
   **step→layout-pane allocation** — every step's tab/pane target must exist (as labeled tab +
-  pane titles) in the belt's `default_layout`, so a misallocated step fails at save/reload with
+  pane titles) in the belt's `default_layout` **and that pane must start an agent** (an `agent:` kind,
+  or a `command` that launches one), so a misallocated or agentless step fails at save/reload with
   the layout's actual panes in the message instead of surfacing at runtime as a layout-wait park
   (a belt with no `default_layout` is skipped — its panes come from outside the factory — and
   `layout_matching` targets are exempt, since those rules commonly serve hand-created worktrees

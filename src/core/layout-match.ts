@@ -56,8 +56,10 @@ export function resolveBeltLayout(belt: BeltConfig, branch: string | undefined, 
 }
 
 /** The layout to build into a worktree on `branch`, for the event hook (which sees any worktree,
- *  not just factory-claimed ones). When the worktree is owned by an active factory run,
- *  `ownedBeltName` is that run's belt and we resolve precisely from it. Otherwise (a hand-created
+ *  not just factory-claimed ones) — WITH the belt it came from, for the caller's own bookkeeping (a
+ *  layout pane names its own agent, so no harness is threaded through). When the worktree is owned by
+ *  an active factory run, `ownedBeltName` is that run's belt and we resolve precisely from it.
+ *  Otherwise (a hand-created
  *  worktree, or the owning belt yields nothing) we walk the repo's belts in priority order and take
  *  the first that yields a layout. undefined ⇒ nothing to build. */
 export function resolveHookLayout(
@@ -65,17 +67,17 @@ export function resolveHookLayout(
   layouts: LayoutConfig[],
   ownedBeltName: string | undefined,
   branch: string | undefined,
-): LayoutConfig | undefined {
+): { layout: LayoutConfig; belt: BeltConfig } | undefined {
   if (ownedBeltName) {
     const owner = belts.find((b) => b.name === ownedBeltName);
     if (owner) {
-      const l = resolveBeltLayout(owner, branch, layouts);
-      if (l) return l;
+      const layout = resolveBeltLayout(owner, branch, layouts);
+      if (layout) return { layout, belt: owner };
     }
   }
   for (const belt of belts) {
-    const l = resolveBeltLayout(belt, branch, layouts);
-    if (l) return l;
+    const layout = resolveBeltLayout(belt, branch, layouts);
+    if (layout) return { layout, belt };
   }
   return undefined;
 }

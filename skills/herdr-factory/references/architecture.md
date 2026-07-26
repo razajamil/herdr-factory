@@ -205,7 +205,7 @@ Re-bases **write NULL rows, never delete** — a delete would let a legacy fallb
 
 The wait window is `limits.layout_wait_seconds` (600). Past it, if the step's `layout_wait` counter is below the respawn limit (3), the wait is **re-armed in place** (`layout pane … not up after Ns — re-arming the wait (retry i/limit)`). Only when the budget is spent does it park `layout_wait_timeout`. Wall clock before a park: `(1 + 3) × layout_wait_seconds` ≈ 40 min at defaults. The same 3 credits are shared by the in-place re-arm and the post-park rescue; a successful dispatch or a `resume` refunds them.
 
-Dispatch never spawns its own pane when a `tab`/`pane` is configured — a fresh pane must be `idle`, and a reused pane that is `working` defers rather than queue into a foreign turn. See [layouts.md](./layouts.md).
+Dispatch never spawns its own pane when a `tab`/`pane` is configured — a fresh pane must be `idle`, and a reused pane that is `working` defers rather than queue into a foreign turn. The prompt submission itself is **confirmed** (`herdr agent prompt --wait --until working`): an unconfirmed one counts as "not dispatched" and retries under the same wait, so a dropped prompt can't start the budget clock. See [layouts.md](./layouts.md).
 
 ### Why a "finished" step can look stuck
 

@@ -160,7 +160,10 @@ describe("config-fields: layouts section", () => {
     if (add?.kind !== "action") throw new Error("expected the add-layout action");
     add.run();
     expect(doc.getIn(["layouts", 0, "id"])).toBe("layout");
-    expect(doc.getIn(["layouts", 0, "tabs", 0, "panes", 0, "command"])).toBe("claude");
+    // The seeded pane is an AGENT pane (`agent: claude`), not a `command: claude` one — herdr
+    // starts the targeting step's own configured harness there.
+    expect(doc.getIn(["layouts", 0, "tabs", 0, "panes", 0, "agent"])).toBe("claude");
+    expect(doc.getIn(["layouts", 0, "tabs", 0, "panes", 0, "command"])).toBeUndefined();
   });
 
   it("exposes a pane's split as an enum with an (unset) clear option", () => {

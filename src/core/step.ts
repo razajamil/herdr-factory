@@ -8,6 +8,8 @@ import { DEFAULT_AGENT_CONFIG } from "../types.ts";
 import { renderWorkVars } from "./branch.ts";
 import { productActiveFor, type PromptStepContext, stripInactiveProductBlocks, validatePromptBody } from "../prompts/contract.ts";
 import { guardsResetOn } from "../steps/guards.ts";
+import { awaitShellPrompt } from "./layout.ts";
+import { showRunPane } from "./pane-display.ts";
 import { signalCommand } from "../signals/registry.ts";
 import { REPO_PACK_SUBDIR, resolvePromptFile } from "../prompt-packs.ts";
 import { telemetrySpan } from "../telemetry/index.ts";
@@ -186,6 +188,15 @@ export const nextStep = (belt: BeltRuntime, name: string): StepConfig | undefine
   return i >= 0 && i < belt.steps.length - 1 ? belt.steps[i + 1] : undefined;
 };
 
+/** A herdr-legal agent name for a factory-spawned pane: `[a-z][a-z0-9_-]{0,31}`, unique among LIVE
+ *  agents (herdr's rule — it rejects anything else with `invalid_agent_name`). Derived from the step +
+ *  work key so it stays recognizable in `herdr agent list`; the display identity (`<step>:<KEY>`, with
+ *  its real casing) is published separately as pane metadata. */
+export function agentNameFor(step: string, key: string): string {
+  const clean = (s: string) => s.toLowerCase().replaceAll(/[^a-z0-9]+/g, "-");
+  return `${clean(step)}-${clean(key)}`.replace(/^[^a-z]+/, "").replace(/-+$/, "").slice(0, 32).replace(/-+$/, "") || "agent";
+}
+
 const dispatchPrompt = (step: string): string =>
   `Read ${MEMORY_DIR}/prompt-${step}.md in this worktree and follow it exactly. This is an autonomous task — do not pause to ask for confirmation.`;
 
@@ -197,29 +208,31 @@ export type DispatchResult = { status: "ready"; paneId: string } | { status: "wa
  * Deliver `prompt` to a step's agent. Two modes, chosen by whether a `tab`/`pane` is configured:
  *
  *  - **Configured** (the user's layout owns this pane): find that pane and require an agent
- *    that is present AND idle, then `agent send` the prompt to it (agent-agnostic — claude,
- *    opencode, …). If the pane isn't up yet, or its agent is still busy starting up, return
+ *    that is present AND idle, then `agent prompt` it (agent-agnostic — claude, opencode, …). If the
+ *    pane isn't up yet, or its agent is still busy starting up, return
  *    `waiting` — we NEVER spawn our own when a tab/pane is configured; the caller waits (and
  *    eventually escalates to attention). This is what lets the user's auto-spawned layout
  *    (setup commands, dev servers, agent startup) settle before work begins.
  *    RE-ENTRY (bounce rework / forward re-advance after a bounce / crash respawn) passes the
- *    pane this step was ALREADY dispatched to as `knownPaneId`: the first dispatch renames the
- *    pane from its configured label to `${step}:${key}` (= `paneName`), so re-resolving by
- *    `tab`/`pane` would no longer find it (the run would wedge in a layout-wait timeout — "pane
- *    never became available"). So we resolve in order: a live `knownPaneId` (the durable handle) →
- *    the configured label (FIRST entry, before any rename) → the renamed `paneName` (a re-entry
- *    whose recorded id was lost). A re-entry pane normally finished its prior pass and sits
- *    idle-at-prompt, so it skips the startup settle — but a pane that is actively `working`
- *    (mid-answer to an on-demand agent-send question, or human-driven) defers the dispatch to a
- *    later tick rather than queueing the prompt into a foreign turn.
- *  - **Not configured** (no tab/pane): spawn a dedicated claude pane ourselves. This is the
- *    only path that creates a pane.
+ *    pane this step was ALREADY dispatched to as `knownPaneId` — the durable handle, which is
+ *    preferred because it survives the pane being re-labelled by anything else. The configured
+ *    label now stays valid across dispatches too (run state is published as display METADATA, not by
+ *    renaming the pane — see core/pane-display.ts), so resolution is: a live `knownPaneId` → the
+ *    configured label. A re-entry pane normally finished its prior pass and sits idle-at-prompt, so
+ *    it skips the idle gate — but a pane that is actively `working` (mid-answer to an on-demand
+ *    agent-send question, or human-driven) defers the dispatch to a later tick rather than queueing
+ *    the prompt into a foreign turn.
+ *  - **Not configured** (no tab/pane): spawn a dedicated pane ourselves (a new tab + the configured
+ *    harness adopted into it). This is the only path that creates a pane.
  *
- * Renames the target pane to `paneName`. Shared by all step agents.
+ * A delivered prompt is CONFIRMED (herdr reports whether the submission actually moved the agent);
+ * an unconfirmed one is reported as `waiting` so the caller retries instead of starting the step's
+ * budget clock against an agent that never got the work. Publishes `<step>:<key>` as the pane's
+ * display name. Shared by all step agents.
  */
 export async function dispatchToLayout(
   deps: Deps,
-  opts: { workspaceId: string; worktree: string; tab?: string; pane?: string; prompt: string; paneName: string; ticketKey: string; knownPaneId?: string; agent: AgentConfig },
+  opts: { workspaceId: string; worktree: string; tab?: string; pane?: string; prompt: string; step: string; ticketKey: string; knownPaneId?: string; agent: AgentConfig },
 ): Promise<DispatchResult> {
   return telemetrySpan(
     "step.dispatch",
@@ -237,18 +250,21 @@ export async function dispatchToLayout(
 
 async function dispatchToLayoutImpl(
   deps: Deps,
-  opts: { workspaceId: string; worktree: string; tab?: string; pane?: string; prompt: string; paneName: string; ticketKey: string; knownPaneId?: string; agent: AgentConfig },
+  opts: { workspaceId: string; worktree: string; tab?: string; pane?: string; prompt: string; step: string; ticketKey: string; knownPaneId?: string; agent: AgentConfig },
 ): Promise<DispatchResult> {
+  const paneName = `${opts.step}:${opts.ticketKey}`;
   if (opts.tab && opts.pane) {
     // Resolve this step's pane, in order (see the dispatchToLayout doc):
     //   1. the recorded pane id, if it's still a live agent — a re-entry's durable handle;
-    //   2. the configured label — a FIRST entry (before the pane is renamed);
-    //   3. the deterministic dispatch name `${step}:${key}` (= opts.paneName) — a re-entry whose
-    //      recorded id was lost (e.g. a run parked by the pre-fix code that had cleared it), whose
-    //      pane still exists but under its renamed label. Without this the run wedges in a layout wait.
+    //   2. the configured label — which now stays valid for the pane's whole life, because run state
+    //      is published as display metadata instead of renaming the pane.
+    //   3. DRAIN-WINDOW SHIM: the dispatch name `${step}:${key}`. Panes that the pre-metadata code
+    //      RENAMED are still live in long-running worktrees across an upgrade; without this they'd be
+    //      unresolvable and their runs would wedge in a layout wait. Delete once no pane can predate
+    //      the switch (one release).
     // (1) and (3) are RE-ENTRIES: the pane already ran a pass, so it's idle-at-prompt — re-prompt it
-    // directly, skipping the idle gate + startup settle (mirrors bounceStep). Only a FRESH (2) pane
-    // must be present AND idle before we send (its agent may still be starting up).
+    // directly, skipping the idle gate (mirrors bounceStep). Only a FRESH (2) pane must be present
+    // AND idle before we send (its agent may still be starting up).
     let target: string | null = null;
     let reused = false;
     if (opts.knownPaneId != null && (await deps.herdr.paneAlive(opts.knownPaneId))) {
@@ -257,7 +273,7 @@ async function dispatchToLayoutImpl(
     } else {
       target = await deps.herdr.tabPaneByLabel(opts.workspaceId, opts.tab, opts.pane);
       if (!target) {
-        target = await deps.herdr.tabPaneByLabel(opts.workspaceId, opts.tab, opts.paneName);
+        target = await deps.herdr.tabPaneByLabel(opts.workspaceId, opts.tab, paneName);
         reused = target != null;
       }
     }
@@ -271,10 +287,16 @@ async function dispatchToLayoutImpl(
     // else — defer instead. The pass stays undispatched, so the caller retries on later ticks
     // under the bounded layout wait until the pane comes back to idle.
     if (reused && state === "working") return { status: "waiting" };
-    if (!reused) await deps.sleep(2000); // settle a just-started agent so the first keystrokes aren't dropped
-    await deps.herdr.agentSend(target, opts.prompt);
-    await deps.herdr.paneSendKeys(target, "Enter");
-    await deps.herdr.agentRename(target, opts.paneName);
+    // No settle sleep and no separate Enter: `agent prompt` is atomic, and `confirm` makes herdr
+    // report whether the submission actually moved the agent. An unconfirmed prompt (a
+    // just-started agent that dropped the keystrokes) is reported as `waiting` — the pass stays
+    // undispatched and retries under the bounded layout wait, instead of starting the step's
+    // budget clock against an agent that never received the work.
+    if (!(await deps.herdr.agentSend(target, opts.prompt, { confirm: true }))) {
+      deps.log("warn", `${opts.ticketKey}: prompt to layout pane ${target} was not confirmed; will retry`);
+      return { status: "waiting" };
+    }
+    await showRunPane(deps, target, { key: opts.ticketKey, step: opts.step, state: "running" });
     deps.log("info", `${opts.ticketKey}: ${reused ? "re-dispatched to reused" : "dispatched to layout"} pane ${target} (${opts.tab}/${opts.pane})`);
     return { status: "ready", paneId: target };
   }
@@ -288,23 +310,37 @@ async function dispatchToLayoutImpl(
   // deferral, and the factory-owned agent queues the message for after its current turn — the
   // lesser evil vs. a human park.
   if (opts.knownPaneId != null && (await deps.herdr.paneAlive(opts.knownPaneId))) {
-    await deps.herdr.agentSend(opts.knownPaneId, opts.prompt);
-    await deps.herdr.paneSendKeys(opts.knownPaneId, "Enter");
-    await deps.herdr.agentRename(opts.knownPaneId, opts.paneName);
+    // A dedicated pane is factory-owned, so an unconfirmed submission here is NOT deferred the way a
+    // layout pane's is: this pane carries no layout-wait guard to bound the retry, and the agent
+    // queues a message sent mid-turn. Log it and treat the dispatch as made (the budget watchdog is
+    // the backstop) — the confirmation is a signal, not a gate, on this path.
+    if (!(await deps.herdr.agentSend(opts.knownPaneId, opts.prompt, { confirm: true }))) {
+      deps.log("warn", `${opts.ticketKey}: prompt to dedicated pane ${opts.knownPaneId} was not confirmed`);
+    }
+    await showRunPane(deps, opts.knownPaneId, { key: opts.ticketKey, step: opts.step, state: "running" });
     deps.log("info", `${opts.ticketKey}: re-dispatched to reused dedicated pane ${opts.knownPaneId}`);
     return { status: "ready", paneId: opts.knownPaneId };
   }
   // The configured harness for this spawned pane: [command, ...flags, prompt]. argv[0] is the
-  // executable (agentStart's documented invariant; herdr's agent kind is derived from it). Defaults
-  // to claude --dangerously-skip-permissions when no `agent:` block is set (byte-identical to before).
+  // executable (agentStart's documented invariant; herdr's agent kind is derived from it, or named
+  // outright by `agent.kind`). Defaults to claude --dangerously-skip-permissions when no `agent:`
+  // block is set. agentStart creates the pane AND waits for the harness to be ready for input, so
+  // there is nothing to settle afterwards — the prompt already rode in on the argv.
+  //
+  // `name` is herdr's AGENT name, not a label: herdr enforces `[a-z][a-z0-9_-]{0,31}` and rejects
+  // anything else outright (`invalid_agent_name`), so the run's own `<step>:<KEY>` can't be used — a
+  // ticket key alone is usually uppercase. The readable identity is published as pane metadata below.
   const target = await deps.herdr.agentStart({
     workspaceId: opts.workspaceId,
     cwd: opts.worktree,
     argv: [opts.agent.command, ...opts.agent.flags, opts.prompt],
     env: { HERDR_FACTORY_TICKET: opts.ticketKey },
+    name: agentNameFor(opts.step, opts.ticketKey),
+    kind: opts.agent.kind,
+    awaitShell: async (paneId) => void (await awaitShellPrompt(deps, paneId)),
   });
   if (!target) throw new Error(`${opts.ticketKey}: failed to spawn dedicated agent (no tab/pane configured)`);
-  await deps.herdr.agentRename(target, opts.paneName);
+  await showRunPane(deps, target, { key: opts.ticketKey, step: opts.step, state: "running" });
   deps.log("info", `${opts.ticketKey}: no tab/pane configured — spawned dedicated pane ${target}`);
   return { status: "ready", paneId: target };
 }
@@ -664,7 +700,7 @@ async function spawnStepImpl(
     tab: step.tab,
     pane: step.pane,
     prompt: dispatchPrompt(stepName),
-    paneName: `${stepName}:${run.ticketKey}`,
+    step: stepName,
     ticketKey: run.ticketKey,
     knownPaneId,
     // Resolved step over belt over repo over the default (config.ts); the ?? guards terse test

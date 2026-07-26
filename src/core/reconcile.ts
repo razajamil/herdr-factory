@@ -13,6 +13,7 @@ import { branchName } from "./branch.ts";
 import { firstStep, indexOfStep, materializeWork, MEMORY_DIR, nextStep, scrubCommittedMemoryDir, spawnStep, stepByName } from "./step.ts";
 import { BOUNCE_CAP, CAPTURE_CAP_GUARD, guardsResetOn, STEP_DESCRIPTORS } from "../steps/registry.ts";
 import { applyWatchRebase, evaluateStepWatches } from "./watches.ts";
+import { showRunPane } from "./pane-display.ts";
 import { PANE_ABSENCE_CONFIRM_SECONDS } from "../steps/engine-watches.ts";
 import { flushOutbox, type OutboxFlow } from "./outbox.ts";
 import { consumeIntentHandoffs, ledgerFlow } from "./ledger.ts";
@@ -889,11 +890,12 @@ async function escalateAttention(
     type: "attention",
     detail: { reason: opts.reason, ...(opts.detail ?? {}) },
   });
-  // Make it obvious in herdr: relabel the active pane. herdr won't let us set agent_status to
-  // "blocked" (that's owned by the agent's own lifecycle hook), so a glaring pane label is the
+  // Make it obvious in herdr: flag the active pane. herdr won't let us set agent_status to
+  // "blocked" (that's owned by the agent's own lifecycle hook), so a glaring pane TITLE is the
   // most visible persistent cue — unlike the one-shot notification, it stays in the tab/pane list
-  // until the run resolves (re-spawn renames it back; teardown removes the pane). Best-effort.
-  if (run.paneId) await deps.herdr.agentRename(run.paneId, `⚠ ATTENTION ${run.ticketKey}`).catch(() => {});
+  // until the run resolves. Published as display metadata (never a rename), so it decorates the pane
+  // without touching the label a step's `pane:` target resolves by. Best-effort.
+  if (run.paneId) await showRunPane(deps, run.paneId, { key: run.ticketKey, step: run.step, state: "attention" });
   await deps.herdr.notify(`herdr-factory: ${run.ticketKey} needs attention`, opts.body).catch(() => {});
   // Best-effort source write-back (once, on escalation — the periodic re-notify stays local).
   // Skipped when the escalation IS about the source item being gone — posting to it can't work.
@@ -1039,10 +1041,14 @@ async function resumeAfterHumanReply(deps: Deps, run: Run, belt: BeltRuntime, sr
     `continue the ${step} step, and only run step-done when the step is actually complete.`;
 
   if (run.paneId && (await deps.herdr.paneAlive(run.paneId))) {
-    await deps.herdr.agentSend(run.paneId, prompt);
-    await deps.herdr.paneSendKeys(run.paneId, "Enter");
-    deps.log("info", `${run.ticketKey}: resumed ${step} with human reply #${q.id}`);
-    return;
+    // Confirmed submission: if the reply prompt never landed, fall through to a respawn rather than
+    // leaving the run "running" against an agent that never heard the answer it was waiting for.
+    if (await deps.herdr.agentSend(run.paneId, prompt, { confirm: true })) {
+      await showRunPane(deps, run.paneId, { key: run.ticketKey, step, state: "running" });
+      deps.log("info", `${run.ticketKey}: resumed ${step} with human reply #${q.id}`);
+      return;
+    }
+    deps.log("warn", `${run.ticketKey}: human-reply prompt to ${run.paneId} was not confirmed — respawning ${step}`);
   }
 
   await spawnStep(deps, deps.store.getRun(run.id)!, belt, src, step);
@@ -1136,8 +1142,8 @@ export async function bounceStep(
   }
 
   // Un-park bookkeeping for a bounce that rescues a watchdog park (the rewind below flips the
-  // phase back to running anyway): record the rescue and restore the pane label the escalation
-  // overwrote with "⚠ ATTENTION …" — mirrors reconcileAttention's step-done rescue.
+  // phase back to running anyway): record the rescue and clear the "⚠ ATTENTION …" cue the
+  // escalation published — mirrors reconcileAttention's step-done rescue.
   if (watchdogParked) {
     deps.store.recordEvent({
       runId: run.id,
@@ -1146,7 +1152,7 @@ export async function bounceStep(
       type: "resumed",
       detail: { reason: "bounce_after_watchdog_park", step: fromStep },
     });
-    if (run.paneId) await deps.herdr.agentRename(run.paneId, `${fromStep}:${run.ticketKey}`).catch(() => {});
+    if (run.paneId) await showRunPane(deps, run.paneId, { key: run.ticketKey, step: fromStep, state: "running" });
     deps.log("info", `${run.ticketKey}: ${fromStep} bounced after a watchdog park — un-parking`);
   }
 
@@ -1827,8 +1833,8 @@ async function reconcileAttention(deps: Deps, run: Run, belt: BeltRuntime, src: 
         type: "resumed",
         detail: { reason: "step_done_after_watchdog_park", step: run.step },
       });
-      // Restore the pane label the escalation overwrote with "⚠ ATTENTION …" (best-effort).
-      if (run.paneId) await deps.herdr.agentRename(run.paneId, `${run.step}:${run.ticketKey}`).catch(() => {});
+      // Clear the "⚠ ATTENTION …" cue the escalation published (best-effort).
+      if (run.paneId) await showRunPane(deps, run.paneId, { key: run.ticketKey, step: run.step, state: "running" });
       deps.log("info", `${run.ticketKey}: ${run.step} finished after a watchdog park — un-parking and advancing`);
       return reconcileStep(deps, deps.store.getRun(run.id)!, belt, src, step);
     }
@@ -1863,12 +1869,12 @@ async function reconcileAttention(deps: Deps, run: Run, belt: BeltRuntime, src: 
         type: "resumed",
         detail: { reason: "layout_wait_respawn", phase, step: step.name, attempt, limit },
       });
-      // Restore the label the escalation overwrote with "⚠ ATTENTION …". run.paneId here belongs to
-      // some EARLIER step (this step's own spawn never landed — that's why it parked), so restore the
-      // owning step's label, not the parked step's.
+      // Clear the "⚠ ATTENTION …" cue the escalation published. run.paneId here belongs to some
+      // EARLIER step (this step's own spawn never landed — that's why it parked), so the display
+      // state names the OWNING step, not the parked step.
       if (run.paneId) {
         const owner = deps.store.runStepsFor(run.id).find((s) => s.paneId === run.paneId)?.step;
-        await deps.herdr.agentRename(run.paneId, `${owner ?? step.name}:${run.ticketKey}`).catch(() => {});
+        await showRunPane(deps, run.paneId, { key: run.ticketKey, step: owner ?? step.name, state: "running" });
       }
       deps.log("info", `${run.ticketKey}: layout-wait park auto-rescue (${attempt}/${limit}) — re-attempting the ${step.name} dispatch`);
       return dispatchPhase(deps, deps.store.getRun(run.id)!, belt, src, ctx);
@@ -1983,15 +1989,14 @@ export async function resumeRun(deps: Deps, run: Run): Promise<{ ok: boolean; ph
     if (paneId) {
       try {
         if ((await deps.herdr.paneState(paneId)) === "idle") {
-          await deps.herdr.agentSend(
+          nudged = await deps.herdr.agentSend(
             paneId,
             `A human resumed ${run.ticketKey} after it was parked (${run.attentionReason ?? "attention"}). ` +
               `Continue the ${run.step} step in this worktree — re-read ${MEMORY_DIR}/prompt-${run.step}.md if you need the full brief. ` +
               `If the step is already complete, write your handoff note and run the step-done command from that prompt now, then stop.`,
+            { confirm: true }, // the recorded `nudged` flag now means "the agent demonstrably woke up"
           );
-          await deps.herdr.paneSendKeys(paneId, "Enter");
-          nudged = true;
-          deps.log("info", `${run.ticketKey}: nudged the resumed ${run.step} agent (pane ${paneId})`);
+          deps.log(nudged ? "info" : "warn", `${run.ticketKey}: nudge of the resumed ${run.step} agent (pane ${paneId}) ${nudged ? "landed" : "was not confirmed"}`);
         }
       } catch {
         /* best-effort — herdr unreachable / pane gone; the reconcile that follows owns recovery */
@@ -1999,8 +2004,8 @@ export async function resumeRun(deps: Deps, run: Run): Promise<{ ok: boolean; ph
     }
   }
   deps.store.recordEvent({ runId: run.id, repo, ticketKey: run.ticketKey, type: "resumed", detail: { phase, step: run.step, nudged } });
-  // Undo the ⚠ pane label (best-effort; a re-spawn would rename it anyway).
-  if (run.paneId) await deps.herdr.agentRename(run.paneId, `${run.step ?? "watch"}:${run.ticketKey}`).catch(() => {});
+  // Clear the ⚠ cue (best-effort; a re-spawn would re-publish it anyway).
+  if (run.paneId) await showRunPane(deps, run.paneId, { key: run.ticketKey, step: run.step, state: run.step ? "running" : "watching" });
   deps.log("info", `${run.ticketKey}: resumed from attention -> ${phase}${run.step ? ` (${run.step})` : ""}`);
   return { ok: true, phase };
 }

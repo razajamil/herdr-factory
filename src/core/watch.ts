@@ -2,7 +2,9 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Deps } from "./deps.ts";
 import type { Run, SourceType } from "../types.ts";
-import { MEMORY_DIR } from "./step.ts";
+import { agentNameFor, MEMORY_DIR } from "./step.ts";
+import { awaitShellPrompt } from "./layout.ts";
+import { showRunPane } from "./pane-display.ts";
 import { productCapabilityFor } from "../products/registry.ts";
 import { SHIPPED_PROMPTS_DIR, packLayers, resolvePromptFile } from "../prompt-packs.ts";
 
@@ -41,8 +43,13 @@ export async function wakeResolver(deps: Deps, run: Run, prNumber: number): Prom
   const instruction = `Read ${MEMORY_DIR}/prompt-${wakePrompt.slug}.md in this worktree and follow it exactly. This is an autonomous task — do not pause to ask for confirmation.`;
 
   if (run.paneId && (await deps.herdr.paneAlive(run.paneId))) {
-    await deps.herdr.agentSend(run.paneId, instruction);
-    await deps.herdr.paneSendKeys(run.paneId, "Enter");
+    // Confirmed submission: an unconfirmed re-prompt means the resolver never woke, and the caller's
+    // contract ("false ⇒ retry rather than marking the round handled") is exactly the right response.
+    if (!(await deps.herdr.agentSend(run.paneId, instruction, { confirm: true }))) {
+      deps.log("warn", `${run.ticketKey}: resolver prompt to ${run.paneId} was not confirmed for PR #${prNumber}`);
+      return false;
+    }
+    await showRunPane(deps, run.paneId, { key: run.ticketKey, step: run.step, state: "watching" });
     deps.log("info", `${run.ticketKey}: re-prompted agent (${run.paneId}) to resolve PR #${prNumber}`);
     return true;
   }
@@ -55,11 +62,18 @@ export async function wakeResolver(deps: Deps, run: Run, prNumber: number): Prom
     workspaceId: run.workspaceId,
     cwd: worktree,
     argv: [agent.command, ...agent.flags, instruction],
+    env: { HERDR_FACTORY_TICKET: run.ticketKey },
+    // herdr's agent NAME (its charset rule bans the run's `<slug>:<KEY>` form); the readable identity
+    // is published as pane display metadata just below.
+    name: agentNameFor(wakePrompt.slug, run.ticketKey),
+    kind: agent.kind,
+    awaitShell: async (paneId) => void (await awaitShellPrompt(deps, paneId)),
   });
   if (!pane) {
     deps.log("warn", `${run.ticketKey}: resolver agentStart returned no pane for PR #${prNumber}`);
     return false;
   }
+  await showRunPane(deps, pane, { key: run.ticketKey, step: wakePrompt.slug, state: "watching" });
   deps.store.updateRun(run.id, { paneId: pane });
   deps.log("info", `${run.ticketKey}: spawned fresh resolver for PR #${prNumber}`);
   return true;

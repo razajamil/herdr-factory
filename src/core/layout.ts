@@ -1,17 +1,34 @@
-// Layout matching, planning, and application — absorbed from the herdr-workspace-manager plugin.
+// Layout matching, planning, and application.
 //
-// Three pure-ish pieces plus one effectful runner:
+// Absorbed from herdr-plugin-workspace-manager, and re-converged with it on herdr 0.7.5's native
+// APIs (the plugin's v0.6.0 rebuild): the topology is declarative, agents are herdr's to start, and
+// nothing is typed into a shell that might not be listening.
+//
 //   • resolveBeltLayout — pick the layout for a worktree from its belt (branch globs → default).
-//   • buildPlan         — turn a layout into an ordered list of symbolic build steps (depth-first
-//                         walk of tabs then panes), referencing panes/tabs by SYMBOLIC handles.
-//   • splitRatioArg     — translate a pane `size`/`ratio` into herdr's `pane split --ratio`.
-//   • applyLayout       — execute a plan against the live herdr server, mapping handles → real ids.
+//   • tabTree           — turn one configured tab into herdr's declarative pane tree: splits with
+//                         their ratios, labels, cwd, env, and each pane's command as ARGV.
+//   • splitRatio        — the size → ratio conversion, given the region being split.
+//   • applyLayout       — one `layout.apply` per tab, then setup, then the agents.
 //
-// The factory builds the layout into a freshly-created worktree (reconcileClaiming), so a step's
-// `tab`/`pane` targeting resolves against panes the factory itself brought up rather than a
-// hand-built herdr layout.
+// What each piece replaced, and why:
+//   – One request per tab instead of a `pane split` + `pane rename` + `pane run` round-trip per pane.
+//     A cell `size` resolves against the tab area queried ONCE rather than re-measuring after every
+//     split, and no symbolic handle map is needed: herdr echoes the tree back with the ids filled in.
+//   – Pane commands are the pane's PROCESS, not keystrokes typed into its shell: they can't race a
+//     shell that isn't ready and don't appear in scrollback. They still run inside the user's
+//     interactive LOGIN shell, because that is what they used to get — dropping it would silently
+//     break any command whose toolchain comes from a shell rc hook (mise, asdf, nvm).
+//   – Setup reports through a status FILE it writes itself, instead of printing a sentinel that
+//     `pane wait-output` scraped back — a marker could scroll out of the matched rows, wrap, or be
+//     matched from the shell's own echo before the command had run.
+//   – An agent is started by herdr (`agent start --kind --pane`), which returns only once it has
+//     detected the agent and marked it ready for input.
 
-import type { LayoutConfig, LayoutSize } from "../config.ts";
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync } from "node:fs";
+import { join } from "node:path";
+import type { LayoutAgent, LayoutConfig, LayoutPane, LayoutSize, LayoutTab } from "../config.ts";
+import { stateRoot } from "../config-paths.ts";
+import type { LayoutNode, PaneBox } from "../types.ts";
 import type { Deps } from "./deps.ts";
 import { telemetrySpan } from "../telemetry/index.ts";
 
@@ -19,52 +36,44 @@ import { telemetrySpan } from "../telemetry/index.ts";
 // can import it without this module's runner/telemetry graph). Re-exported here for existing callers.
 export { globMatch, resolveBeltLayout, resolveHookLayout } from "./layout-match.ts";
 
-// ── Planning: layout → ordered symbolic steps ────────────────────────────────────────────────────
+// ── Shell wrapping ────────────────────────────────────────────────────────────────────────────────
 
-// Symbolic handles the plan references (the runner maps these to real herdr ids as it executes,
-// because a pane's real id is only known after `tab create` / `pane split` returns):
-//   tab  ti  → "t0", "t1", …    ("t0" is the worktree's existing root tab)
-//   pane pj  → "t<ti>p<pj>"      ("t0p0" is the worktree's existing root pane)
-export const ROOT_TAB = "t0";
-export const ROOT_PANE = "t0p0";
-const tabHandle = (ti: number) => `t${ti}`;
-const paneHandle = (ti: number, pj: number) => `t${ti}p${pj}`;
+/** Quote a script for embedding as one single-quoted shell word. */
+const singleQuote = (s: string): string => `'${s.replaceAll("'", `'\\''`)}'`;
 
-export type PlanStep =
-  | { kind: "reuseTab"; tab: string; title?: string } // rename the worktree's existing root tab
-  | { kind: "createTab"; tab: string; pane: string; title?: string; cwd?: string } // herdr tab create
-  | { kind: "split"; pane: string; from: string; direction: "right" | "down"; ratio?: number; size?: LayoutSize; cwd?: string }
-  | { kind: "renamePane"; pane: string; title: string }
-  | { kind: "runSetup"; pane: string; command: string; blocking: boolean } // layout-level setup (+ wait when blocking)
-  | { kind: "run"; pane: string; command: string };
+/** `$SHELL`, falling back to /bin/sh — expanded by the outer `sh`, not by us. */
+const USER_SHELL = '"${SHELL:-/bin/sh}"';
 
-/** Turn a normalized layout into the ordered step sequence a user would follow building it by hand.
- *  Because the walk is depth-first and a blocking RunSetup pauses the runner, putting `setup: true`
- *  on the first pane guarantees no other tab/pane spawns until setup finishes. (Ported from
- *  build_plan.) */
-export function buildPlan(layout: LayoutConfig, cwd?: string): PlanStep[] {
-  const steps: PlanStep[] = [];
-  layout.tabs.forEach((tab, ti) => {
-    const tHandle = tabHandle(ti);
-    if (ti === 0) {
-      steps.push({ kind: "reuseTab", tab: tHandle, title: tab.title });
-    } else {
-      steps.push({ kind: "createTab", tab: tHandle, pane: paneHandle(ti, 0), title: tab.title, cwd });
-    }
-    tab.panes.forEach((pane, pj) => {
-      const pHandle = paneHandle(ti, pj);
-      if (pj > 0) {
-        steps.push({ kind: "split", pane: pHandle, from: paneHandle(ti, pj - 1), direction: pane.split ?? "right", ratio: pane.ratio, size: pane.size, cwd });
-      }
-      if (pane.title) steps.push({ kind: "renamePane", pane: pHandle, title: pane.title });
-      // The single setup pane runs the layout-level setup command first (optionally blocking), then
-      // its own command (if any).
-      if (pane.setup && layout.setup) steps.push({ kind: "runSetup", pane: pHandle, command: layout.setup.command, blocking: layout.setup.blocking });
-      if (pane.command) steps.push({ kind: "run", pane: pHandle, command: pane.command });
-    });
-  });
-  return steps;
+/** Wrap a script as argv for herdr to launch as the pane's process. The user's own LOGIN+interactive
+ *  shell, not a bare `sh`: the old implementation typed commands into the pane's interactive shell,
+ *  so `.zshrc`/`.bash_profile` setup (mise/asdf shims, nvm, PATH edits) was already applied. */
+export const shellArgv = (script: string): string[] => ["sh", "-c", `exec ${USER_SHELL} -lic ${singleQuote(script)}`];
+
+/** Hand the pane back to an interactive shell once its command finishes, so a pane whose command
+ *  exits behaves like one you ran the command in yourself — and so `agent start`, which requires a
+ *  pane sitting at its shell prompt, has one to attach to. Interactive but NOT login: the wrapper
+ *  above already ran the login files and this shell inherits their exported environment; re-running
+ *  them would fire login-only side effects (another ssh-agent, another MOTD) a second time. */
+export const HAND_BACK = `exec ${USER_SHELL} -i`;
+
+/** Record the setup command's exit status where the runner can read it. `$?` is captured immediately
+ *  after the command, before anything else can overwrite it. */
+const recordStatus = (statusPath: string): string => `printf '%s' "$?" > ${singleQuote(statusPath)}`;
+
+/** The script a pane runs, or undefined for a plain shell pane. */
+export function paneScript(pane: LayoutPane, setup?: { command: string; statusPath: string }): string | undefined {
+  const parts: string[] = [];
+  if (setup) {
+    parts.push(setup.command, recordStatus(setup.statusPath));
+  }
+  if (pane.command) parts.push(pane.command);
+  if (parts.length === 0) return undefined;
+  // An agent pane, a plain pane, and a `persist` command pane must all end at a prompt.
+  if (pane.agent || !pane.command || pane.persist) parts.push(HAND_BACK);
+  return parts.join("; ");
 }
+
+// ── Planning: a configured tab → herdr's declarative pane tree ────────────────────────────────────
 
 /** Clamp a split ratio into herdr's usable open interval (0, 1). A fixed cell size that meets or
  *  exceeds the available space would otherwise produce a degenerate 0-width pane. */
@@ -73,47 +82,138 @@ export function clampRatio(r: number): number | undefined {
   return Math.min(0.99, Math.max(0.01, r));
 }
 
-/** The `--ratio` to pass to `herdr pane split`. herdr's ratio is the fraction the PREVIOUS (from)
- *  pane keeps; the new pane gets the rest. A pane's `size` sizes the NEW pane, so it's inverted:
- *  percent p → from keeps (1 - p/100); cells w → from keeps (1 - w/extent). `extent` is the from
- *  pane's live size along the split axis, needed only for a cell size. Legacy `ratio` (already the
- *  from-pane share) passes through. Returns a number in (0, 1), or undefined when nothing sizes the
- *  split (or a cell size can't be converted). */
-export function splitRatioArg(ratio: number | undefined, size: LayoutSize | undefined, extent: number | undefined): number | undefined {
-  if (ratio != null) return ratio;
+/** The ratio for one split: the fraction the FIRST (existing) side keeps, herdr's convention.
+ *
+ *  A pane's `size` sizes the NEW (second) side, so it inverts: percent p → first keeps 1 - p/100;
+ *  cells w → first keeps 1 - w/extent, where `extent` is the region being split along the split axis.
+ *  Legacy `ratio` (already the first side's share) passes through. Returns undefined when nothing
+ *  sizes the split, or when a cell size can't be converted (unknown extent) — an even split then. */
+export function splitRatio(pane: LayoutPane, extent: number | undefined): number | undefined {
+  if (pane.ratio != null) return pane.ratio;
+  const size: LayoutSize | undefined = pane.size;
   if (!size) return undefined;
   if ("percent" in size) return clampRatio(1 - size.percent / 100);
   if (extent == null || !Number.isFinite(extent) || extent <= 0) return undefined;
   return clampRatio(1 - size.cells / extent);
 }
 
-// ── Application: execute a plan against the live herdr server ─────────────────────────────────────
+/** herdr's own even split. `layout.apply` requires an explicit ratio on every split node, so there is
+ *  no "let herdr decide" to defer to. */
+export const EVEN_RATIO = 0.5;
 
-/** The worktree we build a layout INTO: its existing root tab + pane (from worktreeCreate) and the
- *  checkout path new tabs/panes should open in. */
+/** What's left of a region for everything after a split that gave `ratio` to the first side. */
+const remaining = (box: PaneBox, direction: "right" | "down", ratio: number): PaneBox =>
+  direction === "right" ? { ...box, cols: box.cols * (1 - ratio) } : { ...box, rows: box.rows * (1 - ratio) };
+
+/**
+ * Build one tab's herdr pane tree. The config's pane list is linear — pane 0 is the tab's root pane
+ * and each later pane splits off the one before it — which maps onto a right-nested tree:
+ *
+ *   panes [a, b(right), c(down)]  ->  split(right, a, split(down, b, c))
+ *
+ * so every `size` keeps meaning "this share of the pane I split from", not "of the whole tab".
+ * `box` is the tab's cell area; it is tracked down the tree so a fixed `cells` size resolves against
+ * the region actually being split. Omit it and percentages still work exactly (they're relative)
+ * while cell sizes fall back to an even split.
+ */
+export function tabTree(tab: LayoutTab, opts: { cwd?: string; box?: PaneBox; setup?: { command: string; statusPath: string } } = {}): LayoutNode {
+  const leaf = (pane: LayoutPane): LayoutNode => {
+    const script = paneScript(pane, pane.setup ? opts.setup : undefined);
+    return {
+      type: "pane",
+      ...(pane.title ? { label: pane.title } : {}),
+      ...(opts.cwd ? { cwd: opts.cwd } : {}),
+      ...(script ? { command: shellArgv(script) } : {}),
+      ...(Object.keys(pane.env).length > 0 ? { env: pane.env } : {}),
+    };
+  };
+
+  const build = (index: number, box: PaneBox | undefined): LayoutNode => {
+    const pane = tab.panes[index]!;
+    const next = tab.panes[index + 1];
+    if (!next) return leaf(pane);
+    const direction = next.split ?? "right";
+    const extent = box ? (direction === "right" ? box.cols : box.rows) : undefined;
+    const ratio = splitRatio(next, extent) ?? EVEN_RATIO;
+    return {
+      type: "split",
+      direction,
+      ratio,
+      first: leaf(pane),
+      second: build(index + 1, box ? remaining(box, direction, ratio) : undefined),
+    };
+  };
+  return build(0, opts.box);
+}
+
+// ── The setup status file ─────────────────────────────────────────────────────────────────────────
+
+const setupDir = (): string => join(stateRoot(), "layout-hook", "setup");
+
+/** Where one build's setup command should record its exit status. Unique per build, so two worktrees
+ *  created at once can't read each other's. */
+export function setupStatusPath(token: string): string {
+  const dir = setupDir();
+  mkdirSync(dir, { recursive: true });
+  return join(dir, `${token}.status`);
+}
+
+/** Drop status files left behind by builds that died before reading theirs (called from the one-shot
+ *  `[[startup]]` hook). Returns the count reaped. */
+export function reapSetupStatusFiles(maxAgeMs = 24 * 60 * 60 * 1000): number {
+  let reaped = 0;
+  const dir = setupDir();
+  let entries: string[];
+  try {
+    entries = readdirSync(dir);
+  } catch {
+    return 0; // nothing has ever run setup
+  }
+  for (const name of entries) {
+    const p = join(dir, name);
+    try {
+      if (Date.now() - statSync(p).mtimeMs > maxAgeMs) {
+        rmSync(p, { force: true });
+        reaped += 1;
+      }
+    } catch {
+      /* raced with another reader — leave it */
+    }
+  }
+  return reaped;
+}
+
+// ── Application: build the tabs, then setup, then the agents ──────────────────────────────────────
+
+/** The worktree we build a layout INTO: its existing root tab (whose panes `layout.apply` replaces)
+ *  and the checkout path every pane should open in. `rootPaneId` is used to measure the tab area. */
 export interface LayoutTarget {
   workspaceId: string;
   rootTabId: string;
-  rootPaneId: string;
+  rootPaneId?: string;
   cwd?: string;
+  /** Extra env for every pane on top of the layout's own (e.g. the run's work key). */
+  env?: Record<string, string>;
 }
 
-// Give a freshly-spawned pane's shell a beat to be ready before typing into it, and cap a blocking
-// setup command's wait (a hung setup must not wedge the claim forever).
-const PANE_READY_MS = 700;
+/** Cap on a blocking setup command — a hung setup must not wedge the build forever. A timeout is
+ *  REPORTED, not fatal: the layout is already built, and a slow setup shouldn't invalidate it. */
 const SETUP_TIMEOUT_MS = 600_000;
+const SETUP_POLL_MS = 200;
+/** How long to wait for a pane to be back at its shell prompt before starting an agent in it. */
+const SHELL_READY_TIMEOUT_MS = 15_000;
+const SHELL_READY_POLL_MS = 100;
+/** herdr's own default wait for a spawned agent to reach interactive readiness (`agent_timeout_ms`
+ *  overrides it per pane). */
+const AGENT_READY_TIMEOUT_MS = 60_000;
+/** The metadata token a build reports setup progress on, so a long or failed setup is visible in the
+ *  UI rather than only in the log. */
+const SETUP_TOKEN = "hf_setup";
 
-/** Build a setup command wrapped with a completion sentinel printed after it. The marker is
- *  assembled by printf's `%s`, so the full literal never appears in the ECHOED command line — only
- *  in the command's actual output — which is what `herdr wait output` must match on (it also sees
- *  the echoed input, and would otherwise match immediately). (Ported from wrap_setup.) */
-function wrapSetup(command: string, token: string): string {
-  return `( ${command} ) ; printf 'HERDR_FACTORY_SETUP_DONE_%s %s\\n' '${token}' "$?"`;
-}
-
-/** Build `layout` into the target worktree via herdr (create tabs, split panes, run setup +
- *  commands). Emits a `layout.apply` span. Throws on the first herdr failure — the caller
- *  (reconcileClaiming) runs it best-effort so a layout hiccup logs rather than wedging the claim. */
+/** Build `layout` into the target worktree via herdr. Emits a `layout.apply` span. Throws if the
+ *  TOPOLOGY can't be built — the caller (the layout hook) records that and releases its claim so the
+ *  build is retried. A failed setup or agent does NOT throw: the layout is already there, and tearing
+ *  it down over one pane would lose the rest. */
 export async function applyLayout(deps: Deps, target: LayoutTarget, layout: LayoutConfig): Promise<void> {
   return telemetrySpan(
     "layout.apply",
@@ -122,72 +222,180 @@ export async function applyLayout(deps: Deps, target: LayoutTarget, layout: Layo
   );
 }
 
+/** One built pane: the configured pane and the real herdr pane id it became. */
+interface BuiltPane {
+  pane: LayoutPane;
+  paneId: string;
+}
+
 async function applyLayoutImpl(deps: Deps, target: LayoutTarget, layout: LayoutConfig): Promise<void> {
-  const plan = buildPlan(layout, target.cwd);
-  const handles = new Map<string, string>([
-    [ROOT_TAB, target.rootTabId],
-    [ROOT_PANE, target.rootPaneId],
-  ]);
-  const readied = new Set<string>();
+  // Measure the tab ONCE, before anything is split: `pane layout` reports the whole tab's cell area,
+  // which is what every `cells` size resolves against as tabTree walks down.
+  const box = target.rootPaneId ? ((await deps.herdr.tabArea(target.rootPaneId)) ?? undefined) : undefined;
+  const setup = layout.setup ? { command: layout.setup.command, statusPath: setupStatusPath(deps.uid()) } : undefined;
 
-  const resolvePane = (handle: string): string => {
-    const id = handles.get(handle);
-    if (!id) throw new Error(`layout "${layout.id}": unresolved pane handle "${handle}"`);
-    return id;
-  };
-  const ensureReady = async (paneId: string): Promise<void> => {
-    if (!readied.has(paneId)) {
-      readied.add(paneId);
-      if (PANE_READY_MS > 0) await deps.sleep(PANE_READY_MS);
+  const built: BuiltPane[] = [];
+  let setupPaneId: string | undefined;
+  let setupSettled = setup == null;
+
+  for (const [index, tab] of layout.tabs.entries()) {
+    // Extra env (the run's work key) rides on every pane, under the layout's own.
+    const panes = target.env
+      ? tab.panes.map((p) => ({ ...p, env: { ...target.env, ...p.env } }))
+      : tab.panes;
+    const tree = tabTree({ ...tab, panes }, { cwd: target.cwd, box, setup });
+    // Tab 0 REBUILDS the worktree's existing tab (herdr builds the replacement first, then closes the
+    // old one, so the workspace is never briefly tabless); later tabs are created by the same call.
+    // `tab_id` and `workspace_id` are mutually exclusive; `tab_label` applies either way.
+    const applied = await deps.herdr.layoutApply({
+      ...(index === 0 ? { tabId: target.rootTabId } : { workspaceId: target.workspaceId }),
+      tabLabel: tab.title,
+      root: tree,
+    });
+    if (applied.paneIds.length !== tab.panes.length) {
+      throw new Error(`layout "${layout.id}": herdr built ${applied.paneIds.length} panes for tab ${index}, expected ${tab.panes.length}`);
     }
-  };
+    tab.panes.forEach((pane, j) => {
+      const paneId = applied.paneIds[j]!;
+      built.push({ pane, paneId });
+      if (pane.setup && setup) setupPaneId = paneId;
+    });
+    deps.log("info", `layout "${layout.id}": applied tab ${index} → ${applied.tabId} (${tab.panes.length} pane(s))`);
 
-  for (const step of plan) {
-    switch (step.kind) {
-      case "reuseTab": {
-        const tabId = handles.get(step.tab);
-        if (!tabId) throw new Error(`layout "${layout.id}": unresolved tab handle "${step.tab}"`);
-        if (step.title) await deps.herdr.tabRename(tabId, step.title);
-        break;
-      }
-      case "createTab": {
-        const { tabId, paneId } = await deps.herdr.tabCreate(target.workspaceId, { label: step.title, cwd: step.cwd });
-        handles.set(step.tab, tabId);
-        handles.set(step.pane, paneId);
-        break;
-      }
-      case "split": {
-        const fromId = resolvePane(step.from);
-        // A fixed cell size needs the from pane's live extent to become a ratio.
-        const extent = step.size && "cells" in step.size ? await deps.herdr.paneExtent(fromId, step.direction) : null;
-        const ratio = splitRatioArg(step.ratio, step.size, extent ?? undefined);
-        const paneId = await deps.herdr.paneSplit(fromId, { direction: step.direction, ratio: ratio ?? undefined, cwd: step.cwd });
-        handles.set(step.pane, paneId);
-        break;
-      }
-      case "renamePane": {
-        await deps.herdr.paneRename(resolvePane(step.pane), step.title);
-        break;
-      }
-      case "runSetup": {
-        const paneId = resolvePane(step.pane);
-        await ensureReady(paneId);
-        const token = deps.uid();
-        const marker = `HERDR_FACTORY_SETUP_DONE_${token}`;
-        await deps.herdr.paneRun(paneId, wrapSetup(step.command, token));
-        if (step.blocking) {
-          const line = await deps.herdr.waitOutput(paneId, marker, SETUP_TIMEOUT_MS);
-          const code = line ? Number(line.trim().split(/\s+/).pop()) : NaN;
-          if (Number.isFinite(code) && code !== 0) deps.log("warn", `layout "${layout.id}": setup command exited ${code} in ${paneId}`);
-        }
-        break;
-      }
-      case "run": {
-        const paneId = resolvePane(step.pane);
-        await ensureReady(paneId);
-        await deps.herdr.paneRun(paneId, step.command);
-        break;
-      }
+    // A blocking setup must finish before any later tab is spawned.
+    if (setup && layout.setup?.blocking && !setupSettled && setupPaneId) {
+      await awaitSetup(deps, layout, setup.statusPath, setupPaneId);
+      setupSettled = true;
     }
   }
+
+  for (const { pane, paneId } of built) {
+    if (!pane.agent) continue;
+    // An agent is started INTO the pane's shell, so setup running in that same pane must be finished
+    // first even when it isn't marked blocking.
+    if (setup && !setupSettled && setupPaneId === paneId) {
+      deps.log("info", `layout "${layout.id}": waiting for setup before starting the agent in its pane`);
+      await awaitSetup(deps, layout, setup.statusPath, paneId);
+      setupSettled = true;
+    }
+    await startAgent(deps, layout, pane.agent, paneId, target.workspaceId);
+  }
+
+  if (setup && !setupSettled) deps.log("info", `layout "${layout.id}": setup is running in ${setupPaneId ?? "its pane"} (not blocking)`);
+}
+
+/** Start (and optionally prompt) one pane's agent. Never throws: a failed agent doesn't invalidate
+ *  the layout that is already built, so it warns, notifies, and lets the rest of the build stand. */
+async function startAgent(deps: Deps, layout: LayoutConfig, agent: LayoutAgent, paneId: string, workspaceId: string): Promise<void> {
+  // `agent start` refuses a pane that isn't at an available shell prompt, and a freshly created pane
+  // isn't there yet: the shell is still sourcing rc files (mise/asdf activation, prompt setup), and a
+  // setup pane has to finish its command and exec back to a prompt first. Poll for that state rather
+  // than sleeping a fixed guess.
+  if (!(await awaitShellPrompt(deps, paneId))) {
+    deps.log("warn", `layout "${layout.id}": ${paneId} is not back at a shell prompt after ${SHELL_READY_TIMEOUT_MS}ms; starting ${agent.kind} anyway`);
+  }
+  const name = agent.name ?? deriveAgentName(agent.kind, workspaceId);
+  const ok = await deps.herdr.agentAdopt(paneId, {
+    name,
+    kind: agent.kind,
+    args: agent.args,
+    timeoutMs: agent.startTimeoutMs ?? AGENT_READY_TIMEOUT_MS,
+  });
+  if (!ok) {
+    deps.log("warn", `layout "${layout.id}": could not start ${agent.kind} in ${paneId}`);
+    await deps.herdr.notify("herdr-factory: agent did not start", `${agent.kind} in ${paneId} (layout "${layout.id}")`).catch(() => {});
+    return;
+  }
+  deps.log("info", `layout "${layout.id}": started ${agent.kind} as "${name}" in ${paneId}`);
+
+  if (agent.prompt) {
+    // Waiting is opt-in: a prompt timeout means "block until the agent settles or this elapses".
+    // Without one the prompt is submitted and the build moves on, leaving the agent working.
+    const sent = await deps.herdr.agentOpenPrompt(paneId, agent.prompt, { settleTimeoutMs: agent.promptTimeoutMs });
+    deps.log(sent ? "info" : "warn", `layout "${layout.id}": opening prompt for "${name}" ${sent ? "submitted" : "was not accepted"}`);
+  }
+}
+
+/** A herdr-legal agent name (`[a-z][a-z0-9_-]{0,31}`) for a pane whose config didn't pick one. Derived
+ *  from the kind + workspace so two worktrees running the same agent don't collide — herdr requires
+ *  the name to be unique among LIVE agents. */
+export function deriveAgentName(kind: string, workspaceId: string): string {
+  const clean = (s: string) => s.toLowerCase().replaceAll(/[^a-z0-9]/g, "");
+  const base = `${clean(kind) || "agent"}-${clean(workspaceId)}`;
+  return base.slice(0, 32).replace(/-+$/, "");
+}
+
+/** Poll `pane process-info` until the pane's shell owns the foreground alone — the state
+ *  `herdr agent start` requires of a pane before it will start an agent in it. Shared with the
+ *  dedicated-pane spawn path (core/step.ts), which creates a pane the same way and hits the same race:
+ *  a brand-new pane's shell is still sourcing rc files (mise/asdf activation, prompt setup) for a
+ *  moment. Returns false on timeout — callers warn and try anyway, since herdr's own error is clearer
+ *  than refusing to start. */
+export async function awaitShellPrompt(deps: Deps, paneId: string): Promise<boolean> {
+  const deadline = deps.now() * 1000 + SHELL_READY_TIMEOUT_MS;
+  // Two consecutive idle samples: a shell sourcing rc files drops in and out of having a child, so a
+  // single sample can catch the gap between two of them and call the pane ready a moment early.
+  let consecutive = 0;
+  for (;;) {
+    if (await deps.herdr.paneAtShellPrompt(paneId)) {
+      if (++consecutive >= 2) return true;
+    } else {
+      consecutive = 0;
+    }
+    if (Date.now() >= deadline) return false;
+    await deps.sleep(SHELL_READY_POLL_MS);
+  }
+}
+
+/** Block on the setup command, reporting progress and outcome on the pane itself. */
+async function awaitSetup(deps: Deps, layout: LayoutConfig, statusPath: string, paneId: string): Promise<void> {
+  // TTL slightly beyond the wait, so a crashed build can't leave a pane labelled "running" forever.
+  await deps.herdr.reportPaneDisplay(paneId, { tokens: { [SETUP_TOKEN]: "running" }, ttlMs: SETUP_TIMEOUT_MS + 30_000 }).catch(() => {});
+  deps.log("info", `layout "${layout.id}": waiting for setup in ${paneId}`);
+
+  const outcome = await waitForSetup(deps, statusPath);
+  const token = (value: string | null) => deps.herdr.reportPaneDisplay(paneId, { tokens: { [SETUP_TOKEN]: value } }).catch(() => {});
+  if (outcome.kind === "exited" && outcome.code === 0) {
+    await token(null);
+    deps.log("info", `layout "${layout.id}": setup finished in ${paneId}`);
+    return;
+  }
+  const detail =
+    outcome.kind === "timeout"
+      ? `setup did not finish within ${SETUP_TIMEOUT_MS}ms in ${paneId}`
+      : `setup exited ${outcome.code} in ${paneId}`;
+  await token(outcome.kind === "timeout" ? "timed-out" : `failed-${outcome.code}`);
+  deps.log("warn", `layout "${layout.id}": ${detail}`);
+  await deps.herdr.notify("herdr-factory: layout setup failed", `${detail} (layout "${layout.id}")`).catch(() => {});
+}
+
+type SetupOutcome = { kind: "exited"; code: number } | { kind: "timeout" };
+
+/** Setup's exit status, once its pane has written it. Polls for the status file the setup script
+ *  writes: unlike matching a sentinel in terminal output, this can't be missed because the marker
+ *  scrolled away, wrapped, or was echoed back by the shell before the command actually ran. */
+async function waitForSetup(deps: Deps, statusPath: string): Promise<SetupOutcome> {
+  const deadline = Date.now() + SETUP_TIMEOUT_MS;
+  for (;;) {
+    const code = readSetupStatus(statusPath);
+    if (code != null) return { kind: "exited", code };
+    if (Date.now() >= deadline) return { kind: "timeout" };
+    await deps.sleep(SETUP_POLL_MS);
+  }
+}
+
+/** The recorded exit code, or null while the file is absent/empty (i.e. "not yet"). Consumes the file
+ *  once read, so a later build can't see a stale status. */
+function readSetupStatus(statusPath: string): number | null {
+  let text: string;
+  try {
+    if (!existsSync(statusPath)) return null;
+    text = readFileSync(statusPath, "utf8").trim();
+  } catch {
+    return null;
+  }
+  if (!text) return null; // written by one printf, but an empty read just means "not yet"
+  rmSync(statusPath, { force: true });
+  const code = Number.parseInt(text, 10);
+  return Number.isFinite(code) ? code : 0; // unreadable status ⇒ treat as finished
 }

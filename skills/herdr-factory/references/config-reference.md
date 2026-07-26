@@ -108,13 +108,15 @@ belt![]                   { name! , source! , steps![] , priority=100 , active=t
   effects[]               { on! , to! , anchor , step|product|outcome! }
   pr                      { draft , title , labels[] , reviewers[] , assignees[] , automated_round_minutes }
   layout_matching[]       { worktree_pattern! , layout! , title }
-layouts[]=[]              { id! , tabs![] , setup }
+layouts[]=[]              { id! , tabs![] , setup , env={} }
   tabs[]                  { title , panes![] }
-    panes[]               { title , command , setup=false , split , ratio , size }
+    panes[]               { title , command , persist=true , agent , agent_name , agent_args=[] ,
+                            prompt , agent_timeout_ms , prompt_timeout_ms , env={} , setup=false ,
+                            split , ratio , size }
 evidence                  { publisher="s3" , key_prefix="" , github_username , …per-publisher }
 conventions               { commits }
 branch                    { prefixes , slug_max=20 , full_slug_max=50 }
-agent                     { command="claude" , flags=[] }
+agent                     { command="claude" , flags=[] , kind }
 ```
 
 ---
@@ -313,7 +315,15 @@ defaults that always exist: `enter <first step>` → `in_development`, `produce 
 | `tabs[].title` | string trimmed min1 | no | untitled ⇒ **unaddressable** by a step's `tab` |
 | `tabs[].panes` | array `min(1)` | **yes** | — |
 | `panes[].title` | string trimmed min1 | no | untitled ⇒ **unaddressable** by a step's `pane` |
-| `panes[].command` | string trimmed min1 | no | shell command run once the pane is built |
+| `panes[].command` | string trimmed min1 | no | run as the pane's PROCESS in your interactive login shell (`sh -c 'exec "$SHELL" -lic …'`), not typed into it; mutually exclusive with `agent` |
+| `panes[].persist` | boolean | no | **true** — hand the pane back to a prompt when `command` exits. Only valid with `command` |
+| `panes[].agent` | enum: a herdr agent kind | no | this pane hosts that agent: `herdr agent start --kind --pane`, which blocks until herdr has DETECTED it and marked it ready for input. What a step-targeted pane should use; mutually exclusive with `command` |
+| `panes[].agent_args` | `array(scalar)` → strings | no | `[]` — passed to the agent after `--` |
+| `panes[].agent_name` | string matching `[a-z][a-z0-9_-]{0,31}` | no | herdr's agent alias (its own charset rule; unique among LIVE agents). Derived from kind + workspace when unset |
+| `panes[].prompt` | string trimmed min1 | no | opening prompt submitted once the agent is ready. REJECTED on a pane a step targets (the step's prompt is dispatched there) |
+| `panes[].agent_timeout_ms` | int > 0 | no | 60000 — readiness wait for `agent start` |
+| `panes[].prompt_timeout_ms` | int > 0 | no | set ⇒ wait for the agent to settle (idle/done) after prompting; unset ⇒ submit and move on |
+| `panes[].env` | map of scalars → strings | no | `{}` — the pane's environment; merged over the layout's `env` (pane wins) |
 | `panes[].setup` | boolean | no | **false** — marks the pane that runs the layout-level `setup.command`; at most one per layout |
 | `panes[].split` | enum `vertical` \| `horizontal` \| `right` \| `down` | no | ignored on pane 0; normalized `vertical`/`right`→`right`, `horizontal`/`down`→`down` |
 | `panes[].ratio` | number `>0` and `<1` | no | **legacy** — the fraction the PREVIOUS pane keeps; mutually exclusive with `size` |
@@ -363,11 +373,19 @@ order, first match wins (so a type `"Dev bug"` matches the `bug` rule).
 |---|---|---|
 | `command` | string trimmed min1 | `"claude"` |
 | `flags` | `array(string)` (elements may be empty strings) | `[]` |
+| `kind` | enum — a herdr agent kind (`claude`, `codex`, `opencode`, `gemini`, `cursor`, `pi`, `copilot`, `droid`, `amp`, … — the `herdr agent start --kind` set) | *unset* |
 
 No block anywhere ⇒ `DEFAULT_AGENT_CONFIG` = `{ command: "claude", flags:
-["--dangerously-skip-permissions"] }`. Spawned argv is `[command, ...flags, prompt]`. This applies only
-to panes the **factory spawns**; a step targeting an existing layout pane drives whatever that pane
-already runs.
+["--dangerously-skip-permissions"] }`. Spawned argv is `[command, ...flags, prompt]`.
+
+The factory creates the pane and asks herdr to **adopt** the harness into it (`agent start --kind
+--pane`), which blocks until the agent is ready for input. The kind is derived from `command`'s basename
+when that is a bare, known name; `kind:` is for the cases it can't be — a wrapper script or an absolute
+path — and without it such a `command` is merely typed into the pane (no readiness handshake, herdr's
+own process detection only).
+
+This resolution drives the panes the factory **spawns**. A LAYOUT pane names its own agent (`agent:`
+kind + `agent_args`), so the layout owns the harness for the panes it builds.
 
 ---
 
@@ -385,6 +403,7 @@ already runs.
 | `belt[].effects[].outcome` | `merged`, `closed`, `abandoned`, `timeout`, `completed` (only `merged`/`completed`/`abandoned` are ever written — §3.7) |
 | `belt[].effects[].anchor` and canonical `to` | `todo`, `in_development`, `in_review`, `merged`, `aborted`, `done` |
 | `layouts[]…panes[].split` | `vertical`, `horizontal`, `right`, `down` |
+| `agent.kind` (all three levels) | `pi`, `claude`, `codex`, `gemini`, `cursor`, `devin`, `agy`, `cline`, `omp`, `mastracode`, `opencode`, `copilot`, `kimi`, `kiro`, `droid`, `amp`, `grok`, `hermes`, `kilo`, `qodercli`, `maki` |
 | `evidence.publisher` | `s3`, `local`, `command` |
 | `sentry.on_merge` | `comment`, `none`, `resolve`, `resolve_in_next_release` |
 | `github_issues.close_on` keys (strict) | `merged`, `done`, `aborted` |
@@ -465,6 +484,11 @@ the display-only belt type label.
 |---|---|---|
 | a step sets exactly one of `tab`/`pane` | `tab and pane must be set together (or both omitted to spawn a dedicated pane)` | Set both, or delete both. |
 | a pane sets both `ratio` and `size` | `set either ratio or size, not both` | Keep `size` (`ratio` is legacy). |
+| a pane sets both `agent` and `command` | ``set either `agent` or `command`, not both (an agent pane starts its agent itself)`` | Pick one — an agent is started INTO the pane's shell. |
+| `persist` with no `command` | ``\`persist\` only applies to a pane with a \`command\``` | Drop it. |
+| an agent-only key with no `agent:` | ``these keys need an \`agent:\` on the same pane: agent_name, agent_args, prompt, agent_timeout_ms, prompt_timeout_ms`` | Add the `agent:` kind, or remove the key. |
+| a malformed `agent_name` | ``agent_name must start with a lowercase letter and contain only lowercase letters, digits, '-' or '_' (1-32 chars) — herdr's own rule`` | herdr answers `invalid_agent_name` otherwise. |
+| two panes share an `agent_name` | ``two panes in this layout share an \`agent_name\` — herdr agent names must be unique`` | herdr requires uniqueness among live agents. |
 | >1 pane in a layout has `setup: true` | ``at most one pane in a layout may set `setup: true``` | Leave `setup: true` on exactly one pane. |
 | a layout has `setup:` but no pane marked `setup: true` | ``a layout with a `setup` block needs one pane marked `setup: true` to run it in`` | Mark the pane the setup command should run in. |
 | `workspace_name` lacks `{{work_id}}` | `workspace_name must include {{work_id}} so each item gets a unique branch` | Insert `{{work_id}}` (spaces inside the braces are fine). |
@@ -487,6 +511,8 @@ the display-only belt type label.
 | 8 | `default_layout` names no layout | `belt "<belt>" default_layout "<id>" is not a defined layout (defined: <ids>)` | Fix the id or add the layout to `layouts:`. |
 | 9 | `layout_matching[j].layout` names no layout | `belt "<belt>" layout_matching[<j>] references unknown layout "<id>" (defined: <ids>)` | Same. |
 | 10 | a step's `tab`/`pane` pair is not a **titled** tab+pane in the belt's `default_layout` | `belt "<belt>" step "<name>" targets pane <tab>/<pane>, but layout "<id>" does not define it — its labeled panes are: <tab/pane, …>. Fix the step's tab/pane, or add a pane titled "<pane>" to a tab titled "<tab>" in the layout.` | Match a listed pane exactly, or add `title:` to the tab **and** the pane. Untitled panes can never satisfy a target. Belts with no `default_layout`, and `layout_matching` layouts, are exempt. |
+| 10b | that pane exists but starts **no agent** (neither an `agent:` kind nor a `command`) | ``belt "<belt>" step "<name>" targets pane <tab>/<pane> in layout "<id>", but that pane starts no agent — set an `agent:` kind on it (herdr starts that agent as part of the build) or give it a `command` that launches one.`` | Add `agent: claude` (or your kind) to the pane, or a `command` that launches an agent. Same exemptions as #10. |
+| 10c | a step-targeted pane carries its own opening `prompt` | ``layout "<id>" pane <tab>/<pane> sets a `prompt`, but belt "<belt>" step "<name>" targets that pane — remove the pane's `prompt` (the step's own prompt is dispatched there).`` | Drop the pane's `prompt` — two prompts would race in one agent. Keep it only on panes no step targets. |
 | 11 | a `pr:` block on a belt with no PR-opening step (checked over the **kept** steps) | ``belt "<belt>" sets a `pr:` behavior block but has no step that opens a pull request — add a `pr` step or remove the block`` | Add a `pr` step or drop the block. |
 | 12 | two steps in one belt resolve to the same `name` | `belt "<belt>" has duplicate step name "<name>" (name defaults to type — give one an explicit unique name)` | Add `name:` to one (two unnamed `custom` steps always collide). |
 | 13 | two kept steps in one belt target the same layout pane | `belt "<belt>" steps "<owner>" and "<name>" target the same layout pane (tab "<tab>", pane "<pane>") — each step needs its own agent pane` | Give each step its own pane. Two **different** belts may reuse the same tab/pane titles. |

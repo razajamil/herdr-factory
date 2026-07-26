@@ -14,7 +14,7 @@ import type { Config, StepConfig } from "../src/config.ts";
 import { BUDGET_GUARD, HEARTBEAT_GUARD, LAYOUT_WAIT_GUARD, READ_ONLY_GUARD } from "../src/steps/guards.ts";
 import { applyWatchRebase, registerWatchEvaluator } from "../src/core/watches.ts";
 import { runObligations } from "../src/core/obligations.ts";
-import type { FocusedPane, HumanAskInput, HumanPollInput, HumanReply, JiraMatchItem, LocalMarkdownMatchItem, Phase, PrInfo, PrSnapshot, ReviewSig, Ticket, WorkState } from "../src/types.ts";
+import type { FocusedPane, HumanAskInput, HumanPollInput, HumanReply, JiraMatchItem, LayoutNode, LocalMarkdownMatchItem, Phase, PrInfo, PrSnapshot, ReviewSig, Ticket, WorkState } from "../src/types.ts";
 import { DEFAULT_AGENT_CONFIG, StaleItemError } from "../src/types.ts";
 
 const tmps: string[] = [];
@@ -38,7 +38,7 @@ interface FakeState {
   paneState: string;
   deadPanes: Set<string>; // panes herdr no longer tracks (paneAlive → false)
   tabPane: string | null; // what tabPaneByLabel resolves for the CONFIGURED label ("agent") — null ⇒ no match
-  tabPaneByName: Record<string, string>; // what tabPaneByLabel resolves for a NON-configured label (the renamed dispatch name `${step}:${key}`)
+  tabPaneByName: Record<string, string>; // what tabPaneByLabel resolves for a NON-configured label (the drain-window dispatch name `${step}:${key}`)
   headSha: string;
   sessionId: string | null;
   workspaceExists: boolean; // does the workspace still exist after a worktree remove?
@@ -53,6 +53,7 @@ interface FakeState {
   failEligible: boolean; // the jira source's listEligible throws (backend outage)
   authFail: boolean; // the jira source's calls throw SourceUnauthenticatedError (not authenticated)
   itemLabels: Record<string, string[]>; // labels the jira fake attaches per key (default [])
+  promptStalls: boolean; // agentSend reports the submission never moved the agent (herdr's stalled verdict)
 }
 
 /** A resolved belt step for the fakes. Budgets/heartbeat/opensPr mirror what config.ts derives for
@@ -107,13 +108,15 @@ function build(opts: { multi?: boolean } = {}) {
   let now = 1000;
   let uidN = 0; // deterministic per-claim branch suffix (u1, u2, …) so re-claims get distinct branches
   const store = new Store(openDb(":memory:"), () => now);
-  const state: FakeState = { eligible: [], eligible2: [], pr: null, sig: { unresolved: 0, failing: 0, sig: "s0" }, paneState: "idle", deadPanes: new Set(), tabPane: "w1:p1", tabPaneByName: {}, headSha: "sha0", sessionId: "sess-1", workspaceExists: false, focusedPane: { paneId: "w1:p1", workspaceId: "w1", tabId: "w1:t1", label: "agent" }, humanReply: null, herdrUnreachable: false, failTransitions: false, failTransitionStates: new Set(), staleTransitionStates: new Set(), humanPollError: null, humanAskError: null, failEligible: false, authFail: false, itemLabels: {} };
+  const state: FakeState = { eligible: [], eligible2: [], pr: null, sig: { unresolved: 0, failing: 0, sig: "s0" }, paneState: "idle", deadPanes: new Set(), tabPane: "w1:p1", tabPaneByName: {}, headSha: "sha0", sessionId: "sess-1", workspaceExists: false, focusedPane: { paneId: "w1:p1", workspaceId: "w1", tabId: "w1:t1", label: "agent" }, humanReply: null, herdrUnreachable: false, failTransitions: false, failTransitionStates: new Set(), staleTransitionStates: new Set(), humanPollError: null, humanAskError: null, failEligible: false, authFail: false, itemLabels: {}, promptStalls: false };
   const calls = {
     transitions: [] as [string, WorkState][],
     // Belt-effect deliveries: records the source-native statusOverride whenever one is passed.
     transitionOverrides: [] as [string, WorkState, string][],
     agentSend: [] as [string, string][],
-    agentRename: [] as [string, string][],
+    // Display-only pane state (herdr `pane report-metadata`) — [paneId, agentName, title ?? null].
+    // This replaced the pane RENAMES the factory used to convey step/attention state with.
+    paneDisplay: [] as [string, string | undefined, string | null][],
     agentFocus: [] as string[],
     worktreeRemove: [] as string[],
     workspaceClose: [] as string[],
@@ -127,6 +130,8 @@ function build(opts: { multi?: boolean } = {}) {
     agentStart: 0,
     notify: 0,
   };
+    // Panes in a herdr layout tree — the fake answers layoutApply with that many ids.
+  const countPanes = (n: LayoutNode): number => (n.type === "pane" ? 1 : countPanes(n.first) + countPanes(n.second));
   const wrapJira = (t: Ticket): JiraMatchItem => ({ sourceType: "jira", key: t.key, summary: t.summary, type: t.type, status: "To Do", labels: state.itemLabels[t.key] ?? [], fields: {} });
   const wrapLm = (t: Ticket): LocalMarkdownMatchItem => ({ sourceType: "local_markdown", key: t.key, summary: t.summary, type: t.type, labels: [], fields: {}, path: `/f/${t.key}.md`, filename: `${t.key}.md`, frontMatter: {}, body: "" });
   // Fake work sources; transitions record the CANONICAL WorkState (the canonical→backend mapping
@@ -210,21 +215,22 @@ function build(opts: { multi?: boolean } = {}) {
     tabPaneByLabel: async (_ws, _tab, pane) => (pane === "agent" ? state.tabPane : (state.tabPaneByName[pane] ?? null)),
     agentStart: async () => { calls.agentStart += 1; return "w1:p2"; },
     paneRun: async () => {},
+    paneClose: async () => {},
+    agentAdopt: async () => true,
     tabCreate: async () => ({ tabId: "w1:t2", paneId: "w1:pN" }),
     tabRename: async () => {},
-    paneSplit: async () => "w1:pN",
-    paneRename: async () => {},
-    paneExtent: async () => 200,
-    waitOutput: async () => "HERDR_FACTORY_SETUP_DONE_x 0",
+    layoutApply: async (o) => ({ tabId: "w1:t2", paneIds: ["w1:pN", "w1:pN2", "w1:pN3"].slice(0, countPanes(o.root)) }),
+    tabArea: async () => ({ cols: 200, rows: 50 }),
+    agentOpenPrompt: async () => true,
+    paneAtShellPrompt: async () => true,
     firstTabId: async () => "w1:t1",
     workspaceInfo: async () => ({ checkoutPath: worktree, repoRoot: "/main-checkout", repoName: "n", isLinkedWorktree: true, tabCount: 1, paneCount: 1, activeTabId: "w1:t1" }),
     worktreeBranch: async () => "fix/K-1",
     firstPaneOfTab: async () => "w1:p1",
-    agentSend: async (p, t) => { calls.agentSend.push([p, t]); },
+    agentSend: async (p, t) => { calls.agentSend.push([p, t]); return !state.promptStalls; },
     agentFocus: async (id) => { calls.agentFocus.push(id); },
     focusedPane: async () => state.focusedPane,
-    paneSendKeys: async () => {},
-    agentRename: async (p, n) => { calls.agentRename.push([p, n]); },
+    reportPaneDisplay: async (p, d) => { calls.paneDisplay.push([p, d.agentName, d.title ?? null]); },
     notify: async () => { calls.notify += 1; },
   };
   const github: GitHubApi = {
@@ -982,6 +988,32 @@ describe("reconcile pipeline (work_to_pull_request belt)", () => {
     expect(calls.transitions).not.toContainEqual(["W-1", "in_development"]);
   });
 
+  it("a prompt herdr reports as STALLED is not a dispatch — the pass stays undispatched and retries", async () => {
+    // The failure this guards: a submission whose keystrokes were dropped used to look like a
+    // successful dispatch, so the step's budget clock started against an agent that never got the
+    // work and the run parked at budget instead of simply being re-prompted. herdr 0.7.5's
+    // `agent prompt --wait` reports the stall, so the dispatch is treated as not having happened.
+    const { deps, store, state, calls } = build();
+    state.eligible = [ticket("ST-1")];
+    state.promptStalls = true;
+    await reconcileRepo(deps);
+    const run = store.activeRunForTicket("demo", "jira", "ST-1")!;
+    expect(calls.agentSend.length).toBe(1); // it WAS attempted…
+    expect(run.phase).toBe("claiming"); // …but the run never advanced
+    const rs = store.getRunStep(run.id, "fix")!;
+    expect(rs.dispatchedAt).toBeNull(); // the pass still needs its dispatch (bounded layout wait owns the retry)
+    expect(rs.paneId).toBeNull();
+    expect(calls.agentStart).toBe(0); // and it did not fall back to spawning its own pane
+
+    // The identical dispatch lands once the agent is actually reachable.
+    state.promptStalls = false;
+    await reconcileRepo(deps);
+    const rs2 = store.getRunStep(run.id, "fix")!;
+    expect(rs2.dispatchedAt).not.toBeNull();
+    expect(rs2.paneId).toBe("w1:p1");
+    expect(calls.paneDisplay).toContainEqual(["w1:p1", "fix:ST-1", null]);
+  });
+
   it("read_only enforcement: a FROZEN read-only step that moves HEAD (commits) parks for attention", async () => {
     const { deps, store, state, worktree, shipBelt } = build();
     shipBelt.steps[1] = stepCfg("review", { readOnly: true }); // read-only review, guard attached like production
@@ -1134,7 +1166,7 @@ describe("reconcile pipeline (work_to_pull_request belt)", () => {
     // The rescue is on the timeline; the ⚠ label was restored to the pane's OWNING step (fix);
     // and the successful dispatch refunds the respawn budget for future waits.
     expect(store.timeline("demo", "K-LWP").some((e) => e.type === "resumed" && (e.detail ?? "").includes("layout_wait_respawn"))).toBe(true);
-    expect(calls.agentRename).toContainEqual(["w1:pfix", "fix:K-LWP"]);
+    expect(calls.paneDisplay).toContainEqual(["w1:pfix", "fix:K-LWP", null]);
     expect(store.guardCounter(run.id, "evidence", "layout_wait")).toBe(0);
   });
 
@@ -1622,7 +1654,7 @@ describe("reconcile pipeline (work_to_pull_request belt)", () => {
     expect(store.getRun(run.id)!.phase).toBe("attention");
     expect(calls.notify).toBe(1);
     // the active pane is relabelled to a glaring attention marker (the persistent herdr cue)
-    expect(calls.agentRename).toContainEqual(["w1:p1", "⚠ ATTENTION K-B1"]);
+    expect(calls.paneDisplay).toContainEqual(["w1:p1", "review:K-B1", "⚠ ATTENTION K-B1"]);
   });
 
   it("review step over budget but still working → extended (stays running)", async () => {

@@ -636,9 +636,76 @@ export interface StepPosture {
  *  `command` is argv[0], the documented `agentStart` invariant (see clients/herdr.ts). Only panes
  *  the factory spawns itself use this; a step targeting a layout pane drives whatever that pane
  *  already runs. */
+/** A pane's size in terminal cells. Measured on a fresh tab's single pane (so: the tab's own box) to
+ *  turn a layout's fixed `cells` sizes into exact split ratios. */
+export interface PaneBox {
+  cols: number;
+  rows: number;
+}
+
+/** herdr's declarative pane tree (`layout.apply`'s `root`). A leaf is a pane — `label` is its herdr
+ *  label (what a step's `pane:` targets), `cwd`/`env` are its shell's; a branch is a split whose
+ *  `ratio` is the fraction the FIRST child keeps. Serialized straight to herdr, hence snake_case. */
+export type LayoutNode =
+  | {
+      type: "pane";
+      label?: string;
+      cwd?: string;
+      env?: Record<string, string>;
+      /** ARGV herdr launches as the pane's process (not typed into its shell). Omit for a plain shell. */
+      command?: string[];
+    }
+  | { type: "split"; direction: "right" | "down"; ratio: number; first: LayoutNode; second: LayoutNode };
+
+/** What `layout.apply`/`layout.export` echo back: the same tree, with every pane's real id. */
+export type LayoutDescriptionNode =
+  | { type: "pane"; pane_id?: string; label?: string | null }
+  | { type: "split"; direction: string; ratio: number; first: LayoutDescriptionNode; second: LayoutDescriptionNode };
+export interface LayoutDescription {
+  workspace_id?: string;
+  tab_id?: string;
+  root: LayoutDescriptionNode;
+}
+
+/** Display-only pane state the factory publishes to herdr (`pane report-metadata`) instead of
+ *  renaming panes. Every field is a decoration herdr shows next to the pane's own (untouched) label:
+ *  `agentName` overrides the agent column, `title` the pane title, `tokens` are machine-readable
+ *  key/values a user's `[ui.sidebar]` rows can render and an agent-view query can filter on. */
+export interface PaneDisplay {
+  /** The agent-name column — the factory writes `<step>:<KEY>` (what `agent rename` used to set). */
+  agentName?: string;
+  /** A title override. Reserved for the alarm state; cleared otherwise so the agent's own terminal
+   *  title (what herdr's sidebar shows as `terminal_title_stripped`) comes back through. */
+  title?: string;
+  /** Clear the title override (ignored when `title` is set). */
+  clearTitle?: boolean;
+  /** Tokens to set; a null value CLEARS that token. */
+  tokens?: Record<string, string | null>;
+  /** Expire this report after N ms — for state a crashed writer must not leave behind (e.g. "setup
+   *  running"). Omit for state the factory clears explicitly. */
+  ttlMs?: number;
+}
+
+/** The agent kinds herdr 0.7.5 can ADOPT into a pane (`agent start --kind`, whose value set is
+ *  closed — an unknown kind is rejected before anything is typed into the pane). Kept as data
+ *  because the spawn strategy must be chosen BEFORE the pane is touched: a rejected adoption is
+ *  recoverable, but falling back after herdr has already typed the launch command would run the
+ *  harness twice. An `agent.kind` config key overrides the derivation from `command`, which is how a
+ *  WRAPPED harness (`bin/my-claude`) still gets adopted. Lives here (an import-free leaf) so both
+ *  the zod schema and the herdr client can name it without a cycle. */
+export const HERDR_AGENT_KINDS: readonly string[] = [
+  "pi", "claude", "codex", "gemini", "cursor", "devin", "agy", "cline", "omp", "mastracode",
+  "opencode", "copilot", "kimi", "kiro", "droid", "amp", "grok", "hermes", "kilo", "qodercli", "maki",
+];
+
 export interface AgentConfig {
   command: string;
   flags: string[];
+  /** Optional herdr agent KIND (`agent start --kind`) for this harness. Only needed when `command`
+   *  doesn't name one itself — a wrapper script (`bin/my-claude`) or an absolute path. Without it a
+   *  non-kind `command` is typed into the pane instead of adopted, losing herdr's
+   *  readiness handshake (see spawnStrategyForArgv in clients/herdr.ts). */
+  kind?: string;
 }
 
 /** The historical hardcoded harness: `claude --dangerously-skip-permissions`. Used when NO

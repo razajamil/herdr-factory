@@ -389,7 +389,9 @@ holding all the workspace slots (Q1b).
 ## 3. The attention / park reason table
 
 `escalateAttention` always: sets `phase='attention'` + `attention_reason` + `attention_reason_code`,
-records an `attention` event, renames the run's pane to `⚠ ATTENTION <KEY>`, fires a herdr notify,
+records an `attention` event, flags the run's pane with an `⚠ ATTENTION <KEY>` title +
+`hf_state=attention` token (display-only `pane report-metadata` — the pane's real label, which a step's
+`pane:` target resolves by, is never touched), fires a herdr notify,
 and (unless `skipSourceNote`) posts a note on the work item ending
 ``Resume with: herdr-factory --repo <repo> resume <KEY>``.
 

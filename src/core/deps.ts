@@ -8,7 +8,10 @@ import type {
   HumanAskResult,
   HumanPollInput,
   HumanReply,
+  LayoutNode,
   MatchItem,
+  PaneBox,
+  PaneDisplay,
   PrInfo,
   PrSnapshot,
   ReviewSig,
@@ -57,28 +60,47 @@ export interface HerdrApi {
   paneAlive(paneId: string, opts?: LivenessOpts): Promise<boolean>;
   agentSessionId(paneId: string): Promise<string | null>;
   tabPaneByLabel(workspaceId: string, tabLabel: string, paneLabel: string): Promise<string | null>;
-  agentStart(opts: { workspaceId: string; cwd: string; argv: string[]; env?: Record<string, string> }): Promise<string | null>;
+  /** Create a pane and bring the harness up in it (herdr 0.7.5: WE create the pane, herdr adopts the
+   *  agent into it — see the client's doc). null ⇒ it couldn't be brought up; nothing was left behind. */
+  agentStart(opts: {
+    workspaceId: string;
+    cwd: string;
+    argv: string[];
+    env?: Record<string, string>;
+    /** herdr AGENT name — `[a-z][a-z0-9_-]{0,31}`, unique among live agents (herdr's rule). */
+    name?: string;
+    kind?: string;
+    /** Hook to wait for the new pane's shell prompt before the agent is started into it. */
+    awaitShell?: (paneId: string) => Promise<void>;
+  }): Promise<string | null>;
+  /** Start `kind` in an EXISTING pane (a layout's agent pane). true ⇒ herdr says it's ready for input. */
+  agentAdopt(paneId: string, opts: { name: string; kind: string; args?: readonly string[]; timeoutMs?: number }): Promise<boolean>;
+  /** A layout pane's opening `prompt:` — waits for the agent to settle only when a timeout is given. */
+  agentOpenPrompt(target: string, text: string, opts?: { settleTimeoutMs?: number }): Promise<boolean>;
+  /** Is the pane at an available shell prompt (what `agent start` requires)? One sample; callers poll. */
+  paneAtShellPrompt(paneId: string): Promise<boolean>;
   paneRun(paneId: string, command: string): Promise<void>;
+  paneClose(paneId: string): Promise<void>;
   // Layout building (absorbed from workspace-manager); driven by src/core/layout.ts.
-  tabCreate(workspaceId: string, opts: { label?: string; cwd?: string }): Promise<{ tabId: string; paneId: string }>;
+  tabCreate(workspaceId: string, opts: { label?: string; cwd?: string; env?: Record<string, string> }): Promise<{ tabId: string; paneId: string }>;
   tabRename(tabId: string, label: string): Promise<void>;
-  paneSplit(fromPaneId: string, opts: { direction: "right" | "down"; ratio?: number; cwd?: string }): Promise<string>;
-  paneRename(paneId: string, label: string): Promise<void>;
-  /** Pane extent (cells) along the split axis — width for "right", height for "down"; null if unknown. */
-  paneExtent(paneId: string, direction: "right" | "down"): Promise<number | null>;
-  /** Wait for `marker` in a pane's output up to timeoutMs (blocking setup); matched line or null. */
-  waitOutput(paneId: string, marker: string, timeoutMs: number): Promise<string | null>;
+  /** Build a whole tab's pane tree in ONE call; returns the tab id + its panes IN TREE ORDER. */
+  layoutApply(opts: { workspaceId?: string; tabId?: string; tabLabel?: string; root: LayoutNode }): Promise<{ tabId: string; paneIds: string[] }>;
+  /** The cell area of a pane's TAB (null if unknown) — measured once before a build to size `cells`. */
+  tabArea(paneId: string): Promise<PaneBox | null>;
   /** The workspace's first (root) tab id — the tab a fresh worktree comes up with. */
   firstTabId(workspaceId: string): Promise<string | null>;
   // Introspection for the layout event hook (src/core/layout-hook.ts).
   workspaceInfo(workspaceId: string): Promise<WorkspaceInfo | null>;
   worktreeBranch(workspaceId: string, checkoutPath?: string | null): Promise<string | null>;
   firstPaneOfTab(workspaceId: string, tabId: string): Promise<string | null>;
-  agentSend(paneId: string, text: string): Promise<void>;
+  /** Submit a prompt to a pane's agent (atomic: types + Enter). `confirm` waits for herdr to observe
+   *  the agent react and returns false when the submission stalled — the prompt never landed. */
+  agentSend(paneId: string, text: string, opts?: { confirm?: boolean }): Promise<boolean>;
   agentFocus(paneId: string): Promise<void>;
   focusedPane(): Promise<FocusedPane | null>;
-  paneSendKeys(paneId: string, ...keys: string[]): Promise<void>;
-  agentRename(paneId: string, name: string): Promise<void>;
+  /** Publish display-only run state on a pane (never renames it) — see core/pane-display.ts. */
+  reportPaneDisplay(paneId: string, d: PaneDisplay): Promise<void>;
   notify(title: string, body: string): Promise<void>;
 }
 

@@ -5,6 +5,7 @@ import { z } from "zod";
 import {
   DEFAULT_AGENT_CONFIG,
   EFFECT_PRODUCE_PRODUCTS,
+  HERDR_AGENT_KINDS,
   type AgentConfig,
   type BeltEffect,
   type EffectSpec,
@@ -189,8 +190,22 @@ const layoutRefine = {
 // step's `tab`/`pane` (above) then targets, so the factory no longer waits on a hand-built layout. ──
 
 // A layout-level setup command, run once in the single `setup: true` pane before that pane's own
-// command. `blocking: true` makes the builder wait for it to finish before spawning any later tab.
+// command or agent. `blocking: true` makes the builder wait for it to finish before spawning any
+// later tab; an agent on the setup pane always waits for it either way (herdr can only start an agent
+// in a pane that is back at its shell prompt).
 const LayoutSetupSchema = z.object({ command: z.string().trim().min(1), blocking: z.boolean().default(false) }).strict();
+
+// Environment for a pane's process — layout-level (every pane) and pane-level (that pane only, and it
+// wins on conflict). Values are stringified so `PORT: 3000` needs no quoting.
+const LayoutEnvSchema = z.record(z.string().trim().min(1), z.union([z.string(), z.number(), z.boolean()]).transform(String));
+
+// A positive whole number of milliseconds (an agent/prompt timeout).
+const MillisSchema = z.coerce.number().int().positive();
+
+// herdr's own constraint on an agent name: it must be unique among LIVE agents and match this shape
+// (`herdr agent start` answers `invalid_agent_name` otherwise). Enforced here so a bad name is a load
+// error rather than a layout that half-builds.
+const AGENT_NAME_RE = /^[a-z][a-z0-9_-]{0,31}$/;
 
 // A pane's extent along the split axis. A "30%" string (or a fraction 0<n<1) is a percentage of the
 // parent; an integer ≥1 is a fixed cell count. Collapsed to {percent}|{cells} at load (normalizeSize).
@@ -203,17 +218,51 @@ const PaneSizeSchema = z.union([
 // "right"|"down" at load (matches herdr's `pane split --direction`).
 const PaneSplitSchema = z.enum(["vertical", "horizontal", "right", "down"]);
 
+// The agent-only pane keys. Named here so a pane carrying one WITHOUT `agent:` can be rejected: that
+// is almost always a typo or a half-finished edit, and ignoring it silently leaves the user staring at
+// a pane that never starts an agent.
+const AGENT_PANE_KEYS = ["agent_name", "agent_args", "prompt", "agent_timeout_ms", "prompt_timeout_ms"] as const;
+
 const LayoutPaneSchema = z
   .object({
     title: z.string().trim().min(1).optional(), // herdr pane label (what a step's `pane` matches)
-    command: z.string().trim().min(1).optional(), // shell command run in the pane once it's built
+    // A shell command, run as the pane's PROCESS (not typed into its shell) inside your interactive
+    // login shell — so .zshrc/.bash_profile PATH setup (mise, asdf, nvm) applies exactly as it did
+    // when it was typed. When it exits the pane is handed back to a shell prompt unless
+    // `persist: false`. Mutually exclusive with `agent`.
+    command: z.string().trim().min(1).optional(),
+    persist: z.boolean().optional(), // default true; only meaningful with `command`
+    // An agent pane: the herdr agent KIND to start here (`agent: claude`). herdr starts it with
+    // `agent start --kind --pane`, which returns only once it has DETECTED the agent and marked it
+    // ready for input — so the layout knows it actually came up, and a step's first prompt can't land
+    // in a shell that isn't listening yet. This is what a step-targeted pane should use.
+    agent: z.enum(HERDR_AGENT_KINDS as [string, ...string[]]).optional(),
+    agent_name: z.string().trim().min(1).optional(), // stable herdr agent alias; derived when unset
+    agent_args: z.array(z.union([z.string(), z.number(), z.boolean()]).transform(String)).optional(),
+    // An opening prompt submitted once the agent is ready. For a pane a STEP targets, leave this
+    // unset — the reconciler dispatches that step's own prompt (rejected at load, see LayoutSchema).
+    prompt: z.string().trim().min(1).optional(),
+    agent_timeout_ms: MillisSchema.optional(), // how long to wait for the agent to become ready
+    prompt_timeout_ms: MillisSchema.optional(), // set ⇒ wait for the agent to settle after prompting
+    env: LayoutEnvSchema.optional(), // this pane's environment (wins over the layout's)
     setup: z.boolean().default(false), // THIS is the pane the layout-level setup command runs in
     split: PaneSplitSchema.optional(), // how this pane splits off the previous one (ignored on pane 0)
     ratio: z.number().gt(0).lt(1).optional(), // legacy: the fraction the PREVIOUS pane keeps
     size: PaneSizeSchema.optional(), // this pane's extent (mutually exclusive with ratio)
   })
   .strict()
-  .refine((p) => !(p.ratio != null && p.size != null), { message: "set either ratio or size, not both", path: ["size"] });
+  .refine((p) => !(p.ratio != null && p.size != null), { message: "set either ratio or size, not both", path: ["size"] })
+  // An agent is started INTO the pane's shell, so a command occupying that shell would collide with it.
+  .refine((p) => !(p.agent && p.command), { message: "set either `agent` or `command`, not both (an agent pane starts its agent itself)", path: ["agent"] })
+  .refine((p) => !(p.persist != null && p.command == null), { message: "`persist` only applies to a pane with a `command`", path: ["persist"] })
+  .refine((p) => p.agent != null || AGENT_PANE_KEYS.every((k) => p[k] == null), {
+    message: `these keys need an \`agent:\` on the same pane: ${AGENT_PANE_KEYS.join(", ")}`,
+    path: ["agent"],
+  })
+  .refine((p) => p.agent_name == null || AGENT_NAME_RE.test(p.agent_name), {
+    message: "agent_name must start with a lowercase letter and contain only lowercase letters, digits, '-' or '_' (1-32 chars) — herdr's own rule",
+    path: ["agent_name"],
+  });
 
 const LayoutTabSchema = z
   .object({
@@ -226,6 +275,7 @@ const LayoutSchema = z
   .object({
     id: z.string().trim().min(1),
     setup: LayoutSetupSchema.optional(),
+    env: LayoutEnvSchema.optional(), // environment for every pane in this layout
     tabs: z.array(LayoutTabSchema).min(1, "a layout needs at least one tab"),
   })
   .strict()
@@ -238,7 +288,16 @@ const LayoutSchema = z
   .refine((l) => !l.setup || l.tabs.some((t) => t.panes.some((p) => p.setup)), {
     message: "a layout with a `setup` block needs one pane marked `setup: true` to run it in",
     path: ["setup"],
-  });
+  })
+  // herdr requires agent names to be unique among LIVE agents; a layout that reuses one would fail
+  // partway through its own build.
+  .refine(
+    (l) => {
+      const names = l.tabs.flatMap((t) => t.panes).map((p) => p.agent_name).filter((n): n is string => n != null);
+      return new Set(names).size === names.length;
+    },
+    { message: "two panes in this layout share an `agent_name` — herdr agent names must be unique", path: ["tabs"] },
+  );
 
 // A per-belt branch→layout rule: the first rule whose glob matches the worktree's branch wins (see
 // resolveBeltLayout). `*` matches any run of chars (incl "/"), `?` a single char. `title` is docs.
@@ -315,6 +374,11 @@ const AgentBlockSchema = z
   .object({
     command: z.string().trim().min(1).optional(),
     flags: z.array(z.string()).optional(),
+    // The herdr agent KIND to adopt this harness as (`herdr agent start --kind`). Needed ONLY when
+    // `command` isn't itself a bare kind name — a wrapper script or an absolute path. Set it and the
+    // pane is adopted (herdr blocks until the agent is ready for input); omit it for such a command
+    // and the argv is typed into the pane instead, which works but has no readiness handshake.
+    kind: z.enum(HERDR_AGENT_KINDS as [string, ...string[]]).optional(),
   })
   .strict();
 type ParsedAgentBlock = z.infer<typeof AgentBlockSchema>;
@@ -419,7 +483,7 @@ function resolveBranchTaxonomy(repo: ParsedBranchBlock | undefined, belt: Parsed
 function resolveAgent(repo: ParsedAgentBlock | undefined, belt: ParsedAgentBlock | undefined, step: ParsedAgentBlock | undefined): AgentConfig {
   const block = step ?? belt ?? repo;
   if (!block) return DEFAULT_AGENT_CONFIG;
-  return { command: block.command ?? DEFAULT_AGENT_CONFIG.command, flags: block.flags ?? [] };
+  return { command: block.command ?? DEFAULT_AGENT_CONFIG.command, flags: block.flags ?? [], kind: block.kind };
 }
 
 // The canonical WorkState vocabulary + run outcomes, as config enums for the belt-effects block.
@@ -702,13 +766,29 @@ export const RepoConfigSchema = z
     // at dispatch (herdr labels come from the titles). Untitled tabs/panes are unaddressable by
     // label, so they contribute nothing here.
     const layoutPaneTargets = new Map<string, Set<string>>(); // layout id → "tab\0pane"
+    // …and which of those panes actually bring an AGENT up: an `agent:` kind (herdr starts the
+    // configured harness) or a `command` (the pane runs one itself, the pre-`agent:` idiom). A step
+    // targeting a pane in neither set would wait for an agent that never appears.
+    const layoutAgentPanes = new Map<string, Set<string>>();
+    // …and which carry their own opening `prompt:`, which collides with a step's dispatch.
+    const layoutPromptPanes = new Map<string, Set<string>>();
     for (const l of cfg.layouts) {
       const targets = new Set<string>();
+      const agentPanes = new Set<string>();
+      const promptPanes = new Set<string>();
       for (const t of l.tabs) {
         if (!t.title) continue;
-        for (const p of t.panes) if (p.title) targets.add(`${t.title}\0${p.title}`);
+        for (const p of t.panes) {
+          if (!p.title) continue;
+          const key = `${t.title}\0${p.title}`;
+          targets.add(key);
+          if (p.agent || p.command) agentPanes.add(key);
+          if (p.prompt) promptPanes.add(key);
+        }
       }
       layoutPaneTargets.set(l.id, targets);
+      layoutAgentPanes.set(l.id, agentPanes);
+      layoutPromptPanes.set(l.id, promptPanes);
     }
     // Belt names unique; each belt.source references a configured work source; custom step names
     // unique within their belt; the per-belt pickup `label` matches its source's label semantics
@@ -778,6 +858,35 @@ export const RepoConfigSchema = z
             path: ["belt", i, "steps", j, "pane"],
           });
         });
+        // The pane exists — but does anything start an agent IN it? A step only ever prompts an agent
+        // it finds already running in its target pane; a pane that starts none makes the step wait out
+        // its whole layout-wait budget and park. Same reasoning as the target check above: catch it at
+        // save/reload, not as a runtime park.
+        const agentPanes = b.default_layout != null ? layoutAgentPanes.get(b.default_layout) : undefined;
+        const promptPanes = b.default_layout != null ? layoutPromptPanes.get(b.default_layout) : undefined;
+        if (agentPanes) {
+          b.steps.forEach((s, j) => {
+            if (s.tab == null || s.pane == null) return;
+            const key = `${s.tab}\0${s.pane}`;
+            if (!defaultLayoutTargets.has(key)) return; // already reported above
+            if (!agentPanes.has(key)) {
+              ctx.addIssue({
+                code: "custom",
+                message: `belt "${b.name}" step "${s.name ?? s.type}" targets pane ${s.tab}/${s.pane} in layout "${b.default_layout}", but that pane starts no agent — set an \`agent:\` kind on it (herdr starts that agent as part of the build) or give it a \`command\` that launches one.`,
+                path: ["belt", i, "steps", j, "pane"],
+              });
+            }
+            // A layout `prompt:` is submitted as soon as the agent is ready; the step's own prompt is
+            // dispatched by the reconciler. Both would land in the same agent, racing each other.
+            if (promptPanes?.has(key)) {
+              ctx.addIssue({
+                code: "custom",
+                message: `layout "${b.default_layout}" pane ${s.tab}/${s.pane} sets a \`prompt\`, but belt "${b.name}" step "${s.name ?? s.type}" targets that pane — remove the pane's \`prompt\` (the step's own prompt is dispatched there).`,
+                path: ["belt", i, "steps", j, "pane"],
+              });
+            }
+          });
+        }
       }
       // Step validation for EVERY belt (previously custom-only). Each step references a registered
       // primitive; resolve its descriptor and run the structural checks the reconciler relies on.
@@ -963,10 +1072,31 @@ export interface StepConfig {
  *  count. Config accepts "30%" / 0.3 / 40; normalizeSize collapses those to this. */
 export type LayoutSize = { percent: number } | { cells: number };
 
+/** A resolved agent pane: which herdr agent to start there, and how. */
+export interface LayoutAgent {
+  /** The herdr agent kind (`claude`, `opencode`, …) — `agent start --kind`. */
+  kind: string;
+  /** herdr agent alias; derived from the kind + workspace when unset (see deriveAgentName). */
+  name?: string;
+  /** Args passed through to the agent's own command line. */
+  args: string[];
+  /** An opening prompt submitted once herdr reports the agent ready. */
+  prompt?: string;
+  startTimeoutMs?: number;
+  /** Set ⇒ wait for the agent to settle after prompting; unset ⇒ submit and move on. */
+  promptTimeoutMs?: number;
+}
+
 /** One resolved layout pane. `split` is normalized to right|down; `size` to LayoutSize. */
 export interface LayoutPane {
   title?: string;
   command?: string;
+  /** Keep the pane at a shell prompt after `command` exits (default true). */
+  persist: boolean;
+  /** Set ⇒ this pane hosts an agent, started as part of the build. */
+  agent?: LayoutAgent;
+  /** Environment for this pane's process (layout env merged first, so these win). */
+  env: Record<string, string>;
   setup: boolean;
   split?: "right" | "down";
   ratio?: number;
@@ -1468,6 +1598,19 @@ export function loadConfig(repoName: string): Loaded {
       panes: t.panes.map((p) => ({
         title: p.title,
         command: p.command,
+        persist: p.persist ?? true,
+        agent: p.agent
+          ? {
+              kind: p.agent,
+              name: p.agent_name,
+              args: p.agent_args ?? [],
+              prompt: p.prompt,
+              startTimeoutMs: p.agent_timeout_ms,
+              promptTimeoutMs: p.prompt_timeout_ms,
+            }
+          : undefined,
+        // Layout env first so a pane's own entries win on conflict.
+        env: { ...(l.env ?? {}), ...(p.env ?? {}) },
         setup: p.setup,
         split: p.split ? normalizeSplit(p.split) : undefined,
         ratio: p.ratio,

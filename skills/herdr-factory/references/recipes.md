@@ -325,12 +325,12 @@ layouts:
     tabs:
       - title: dev
         panes:
-          - { title: work, command: claude, setup: true } # the work step's agent; also runs setup
+          - { title: work, agent: claude, agent_args: [--dangerously-skip-permissions], setup: true } # the work step's agent; also runs setup
           - { title: server, command: mise run dev, split: right, size: "40%" }
       - title: qa
         panes:
-          - { title: evidence, command: claude }
-          - { title: review, command: claude, split: down, size: "50%" }
+          - { title: evidence, agent: claude, agent_args: [--dangerously-skip-permissions] }
+          - { title: review, agent: claude, agent_args: [--dangerously-skip-permissions], split: down, size: "50%" }
 
 evidence:
   bucket: my-evidence-bucket # EDIT
@@ -356,7 +356,7 @@ herdr-factory --repo my-repo run
 
 Notes:
 - Building layouts needs the factory registered as a herdr plugin (the `worktree.created` hook) — see [layouts.md](./layouts.md).
-- A step with `tab`+`pane` **never** gets a factory-spawned pane: the layout pane must already be running an agent (`command: claude`), and the pair must exist as a *titled* tab + *titled* pane in `default_layout`. Two steps of one belt may not share a pane.
+- A step with `tab`+`pane` **never** gets a factory-spawned pane: the layout pane must start an agent — `agent: <kind>` (herdr starts it as part of the build and waits until it's ready) or a `command` that launches one — and the pair must exist as a *titled* tab + *titled* pane in `default_layout`. Both are checked at config load. Two steps of one belt may not share a pane.
 - Drop the evidence step's `tab`/`pane` and the step vanishes silently — but drop the `produce evidence` effect with it: an effect on a product no surviving step produces is a **load error** (`belt "ship-bugs" effect on producing "evidence" — no step in the belt produces it`). With both removed the belt is work → review → pr. Evidence never blocks otherwise: a capture-cap park is un-parked by a later genuine step-done, and an upload failure notifies rather than parking.
 
 ## 7. A bespoke read-only gate before the PR

@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { parseEventPayload, claimApply, releaseApply, alreadyApplied, isDecided, markDecided, reapOrphanClaims } from "../src/core/layout-hook.ts";
+import { parseEventPayload, claimApply, releaseApply, alreadyApplied, isDecided, markDecided, reapOrphanClaims, runLayoutStartup } from "../src/core/layout-hook.ts";
 import { resolveHookLayout } from "../src/core/layout-match.ts";
 import type { BeltConfig, LayoutConfig } from "../src/config.ts";
 
@@ -98,26 +98,45 @@ describe("claim / decided / reap — filesystem idempotency", () => {
     expect(isDecided("w5")).toBe(true);
     expect(isDecided("w6")).toBe(false);
   });
+
+  it("the [[startup]] hook reaps orphans and clears the decided cache, keeping live claims", () => {
+    // Workspace ids are per-server-session and RECYCLED, so a decided entry surviving a herdr restart
+    // could make the hook skip a layout for a different workspace that inherited the id. The
+    // per-path claim is the real guard, and it must survive.
+    useStateDir();
+    const live = tmp("wt-live-");
+    const gone = tmp("wt-gone-");
+    expect(claimApply(live)).toBe(true);
+    expect(claimApply(gone)).toBe(true);
+    rmSync(gone, { recursive: true, force: true });
+    markDecided("w1");
+
+    expect(runLayoutStartup()).toEqual({ reaped: 1, decidedCleared: true });
+    expect(isDecided("w1")).toBe(false);
+    expect(alreadyApplied(live)).toBe(true); // the durable claim is untouched
+    expect(alreadyApplied(gone)).toBe(false);
+    expect(runLayoutStartup()).toEqual({ reaped: 0, decidedCleared: false }); // idempotent
+  });
 });
 
 describe("resolveHookLayout — factory-owned vs manual worktree", () => {
   const layouts: LayoutConfig[] = [
-    { id: "web", tabs: [{ panes: [{ setup: false }] }] },
-    { id: "hot", tabs: [{ panes: [{ setup: false }] }] },
+    { id: "web", tabs: [{ panes: [{ persist: true, env: {}, setup: false }] }] },
+    { id: "hot", tabs: [{ panes: [{ persist: true, env: {}, setup: false }] }] },
   ];
   const belt = (over: Partial<BeltConfig>): BeltConfig => ({ name: "b", beltType: "custom", source: "s", priority: 100, active: true, steps: [], watchPr: false, ...over });
 
   it("uses the owning run's belt when the worktree is factory-owned", () => {
     const belts = [belt({ name: "a", priority: 1, defaultLayout: "web" }), belt({ name: "b", priority: 2, defaultLayout: "hot" })];
-    expect(resolveHookLayout(belts, layouts, "b", "any-branch")?.id).toBe("hot");
+    expect(resolveHookLayout(belts, layouts, "b", "any-branch")?.layout.id).toBe("hot");
   });
   it("walks belts in order for a manual worktree (first that yields a layout wins)", () => {
     const belts = [belt({ name: "a", priority: 1, defaultLayout: "web" }), belt({ name: "b", priority: 2, defaultLayout: "hot" })];
-    expect(resolveHookLayout(belts, layouts, undefined, "any-branch")?.id).toBe("web");
+    expect(resolveHookLayout(belts, layouts, undefined, "any-branch")?.layout.id).toBe("web");
   });
   it("owner belt yielding nothing falls back to walking belts", () => {
     const belts = [belt({ name: "a", priority: 1, defaultLayout: "web" }), belt({ name: "b", priority: 2 })];
-    expect(resolveHookLayout(belts, layouts, "b", "any-branch")?.id).toBe("web");
+    expect(resolveHookLayout(belts, layouts, "b", "any-branch")?.layout.id).toBe("web");
   });
   it("undefined when no belt yields a layout", () => {
     expect(resolveHookLayout([belt({})], layouts, undefined, "any-branch")).toBeUndefined();

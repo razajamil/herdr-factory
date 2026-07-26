@@ -55,13 +55,15 @@ is on PATH; otherwise link it later with `herdr plugin link <checkout>`).
 
 | Tool                         | Used for                                                                                         |
 | ---------------------------- | ------------------------------------------------------------------------------------------------ |
-| [`herdr`](https://herdr.dev) | worktrees, workspaces, panes, and agent lifecycle — the factory floor                            |
+| [`herdr`](https://herdr.dev) | worktrees, workspaces, panes, and agent lifecycle — the factory floor (**≥ 0.7.5**; `herdr update`) |
 | your agent's CLI             | the workers — `claude`, `opencode`, `pi`, `codex`, … (factory-spawned panes default to `claude`; [configurable](#agent-optional)) |
 | `gh` (authenticated)         | PR discovery, CI/review polling                                                                  |
 | `git`                        | branch cleanup, heartbeats                                                                       |
 
 The installer finishes by printing this checklist and running `herdr-factory doctor`, so you see
-what's still on you (herdr, an agent CLI, `gh auth`) right away. Run `herdr-factory doctor` (or
+what's still on you (herdr, an agent CLI, `gh auth`) right away — the herdr check also enforces the
+**0.7.5** floor (its agent/pane CLI changed there), and `--deep` additionally confirms the running
+herdr server speaks a protocol this herdr CLI can talk to. Run `herdr-factory doctor` (or
 `doctor --deep`) any time — it checks everything above, plus the supervisor, server, database, and
 each repo's config, sources, and evidence bucket.
 
@@ -867,6 +869,8 @@ flags. Repo-wide, **overridable per belt and per step**:
 agent:
   command: opencode # the executable the spawned pane runs (default: claude)
   flags: [--some-flag] # its flags (default: none once you set an `agent:` block)
+  # kind: claude      # ONLY when `command` isn't itself a herdr agent name (a wrapper script, an
+  #                   # absolute path): the herdr agent kind to start it as
 
 belt:
   - name: ship
@@ -880,16 +884,22 @@ belt:
 
 The spawned pane's command line is `<command> <flags…> <prompt>`, so `command` is a herdr-recognized
 agent (`claude`, `opencode`, `codex`, `pi`, … — whatever `herdr integration install` supports, so
-herdr can detect its idle/working state) and the flags are whatever that agent takes. The PR-watch
-resolver reuses the `pr` step's harness (else the repo's).
+herdr can detect its idle/working state) and the flags are whatever that agent takes. The factory
+creates the pane and asks herdr to **start the agent in it**, which waits until the agent is ready for
+input — so the first prompt can't be dropped into a shell that isn't listening yet. That needs herdr to
+recognize the harness: a bare, known name (`claude`) is recognized automatically, while a wrapper
+script or an absolute path needs `kind:` to name the herdr agent it really is (without it, the argv is
+simply typed into the pane and the readiness wait is skipped). The PR-watch resolver reuses the `pr`
+step's harness (else the repo's).
 
 Resolution is **whole-block, most-specific-wins** — step over belt over repo — **not** field-merged:
 because flags are command-specific, a belt that switches `command` to `opencode` must not inherit the
 repo's claude `--dangerously-skip-permissions`. So once you write an `agent:` block, `command` defaults
 to `claude` and `flags` defaults to **empty** — list the flags you want. **Omit `agent:` everywhere and
 nothing changes**: spawned panes launch `claude --dangerously-skip-permissions`, exactly as before (see
-the [security note](#security-note)). Panes **your** [layout](#layouts) provides are unaffected — the
-step drives whatever that pane already runs, so set the agent there in the layout's `command:`.
+the [security note](#security-note)). This block governs the panes the **factory spawns**; a
+[layout](#layouts) pane names its own agent (`agent: claude` + `agent_args`), so the layout owns the
+harness for the panes it builds.
 
 ### Layouts
 
@@ -915,11 +925,14 @@ layouts:
     tabs:
       - title: work # a step with `tab: work, pane: agent` targets the pane below
         panes:
-          - { title: agent, command: claude, setup: true } # the idle agent the step's prompt is sent to
+          - title: agent # the step's agent — herdr starts it and waits until it's ready
+            agent: claude
+            agent_args: [--dangerously-skip-permissions]
+            setup: true # …and this is the pane the layout's `setup.command` runs in
           - { title: server, command: mise run dev, split: right, size: "40%" }
       - title: review
         panes:
-          - { title: agent, command: opencode }
+          - { title: agent, agent: opencode }
 
 belt:
   - name: fix-tickets
@@ -933,12 +946,25 @@ belt:
       # …
 ```
 
-- **Panes** — `command` runs once the pane is up. A step's `tab`+`pane` targets a pane by its tab
-  title + pane title; that pane should run an **idle agent** (`command: claude`, `opencode`, `pi`,
-  `codex` — anything that reports idle) so the step's prompt can be delivered to it. `split` is
-  `vertical`/`right` or `horizontal`/`down`; `size` is a `"30%"` percentage, a `0<n<1` fraction, or
-  an integer cell count. At most one pane may be `setup: true` — the layout-level `setup.command`
-  runs there first (`blocking: true` waits for it before any later tab spawns).
+- **Agent panes** — `agent: <kind>` names a herdr-recognized agent (`claude`, `opencode`, `codex`,
+  `pi`, … — whatever `herdr integration install` supports). herdr starts it in that pane and **returns
+  only once it has detected the agent and marked it ready for input**, so the layout knows it actually
+  came up and a step's first prompt can't be dropped into a shell that isn't listening. Companions:
+  `agent_args` (passed to the agent), `agent_name` (a stable herdr alias — lowercase, unique; derived
+  when unset), `agent_timeout_ms`. A pane **no step targets** may also carry a `prompt` (+ optional
+  `prompt_timeout_ms` to wait for it to settle) — a step-targeted pane must not, since the step's own
+  prompt is what gets dispatched there.
+- **Command panes** — `command` runs as the pane's **process**, inside your interactive login shell, so
+  `.zshrc`/`.bash_profile` setup (mise, asdf, nvm, PATH) applies. It isn't typed into the pane, so it
+  leaves no scrollback and can't race a shell that isn't ready. The pane returns to a prompt when the
+  command exits unless you set `persist: false`. A pane sets `agent` or `command`, never both.
+- **Everything else** — `env: {KEY: value}` per pane (and per layout, with the pane's entries winning).
+  A step's `tab`+`pane` targets a pane by its tab title + pane title, and that pane must start an
+  agent — an `agent:` kind, or a `command` that launches one — which the config loader checks when you
+  save. `split` is `vertical`/`right` or `horizontal`/`down`; `size` is a `"30%"` percentage, a `0<n<1`
+  fraction, or an integer cell count. At most one pane may be `setup: true` — the layout-level
+  `setup.command` runs there first (`blocking: true` waits for it to finish before any other pane's
+  command or agent starts; an agent on the setup pane always waits for it).
 - **Selection** — a belt builds its `default_layout`, unless an earlier `layout_matching` glob
   matches the worktree's branch. A hand-created worktree (no owning run) resolves by walking the
   repo's belts. Layouts are keyed to the repo by the config file (one config = one repo), so no

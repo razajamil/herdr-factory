@@ -153,6 +153,8 @@ export function alreadyApplied(checkoutPath: string): boolean {
 
 // "Decided" cache by workspace id: the hot workspace.focused event skips instantly once a workspace
 // has been handled, without re-querying herdr. The persistent claim (by path) remains the real guard.
+// Workspace ids are per-SERVER-SESSION and recycled (w1, w2, …), so this cache is only valid for the
+// life of one herdr server — the `[[startup]]` hook clears it (see runLayoutStartup).
 function decidedPath(workspaceId: string): string {
   return join(decidedDir(), workspaceId.replace(/[^A-Za-z0-9_.-]/g, "_"));
 }
@@ -165,6 +167,21 @@ export function markDecided(workspaceId: string): void {
     mkdirSync(decidedPath(workspaceId));
   } catch {
     /* already marked — fine */
+  }
+}
+
+/** Drop the whole per-workspace "decided" cache. Called from the one-shot `[[startup]]` hook: a new
+ *  herdr server hands out workspace ids from scratch, so every entry is either stale or — worse —
+ *  about to collide with a DIFFERENT workspace that recycles the id, which would make the hook skip a
+ *  layout it never actually applied. Returns whether anything was there. */
+export function clearDecided(): boolean {
+  const dir = decidedDir();
+  if (!existsSync(dir)) return false;
+  try {
+    rmSync(dir, { recursive: true, force: true });
+    return true;
+  } catch {
+    return false; // a stale cache only costs one redundant (idempotent) evaluation
   }
 }
 
@@ -203,6 +220,17 @@ export interface HookResult {
   skipped?: string;
 }
 
+/** The one-shot `[[startup]]` hook (herdr 0.7.5): runs once per herdr server start, before any
+ *  worktree event can fire. It owns the state hygiene the per-event path used to pay for on every
+ *  single invocation — reaping claims for worktrees that vanished while herdr was down, and clearing
+ *  the session-scoped "decided" cache. Correctness never depended on the reap (a recreated worktree
+ *  is caught by the inode/birthtime staleness check); it was there to keep `applied/` from growing
+ *  without bound, which is exactly the kind of work that belongs at startup rather than in a
+ *  constantly-firing focus handler. */
+export function runLayoutStartup(): { reaped: number; decidedCleared: boolean } {
+  return { reaped: reapOrphanClaims(), decidedCleared: clearDecided() };
+}
+
 /** Handle a herdr worktree/workspace event: build the matching layout into a freshly-created, fresh
  *  (1-tab/1-pane) LINKED worktree, exactly once. Mirrors the plugin's cmd_event. Heavy modules are
  *  imported lazily so the already-decided focus path stays cheap. Throws on an apply failure (after
@@ -213,16 +241,18 @@ export async function runLayoutHook(env: Record<string, string | undefined> = pr
   if (!workspaceId) return { skipped: "no workspace id in event" };
 
   const isFocus = (env.HERDR_PLUGIN_EVENT ?? "").includes("focus");
+  // The focus event exists only because herdr's in-app "new worktree" has historically emitted
+  // NEITHER worktree.created NOR workspace.created to plugins. It fires on every workspace switch, so
+  // it is by far the most frequent reason this runs — set HERDR_FACTORY_FOCUS_HOOK=0 in herdr's
+  // environment to drop it entirely on a build whose UI worktree creation does emit worktree.created
+  // (check with `herdr plugin log list --plugin herdr-factory` after creating one in the app).
+  if (isFocus && env.HERDR_FACTORY_FOCUS_HOOK?.trim() === "0") return { skipped: "focus hook disabled" };
   if (isFocus && isDecided(workspaceId)) return { skipped: "already decided" };
 
   const done = (skipped: string): HookResult => {
     if (isFocus) markDecided(workspaceId);
     return { skipped };
   };
-
-  // Past the hot repeat-focus path — reap claims for worktrees removed out-of-band (by us, another
-  // tool, or the user) so a recreate at a reclaimed path isn't wrongly skipped.
-  reapOrphanClaims();
 
   const { HerdrClient } = await import("../clients/herdr.ts");
   const herdr = new HerdrClient(env.HERDR_BIN_PATH ?? "herdr");
@@ -255,8 +285,9 @@ export async function runLayoutHook(env: Record<string, string | undefined> = pr
 
   const branch = await deps.herdr.worktreeBranch(workspaceId, checkoutPath);
   const ownerRun = branch ? deps.store.activeRunForBranch(repoName, branch) : undefined;
-  const layout = resolveHookLayout(deps.config.belts, deps.config.layouts, ownerRun?.belt ?? undefined, branch ?? undefined);
-  if (!layout) return done(`no layout matches ${checkoutPath}`);
+  const matched = resolveHookLayout(deps.config.belts, deps.config.layouts, ownerRun?.belt ?? undefined, branch ?? undefined);
+  if (!matched) return done(`no layout matches ${checkoutPath}`);
+  const { layout } = matched;
 
   // Fresh workspace only — never clobber an arranged/restored one.
   if (info.tabCount !== 1 || info.paneCount !== 1) return done(`workspace ${workspaceId} is not a fresh 1-tab/1-pane workspace; skipping`);
@@ -272,16 +303,27 @@ export async function runLayoutHook(env: Record<string, string | undefined> = pr
     releaseApply(checkoutPath);
     throw new Error(`layout hook: no tab found for workspace ${workspaceId}`);
   }
+  // The root pane is only MEASURED now (its box sizes `cells` panes; `layout.apply` rebuilds the tab
+  // rather than splitting from it), so an unresolvable one is not fatal — cell sizes just fall back to
+  // even splits.
   const rootPaneId =
-    (payload.rootPaneId?.startsWith(prefix) ? payload.rootPaneId : undefined) ?? (await deps.herdr.firstPaneOfTab(workspaceId, rootTabId));
-  if (!rootPaneId) {
-    releaseApply(checkoutPath);
-    throw new Error(`layout hook: no root pane found for tab ${rootTabId}`);
-  }
+    (payload.rootPaneId?.startsWith(prefix) ? payload.rootPaneId : undefined) ?? (await deps.herdr.firstPaneOfTab(workspaceId, rootTabId)) ?? undefined;
 
   const { applyLayout } = await import("./layout.ts");
   try {
-    await applyLayout(deps, { workspaceId, rootTabId, rootPaneId, cwd: checkoutPath }, layout);
+    await applyLayout(
+      deps,
+      {
+        workspaceId,
+        rootTabId,
+        rootPaneId,
+        cwd: checkoutPath,
+        // The work key rides into every pane's shell (it used to reach only the panes the factory
+        // spawned itself). A layout pane names its own agent, so no harness is threaded through.
+        env: ownerRun?.ticketKey ? { HERDR_FACTORY_TICKET: ownerRun.ticketKey } : undefined,
+      },
+      layout,
+    );
   } catch (e) {
     releaseApply(checkoutPath); // allow a retry on transient failure
     deps.store.recordEvent({
@@ -291,6 +333,11 @@ export async function runLayoutHook(env: Record<string, string | undefined> = pr
       type: "layout_apply_failed",
       detail: { layout: layout.id, workspaceId, error: e instanceof Error ? e.message : String(e) },
     });
+    // The hook runs headless: without this the failure reaches only the plugin log and the run's
+    // timeline, while the operator sits looking at a worktree that never got its panes.
+    await deps.herdr
+      .notify("herdr-factory: layout failed", `Layout "${layout.id}" for ${checkoutPath}: ${e instanceof Error ? e.message : String(e)}`)
+      .catch(() => {});
     throw e;
   }
   deps.store.recordEvent({

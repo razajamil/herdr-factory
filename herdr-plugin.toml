@@ -29,3 +29,10 @@ command = ["bash", "bin/herdr-factory", "layout-hook"]
 [[events]]
 on = "workspace.focused"
 command = ["bash", "bin/herdr-factory", "layout-hook"]
+
+# One-shot, once per herdr server start (herdr 0.7.5), before any worktree event can fire. Owns the
+# hook's state hygiene so the per-event path — above all the constantly-firing focus one — doesn't:
+# reap claims for worktrees that disappeared while herdr was down, and clear the "decided" cache,
+# whose keys are per-server-session workspace ids that the next server recycles.
+[[startup]]
+command = ["bash", "bin/herdr-factory", "layout-hook", "--startup"]

@@ -138,32 +138,46 @@ belt:
       - { type: custom, name: create_jira_ticket, prompt_file: prompts/work_generation/create-jira-ticket.md }
 
 # ── Layouts: herdr tab/pane arrangements the factory BUILDS into each worktree on claim (absorbed
-# from the workspace-manager plugin). A belt picks one via `default_layout` (or, per branch,
-# `layout_matching`) above. Building the layout is what brings up the panes a step's `tab`/`pane`
-# targets, so you no longer hand-build a herdr layout per worktree. Each pane's `command` runs once
-# the pane is up (a step's target pane runs an interactive agent — e.g. `command: claude` — that the
-# step then delivers its prompt to). `split` is vertical|right / horizontal|down; a pane's `size` is
-# a "30%" percentage, a 0<n<1 fraction, or an integer count of cells. At most ONE pane may be
-# `setup: true`: the layout-level `setup.command` runs there first, and `blocking: true` makes the
-# builder wait for it to finish before spawning any later tab. OPTIONAL — omit `layouts` (and a
-# belt's default_layout/layout_matching) and the factory builds nothing.
+# from the workspace-manager plugin, and kept in step with it). A belt picks one via `default_layout`
+# (or, per branch, `layout_matching`) above. Building the layout is what brings up the panes a step's
+# `tab`/`pane` targets, so you no longer hand-build a herdr layout per worktree.
+#
+# Each tab is built in ONE herdr request from its pane tree, then each pane's own work starts:
+#   agent: <kind>   herdr starts that agent in the pane (`claude`, `opencode`, `codex`, … — whatever
+#                   `herdr integration install` supports) and waits until it is ready for input, so a
+#                   step's first prompt can't be dropped. Mark every pane a step targets this way.
+#                   Companions: agent_args (passed to the agent), agent_name (a stable herdr alias),
+#                   agent_timeout_ms; plus prompt/prompt_timeout_ms for a pane NO step targets.
+#   command: …      a shell command run as the pane's process, inside your interactive login shell
+#                   (so mise/asdf/nvm PATH setup applies). The pane returns to a prompt when it exits
+#                   unless `persist: false`. Mutually exclusive with `agent`.
+#   env: {K: V}     environment for the pane (also settable layout-wide; the pane's entries win).
+# `split` is vertical|right / horizontal|down; a pane's `size` is a "30%" percentage, a 0<n<1
+# fraction, or an integer count of cells. At most ONE pane may be `setup: true`: the layout-level
+# `setup.command` runs there first, and `blocking: true` makes the builder wait for it before any
+# other pane's command or agent starts. OPTIONAL — omit `layouts` (and a belt's
+# default_layout/layout_matching) and the factory builds nothing.
 layouts:
   - id: bug-dev
     setup: { command: mise run setup, blocking: true } # runs once in the setup pane before the rest of the layout
     tabs:
       - title: work # ← the `work` step targets tab: work / pane: agent
         panes:
-          - { title: agent, command: claude, setup: true } # the agent the work step delivers its prompt to; also runs setup
+          # The work step's agent — started by herdr, and also the pane setup runs in.
+          - title: agent
+            agent: claude
+            agent_args: [--dangerously-skip-permissions]
+            setup: true
           - { title: server, command: mise run dev, split: right, size: "40%" } # dev server alongside, 40% wide
       - title: evidence # ← the `evidence` step targets tab: evidence / pane: agent
         panes:
-          - { title: agent, command: claude }
+          - { title: agent, agent: claude, agent_args: [--dangerously-skip-permissions] }
       - title: review # ← the `review` step
         panes:
-          - { title: agent, command: claude }
+          - { title: agent, agent: claude, agent_args: [--dangerously-skip-permissions] }
       - title: pr # ← the `pr` step
         panes:
-          - { title: agent, command: claude }
+          - { title: agent, agent: claude, agent_args: [--dangerously-skip-permissions] }
 
 # ── evidence: where the evidence step publishes captured screenshots/video. ──
 # OPTIONAL — omit it and the evidence step still captures + assesses (and can bounce), it just

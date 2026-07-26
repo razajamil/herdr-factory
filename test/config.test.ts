@@ -1844,6 +1844,89 @@ describe("loadConfig — layouts (workspace-manager port)", () => {
     expect(() => loadConfig("demo")).toThrow(/step "work" targets pane main\/agent, but layout "web" does not define it/);
   });
 
+  it("rejects a step whose target pane starts no agent at all", () => {
+    // The pane EXISTS but nothing brings an agent up in it, so the step would wait out its whole
+    // layout-wait budget and park. An `agent:` kind (or a `command` that launches one) is the fix.
+    const noAgent = LAYOUTS.replace("- { title: agent,  command: claude,  setup: true }", "- { title: agent,  setup: true }");
+    setup(full(BELT_WEB_ONLY, noAgent));
+    expect(() => loadConfig("demo")).toThrow(/step "work" targets pane main\/agent in layout "web", but that pane starts no agent — set an `agent:` kind/);
+  });
+
+  it("an `agent:` pane satisfies the check — herdr starts that agent as part of the build", () => {
+    const declared = LAYOUTS.replace(
+      "- { title: agent,  command: claude,  setup: true }",
+      "- { title: agent,  agent: claude,  agent_args: [--dangerously-skip-permissions],  setup: true }",
+    );
+    setup(full(BELT_WEB_ONLY, declared));
+    expect(() => loadConfig("demo")).not.toThrow();
+    expect(loadConfig("demo").config.layouts[0]!.tabs[0]!.panes[0]!.agent).toEqual({
+      kind: "claude",
+      name: undefined,
+      args: ["--dangerously-skip-permissions"],
+      prompt: undefined,
+      startTimeoutMs: undefined,
+      promptTimeoutMs: undefined,
+    });
+  });
+
+  it("rejects a pane that sets both `agent` and a `command` (they race for the same shell)", () => {
+    const bad = `  - id: web\n    tabs:\n      - panes:\n          - { agent: claude, command: nvim }\n`;
+    setup(full(BELT_NO_PANES, bad));
+    expect(() => loadConfig("demo")).toThrow(/either `agent` or `command`, not both/);
+  });
+
+  it("rejects an agent kind herdr doesn't support", () => {
+    const bad = `  - id: web\n    tabs:\n      - panes:\n          - { agent: notanagent }\n`;
+    setup(full(BELT_NO_PANES, bad));
+    expect(() => loadConfig("demo")).toThrow(/agent/);
+  });
+
+  it("rejects agent-only keys on a pane with no `agent:` (a typo would silently never start one)", () => {
+    const bad = `  - id: web\n    tabs:\n      - panes:\n          - { title: a, prompt: do the thing }\n`;
+    setup(full(BELT_NO_PANES, bad));
+    expect(() => loadConfig("demo")).toThrow(/need an `agent:` on the same pane/);
+  });
+
+  it("rejects an agent_name herdr would reject, and a layout that reuses one", () => {
+    const badName = `  - id: web\n    tabs:\n      - panes:\n          - { agent: claude, agent_name: "Fix:K-1" }\n`;
+    setup(full(BELT_NO_PANES, badName));
+    expect(() => loadConfig("demo")).toThrow(/agent_name must start with a lowercase letter/);
+
+    const dupe = `  - id: web\n    tabs:\n      - panes:\n          - { agent: claude, agent_name: main }\n          - { agent: claude, agent_name: main, split: right }\n`;
+    setup(full(BELT_NO_PANES, dupe));
+    expect(() => loadConfig("demo")).toThrow(/share an `agent_name`/);
+  });
+
+  it("rejects a layout `prompt` on a pane a step targets (two prompts would race in one agent)", () => {
+    const withPrompt = LAYOUTS.replace(
+      "- { title: agent,  command: claude,  setup: true }",
+      "- { title: agent,  agent: claude,  prompt: start now,  setup: true }",
+    );
+    setup(full(BELT_WEB_ONLY, withPrompt));
+    expect(() => loadConfig("demo")).toThrow(/sets a `prompt`, but belt "ship" step "work" targets that pane/);
+  });
+
+  it("allows a `prompt` on an agent pane NO step targets", () => {
+    const helper = LAYOUTS.replace(
+      "- { title: logs, split: horizontal, size: 40 }",
+      "- { title: logs, agent: claude, prompt: watch the logs, split: horizontal, size: 40 }",
+    );
+    setup(full(BELT_WEB_ONLY, helper));
+    expect(() => loadConfig("demo")).not.toThrow();
+  });
+
+  it("rejects `persist` on a pane with no command (there is nothing to persist past)", () => {
+    const bad = `  - id: web\n    tabs:\n      - panes:\n          - { title: a, persist: false }\n`;
+    setup(full(BELT_NO_PANES, bad));
+    expect(() => loadConfig("demo")).toThrow(/`persist` only applies to a pane with a `command`/);
+  });
+
+  it("merges layout env under pane env (the pane wins) and stringifies scalars", () => {
+    const envs = `  - id: web\n    env: { SHARED: layout, ONLY_LAYOUT: yes }\n    tabs:\n      - panes:\n          - { title: a, env: { SHARED: pane, PORT: 3000 } }\n`;
+    setup(full(BELT_NO_PANES, envs));
+    expect(loadConfig("demo").config.layouts[0]!.tabs[0]!.panes[0]!.env).toEqual({ SHARED: "pane", ONLY_LAYOUT: "yes", PORT: "3000" });
+  });
+
   it("the shipped example config parses against the schema (guards example drift)", () => {
     const repoRoot = fileURLToPath(new URL("../", import.meta.url));
     const raw = readFileSync(join(repoRoot, "examples/example-repo/config.yml"), "utf8");

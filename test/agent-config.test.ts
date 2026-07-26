@@ -7,6 +7,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { agentKindForArgv } from "../src/clients/herdr.ts";
+import { agentNameFor } from "../src/core/step.ts";
 import { dispatchToLayout } from "../src/core/step.ts";
 import { wakeResolver } from "../src/core/watch.ts";
 import { DEFAULT_AGENT_CONFIG } from "../src/types.ts";
@@ -30,25 +31,47 @@ describe("agentKindForArgv — the herdr `agent start <name>` kind", () => {
   });
 });
 
+describe("agentNameFor — herdr's agent-name rule for a factory-spawned pane", () => {
+  // herdr rejects anything outside [a-z][a-z0-9_-]{0,31} with `invalid_agent_name`, so the run's own
+  // `<step>:<KEY>` (uppercase key, a colon) can never be used as the agent name — it is published as
+  // pane DISPLAY metadata instead.
+  it("lowercases and hyphenates a step + work key", () => {
+    expect(agentNameFor("work", "RWR-18147")).toBe("work-rwr-18147");
+    expect(agentNameFor("fix", "K-1")).toBe("fix-k-1");
+  });
+  it("only ever emits a name herdr accepts", () => {
+    for (const [step, key] of [
+      ["work", "PROJ#42"],
+      ["review", "a/b c"],
+      ["evidence", "GH-999999999999999999999999999999999999"],
+      ["1st_step", "K-1"],
+    ]) {
+      expect(agentNameFor(step!, key!)).toMatch(/^[a-z][a-z0-9_-]{0,31}$/);
+    }
+  });
+});
+
 describe("dispatchToLayout — spawned-pane argv is [command, ...flags, prompt]", () => {
   /** A minimal Deps that captures the argv agentStart is called with (the only thing under test on
    *  the dedicated-spawn path: no tab/pane, no known pane → agentStart is the single pane-creator). */
   function capturingDeps() {
-    const captured: { argv?: string[] } = {};
+    const captured: { argv?: string[]; name?: string; kind?: string } = {};
     const herdr = {
       paneAlive: async () => false,
-      agentStart: async (o: { argv: string[] }) => {
+      agentStart: async (o: { argv: string[]; name?: string; kind?: string }) => {
         captured.argv = o.argv;
+        captured.name = o.name;
+        captured.kind = o.kind;
         return "w1:p1";
       },
-      agentRename: async () => {},
+      reportPaneDisplay: async () => {},
     };
     const deps = { herdr, log: () => {}, sleep: async () => {}, config: { repoName: "demo" } } as unknown as Deps;
     return { deps, captured };
   }
 
   const dispatch = (deps: Deps, agent: AgentConfig) =>
-    dispatchToLayout(deps, { workspaceId: "w1", worktree: "/wt", prompt: "PROMPT", paneName: "work:K", ticketKey: "K", agent });
+    dispatchToLayout(deps, { workspaceId: "w1", worktree: "/wt", prompt: "PROMPT", step: "work", ticketKey: "K", agent });
 
   it("is byte-identical to the historical claude harness with no `agent:` block (default)", async () => {
     const { deps, captured } = capturingDeps();
@@ -91,6 +114,7 @@ describe("wakeResolver — the PR-watch resolver uses the pr step's (else repo's
         captured.argv = o.argv;
         return "w1:pR";
       },
+      reportPaneDisplay: async () => {},
     };
     const deps = {
       herdr,

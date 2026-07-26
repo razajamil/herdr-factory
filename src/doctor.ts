@@ -3,7 +3,8 @@
 // check logic lives in exactly one place. Grouped by ownership: what herdr-factory provisions &
 // maintains itself vs the external tools + auth the user supplies. Repo-specific checks are a
 // separate group behind `--repo`.
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createEvidencePublisher } from "./clients/evidence.ts";
 import { run } from "./clients/exec.ts";
@@ -94,6 +95,38 @@ async function onPath(tool: string, env?: NodeJS.ProcessEnv): Promise<void> {
   await run("sh", ["-c", `command -v ${JSON.stringify(tool)} >/dev/null 2>&1`], { env });
 }
 
+/** The minimum herdr the factory works against, read from the plugin manifest so the CLI floor and
+ *  the floor herdr itself enforces when loading our plugin can never drift. */
+export function minHerdrVersion(): string {
+  const manifest = readFileSync(join(PKG_ROOT, "herdr-plugin.toml"), "utf8");
+  return /^\s*min_herdr_version\s*=\s*"([^"]+)"/m.exec(manifest)?.[1] ?? "0.0.0";
+}
+
+/** Compare dotted numeric versions: <0 / 0 / >0. Non-numeric suffixes (a `-beta` tail) are ignored —
+ *  a pre-release of the floor counts as the floor, which is the friendlier read for a doctor check. */
+export function compareVersions(a: string, b: string): number {
+  const parts = (v: string) => v.split(".").map((p) => Number.parseInt(p, 10) || 0);
+  const [xs, ys] = [parts(a), parts(b)];
+  for (let i = 0; i < Math.max(xs.length, ys.length); i++) {
+    const d = (xs[i] ?? 0) - (ys[i] ?? 0);
+    if (d !== 0) return d;
+  }
+  return 0;
+}
+
+/** herdr's own version floor check. `herdr --version` prints `herdr <semver>`; below the floor the
+ *  factory's CLI calls fail in ways that are hard to read from the run's own symptoms (0.7.5 changed
+ *  `agent start` to adopt an existing pane and replaced the top-level `wait`), so it is worth one
+ *  cheap, local subprocess to say so plainly. */
+async function herdrVersionCheck(herdrBin: string, env?: NodeJS.ProcessEnv): Promise<string> {
+  const r = await run(herdrBin, ["--version"], { env, allowFail: true });
+  const version = /(\d+\.\d+\.\d+)/.exec(`${r.stdout} ${r.stderr}`)?.[1];
+  if (!version) throw new Error("not on PATH (or `herdr --version` gave no version)");
+  const floor = minHerdrVersion();
+  if (compareVersions(version, floor) < 0) throw new Error(`v${version} is too old — the factory needs >= ${floor} (run \`herdr update\`)`);
+  return `v${version}`;
+}
+
 /** Machine-wide checks, grouped by ownership. No repo needed.
  *  `deep` = also interact with external services (gh auth, herdr daemon); the default is local-only
  *  and side-effect-free (tool presence, no network calls). */
@@ -136,8 +169,18 @@ export async function baseGroups(deep = false): Promise<DoctorGroup[]> {
   const provided = await Promise.all([
     attempt("git", () => onPath("git", toolEnv)),
     deep
-      ? attempt("herdr (daemon responds)", async () => void (await run(herdrBin, ["workspace", "list"], { env: toolEnv })))
-      : attempt("herdr", () => onPath(herdrBin, toolEnv)),
+      ? attempt("herdr (daemon responds)", async () => {
+          const version = await herdrVersionCheck(herdrBin, toolEnv);
+          // `status server` reports the running daemon's protocol + whether this CLI can speak it —
+          // a mismatch means an updated binary with a stale server still running (`herdr update`
+          // without a restart), which presents as arbitrary socket failures.
+          const r = await run(herdrBin, ["status", "server"], { env: toolEnv, allowFail: true });
+          const field = (k: string) => new RegExp(`^${k}:\\s*(.+)$`, "m").exec(r.stdout)?.[1]?.trim();
+          if (field("compatible") === "no") throw new Error(`${version} CLI cannot speak the running server's protocol ${field("protocol") ?? "?"} — restart herdr`);
+          await run(herdrBin, ["workspace", "list"], { env: toolEnv });
+          return `${version}, protocol ${field("protocol") ?? "?"}`;
+        })
+      : attempt("herdr", () => herdrVersionCheck(herdrBin, toolEnv)),
     deep
       ? attempt("gh (authenticated)", async () => void (await run("gh", ["auth", "status"], { env: toolEnv })))
       : attempt("gh", () => onPath("gh", toolEnv)),
