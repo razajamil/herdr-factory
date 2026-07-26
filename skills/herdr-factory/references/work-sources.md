@@ -1,5 +1,11 @@
 # Work sources
 
+> A work item that vanishes at the backend (deleted, moved, permissions revoked) is `stale`, not an
+> error: jira and github_issues both map 404/410 that way, so the write-back is marked delivered and
+> the run is aborted (pre-work) or parked (mid-flight) instead of retrying forever. Sentry and
+> local_markdown keep their lifecycle in the factory's own ledger, so nothing can go stale under them.
+
+
 Where work comes from: the four `work_sources[]` types, their config blocks, credentials, eligibility rules, lifecycle write-backs, and what each one materializes into the worktree.
 
 Answers these questions:

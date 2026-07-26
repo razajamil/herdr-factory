@@ -417,7 +417,11 @@ reverse-engineered during the bash prototype.
     source (**decided with no network call** — `spec.mappedStates`), or the backend's own
     automation won the race; `stale` = the item is gone (deleted/transferred — retrying cannot
     help): the outbox marks the intent delivered and flags the run for the run-locked stale
-    policy (§7). A throw means "retry me". Callers never invoke this fire-and-forget — the
+    policy (§7). A throw means "retry me". **Every EXTERNAL-status source must map its own gone
+    responses onto `stale`** — jira and github_issues both map 404/410 (and their
+    `askHuman`/`pollHumanReply` throw `StaleItemError`); one that rethrew instead would leave the
+    outbox retrying a deleted item on its 60s→1h backoff forever AND, through the Phase-B claim guard
+    on undelivered write-backs, hold that item un-claimable behind it. Callers never invoke this fire-and-forget — the
     reconciler routes every transition through the **outbox** (§7). An optional 4th arg
     (`TransitionContext`) carries the merged PR's number+URL, built by the outbox delivery from the
     run + resolved GitHub repo: an internal-ledger source with an external reply channel (`sentry`)

@@ -76,6 +76,12 @@ never reconstructs one. That makes the suite a live check of the agent-CLI contr
 | `capture-cap` | a flaky capture loop parks at the cap — and the station's own verdict still wins |
 | `pr-review-watch` | a draft PR keeps the step-done gate, a ready one hands off without it, and a new review thread wakes a resolver that holds a slot only while working |
 | `pr-closed-park` | a PR closed without merging parks for a human and keeps its worktree |
+| `belt-matrix` | priority order, a `match` predicate, first-match-wins, an `active: false` belt that takes nothing, and the per-source cap |
+| `config-rejections` | 11 broken configs are each refused at load with a message that names the problem — and the server survives all of them |
+| `jira-parity` | a source whose status of record is the BACKEND: label pickup, ordered write-backs, a belt effect onto a custom Jira column |
+| `jira-ask-human` | the reply channel as comments, including the marker filter that stops the factory answering itself |
+| `jira-stale-item` | a ticket that vanishes is `stale`, not an infinite retry |
+| `sentry-parity` | the mirror image: internal ledger, Sentry never moved for lifecycle, the `on_merge` note, and a release regression reopening the work |
 
 ## Things the harness found — and what changed
 
@@ -142,7 +148,20 @@ comes back.
 11. **Teardown drops an undelivered evidence publish** — deliberately (the bytes live in the worktree
    it is removing), which a `work_to_pull_request` belt never notices because the PR watch keeps the
    run alive, but a short belt can. The evidence scenarios carry a `pr` step for exactly this reason.
-12. **Documentation drift** (fixed): `runs.pr_number` / `resolver_active` / `last_thread_sig` moved to
+12. **A Jira ticket that vanished was retried forever.** `github_issues` maps its own 301/404/410 to
+   `stale` (`classifyGone`), but `jira-source` had no equivalent: `transition` rethrew, so the outbox
+   retried a deleted ticket on its 60s→1h backoff indefinitely — and, because Phase B skips an item
+   with an undelivered write-back, the item stayed un-claimable behind it. `askHuman`/`pollHumanReply`
+   surfaced the raw HTTP error too, where §5 says they throw `StaleItemError` so a waiting run
+   escalates rather than polling a ticket nobody can answer. **Fixed** (`clients/jira-source.ts`):
+   404/410 → `stale` / `StaleItemError`, same rule and same reason as github_issues.
+   → `jira-stale-item`. (Found while the Jira fake was being verified against the real client — the
+   fake's own 404 injection is what asked the question.)
+13. **Jira `materialize` on a gone ticket returns normally**, having written no `ticket.json`, so a
+   claim can point an agent at a work doc that doesn't exist. Left as-is: `materialize` is
+   best-effort by charter, and with the fix above the claim's own write-back now reports `stale` and
+   the run is aborted before the agent gets far. Worth revisiting if that ordering ever changes.
+14. **Documentation drift** (fixed): `runs.pr_number` / `resolver_active` / `last_thread_sig` moved to
    `run_products` in v18 but ARCHITECTURE §6 still showed them on `runs`; the §6 event list named
    `merged`/`closed`, which nothing emits, and omitted `layout_applied`, `layout_apply_failed`,
    `intent_deadline`, `intent_fulfilled`.
@@ -161,9 +180,10 @@ comes back.
 ## Not built yet (the plan's later milestones)
 
 M2 remainder: the evidence station (capture cap, `local` publisher, a failing `command` publisher's
-retry) and the PR lifecycle (draft gate, closed → park, resolver wake) · M3 source parity — the
-`HttpStub` under `harness/sources/` is the first brick; it grows into a Jira board that transitions
-issues and a Sentry project, both reachable because those sources take a configurable `base_url`
-(`github_issues` hardcodes api.github.com and needs a `GITHUB_API_URL` seam) — plus belt/config
-breadth · M4 the fake-herdr lane and the performance scenarios (call budgets, scale drain, tick
+retry) and the PR lifecycle (draft gate, closed → park, resolver wake) · M3 is done except `github_issues`, which hardcodes
+api.github.com and needs a `GITHUB_API_URL` seam before it can be covered the way jira/sentry are
+(both reachable because they take a configurable `base_url`). The fakes under `harness/sources/` are
+stateful, not route tables: `jira-fake.ts` parses the pickup JQL and really moves statuses,
+`sentry-fake.ts` serves the issue/event shapes the materializer renders — each documented in its own
+`.md`, each verified by driving the ENGINE'S OWN client against it · M4 the fake-herdr lane and the performance scenarios (call budgets, scale drain, tick
 latency, resource soak) · M5 the DS4 tier and the TUI boot assertion.

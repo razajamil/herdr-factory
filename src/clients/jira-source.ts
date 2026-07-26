@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { bearsHerdrMarker, HERDR_MARKER, type Logger, type SourceAuthStatus, type WorkSource, type WorkSourceSpec } from "../core/deps.ts";
+import { HttpStatusError } from "./http.ts";
 import type { JiraAuth } from "../auth/jira-provider.ts";
 import type {
   HumanAskInput,
@@ -14,6 +15,7 @@ import type {
   WorkDocInfo,
   WorkState,
 } from "../types.ts";
+import { StaleItemError } from "../types.ts";
 import { JiraClient, type JiraComment } from "./jira.ts";
 
 // Attachment caps for materialize (images + videos share the count budget). Moved here from
@@ -24,6 +26,22 @@ const MAX_VIDEO_BYTES = 50 * 1024 * 1024; // 50 MB
 const isMedia = (mime: string): boolean => mime.startsWith("image/") || mime.startsWith("video/");
 
 const QUESTION_MARKER = `${HERDR_MARKER} question:`;
+
+/** Is this failure "the ticket is no longer ours"? Jira answers 404 for an issue that was deleted,
+ *  moved to a project the token can't see, or had its permissions revoked, and 410 for a hard-deleted
+ *  one — none of which retrying can fix.
+ *
+ *  Without this the charter's typed escape is unreachable for Jira: `transition` would rethrow, so the
+ *  outbox retried a deleted ticket on its 60s→1h backoff forever (and Phase B's claim guard kept the
+ *  item un-claimable behind it), and the human loop would poll a ticket nobody can answer instead of
+ *  escalating. github_issues has always mapped its own 301/404/410 this way (`classifyGone`); this is
+ *  the same rule for the same reason. Found end-to-end while verifying the e2e Jira fake. */
+function goneReason(e: unknown): string | null {
+  if (!(e instanceof HttpStatusError)) return null;
+  if (e.status === 404) return "not found (deleted, moved, or no longer visible to this token)";
+  if (e.status === 410) return "deleted";
+  return null;
+}
 
 /** Resolved Jira-source config (the client owns its config shape; the descriptor maps YAML onto it).
  *  The pickup label is NOT here — it's per-belt and arrives as an argument to listEligible/health.
@@ -157,8 +175,16 @@ export class JiraSource implements WorkSource {
     // validated against statusExtra at config-load, so an unknown one here is a bug, not user error.
     const status = statusOverride ? this.cfg.statusExtra[statusOverride] : this.statusFor(to);
     if (!status) return { kind: "noop" }; // unmapped → no-op, and crucially NO network call (teardown parity)
-    const moved = await this.jira.transition(key, status);
-    return moved ? { kind: "applied" } : { kind: "noop" };
+    try {
+      const moved = await this.jira.transition(key, status);
+      return moved ? { kind: "applied" } : { kind: "noop" };
+    } catch (e) {
+      // `stale` is delivered, not retried: the engine's two-phase handling then aborts a pre-work run
+      // and parks a mid-flight one. A plausibly-transient failure must still THROW (throw = retry me).
+      const gone = goneReason(e);
+      if (gone) return { kind: "stale", detail: `${key} ${gone}` };
+      throw e;
+    }
   }
 
   async materialize(key: string, memDir: string, log: Logger): Promise<void> {
@@ -207,14 +233,31 @@ export class JiraSource implements WorkSource {
     // PERSISTED — if an earlier POST succeeded but the response was lost, re-posting would ask
     // the human twice. Scan for this question's marker first.
     const marker = `${QUESTION_MARKER} ${input.repo}/${input.runId}/${input.questionId}]`;
-    const existing = (await this.jira.listComments(input.key)).find((c) => commentText(c).includes(marker));
-    if (existing) return { externalId: existing.id, externalCreatedAt: existing.created ?? null };
-    const comment = await this.jira.addComment(input.key, humanQuestionComment(input));
-    return { externalId: comment.id, externalCreatedAt: comment.created ?? null };
+    try {
+      const existing = (await this.jira.listComments(input.key)).find((c) => commentText(c).includes(marker));
+      if (existing) return { externalId: existing.id, externalCreatedAt: existing.created ?? null };
+      const comment = await this.jira.addComment(input.key, humanQuestionComment(input));
+      return { externalId: comment.id, externalCreatedAt: comment.created ?? null };
+    } catch (e) {
+      // A question can't be asked on a ticket that no longer exists — escalate the run rather than
+      // retrying the post forever (the charter's typed escape; §5).
+      const gone = goneReason(e);
+      if (gone) throw new StaleItemError(`${input.key} ${gone}`);
+      throw e;
+    }
   }
 
   async pollHumanReply(input: HumanPollInput): Promise<HumanReply | null> {
-    const comments = await this.jira.listComments(input.key);
+    let comments: JiraComment[];
+    try {
+      comments = await this.jira.listComments(input.key);
+    } catch (e) {
+      // Same rule as askHuman: polling a ticket that is gone can never produce an answer, so the
+      // waiting run must escalate instead of backing off against a 404 until a human notices.
+      const gone = goneReason(e);
+      if (gone) throw new StaleItemError(`${input.key} ${gone}`);
+      throw e;
+    }
     const questionIndex = comments.findIndex((c) => c.id === input.externalId);
     const cutoff = input.externalCreatedAt ? Date.parse(input.externalCreatedAt) : Number.NaN;
     const candidates = questionIndex >= 0
