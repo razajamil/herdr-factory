@@ -86,9 +86,13 @@ belt:
   # `layouts` entry builds (see below) — the belt's `default_layout` is built into each worktree on
   # claim, so those panes come up automatically; omit both to have herdr-factory spawn a dedicated pane — except
   # `evidence`, which runs ONLY when a tab+pane targets an agent your layout provides (drop it — or
-  # its tab/pane — and the belt is work → review → pr). A step may OPTIONALLY add a `prompt_file`
-  # (+ optional `prompt_file_source`, default `config` = this folder; set `repo` to read it from the
-  # target repo checkout — the worktree — at run time) that AUGMENTS its engine prompt — e.g.
+  # its tab/pane — and the belt is work → review → pr). On a belt with a `default_layout` the FIRST
+  # step that actually runs MUST carry a tab+pane (hence `work` below): its dispatch shares the claim's
+  # reconcile pass, and a spawned pane's new tab makes the layout hook skip the build entirely — so
+  # config-load rejects that belt. Later steps may omit both; by then the layout is up. A step may
+  # OPTIONALLY add a `prompt_file` (+ optional `prompt_file_source`, default `config` = this folder; set
+  # `repo` to read it from the target repo checkout — the worktree — at run time) that AUGMENTS its
+  # engine prompt — e.g.
   # `{ type: work, tab: work, pane: agent, prompt_file: .herdr/work-notes.md, prompt_file_source: repo }`.
   - name: ship_bugs
     source: jira
@@ -98,6 +102,8 @@ belt:
     #              # in-flight runs still progress to completion — a delete-free way to disable a belt
     match: match-bugs.ts # optional; omit ⇒ this belt accepts anything from `jira` carrying `label`
     workspace_name: "{{semantic_work_prefix}}/{{work_id}}-{{work_slug}}"
+    # Setting this obliges the FIRST running step to target one of the layout's panes (see `steps:` —
+    # `work` does); a spawned pane's extra tab would stop the layout being built, so load-time rejects it.
     default_layout: bug-dev # the layout (see `layouts:` below) the factory builds into every worktree this belt claims
     # layout_matching:                                  # optional: pick a different layout per branch — first glob that matches the branch wins
     #   - { worktree_pattern: "hotfix/*", layout: bug-dev }

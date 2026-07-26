@@ -106,7 +106,9 @@ Pane targeting (`src/core/step.ts`):
 - **no `tab`/`pane`** — the factory creates a tab (carrying `HERDR_FACTORY_TICKET=<KEY>`), waits for its
   shell prompt, then has herdr start the harness in it (`agent start --kind --pane`, blocking until the
   agent is ready for input) with `[agent.command, ...agent.flags, prompt]`. There is no `layout_wait`
-  bound on this path; a busy dedicated pane just queues the message.
+  bound on this path; a busy dedicated pane just queues the message. That created **tab** is why the
+  first kept step of a `default_layout` belt may not omit `tab`/`pane` (§4) — it beats the layout hook to
+  the workspace and the build is then skipped.
 
 **Submission is confirmed.** `herdr agent prompt` is atomic (it types and presses Enter), and the
 factory asks herdr to observe the agent react (`--wait --until working`). An unconfirmed submission —
@@ -200,8 +202,8 @@ bounce target**. See §5.
 |---|---|---|---|
 | `type` | `work` \| `evidence` \| `review` \| `pr` \| `custom` | — | **required**; closed enum |
 | `name` | lowercase slug `/^[a-z0-9][a-z0-9_-]*$/` | **= `type`** | must be unique in the belt. Bad slug → `step name must be a lowercase slug ([a-z0-9_-], starting alphanumeric)` |
-| `tab` | string | — | both-or-neither with `pane` |
-| `pane` | string | — | both omitted ⇒ the factory spawns a dedicated agent pane |
+| `tab` | string | — | both-or-neither with `pane`; **both required on the first kept step of a belt that sets `default_layout`** — an untargeted first step costs that belt its layout entirely, so load rejects it (§6, and [layouts.md](./layouts.md) for the mechanism) |
+| `pane` | string | — | both omitted ⇒ the factory spawns a dedicated agent pane. Harmless on any *later* step of a `default_layout` belt — the layout is already built by then |
 | `budget_seconds` | positive int (quoted numbers coerce) | descriptor default → `limits.step_budget_seconds` | |
 | `heartbeat` | boolean | **false** | legal on any type, but only meaningful on `custom`: it adds `commits` to `produces` **and** attaches the heartbeat guard. On `evidence`/`review` it is therefore rejected (read-only + commits). On `work`/`pr` it is a no-op |
 | `prompt_file` | string | — | **required for `custom`**. Path relative to the repo's config folder (or absolute); `~` is **not** expanded here |
@@ -335,6 +337,7 @@ path such as `belt.0.steps.1`.
 | `[{type: work}, {type: work}]` | `belt "X" has duplicate step name "work" (name defaults to type — give one an explicit unique name)` |
 | `steps: []` | `a belt needs at least one step` |
 | `{type: work, tab: work}` (no `pane`) | `tab and pane must be set together (or both omitted to spawn a dedicated pane)` |
+| `[{type: work}, {type: review, tab: r, pane: agent}]` on a belt with `default_layout: L` — the first **kept** step is untargeted | ``belt "X" sets default_layout "L", but its first step "work" has no `tab`/`pane` — that step spawns a dedicated pane, whose new tab makes the layout hook skip the build ("not a fresh 1-tab/1-pane workspace"), and every later layout-targeted step then parks with `layout_wait_timeout`. Give the first step a tab/pane in "L", reorder so a layout-targeted step runs first, or remove default_layout from this belt.`` (reported at `belt.0.steps.0.pane` — the offending step's index in the **written** list, so a dropped bare `{type: evidence}` written ahead of it would make it `steps.1`) |
 | `{type: research}` | zod enum error on `belt.0.steps.0.type` (closed enum) |
 | `produces: [pull_request]` on a custom step | parse-time zod enum error (`commits` is the only allowed value) |
 | `pr:` block on a belt with no `pr` step | ``belt "X" sets a `pr:` behavior block but has no step that opens a pull request — add a `pr` step or remove the block`` |
@@ -342,8 +345,11 @@ path such as `belt.0.steps.1`.
 Two more traps:
 
 - A step's `tab`/`pane` is only checked against a layout when the belt sets `default_layout`
-  (`belt "X" step "N" targets pane t/p, but layout "L" does not define it — its labeled panes are: …`).
-  With no `default_layout`, a typo surfaces only at runtime as a `layout_wait_timeout` park.
+  (`belt "X" step "N" targets pane t/p, but layout "L" does not define it — its labeled panes are: …`),
+  and so is the first-kept-step rule above. With no `default_layout`, a typo surfaces only at runtime as
+  a `layout_wait_timeout` park — and a belt whose layout comes *only* from a `layout_matching` rule can
+  still lose the layout outright to an untargeted first step, silently, with the reason visible nowhere
+  but `herdr plugin log list --plugin herdr-factory` ([layouts.md](./layouts.md)).
 - A belt whose **only** written step is a bare `{ type: evidence }` passes validation (`min(1)` applies
   to the written list) and resolves to **zero** kept steps. UNVERIFIED what the reconciler does with a
   zero-step belt — don't ship one.

@@ -737,6 +737,14 @@ when it has no tab/pane), optional `budget_seconds` (else the primitive's defaul
 `evidence` 2400 · `review` 1800 · `pr` 3600 — else `limits.step_budget_seconds`), and `heartbeat`
 (commit-stall detection; on for `work`/`pr`, opt-in elsewhere).
 
+**A belt with a `default_layout` must give its FIRST step a `tab`/`pane`.** The claim creates the
+worktree and dispatches that step in the same pass, and a dedicated pane is a new herdr tab — which
+makes the layout hook decline the build (see [Layouts](#layouts)), leaving every later
+layout-targeted step to park. Config-load rejects the shape, naming the offending step and offering
+the three fixes (target it, reorder so a layout-targeted step runs first, or drop `default_layout`).
+It's the first **surviving** step that counts — an `evidence` step skipped for want of a tab/pane
+isn't it — and later steps may omit tab/pane freely, since by then the layout exists.
+
 For `work`/`evidence`/`review`/`pr` the engine ships the prompt and `prompt_file` (with an optional
 `prompt_file_source`) _augments_ it — unless you set `prompt_mode: replace`, which makes your
 `prompt_file` **own** that step's body outright: the shipped prose is dropped, but the engine still
@@ -973,12 +981,20 @@ belt:
   repo's belts. Layouts are keyed to the repo by the config file (one config = one repo), so no
   repo path is restated.
 - **Idempotent** — applied exactly once per worktree, and only to a **fresh** (1-tab/1-pane) linked
-  worktree, so it never clobbers an arranged or restored workspace.
+  worktree, so it never clobbers an arranged or restored workspace. That freshness gate loses a race
+  against a step spawning its own pane (a new tab, decided in-process while this out-of-process hook
+  is still booting), so a belt with a `default_layout` must target its **first** step at a layout
+  pane — validated at config-load, not left to fail at runtime.
 
 A step whose `tab`/`pane` names a pane the layout doesn't (yet) provide waits up to
 `limits.layout_wait_seconds`; an expired window is automatically re-armed up to 3 times (a
 transient herdr/layout race self-heals — even from an already-parked run), and only then does the
-run park for attention. Omit `layouts` (and a belt's
+run park for attention. An untargeted first step is no longer one of the causes — config-load
+refuses that belt — so a park here means the factory plugin isn't linked with herdr, the layout's
+tab/pane titles don't match the step's, or the belt gets its layout **only** from a
+`layout_matching` rule: that shape is exempt from the first-step check (those rules commonly serve
+hand-created worktrees), so a matching rule intercepting a factory claim can still lose its build
+silently. Omit `layouts` (and a belt's
 `default_layout`/`layout_matching`) and steps just spawn their own dedicated panes — zero layout
 setup required.
 
@@ -1090,8 +1106,8 @@ startup** — so an auto-update (which restarts the server onto the new code) ke
 in lock-step with the running engine automatically; `herdr-factory schema` regenerates it by hand if
 you ever need to. A committed copy at the repo root serves the in-repo example (`npm run
 schema`; a test guards it against drift). Cross-field rules — belt `source` refs, unique names,
-tab/pane both-or-neither, `{{work_id}}` presence, file existence — are validated at load with
-readable errors.
+tab/pane both-or-neither, a `default_layout` belt's first step carrying one, `{{work_id}}` presence,
+file existence — are validated at load with readable errors.
 
 ## Commands
 
@@ -1188,6 +1204,8 @@ cursor.
   that layout's real tabs and panes — the pane list follows the chosen tab, and choosing a tab lands on
   one of its panes, so the both-or-neither pair is always complete and `[4]`/`[5]` never need
   cross-referencing (with no `default_layout` there's nothing to enumerate, so they stay free text).
+  The pick-lists start unset, so picking a `default_layout` and leaving the **first** step's pane
+  unpicked fails the save — that belt could never build its layout (see [Layouts](#layouts)).
   Renaming a layout id, tab title, or pane title in `[4]` **repoints every belt and step that
   referenced it** and reports what moved — the one case it won't guess is a target two of the same
   belt's layouts both define (left alone, and flagged). When a step's `config`-sourced `prompt_file` or a

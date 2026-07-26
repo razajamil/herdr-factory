@@ -78,10 +78,10 @@ describe("config-fields: jira board (api_token only — no auth field)", () => {
 });
 
 /** Build the belt-section fields with belt 0 and its step 0 expanded (inner fields render only when open). */
-function beltStepFields(doc: Document): FieldDesc[] {
+function beltStepFields(doc: Document, stepIndex = 0): FieldDesc[] {
   const expanded = new WeakSet<object>();
   const belt = doc.getIn(["belt", 0]) as object;
-  const step = doc.getIn(["belt", 0, "steps", 0]) as object;
+  const step = doc.getIn(["belt", 0, "steps", stepIndex]) as object;
   if (belt) expanded.add(belt);
   if (step) expanded.add(step);
   return buildDescriptors(doc, () => {}, ctx(), expanded, "belt");
@@ -330,6 +330,26 @@ layouts: [{ id: bare, tabs: [{ panes: [{ command: claude }] }] }]
     expect(skipped).toBeDefined();
     const allocated = beltStepFields(allocDoc("{ type: evidence, tab: work, pane: agent }")).find((f) => f.kind === "header" && f.label.includes("SKIPPED"));
     expect(allocated).toBeUndefined();
+  });
+
+  // Load REFUSES a default_layout belt whose first surviving step has no target, so the editor says so
+  // beside the pick-lists that fix it rather than letting ^S fail with a message about a step index.
+  const firstStepWarning = (step: string, expand = 0): boolean =>
+    beltStepFields(allocDoc(step), expand).some((f) => f.kind === "header" && f.label.includes("MUST name a pane"));
+
+  it("warns when the FIRST step of a default_layout belt has no tab/pane (config-load would refuse it)", () => {
+    expect(firstStepWarning("{ type: work }")).toBe(true);
+    expect(firstStepWarning("{ type: work, tab: work, pane: agent }")).toBe(false);
+  });
+
+  it("…and points at the first SURVIVING step — a skipped evidence step ahead of it is not the one", () => {
+    // `{ type: evidence }` is dropped at load, so the `work` step behind it is what dispatches first:
+    // the warning belongs to it, and disappears once IT is targeted.
+    // (expand index 1 — a collapsed step renders no rows of its own, so the warning lives with it.)
+    expect(firstStepWarning("{ type: evidence }, { type: work }", 1)).toBe(true);
+    expect(firstStepWarning("{ type: evidence }, { type: work, tab: work, pane: agent }", 1)).toBe(false);
+    // …and the skipped evidence step itself never carries it, even expanded.
+    expect(firstStepWarning("{ type: evidence }, { type: work }", 0)).toBe(false);
   });
 });
 

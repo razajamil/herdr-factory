@@ -58,13 +58,6 @@ layouts:
 |---|---|---|---|
 | `id` | string, trimmed, min 1 | **required** | Unique across `layouts`; what a belt's `default_layout`/`layout_matching` references. |
 | `env` | map of scalars | `{}` | Environment for **every** pane in this layout (a pane's own `env` wins). |
-> **Give EVERY step of a layout belt a `tab`/`pane`.** The hook builds a layout only into a *fresh*
-> (1-tab/1-pane) worktree, and a step with no `tab`/`pane` spawns its own pane immediately — adding a
-> tab that makes the worktree non-fresh, so the layout is skipped entirely. The symptom is the
-> opposite of where the mistake is: the steps that DO name panes sit in
-> `<step> waiting for layout pane <tab>/<pane>` until they park `layout_wait_timeout`. Config-load does
-> not catch this yet. (Reproduced by `test/e2e/scenarios/evidence.e2e.ts`.)
-
 | `setup.command` | string, trimmed, min 1 | **required inside `setup`** | Runs once, in the single `setup: true` pane, **before** that pane's own `command`. On an **agent** pane it is executed *in* the pane (`pane run`, through the same login shell, as a child) instead of being baked into the pane's process — an agent can only be started in a pane that is sitting at herdr's own shell. If that pane never reaches a prompt the setup is reported as failed rather than silently waited out. |
 | `setup.blocking` | bool | `false` | The builder waits for it (cap `SETUP_TIMEOUT_MS` = 600 s) before **any** pane `command` or `agent` starts. (The topology is already fully built by then — see [what the builder issues](#what-the-builder-actually-issues).) |
 | `tabs[]` | array | **required**, min 1 | `a layout needs at least one tab` |
@@ -97,6 +90,17 @@ Split normalization: `vertical`/`right` → a new pane to the **right**; `horizo
 
 **`size` sizes the NEW pane; a herdr split's `ratio` sizes the FIRST (existing) side** — the builder inverts it, so `size: "30%"` becomes `ratio: 0.7`, clamped to `[0.01, 0.99]`. A **cells** size is resolved against the box actually being split: the tab is measured ONCE before the build (`herdr pane layout --pane <root>`) and each split's boxes are computed as the tree is walked — so pane 2 splitting a 50-cell pane 1 sizes against 50, not against the whole tab. When the tab can't be measured, a cells size falls back to an **even split** (`ratio: 0.5`).
 
+> **The FIRST step of a `default_layout` belt must carry a `tab`/`pane`.** The hook builds a layout only
+> into a *fresh* (1-tab/1-pane) worktree, and a step with no `tab`/`pane` spawns its own pane
+> immediately — a new tab, which makes the worktree non-fresh before the hook ever looks, so the layout
+> is skipped entirely. Config load now refuses that shape (see [Layout-specific load
+> errors](#layout-specific-load-errors)); *later* steps may still omit `tab`/`pane`, harmlessly, because
+> by then the layout exists. A belt whose layout comes only from a `layout_matching` rule is **not**
+> covered, and there the failure is still silent — the symptom lands the opposite side of the mistake:
+> the steps that DO name panes sit in `<step> waiting for layout pane <tab>/<pane>` until they park
+> `layout_wait_timeout`. See [Mixing layout panes with dedicated
+> panes](#mixing-layout-panes-with-dedicated-panes--the-first-step-decides).
+
 ### Layout-specific load errors
 
 | error text | cause |
@@ -115,6 +119,7 @@ Split normalization: `vertical`/`right` → a new pane to the **right**; `horizo
 | `layout "<id>": a fixed pane size (<n>) must be a whole number of cells` | `size: 40.5` |
 | `belt "<b>" default_layout "<x>" is not a defined layout (defined: …)` | unknown id |
 | `belt "<b>" layout_matching[<j>] references unknown layout "<x>" (defined: …)` | unknown id in a rule |
+| `belt "<b>" sets default_layout "<L>", but its first step "<name>" has no \`tab\`/\`pane\` — that step spawns a dedicated pane, whose new tab makes the layout hook skip the build ("not a fresh 1-tab/1-pane workspace"), and every later layout-targeted step then parks with \`layout_wait_timeout\`. Give the first step a tab/pane in "<L>", reorder so a layout-targeted step runs first, or remove default_layout from this belt.` | the belt's first **surviving** step targets no layout pane, so its dedicated pane's tab would beat the hook and the layout would never be built (path `belt.<i>.steps.<j>.pane`, `j` = that step's index in the WRITTEN steps list) |
 
 The complete load-time rejection catalogue is in [config-reference.md](./config-reference.md).
 
@@ -164,6 +169,8 @@ steps:
 ```
 
 - `tab` and `pane` are **both-or-neither**: `tab and pane must be set together (or both omitted to spawn a dedicated pane)` (reported at path `pane`).
+- **On a `default_layout` belt the FIRST step must supply them.** Both-or-neither applies to every step, but only the first is *mandatory* — it dispatches in the same flow that creates the worktree, and a dedicated pane there costs the whole layout build. "First" means the first **surviving** step: a `requiresLayout` step with no `tab`/`pane` (today only `evidence`) is dropped at load, so the check looks past it. Later steps may omit both. Load error:
+  `belt "<b>" sets default_layout "<L>", but its first step "<name>" has no \`tab\`/\`pane\` — … Give the first step a tab/pane in "<L>", reorder so a layout-targeted step runs first, or remove default_layout from this belt.` (path `belt.<i>.steps.<j>.pane`, `j` = the offending step's index in the WRITTEN list). Mechanism and the case it does **not** cover: [Mixing layout panes with dedicated panes](#mixing-layout-panes-with-dedicated-panes--the-first-step-decides).
 - They match **herdr labels by exact string equality** — the layout's `tabs[].title` and `panes[].title`. No trimming, no case folding, no fuzzy match. A trailing space or a different emoji is a permanent miss.
 - **Untitled tabs/panes cannot be targeted.** The loader's target set only contains titled tab × titled pane pairs.
 - **Two steps of one belt may not target the same pane**: `belt "<b>" steps "<a>" and "<b>" target the same layout pane (tab "<t>", pane "<p>") — each step needs its own agent pane`. Reason: they would share one agent, so the second step's prompt would land in a conversation still carrying the first step's context — and dispatch defers while that agent is `working`, burning the layout-wait budget. **Two different belts may reuse the same titles** — a worktree only ever runs one belt.
@@ -187,30 +194,33 @@ The repo/belt/step `agent:` block governs the panes the factory **spawns** (a st
 
 ### Mixing layout panes with dedicated panes — the FIRST step decides
 
-A belt may mix targeted and untargeted steps, and config load allows it (the targeting checks skip any
-step without `tab`/`pane`). But the **first** step is special, and getting it wrong silently costs the
-whole layout:
+A belt may still mix targeted and untargeted steps — the targeting checks skip any step without
+`tab`/`pane`, and once the layout exists a dedicated pane is harmless. What is no longer legal is an
+untargeted step **first**, because that costs the whole layout build:
 
 | belt shape (with `default_layout`) | what happens |
 |---|---|
 | `steps[0]` **targets** a layout pane | the step waits for its pane, the hook builds the layout, everything resolves — later untargeted steps get their own dedicated tab, harmlessly |
-| `steps[0]` has **no** `tab`/`pane` | the layout is **never built**, and every later targeted step burns its layout-wait budget and parks with `layout_wait_timeout` |
+| `steps[0]` has **no** `tab`/`pane` | **rejected at load** (path `belt.<i>.steps.<j>.pane`) — give that step a tab/pane, reorder so a layout-targeted step runs first, or drop `default_layout`. `steps[0]` here means the first **surviving** step: a `requiresLayout` step with no `tab`/`pane` is dropped at load, so it is not the step that dispatches, and the check looks past it |
 
 Why: a claim creates the worktree and dispatches `steps[0]` in the same reconcile flow. An untargeted
-step spawns a *dedicated pane*, which is a new **tab** (`herdr tab create`) — one socket call from a
-running process. The layout hook is an out-of-process plugin command that has to boot Node, load
+step spawns a *dedicated pane*, which is a new **tab** (`herdr tab create`) — one CLI round-trip from
+the already-running engine. The layout hook is an out-of-process plugin command that has to boot Node, load
 config and query herdr (~300–400 ms), and its very first look at the workspace then sees 2 tabs, so
 gate 7 declines: `workspace <id> is not a fresh 1-tab/1-pane workspace; skipping`. Nothing coordinates
-the two — the engine never waits on the hook, and the hook never learns why it lost.
+the two — the engine never waits on the hook, and the hook never learns why it lost. The reverse order
+always works, and that asymmetry is why the whole fix is a load-time rule.
 
-What it looks like when it bites: no `layout_applied` event, an extra tab named after the step,
-`layout_wait_retry` events, then an attention park whose message asks *"is the herdr layout for this
-worktree running?"* — pointing at herdr when the cause is the belt's own first step. The only place the
-real reason appears is `herdr plugin log list --plugin herdr-factory`.
-
-**Fix:** give `steps[0]` a `tab`/`pane` in the layout. If the first step genuinely wants a dedicated
-pane, the belt shouldn't declare `default_layout` — or that step should be moved after one that targets
-the layout.
+**The one shape that still fails silently: no `default_layout`, layout from a `layout_matching` rule
+only.** The rule is scoped to `default_layout`, like every other layout-target check, because a matching
+rule commonly serves HAND-created worktrees whose step order the factory doesn't control — so a rule that
+intercepts a *factory* claim can still lose its layout exactly as above, with nothing rejected at load.
+(Same for hand-built worktrees and a second layout plugin.) What it looks like: no `layout_applied`
+event, an extra tab labelled `<step>-<key>` (the dedicated pane's agent name), `layout_wait_retry`
+events, then an attention park whose message asks *"is the herdr layout for this worktree running?"* —
+pointing at herdr when the cause is the belt's own first step. The only place the real reason appears is
+`herdr plugin log list --plugin herdr-factory`. Fix it by hand the same way: give `steps[0]` a
+`tab`/`pane` in the matched layout, or move it after a step that targets one.
 
 ---
 
@@ -222,6 +232,10 @@ belt:
     default_layout: app-dev
     layout_matching:
       - { title: hotfixes, worktree_pattern: "hotfix/*", layout: app-dev-hotfix }
+    steps:
+      # The first step must target a pane (see above) — otherwise its dedicated pane's tab
+      # stops the layout from ever being built, and load refuses the belt.
+      - { type: work, tab: work, pane: agent }
 ```
 
 `resolveBeltLayout` (`src/core/layout-match.ts`): walk `layout_matching` **in written order**; the first rule whose glob matches **and** whose `layout` id exists wins. Otherwise `default_layout` (if set and defined). Otherwise nothing is built.
@@ -298,7 +312,7 @@ Also: `herdr plugin enable|disable herdr-factory`. `doctor` checks **none** of t
 4. not a linked worktree → `main checkout — never touch`
 5. no configured repo whose `resolve(repo.path)` equals `resolve(repo_root)` → `no factory repo config for <repoRoot>` (a repo whose `config.yml` currently fails to load is silently skipped here)
 6. no layout resolves → `no layout matches <checkoutPath>`
-7. not fresh → `workspace <id> is not a fresh 1-tab/1-pane workspace; skipping`. Two ways to hit this that don't look like "not fresh": a belt whose **first** step has no `tab`/`pane` — its dedicated pane is a new TAB, created before the hook's snapshot, so the layout is never built (see *Mixing layout panes with dedicated panes* under Step → pane targeting); and a herdr that doesn't report `tab_count`/`pane_count`, which reads as `null !== 1` and silently declines **every** build.
+7. not fresh → `workspace <id> is not a fresh 1-tab/1-pane workspace; skipping`. Two ways to hit this that don't look like "not fresh": a belt whose **first** step has no `tab`/`pane` — its dedicated pane is a new TAB, created before the hook's snapshot, so the layout is never built — which config load now rejects for a `default_layout` belt, leaving it reachable only where the layout comes from a `layout_matching` rule (see *Mixing layout panes with dedicated panes* under Step → pane targeting); and a herdr that doesn't report `tab_count`/`pane_count`, which reads as `null !== 1` and silently declines **every** build.
 8. already claimed → `layout already applied for <checkoutPath>; skipping`
 9. no root TAB resolvable → releases the claim and throws `layout hook: no tab found for workspace <id>`. The root **pane** is only *measured* (its box sizes `cells` panes; `layout.apply` rebuilds the tab rather than splitting from it), so an unresolvable one is not fatal — cell sizes fall back to even splits.
 
@@ -354,6 +368,7 @@ The counter is also refunded on a successful dispatch. Related: when a live layo
 | `"enabled": false`, no plugin-log rows | plugin disabled | `herdr plugin enable herdr-factory` |
 | Duplicate/competing panes, or `not a fresh 1-tab/1-pane workspace; skipping` | a second layout plugin (workspace-manager) on the same events | disable it, or drop its mapping for factory-managed repos |
 | `workspace <id> is not a fresh 1-tab/1-pane workspace; skipping` | reopened/arranged worktree, or a pane split before the hook ran | remove + recreate the worktree, or hand-build the tab/pane with byte-identical titles |
+| No `layout_applied` event, an extra tab labelled `<step>-<key>`, then every targeted step parks `layout_wait_timeout` (real reason only in the plugin log) | the belt's first step has no `tab`/`pane`, so its dedicated pane's tab beat the hook — possible only when the layout comes from a `layout_matching` rule (or the worktree is hand-built), since a `default_layout` belt is rejected at load | give `steps[0]` a `tab`/`pane` in the matched layout, or reorder so a layout-targeted step runs first |
 | `layout already applied for <path>; skipping` | a reopened worktree at a claimed path | `rm -rf <state>/layout-hook/applied/<sha1>` (or the whole `applied/` dir), then recreate the worktree |
 | `no factory repo config for <root>` | `resolve(repo.path)` ≠ herdr's `repo_root` — `resolve()` does **not** realpath, so a symlinked home or `/Users` vs `/System/Volumes/Data` misses | set `repo.path` to exactly what `herdr worktree list --json` reports as `repo_root` |
 | `no factory repo config for …` but the path is right | that repo's `config.yml` currently fails to load (the hook swallows it) | `herdr-factory --repo <r> doctor` and fix the config error |

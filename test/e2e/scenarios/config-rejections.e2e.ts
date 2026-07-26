@@ -87,6 +87,18 @@ const CASES: Case[] = [
     expect: /review|pane/i,
   },
   {
+    // The step that dispatches first spawns a dedicated pane if it has no target, and that pane is a
+    // new herdr TAB — which makes the layout hook decline its freshness gate and never build the
+    // layout, after which every targeted step parks blaming herdr. Refused at load instead.
+    what: "a belt with a default_layout whose FIRST step has no tab/pane",
+    break: (c) => {
+      c.layouts = [{ id: "dev", tabs: [{ title: "work", panes: [{ title: "agent", agent: "claude" }] }] }];
+      c.belt[0].default_layout = "dev";
+      c.belt[0].steps = [{ type: "work" }, { type: "review", tab: "work", pane: "agent" }];
+    },
+    expect: /first step "work" has no .tab.\/.pane.|not a fresh 1-tab\/1-pane/i,
+  },
+  {
     what: "a belt whose step needs an input nothing upstream produces",
     break: (c) => void (c.belt[0].steps = [{ type: "review" }, { type: "pr" }]),
     expect: /commits|consumes|produce/i,

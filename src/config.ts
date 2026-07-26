@@ -894,6 +894,37 @@ export const RepoConfigSchema = z
         const d = stepDescriptorFor(s.type);
         return d ? !stepSkipped(d, s) : true;
       });
+      // The FIRST step decides whether this belt's layout is ever BUILT. A claim creates the worktree
+      // and dispatches the first step in the same reconcile flow; a step with no tab/pane spawns a
+      // DEDICATED pane, and that is a new herdr TAB (`herdr tab create`) — one CLI round-trip from the
+      // already-running engine. The layout is built by an out-of-process plugin hook that must boot
+      // Node, load this config and query herdr before it can even look (~300-400ms measured), so its
+      // freshness gate then sees two tabs and declines
+      // (`workspace <id> is not a fresh 1-tab/1-pane workspace; skipping`). Nothing coordinates the two:
+      // the engine never waits on the hook, the hook never learns why it lost, and the decline reaches
+      // no event and no log — only herdr's plugin log. Every later layout-targeted step then burns its
+      // whole layout-wait budget and parks asking whether herdr's layout is running, which points at
+      // herdr for a belt-ordering mistake. The reverse order is fine (once the layout exists, a later
+      // dedicated pane is harmless), so this is a shape to refuse at save/reload, not a race to lose.
+      // `kept` — not b.steps — because a requiresLayout step with no pane is dropped above, and the
+      // step that DISPATCHES first is the first surviving one.
+      // Deliberately scoped to `default_layout`, like every other layout-target check: a
+      // `layout_matching` rule commonly serves HAND-created worktrees, whose ordering the factory
+      // doesn't control. The same hazard exists for a matching rule that intercepts a factory claim —
+      // documented in skills/herdr-factory/references/layouts.md, not enforceable here.
+      if (b.default_layout != null && kept.length > 0 && !(kept[0]!.tab && kept[0]!.pane)) {
+        const f = kept[0]!;
+        const at = Math.max(0, b.steps.indexOf(f));
+        ctx.addIssue({
+          code: "custom",
+          message:
+            `belt "${b.name}" sets default_layout "${b.default_layout}", but its first step "${f.name ?? f.type}" has no \`tab\`/\`pane\` — ` +
+            `that step spawns a dedicated pane, whose new tab makes the layout hook skip the build ("not a fresh 1-tab/1-pane workspace"), ` +
+            `and every later layout-targeted step then parks with \`layout_wait_timeout\`. ` +
+            `Give the first step a tab/pane in "${b.default_layout}", reorder so a layout-targeted step runs first, or remove default_layout from this belt.`,
+          path: ["belt", i, "steps", at, "pane"],
+        });
+      }
       // A belt-level `pr:` block only does anything on a belt that opens a PR. Reject it on a belt
       // with no pull_request-producing step (a `pr` step) so the policy can't silently no-op — the
       // same "keep the composition honest" stance as the dataflow checks below.

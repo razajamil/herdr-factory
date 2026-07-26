@@ -512,6 +512,21 @@ export function buildDescriptors(draft: Document, rebuild: () => void, ctx: Fiel
       if (requiresLayout && !(tabCur && paneCur)) {
         d.push({ kind: "header", label: `↳ no tab/pane ⇒ this ${stType} step is SKIPPED (it only runs in a layout pane)`, level: 2, indent: 2 });
       }
+      // The first SURVIVING step of a `default_layout` belt must carry a target: its dedicated pane
+      // would be a new tab, which stops the layout from ever being built, so config-load refuses the
+      // belt. Say it here, beside the pick-lists that fix it, rather than letting `^S` fail.
+      const firstKeptIdx = steps.findIndex((s) => {
+        const d2 = stepDescriptorFor(String(s?.type ?? "custom"));
+        return !(d2?.controls.posture?.requiresLayout === true && !(s?.tab && s?.pane));
+      });
+      if (b?.default_layout != null && j === firstKeptIdx && !(tabCur && paneCur)) {
+        d.push({
+          kind: "header",
+          label: `↳ the first step of a layout belt MUST name a pane — without one its own pane's tab stops "${String(b.default_layout)}" from being built`,
+          level: 2,
+          indent: 2,
+        });
+      }
       if (targets.length > 0) {
         // Move both keys together, so the both-or-neither invariant can't be broken from here.
         const setTarget = (tab: string | null, pane: string | null) => {

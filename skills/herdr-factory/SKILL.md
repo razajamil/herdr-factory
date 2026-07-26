@@ -98,7 +98,7 @@ Triage by symptom — each row has a full playbook in
 |---|---|
 | nothing is claimed | server isn't ticking this repo · belt `active: false` · at a concurrency cap · pickup label missing or already consumed · `match` rejecting it · source credentials paused · an undelivered write-back vetoing the item |
 | run parked for attention | route by `attention_reason_code` — the table in troubleshooting.md says which are auto-rescuable and how to clear each |
-| step never starts | herdr never created the worktree · no herdr plugin link so no layout was ever built · its `tab`/`pane` names no pane the layout defines · the target pane's agent never came up (look for `could not start <kind> in <pane>` / a "agent did not start" notification) · (for a step with no `tab`/`pane`) the agent binary is missing from the **service** PATH |
+| step never starts | herdr never created the worktree · no herdr plugin link so no layout was ever built · the belt's FIRST step had no `tab`/`pane`, so its own pane pre-empted the build (only possible on a `layout_matching`-only belt — `default_layout` rejects that shape at load) · its `tab`/`pane` names no pane the layout defines · the target pane's agent never came up (look for `could not start <kind> in <pane>` / a "agent did not start" notification) · (for a step with no `tab`/`pane`) the agent binary is missing from the **service** PATH |
 | agent says it's done, run didn't advance | the `step-done` signal never landed — check the timeline, then fire it by hand |
 | stuck in `reviewing` | that's normal — the PR watch has no time limit and holds no slot while idle |
 | config edits do nothing | `herdr-factory reload` (or the server never picked the repo up at boot) |
@@ -170,7 +170,7 @@ The values asked for most often. Everything else is in
 | default pipeline | `steps: [{ type: work }, { type: review }, { type: pr }]` |
 | step budgets | `work` 5400s · `evidence` 2400s · `review` 1800s · `pr` 3600s; fallback `limits.step_budget_seconds` 3600 |
 | key defaults | `max_active_workspaces` 3 (per source: 2) · `max_bounces` 6 · `tick_interval_seconds` 60 · `stall_seconds` 2700 · `layout_wait_seconds` 600 · `max_capture_attempts` 5 |
-| a step with no `tab`/`pane` | gets a pane spawned for it — except `evidence`, which is **silently skipped** without one |
+| a step with no `tab`/`pane` | gets a pane spawned for it — except `evidence`, which is **silently skipped** without one, and the first step of a `default_layout` belt, which config-load **rejects** (that pane's new tab would cost the belt its layout) |
 | a layout pane a step targets | declares its own agent (`agent: claude` + `agent_args: […]`); herdr starts it and waits until it is ready for input. Config-load rejects a target pane that starts no agent |
 | on merge | each source decides: `jira` stays **silent** unless you set `jira.status.done`; `github_issues` **closes the issue** as completed (`close_on.merged`, default `true`); `sentry` posts a PR-link comment (`on_merge`, default `comment`). A belt `effects` entry overrides. |
 | spawned agents | `claude --dangerously-skip-permissions` unless an `agent:` block says otherwise (that block drives SPAWNED panes; a layout pane names its own agent) |

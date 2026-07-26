@@ -227,7 +227,7 @@ Start from what `init` wrote and walk outward. The default is deliberate — **r
 | add | what it costs | the fragment |
 |---|---|---|
 | nothing | — | leave as scaffolded |
-| **evidence** (visual proof before review) | a layout pane **and** an `evidence:` publisher block, plus a dev-server command you must ask for | see below |
+| **evidence** (visual proof before review) | two layout panes (its own **and** the belt's first step's), an `evidence:` publisher block, plus a dev-server command you must ask for | see below |
 | a **custom gate** | a prompt file you have to write | `- { type: custom, name: gate, prompt_file: prompts/gate.md, read_only: true, bounce: true }` |
 | a **fully custom belt** (e.g. triage, no PR) | you own every prompt | steps of `type: custom` only; no `pr` step ⇒ no PR watch |
 
@@ -255,8 +255,11 @@ layouts:
     tabs:
       - title: work
         panes:
-          - title: agent
+          - { title: agent, agent: claude, agent_args: [--dangerously-skip-permissions] }
           - { title: server, command: pnpm dev, split: right, size: "40%" }
+      - title: qa
+        panes:
+          - { title: evidence, agent: claude, agent_args: [--dangerously-skip-permissions] }
 
 belt:
   - name: issues-to-prs
@@ -264,13 +267,24 @@ belt:
     label: agent
     default_layout: dev
     steps:
-      - { type: work }
-      - { type: evidence, tab: work, pane: agent }
-      - { type: review }
+      - { type: work, tab: work, pane: agent } # the FIRST step must target a pane too — see below
+      - { type: evidence, tab: qa, pane: evidence }
+      - { type: review } # untargeted from here on is fine: the layout already exists
       - { type: pr }
 ```
 
-When the belt sets `default_layout`, the `tab`/`pane` pair is validated at load against that layout's **titled** panes — an untitled pane cannot satisfy a target, and the error lists what is available. With no `default_layout` the check is skipped (the pane is assumed to come from a hand-made herdr workspace) and a wrong name instead parks the run at run time with `layout_wait_timeout`.
+When the belt sets `default_layout`, every step's `tab`/`pane` pair is validated at load against that layout's **titled** panes — an untitled pane cannot satisfy a target, that pane must itself start an agent (`agent:`, or a `command` that launches one), and the error lists what is available. Two more obligations bite in this shape, and the example above is written to satisfy both:
+
+- **The first step needs a pane as well**, which is why `work` carries one. A belt with `default_layout` whose first *surviving* step has no `tab`/`pane` is rejected at load — surviving, because a bare `evidence` step is dropped before this check, so it lands on the steps that remain:
+
+  ```
+  belt "<b>" sets default_layout "<L>", but its first step "<n>" has no `tab`/`pane` — that step spawns a dedicated pane, whose new tab makes the layout hook skip the build ("not a fresh 1-tab/1-pane workspace"), and every later layout-targeted step then parks with `layout_wait_timeout`. Give the first step a tab/pane in "<L>", reorder so a layout-targeted step runs first, or remove default_layout from this belt.
+  ```
+
+  Reported at `belt.<i>.steps.<j>.pane`, `<j>` being that step's index in the **written** steps list. Later steps may omit `tab`/`pane` freely — they get a dedicated pane, harmlessly, because the layout is already built by then.
+- **No two steps of one belt may target the same pane** (`each step needs its own agent pane`) — so `evidence` gets a second titled pane rather than sharing `work`/`agent` with the `work` step.
+
+With no `default_layout` the target, agent-in-pane and first-step checks are all skipped (the panes are assumed to come from a hand-made herdr workspace) and a wrong name instead parks the run at run time with `layout_wait_timeout`. One pane per step is enforced on every belt regardless.
 
 `pnpm dev` is a placeholder — **ask** for the repo's real dev-server command.
 
@@ -282,6 +296,8 @@ Declare a `layouts[]` entry + `default_layout` only when:
 - you added an `evidence` step (it needs a pane, and usually a sibling pane running the dev server), or
 - the user wants to watch the run in a specific herdr tab/pane arrangement, or
 - a step must drive a pane that already runs something else (a step targeting an existing pane drives whatever that pane runs — the `agent:` block only applies to panes the **factory** spawns).
+
+Say what a `default_layout` commits them to before they pick it: the belt's **first** step must then target a pane in that layout (it is a load error otherwise, 2c), and the layout must give that pane an agent. So a layout and untargeted steps are not a mix-and-match — an interview that scaffolds steps with no `tab`/`pane` must not also set `default_layout`, and a belt that wants a layout pays for at least its first step's pane. Later steps stay free either way.
 
 Everything about the layouts library, pane sizing, `layout_matching`, and the herdr plugin hook that builds them: [layouts.md](./layouts.md).
 
@@ -400,6 +416,7 @@ herdr-factory --repo <name> doctor --deep
 | error line | where in the YAML |
 |---|---|
 | `belt.0.steps.2.pane: tab and pane must be set together …` | 3rd entry of `steps:` under the 1st entry of `belt:` |
+| `belt.0.steps.0.pane: belt "…" sets default_layout "…", but its first step … has no \`tab\`/\`pane\` …` | the **1st** `steps:` entry — the step to fix (or reorder), not the belt's `default_layout:` key |
 | `work_sources.1.jira.board: set \`jira.board\` to the Agile board id …` | the `board:` key of the 2nd `work_sources` entry |
 | `belt.0.effects.1: Unrecognized key: "product"` | 2nd `effects` entry of the 1st belt |
 | `(root): …` | the top-level object |

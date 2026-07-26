@@ -210,7 +210,7 @@ write-backs are in [work-sources.md](./work-sources.md); the schema shape in one
 | `workspace_name` | template string | no | `"{{semantic_work_prefix}}/{{work_id}}-{{work_full_slug}}"` | Must contain `{{work_id}}`. |
 | `match` | path to a `.ts` module | no | unset ⇒ the belt accepts anything from its source | `export default (ctx) => boolean`. |
 | `max_bounces` | int non-negative | no | `limits.max_bounces` | |
-| `default_layout` | a `layouts[].id` | no | unset ⇒ the factory builds no layout | |
+| `default_layout` | a `layouts[].id` | no | unset ⇒ the factory builds no layout | Setting it turns on the step→pane allocation checks (§6.3 #10–10c) **and** obliges the belt's first *surviving* step to carry `tab`+`pane` (#10d). |
 | `layout_matching` | array of rules | no | `[]` | |
 | `pr` | strict object | no | unset | Prompt tokens only — see §3.6. |
 | `branch` | strict object | no | falls back to top-level `branch`, then built-in | |
@@ -231,8 +231,8 @@ appended, so a re-claim gets a distinct branch.
 |---|---|---|---|---|
 | `type` | enum `work` \| `evidence` \| `review` \| `pr` \| `custom` | **yes** | — | The primitive. |
 | `name` | trimmed, `/^[a-z0-9][a-z0-9_-]*$/` | no | **= `type`** | Unique within the belt. |
-| `tab` | string | no | — | Layout tab title. Both-or-neither with `pane`. |
-| `pane` | string | no | — | Layout pane title; omit both to spawn a dedicated pane. |
+| `tab` | string | no | — | Layout tab title. Both-or-neither with `pane`. **Required on the first surviving step of a `default_layout` belt** (§6.3 #10d). |
+| `pane` | string | no | — | Layout pane title; omit both to spawn a dedicated pane — legal on every step *except* that first one. |
 | `prompt_file` | string | **yes for `custom`** | — | Relative to `<repoDir>` (source `config`) or to the worktree (source `repo`). |
 | `prompt_file_source` | enum `config` \| `repo` | no | **`"config"`** | Inert (and dropped) without a `prompt_file`. |
 | `prompt_mode` | enum `augment` \| `replace` | no | **`"augment"`** | Likewise inert without a `prompt_file`. |
@@ -513,6 +513,7 @@ the display-only belt type label.
 | 10 | a step's `tab`/`pane` pair is not a **titled** tab+pane in the belt's `default_layout` | `belt "<belt>" step "<name>" targets pane <tab>/<pane>, but layout "<id>" does not define it — its labeled panes are: <tab/pane, …>. Fix the step's tab/pane, or add a pane titled "<pane>" to a tab titled "<tab>" in the layout.` | Match a listed pane exactly, or add `title:` to the tab **and** the pane. Untitled panes can never satisfy a target. Belts with no `default_layout`, and `layout_matching` layouts, are exempt. |
 | 10b | that pane exists but starts **no agent** (neither an `agent:` kind nor a `command`) | ``belt "<belt>" step "<name>" targets pane <tab>/<pane> in layout "<id>", but that pane starts no agent — set an `agent:` kind on it (herdr starts that agent as part of the build) or give it a `command` that launches one.`` | Add `agent: claude` (or your kind) to the pane, or a `command` that launches an agent. Same exemptions as #10. |
 | 10c | a step-targeted pane carries its own opening `prompt` | ``layout "<id>" pane <tab>/<pane> sets a `prompt`, but belt "<belt>" step "<name>" targets that pane — remove the pane's `prompt` (the step's own prompt is dispatched there).`` | Drop the pane's `prompt` — two prompts would race in one agent. Keep it only on panes no step targets. |
+| 10d | a `default_layout` belt whose first **surviving** step (the first one left after a bare `evidence` is dropped) has no `tab`/`pane` | ``belt "<belt>" sets default_layout "<id>", but its first step "<name>" has no `tab`/`pane` — that step spawns a dedicated pane, whose new tab makes the layout hook skip the build ("not a fresh 1-tab/1-pane workspace"), and every later layout-targeted step then parks with `layout_wait_timeout`. Give the first step a tab/pane in "<id>", reorder so a layout-targeted step runs first, or remove default_layout from this belt.`` | Do one of the three. Only the FIRST surviving step is obliged — later steps may omit `tab`/`pane` and get a dedicated pane harmlessly, because the layout already exists by then. Reported at `belt.<i>.steps.<j>.pane`, `<j>` being the step's index in the **written** list. Same exemptions as #10, so a `layout_matching`-only belt still hits this at runtime (§8 #11). |
 | 11 | a `pr:` block on a belt with no PR-opening step (checked over the **kept** steps) | ``belt "<belt>" sets a `pr:` behavior block but has no step that opens a pull request — add a `pr` step or remove the block`` | Add a `pr` step or drop the block. |
 | 12 | two steps in one belt resolve to the same `name` | `belt "<belt>" has duplicate step name "<name>" (name defaults to type — give one an explicit unique name)` | Add `name:` to one (two unnamed `custom` steps always collide). |
 | 13 | two kept steps in one belt target the same layout pane | `belt "<belt>" steps "<owner>" and "<name>" target the same layout pane (tab "<tab>", pane "<pane>") — each step needs its own agent pane` | Give each step its own pane. Two **different** belts may reuse the same tab/pane titles. |
@@ -612,9 +613,17 @@ have no effect, **check the spelling of its top-level key first**.
    `local_markdown`/`sentry`. The rule is driven by the source descriptor, not a hardcoded list.
 10. **Step `name` defaults to `type`**, so two unnamed `custom` steps (or two unnamed `work` steps)
     collide with "duplicate step name".
-11. **The step→pane check only runs against `default_layout`.** `layout_matching` layouts and belts
-    with no `default_layout` are exempt by design — a wrong `tab`/`pane` there fails at runtime
-    (`layout_wait_timeout`), not at load. **Untitled** tabs/panes are unaddressable.
+11. **The step→pane checks only run against `default_layout`** — including the first-step rule: on a
+    `default_layout` belt the first *surviving* step must carry `tab`+`pane`, because an untargeted step
+    spawns a dedicated pane, that new tab makes the out-of-process layout hook decline the build as "not
+    a fresh 1-tab/1-pane workspace", and every later targeted step then parks `layout_wait_timeout`
+    blaming herdr. `layout_matching` layouts and belts with no `default_layout` are exempt by design — a
+    wrong `tab`/`pane` there fails at runtime (`layout_wait_timeout`), not at load. So that lost-layout
+    failure is **impossible on a `default_layout` belt** (#10d rejects it at save/reload) and
+    survives only where the factory can't see the shape coming: a belt whose layout comes *only* from a
+    `layout_matching` rule, plus hand-built and multi-plugin worktrees. There it is silent — the decline
+    reaches no event and no repo log, only `herdr plugin log list --plugin herdr-factory`
+    ([layouts.md](./layouts.md)). **Untitled** tabs/panes are unaddressable.
 12. **`read_only` + (`produces: [commits]` or `heartbeat: true`) is rejected.** `heartbeat: true`
     implies producing commits; `produces: [commits]` alone does **not** turn on the heartbeat guard.
 13. **`consumes`/`produces`/`read_only`/`bounce` are `custom`-only**, and their only legal product is

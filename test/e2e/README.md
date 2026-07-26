@@ -77,7 +77,7 @@ never reconstructs one. That makes the suite a live check of the agent-CLI contr
 | `pr-review-watch` | a draft PR keeps the step-done gate, a ready one hands off without it, and a new review thread wakes a resolver that holds a slot only while working |
 | `pr-closed-park` | a PR closed without merging parks for a human and keeps its worktree |
 | `belt-matrix` | priority order, a `match` predicate, first-match-wins, an `active: false` belt that takes nothing, and the per-source cap |
-| `config-rejections` | 11 broken configs are each refused at load with a message that names the problem — and the server survives all of them |
+| `config-rejections` | 12 broken configs are each refused at load with a message that names the problem — and the server survives all of them |
 | `jira-parity` | a source whose status of record is the BACKEND: label pickup, ordered write-backs, a belt effect onto a custom Jira column |
 | `jira-ask-human` | the reply channel as comments, including the marker filter that stops the factory answering itself |
 | `jira-stale-item` | a ticket that vanishes is `stale`, not an infinite retry |
@@ -242,12 +242,10 @@ the local server up on `:8000`. The tier filter defaults to `scripted`, so `--ti
 model scenarios and only those; a scenario always runs as the tier it declares. Preflight fails fast
 and says which of the two prerequisites is missing rather than letting a scenario time out.
 
-One design question is open rather than covered, and it is narrower than it first looked: a belt with
-`default_layout` whose **first** step has no `tab`/`pane` never gets its layout. The dedicated spawn for
-that step is a new tab, issued as one socket call from the running engine, while the hook is an
-out-of-process command that needs ~300–400ms to boot — so it loses, sees 2 tabs, and declines on its
-freshness gate. Every later targeted step then burns its layout-wait budget and parks blaming herdr.
-Reverse the order and everything works, including untargeted later steps. Measured both ways with a
-throwaway probe scenario; documented in the skill's `layouts.md`. The fix (reject `steps[0]` without a
-target at config load / hold that first dedicated spawn until the hook has decided / make the hook
-tolerant of factory-owned tabs) is a product call, so scenarios give every step a pane for now.
+The mixed layout/dedicated-pane hazard the harness surfaced is now **closed at config load**: a belt
+with `default_layout` whose first surviving step has no `tab`/`pane` is refused, because that step's
+dedicated pane is a new tab and the layout hook then declines its freshness gate — so the layout is
+never built and every later targeted step parks blaming herdr. Measured both ways with a throwaway
+probe before choosing the fix; the reverse order was always fine, which is what made a load-time rule
+the cheap answer. `config-rejections` pins the message; four unit tests pin the scope, including that
+a *skipped* evidence step ahead of a targeted one stays legal.

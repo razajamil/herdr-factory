@@ -1,4 +1,5 @@
 import { describe, it, expect, afterEach } from "vitest";
+import { execSync } from "node:child_process";
 import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir, homedir } from "node:os";
 import { dirname, join } from "node:path";
@@ -1726,12 +1727,14 @@ describe("loadConfig — layouts (workspace-manager port)", () => {
       - { type: review, tab: review, pane: agent }
       - { type: pr,     tab: pr,     pane: agent }
 `;
-  // A belt whose steps target NO panes — for layout-SCHEMA tests whose deliberately-broken
-  // layouts would otherwise also trip the step→pane allocation check and drown the assertion.
+  // A belt whose steps target NO panes — for layout-SCHEMA tests whose deliberately-broken layouts
+  // would otherwise also trip the step→pane allocation check and drown the assertion. It must NOT
+  // declare `default_layout`: such a belt is itself rejected at load (its first step's dedicated pane
+  // would stop the layout from ever being built), and that refusal is a superRefine issue — which
+  // aborts before the resolution stage where sizes/splits are normalized, masking these assertions.
   const BELT_NO_PANES = `  - name: ship
     source: jira
     label: agent
-    default_layout: web
     steps:
       - { type: work }
       - { type: review }
@@ -1830,6 +1833,38 @@ describe("loadConfig — layouts (workspace-manager port)", () => {
     // that must stay legal (factory claims never produce hotfix/* branches; humans do).
     setup(full());
     expect(() => loadConfig("demo")).not.toThrow();
+  });
+
+  // ── the FIRST step decides whether the layout is ever built ────────────────────────────────────
+  it("rejects a default_layout belt whose FIRST step has no tab/pane (its dedicated pane's tab kills the layout build)", () => {
+    // Measured, not theorised: the dedicated spawn is one socket call from the running engine, the
+    // layout hook is an out-of-process command that needs ~300-400ms to boot, so the hook's freshness
+    // gate always sees 2 tabs and declines — after which every layout-targeted step parks.
+    setup(full(BELT_WEB_ONLY.replace("      - { type: work,   tab: main,   pane: agent }\n", "      - { type: work }\n")));
+    expect(() => loadConfig("demo")).toThrow(
+      /belt "ship" sets default_layout "web", but its first step "work" has no `tab`\/`pane`.*not a fresh 1-tab\/1-pane workspace.*layout_wait_timeout/s,
+    );
+  });
+
+  it("accepts a LATER step with no tab/pane — once the layout exists, a dedicated pane is harmless", () => {
+    setup(full(BELT_WEB_ONLY.replace("      - { type: review, tab: review, pane: agent }\n", "      - { type: review }\n")));
+    expect(() => loadConfig("demo")).not.toThrow();
+  });
+
+  it("looks at the first SURVIVING step: a skipped evidence step ahead of a targeted one is fine", () => {
+    // A requiresLayout step with no tab/pane is dropped at load, so it is not the step that dispatches
+    // first — rejecting on it would refuse a belt that works.
+    setup(full(BELT_WEB_ONLY.replace("    steps:\n", "    steps:\n      - { type: evidence }\n")));
+    expect(() => loadConfig("demo")).not.toThrow();
+  });
+
+  it("…and names the first surviving step when THAT one is untargeted", () => {
+    const belt = BELT_WEB_ONLY.replace("    steps:\n", "    steps:\n      - { type: evidence }\n").replace(
+      "      - { type: work,   tab: main,   pane: agent }\n",
+      "      - { type: work }\n",
+    );
+    setup(full(belt));
+    expect(() => loadConfig("demo")).toThrow(/its first step "work" has no `tab`\/`pane`/);
   });
 
   it("a belt with no default_layout skips the allocation check (panes provided outside the factory)", () => {
@@ -1933,6 +1968,52 @@ describe("loadConfig — layouts (workspace-manager port)", () => {
     const r = RepoConfigSchema.safeParse(parseYaml(raw));
     const detail = r.success ? "" : r.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("; ");
     expect(r.success, detail).toBe(true);
+  });
+
+  // Every WHOLE config we print in the docs must actually load. A published example that the loader
+  // refuses is worse than no example — a reader copies it, gets a rejection, and stops trusting the
+  // docs. This found a real one: the evidence-step scaffold in the setup interview had an agent-less
+  // target pane, so it had never loaded, and a new first-step rule would have been blamed for it.
+  // Only fences that are a complete config are checked (repo + work_sources + belt); fragments that
+  // illustrate one block can't be validated as a whole and are skipped.
+  it("every complete config example in the docs parses against the schema", () => {
+    const repoRoot = fileURLToPath(new URL("../", import.meta.url));
+    const files = execSync("git ls-files '*.md' '*.yml'", { cwd: repoRoot, encoding: "utf8" }).trim().split("\n").filter(Boolean);
+    const failures: string[] = [];
+    let checked = 0;
+    for (const rel of files) {
+      const text = readFileSync(join(repoRoot, rel), "utf8");
+      const fences: { body: string; line: number }[] = [];
+      if (rel.endsWith(".yml")) {
+        fences.push({ body: text, line: 1 });
+      } else {
+        const lines = text.split("\n");
+        for (let i = 0; i < lines.length; i++) {
+          if (!/^```ya?ml\s*$/.test(lines[i]!)) continue;
+          let j = i + 1;
+          while (j < lines.length && !/^```\s*$/.test(lines[j]!)) j++;
+          fences.push({ body: lines.slice(i + 1, j).join("\n"), line: i + 2 });
+          i = j;
+        }
+      }
+      for (const fence of fences) {
+        if (!/^repo:/m.test(fence.body) || !/^belt:/m.test(fence.body) || !/^work_sources:/m.test(fence.body)) continue;
+        checked++;
+        let doc: unknown;
+        try {
+          doc = parseYaml(fence.body.replaceAll("__REPO__", "/tmp"));
+        } catch (e) {
+          failures.push(`${rel}:${fence.line} — invalid YAML: ${String(e).slice(0, 200)}`);
+          continue;
+        }
+        const r = RepoConfigSchema.safeParse(doc);
+        if (!r.success) {
+          failures.push(`${rel}:${fence.line} — ${r.error.issues.map((iss) => `${iss.path.join(".")}: ${iss.message}`).join(" | ").slice(0, 500)}`);
+        }
+      }
+    }
+    expect(checked, "found no complete config examples to check — the fence detection probably broke").toBeGreaterThan(2);
+    expect(failures.join("\n"), "a config example in the docs no longer loads").toBe("");
   });
 });
 

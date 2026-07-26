@@ -278,7 +278,12 @@ status file that will never be written.
 The hook is idempotent (a per-checkout-path filesystem claim + a fresh 1-tab/1-pane
 guard + a per-workspace "decided" cache) and sits behind a **lean entry** (`src/cli/layout-hook.ts`,
 routed by `bin/herdr-factory`) that lazy-loads the heavy graph, so the constantly-firing focus event
-stays cheap. A one-shot **`[[startup]]` hook** (same lean entry, `--startup`) owns the per-server-session
+stays cheap. The freshness guard is a gate this hook can LOSE: it boots Node, loads config and queries
+herdr first, so a pane the engine spawns in-process during the same claim shows up as a second tab and
+the guard declines a workspace it should have built (visible only in `herdr plugin log list`). Config
+load now guarantees a `default_layout` belt cannot defeat its own guard — its first surviving step must
+target a layout pane ([§10](#10-config)) — leaving that failure mode only to a `layout_matching`-only
+belt, a hand-built workspace, or a second layout plugin. A one-shot **`[[startup]]` hook** (same lean entry, `--startup`) owns the per-server-session
 state hygiene the event path used to pay for on every firing: reaping claims whose worktree vanished
 while herdr was down, and clearing the "decided" cache, whose keys are workspace ids the next herdr
 server recycles. Modules: `src/core/layout-match.ts` (pure matching), `layout.ts` (tree builder +
@@ -286,7 +291,8 @@ runner), `layout-hook.ts` (the event + startup handlers).
 
 A belt step then simply *targets* a resulting pane via its own `tab`/`pane` (from its `steps[]`
 entry); that pane declares its own agent (`agent: claude` + `agent_args`) so the build brings one up
-there (config-load rejects a step whose target pane starts no agent at all — see [§10](#10-config)).
+there (config-load rejects a step whose target pane starts no agent at all, and a `default_layout`
+belt whose FIRST surviving step targets no pane at all — see [§10](#10-config)).
 herdr-factory **waits** for a targeted pane to come up (re-arming an expired
 `layout_wait_seconds` window a bounded number of times, then escalating to `attention` —
 [§8](#8-step-agent-model)) and only spawns a pane itself for steps that have **no** tab/pane
@@ -1442,6 +1448,14 @@ about to revert. It's driven two ways:
   a step's tab/pane are chosen from the belt's `default_layout`, and renaming a layout id / tab /
   pane title repoints every belt + step reference in the same edit, so this check fires on
   hand-edits, not on the editor's own output — `src/tui/layout-refs.ts`),
+  **first-step layout targeting** — a belt with a `default_layout` must give its first SURVIVING step
+  (a `requiresLayout` step dropped for want of a pane is not it) a `tab`/`pane`, because a claim
+  dispatches that step in the same reconcile pass and a dedicated pane's new tab makes the
+  out-of-process layout hook decline the build ([§4](#4-herdr-ownership-boundary)) — after which every
+  later layout-targeted step parks with `layout_wait_timeout`, blaming herdr for a belt-ordering
+  mistake; reported at `belt.<i>.steps.<j>.pane` (j indexing the WRITTEN steps), and scoped to
+  `default_layout` like the checks above, so a `layout_matching`-only belt can still lose its build at
+  runtime,
   `{{work_id}}` in `workspace_name`, and `match` / `config`-sourced `prompt_file` existence — all
   with readable errors. The work-source *clients* are constructed in `build-deps.ts`'s `buildDeps` via each
   type's registry descriptor (`descriptorFor(type).create(ctx)` — the ctx carries the env map,
