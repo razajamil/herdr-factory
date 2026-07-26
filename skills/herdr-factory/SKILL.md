@@ -46,6 +46,7 @@ Load **one** reference file, not the whole bundle. Each is self-contained.
 | to know *why* the engine did something | [references/architecture.md](references/architecture.md) |
 | better results out of the agents | [references/target-repo.md](references/target-repo.md) |
 | to install/update/uninstall the factory itself, or drive the TUI | [references/install-and-operate.md](references/install-and-operate.md) |
+| to verify a change to the factory itself, or to know why a pane's agent never started | [references/testing.md](references/testing.md) |
 
 When a reference doesn't settle it, read the engine — the checkout is on the machine at
 `~/.local/share/herdr-factory/`: `src/config.ts` for the config schema and every load-time rejection,

@@ -2,7 +2,10 @@
 //
 // Absorbed from herdr-plugin-workspace-manager, and re-converged with it on herdr 0.7.5's native
 // APIs (the plugin's v0.6.0 rebuild): the topology is declarative, agents are herdr's to start, and
-// nothing is typed into a shell that might not be listening.
+// nothing is typed into a shell that might not be listening — with one deliberate exception, the
+// setup command of a pane that also hosts an agent, which is run in the pane only once its shell is
+// idle (see `paneScript`/`runSetupInPane`: herdr will not adopt an agent into a pane whose process is
+// a script).
 //
 //   • resolveBeltLayout — pick the layout for a worktree from its belt (branch globs → default).
 //   • tabTree           — turn one configured tab into herdr's declarative pane tree: splits with
@@ -17,7 +20,9 @@
 //   – Pane commands are the pane's PROCESS, not keystrokes typed into its shell: they can't race a
 //     shell that isn't ready and don't appear in scrollback. They still run inside the user's
 //     interactive LOGIN shell, because that is what they used to get — dropping it would silently
-//     break any command whose toolchain comes from a shell rc hook (mise, asdf, nvm).
+//     break any command whose toolchain comes from a shell rc hook (mise, asdf, nvm). The one typed
+//     command (an agent pane's setup) goes through that same login shell as a child, so the identical
+//     `setup.command` behaves identically wherever it runs.
 //   – Setup reports through a status FILE it writes itself, instead of printing a sentinel that
 //     `pane wait-output` scraped back — a marker could scroll out of the matched rows, wrap, or be
 //     matched from the shell's own echo before the command had run.
@@ -60,16 +65,38 @@ export const HAND_BACK = `exec ${USER_SHELL} -i`;
  *  after the command, before anything else can overwrite it. */
 const recordStatus = (statusPath: string): string => `printf '%s' "$?" > ${singleQuote(statusPath)}`;
 
-/** The script a pane runs, or undefined for a plain shell pane. */
+/** The setup command as a line to RUN IN a setup pane that hosts an agent (see `paneScript`), rather
+ *  than baking it into the pane's own process.
+ *
+ *  It goes through the same login+interactive shell a pane-PROCESS command gets (`shellArgv`) so the
+ *  identical `setup.command` behaves identically either way — a toolchain that comes from a shell rc
+ *  hook (mise, asdf, nvm, `brew shellenv` in `.zprofile`) must not depend on whether the pane happens
+ *  to host an agent. But as a CHILD, never `exec`: the pane's own shell has to survive, because that
+ *  is exactly what `agent start` attaches to. */
+export const setupScript = (setup: { command: string; statusPath: string }): string =>
+  `${USER_SHELL} -lic ${singleQuote(`${setup.command}; ${recordStatus(setup.statusPath)}`)}`;
+
+/** The script a pane runs, or undefined for a plain shell pane.
+ *
+ *  An AGENT pane is deliberately left script-free even when it is the layout's setup pane. Baking the
+ *  setup in makes the pane's process a wrapper script ending in `exec $SHELL -i`, and herdr will NOT
+ *  adopt an agent into that re-exec'd shell: `agent start` accepts the pane, launches nothing, and
+ *  times out after 60s, so every step targeting the pane burns its layout wait and the run parks
+ *  `layout_wait_timeout`. (Found end-to-end — `test/e2e/scenarios/layout-setup-on-agent-pane.e2e.ts`;
+ *  `pane process-info` shows the pane's process replaced by a non-login `/bin/bash -i` where a
+ *  working agent pane shows herdr's own shell.) The runner instead runs `setupScript` IN the pane
+ *  with `pane run` once it exists, which is what a human would do and leaves herdr's shell intact. */
 export function paneScript(pane: LayoutPane, setup?: { command: string; statusPath: string }): string | undefined {
   const parts: string[] = [];
-  if (setup) {
+  if (setup && !pane.agent) {
     parts.push(setup.command, recordStatus(setup.statusPath));
   }
   if (pane.command) parts.push(pane.command);
   if (parts.length === 0) return undefined;
-  // An agent pane, a plain pane, and a `persist` command pane must all end at a prompt.
-  if (pane.agent || !pane.command || pane.persist) parts.push(HAND_BACK);
+  // A plain pane and a `persist` command pane must end at a prompt. (An agent pane can't reach here:
+  // config forbids `agent` + `command`, and its setup is run in the pane rather than baked in, so it
+  // has no script at all.)
+  if (!pane.command || pane.persist) parts.push(HAND_BACK);
   return parts.join("; ");
 }
 
@@ -237,6 +264,11 @@ async function applyLayoutImpl(deps: Deps, target: LayoutTarget, layout: LayoutC
   const built: BuiltPane[] = [];
   let setupPaneId: string | undefined;
   let setupSettled = setup == null;
+  // An agent setup pane carries no spawn script (see paneScript), so its setup has to be RUN in it.
+  // `setupRun` resolves to whether the command was actually issued; everything that depends on the
+  // setup awaits it first (`setupIssued`).
+  let setupNeedsRun = false;
+  let setupRun: Promise<boolean> | null = null;
 
   for (const [index, tab] of layout.tabs.entries()) {
     // Extra env (the run's work key) rides on every pane, under the layout's own.
@@ -258,13 +290,24 @@ async function applyLayoutImpl(deps: Deps, target: LayoutTarget, layout: LayoutC
     tab.panes.forEach((pane, j) => {
       const paneId = applied.paneIds[j]!;
       built.push({ pane, paneId });
-      if (pane.setup && setup) setupPaneId = paneId;
+      if (pane.setup && setup) {
+        setupPaneId = paneId;
+        setupNeedsRun = pane.agent != null;
+      }
     });
     deps.log("info", `layout "${layout.id}": applied tab ${index} → ${applied.tabId} (${tab.panes.length} pane(s))`);
 
+    // An agent setup pane's command isn't part of its process — issue it the moment the pane exists.
+    // Deliberately NOT awaited here: `runSetupInPane` first waits for that pane's shell (up to
+    // SHELL_READY_TIMEOUT_MS), and a NON-blocking setup must not delay the remaining tabs, which it
+    // never did when the command was the pane's own process.
+    if (setup && setupPaneId && setupNeedsRun && !setupRun) {
+      setupRun = runSetupInPane(deps, layout, setup, setupPaneId);
+    }
+
     // A blocking setup must finish before any later tab is spawned.
     if (setup && layout.setup?.blocking && !setupSettled && setupPaneId) {
-      await awaitSetup(deps, layout, setup.statusPath, setupPaneId);
+      if (await setupIssued(setupRun)) await awaitSetup(deps, layout, setup.statusPath, setupPaneId);
       setupSettled = true;
     }
   }
@@ -276,13 +319,40 @@ async function applyLayoutImpl(deps: Deps, target: LayoutTarget, layout: LayoutC
     // first even when it isn't marked blocking.
     if (setup && !setupSettled && setupPaneId === paneId) {
       deps.log("info", `layout "${layout.id}": waiting for setup before starting the agent in its pane`);
-      await awaitSetup(deps, layout, setup.statusPath, paneId);
+      if (await setupIssued(setupRun)) await awaitSetup(deps, layout, setup.statusPath, paneId);
       setupSettled = true;
     }
     await startAgent(deps, layout, pane.agent, paneId, target.workspaceId, agentNames);
   }
 
   if (setup && !setupSettled) deps.log("info", `layout "${layout.id}": setup is running in ${setupPaneId ?? "its pane"} (not blocking)`);
+}
+
+/** Run the layout's setup command IN an agent pane, rather than as the pane's own process. Keeping
+ *  herdr's shell — instead of a wrapper that ends in `exec $SHELL -i` — is what leaves the pane
+ *  adoptable by `agent start` (see paneScript). Answers whether the command was actually issued.
+ *
+ *  A pane that never reaches a prompt is NOT tried anyway: the keystrokes would be dropped, the status
+ *  file would never appear, and the caller would then sit out the full SETUP_TIMEOUT_MS (10 min) —
+ *  inside the worktree.created hook — for a setup that never ran. Report it like any other setup
+ *  failure and let the build continue; the layout still stands and the agent still starts. */
+async function runSetupInPane(deps: Deps, layout: LayoutConfig, setup: { command: string; statusPath: string }, paneId: string): Promise<boolean> {
+  if (!(await awaitShellPrompt(deps, paneId))) {
+    const detail = `setup pane ${paneId} never reached a shell prompt (${SHELL_READY_TIMEOUT_MS}ms) — setup was not run`;
+    await deps.herdr.reportPaneDisplay(paneId, { tokens: { [SETUP_TOKEN]: "not-run" } }).catch(() => {});
+    deps.log("warn", `layout "${layout.id}": ${detail}`);
+    await deps.herdr.notify("herdr-factory: layout setup failed", `${detail} (layout "${layout.id}")`).catch(() => {});
+    return false;
+  }
+  deps.log("info", `layout "${layout.id}": running setup in ${paneId}`);
+  await deps.herdr.paneRun(paneId, setupScript(setup));
+  return true;
+}
+
+/** Was the pane-run setup issued? `null` means there was nothing to issue (the setup rides on a pane's
+ *  own process), which counts as issued. Never rejects — a thrown pane-run is "not issued". */
+function setupIssued(run: Promise<boolean> | null): Promise<boolean> {
+  return run === null ? Promise.resolve(true) : run.catch(() => false);
 }
 
 /** Start (and optionally prompt) one pane's agent. Never throws: a failed agent doesn't invalidate

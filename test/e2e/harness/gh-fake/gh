@@ -1,0 +1,597 @@
+#!/usr/bin/env node
+// The E2E harness's fake `gh` CLI. Installed FIRST on PATH inside a scenario world (there is no
+// `gh` path override in the engine — src/clients/github.ts hardcodes the command name), so both the
+// resident `serve` and every agent pane resolve to this file.
+//
+// PLAIN JavaScript on purpose: this file has a shebang and no extension, and node cannot strip types
+// from an extensionless file. It also avoids `require` and top-level `await` so it runs identically
+// whether node decides the file is CommonJS or ESM (only dynamic `import()` is used, which is legal
+// in both).
+//
+// Contract, argv shapes, state schema and failure injection: see ./README.md.
+// State file: $HF_GH_STATE (JSON). Call log: $HF_GH_LOG (JSONL, one line per invocation).
+
+const FAILING = /FAIL|ERROR|TIMED_OUT|CANCELLED|FAILURE/; // must stay identical to src/clients/github.ts
+const SKIPPED = /SKIP|NEUTRAL|STALE/;
+const VERSION = "gh version 2.63.0 (herdr-factory e2e fake)";
+
+// --- argv helpers ------------------------------------------------------------
+
+/** Flags that consume the NEXT argv token, so positional scanning can skip their values. */
+const VALUE_FLAGS = new Set([
+  "--repo", "-R", "--head", "-H", "--base", "-B", "--title", "-t", "--body", "-b", "--body-file", "-F",
+  "--label", "-l", "--reviewer", "-r", "--assignee", "-a", "--milestone", "-m", "--project", "-p",
+  "--json", "--jq", "-q", "--template", "-t", "--limit", "-L", "--state", "-s", "--author", "--app",
+  "--search", "--field", "--raw-field", "--method", "-X", "--hostname", "--header", "-H", "--input",
+  "--watch-interval", "-i", "--comment", "-c", "--match-commit", "--paginate-limit",
+]);
+
+/** Value of `--name v` / `--name=v` (last wins), or undefined. */
+function flag(argv, ...names) {
+  let found;
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    for (const n of names) {
+      if (a === n) found = argv[i + 1] ?? "";
+      else if (a.startsWith(n + "=")) found = a.slice(n.length + 1);
+    }
+  }
+  return found;
+}
+
+/** Every value of a repeatable flag, comma-splitting each (gh accepts `--label a,b`). */
+function multiFlag(argv, ...names) {
+  const out = [];
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    for (const n of names) {
+      let v;
+      if (a === n) v = argv[i + 1];
+      else if (a.startsWith(n + "=")) v = a.slice(n.length + 1);
+      if (v == null) continue;
+      for (const part of v.split(",")) if (part.trim()) out.push(part.trim());
+    }
+  }
+  return out;
+}
+
+function hasFlag(argv, ...names) {
+  return argv.some((a) => names.some((n) => a === n || a.startsWith(n + "=")));
+}
+
+/** Positional tokens after `argv[0..skip-1]`, ignoring flags and the values they consume. */
+function positionals(argv, skip) {
+  const out = [];
+  for (let i = skip; i < argv.length; i++) {
+    const a = argv[i];
+    if (a.startsWith("-")) {
+      if (VALUE_FLAGS.has(a) && !a.includes("=")) i++;
+      continue;
+    }
+    out.push(a);
+  }
+  return out;
+}
+
+/** `gh api`'s `-f/-F/--field/--raw-field key=value` pairs. */
+function apiFields(argv) {
+  const out = {};
+  const NAMES = ["-f", "-F", "--field", "--raw-field"];
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    let v;
+    if (NAMES.includes(a)) v = argv[++i];
+    else {
+      const n = NAMES.find((x) => a.startsWith(x + "="));
+      if (n) v = a.slice(n.length + 1);
+    }
+    if (v == null) continue;
+    const eq = v.indexOf("=");
+    if (eq > 0) out[v.slice(0, eq)] = v.slice(eq + 1);
+  }
+  return out;
+}
+
+/** A PR reference: a number, a PR URL, or a branch name. */
+function prRef(argv, skip) {
+  for (const p of positionals(argv, skip)) {
+    if (/^\d+$/.test(p)) return { number: Number(p) };
+    const m = /\/pull\/(\d+)/.exec(p);
+    if (m) return { number: Number(m[1]) };
+    return { branch: p };
+  }
+  return {};
+}
+
+/** Stable log/budget classification. Keep this vocabulary frozen — the suite asserts on it. */
+function classify(argv) {
+  const [a, b] = argv;
+  if (a === "api" && b === "graphql") return "api graphql";
+  if (a === "api" && b === "user") return "api user";
+  if (a === "pr") {
+    if (b === "list") return "pr list";
+    if (b === "view") return "pr view";
+    if (b === "create") return "pr create";
+    if (b === "checks") return "pr checks";
+  }
+  if (a === "auth") return "auth";
+  return "other";
+}
+
+// --- state -------------------------------------------------------------------
+
+function sleepSync(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+function readState(fs, path) {
+  const raw = fs.readFileSync(path, "utf8");
+  const s = JSON.parse(raw);
+  if (!s.prs) s.prs = {};
+  return s;
+}
+
+function writeState(fs, path, s) {
+  const tmp = `${path}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(s, null, 2));
+  fs.renameSync(tmp, path);
+}
+
+/** Read-modify-write under a coarse mkdir lock: concurrent invocations (many panes, one server)
+ *  must never interleave a `pr create` number allocation or lose a mutation. */
+function mutate(fs, path, fn) {
+  const lock = `${path}.lock`;
+  const deadline = Date.now() + 5000;
+  let held = false;
+  for (;;) {
+    try {
+      fs.mkdirSync(lock);
+      held = true;
+      break;
+    } catch (e) {
+      if (e.code !== "EEXIST") throw e;
+      if (Date.now() > deadline) break; // stale lock: proceed rather than hang the run
+      sleepSync(20);
+    }
+  }
+  try {
+    const s = readState(fs, path);
+    const r = fn(s);
+    writeState(fs, path, s);
+    return r;
+  } finally {
+    if (held) {
+      try {
+        fs.rmdirSync(lock);
+      } catch {
+        /* already gone */
+      }
+    }
+  }
+}
+
+// --- projections -------------------------------------------------------------
+
+function prJson(pr, fields) {
+  const all = {
+    number: pr.number,
+    state: pr.state,
+    url: pr.url,
+    isDraft: !!pr.isDraft,
+    title: pr.title ?? "",
+    body: pr.body ?? "",
+    headRefName: pr.headRefName ?? "",
+    baseRefName: pr.base ?? "main",
+    mergeable: pr.state === "OPEN" ? "MERGEABLE" : "UNKNOWN",
+    labels: (pr.labels ?? []).map((n) => ({ name: n })),
+    statusCheckRollup: rollupJson(pr),
+    reviewDecision: "",
+  };
+  if (!fields || !fields.length) return all;
+  const out = {};
+  for (const f of fields) if (f in all) out[f] = all[f];
+  return out;
+}
+
+/** `gh pr view --json statusCheckRollup` shape: a flat array of CheckRun / StatusContext nodes. */
+function rollupJson(pr) {
+  return (pr.checks ?? []).map((c) =>
+    c.kind === "StatusContext"
+      ? { __typename: "StatusContext", context: c.name, state: c.conclusion ?? "PENDING", targetUrl: `https://ci.example/${c.name}` }
+      : {
+          __typename: "CheckRun",
+          name: c.name,
+          status: c.conclusion == null ? "IN_PROGRESS" : "COMPLETED",
+          conclusion: c.conclusion ?? "",
+          detailsUrl: `https://ci.example/${c.name}`,
+        },
+  );
+}
+
+/** The GraphQL `statusCheckRollup.contexts.nodes` shape — null when there are no checks at all,
+ *  exactly like GitHub (the engine's optional chaining tolerates it; that path deserves coverage). */
+function rollupGraphql(pr) {
+  const checks = pr.checks ?? [];
+  if (!checks.length) return null;
+  return {
+    contexts: {
+      nodes: checks.map((c) =>
+        c.kind === "StatusContext"
+          ? { __typename: "StatusContext", context: c.name, state: c.conclusion ?? "PENDING" }
+          : { __typename: "CheckRun", name: c.name, conclusion: c.conclusion ?? null },
+      ),
+    },
+  };
+}
+
+function threadsGraphql(pr) {
+  return {
+    nodes: (pr.threads ?? []).map((t) => ({ isResolved: !!t.isResolved, comments: { nodes: [{ id: t.id }] } })),
+  };
+}
+
+function prGraphql(pr) {
+  return {
+    number: pr.number,
+    state: pr.state,
+    url: pr.url,
+    isDraft: !!pr.isDraft,
+    reviewThreads: threadsGraphql(pr),
+    commits: { nodes: [{ commit: { statusCheckRollup: rollupGraphql(pr) } }] },
+  };
+}
+
+function checkBucket(c) {
+  const v = c.conclusion ?? "";
+  if (!v) return "pending";
+  if (FAILING.test(v)) return "fail";
+  if (SKIPPED.test(v)) return "skipping";
+  return "pass";
+}
+
+// --- handlers ----------------------------------------------------------------
+
+/** Every handler returns { code, out, err }. `code` non-zero + a gh-like stderr = "recognised argv
+ *  I cannot serve" (unknown PR, duplicate create); it is never used for "I don't understand". */
+function handle(fs, argv, statePath) {
+  const [a, b] = argv;
+
+  if (hasFlag(argv, "--version") || a === "version") return { code: 0, out: VERSION + "\n", err: "" };
+
+  if (a === "auth") {
+    if (b === "token") return { code: 0, out: (process.env.HF_GH_TOKEN || "gho_e2efake000000000000000000000000000000") + "\n", err: "" };
+    const login = readState(fs, statePath).login;
+    return {
+      code: 0,
+      out: `github.com\n  ✓ Logged in to github.com account ${login} (keyring)\n  - Active account: true\n  - Token scopes: 'gist', 'read:org', 'repo', 'workflow'\n`,
+      err: "",
+    };
+  }
+
+  if (a === "api" && b === "user") {
+    const s = readState(fs, statePath);
+    const jq = flag(argv, "--jq", "-q");
+    if (jq === ".login") return { code: 0, out: s.login + "\n", err: "" };
+    return { code: 0, out: JSON.stringify({ login: s.login, id: 4242, type: "User" }) + "\n", err: "" };
+  }
+
+  if (a === "api" && b === "graphql") return graphql(fs, argv, statePath);
+
+  // `gh api <path>` — nothing in the engine uses it (github_issues talks HTTP directly); answer
+  // something shaped-plausible so a model agent's stray call cannot crash or hang a run.
+  if (a === "api") {
+    const path = positionals(argv, 1)[0] ?? "";
+    if (/\/(comments|labels|issues|reviews|files|commits)\/?$/.test(path) && !flag(argv, "--method", "-X")) return { code: 0, out: "[]\n", err: "" };
+    return { code: 0, out: "{}\n", err: "" };
+  }
+
+  if (a === "pr") return prCommand(fs, argv, statePath);
+
+  return null; // unrecognised → the caller answers `{}` with exit 0
+}
+
+function graphql(fs, argv, statePath) {
+  const fields = apiFields(argv);
+  const query = fields.query ?? "";
+
+  if (/\bmutation\b/.test(query)) {
+    // The resolver prompt tells the agent to resolve threads; `gh api graphql` + resolveReviewThread
+    // is how gh does that. Anything else is accepted and ignored.
+    const id = /threadId:\s*"?([^"\s,})]+)"?/.exec(query)?.[1] ?? fields.threadId ?? fields.id;
+    if (/resolveReviewThread/.test(query) && id) {
+      const found = mutate(fs, statePath, (s) => {
+        for (const pr of Object.values(s.prs)) {
+          for (const t of pr.threads ?? []) {
+            if (t.id === id) {
+              t.isResolved = true;
+              return true;
+            }
+          }
+        }
+        return false;
+      });
+      if (!found) return { code: 1, out: "", err: `GraphQL: Could not resolve to a node with the global id of '${id}'\n` };
+      return { code: 0, out: JSON.stringify({ data: { resolveReviewThread: { thread: { isResolved: true } } } }) + "\n", err: "" };
+    }
+    return { code: 0, out: JSON.stringify({ data: {} }) + "\n", err: "" };
+  }
+
+  const s = readState(fs, statePath);
+
+  // The BATCHED snapshot query: aliased `pr<n>: pullRequest(number: <n>)` fields. Answer exactly the
+  // aliases asked for; a PR that isn't in state is simply absent (+ a GitHub-like error and exit 1,
+  // which is what real gh does — see the allowFail comment in src/clients/github.ts).
+  const aliases = [...query.matchAll(/pr(\d+):\s*pullRequest\(number:\s*(\d+)\)/g)];
+  if (aliases.length) {
+    const repository = {};
+    const errors = [];
+    for (const m of aliases) {
+      const alias = `pr${m[1]}`;
+      const pr = s.prs[String(Number(m[2]))];
+      if (pr) repository[alias] = prGraphql(pr);
+      else errors.push({ type: "NOT_FOUND", path: ["repository", alias], message: `Could not resolve to a PullRequest with the number of ${m[2]}.` });
+    }
+    const body = errors.length ? { data: { repository }, errors } : { data: { repository } };
+    return { code: errors.length ? 1 : 0, out: JSON.stringify(body) + "\n", err: errors.length ? "gh: Could not resolve to a PullRequest (some aliases missing)\n" : "" };
+  }
+
+  // The single-PR reviewSignature query: repository.pullRequest.reviewThreads, PR number in `-F n=`.
+  if (/pullRequest\(number:\s*\$n\)/.test(query)) {
+    const n = Number(fields.n);
+    const pr = s.prs[String(n)];
+    if (!pr) {
+      return {
+        code: 1,
+        out: JSON.stringify({ data: { repository: { pullRequest: null } }, errors: [{ type: "NOT_FOUND", message: `Could not resolve to a PullRequest with the number of ${n}.` }] }) + "\n",
+        err: `gh: Could not resolve to a PullRequest with the number of ${n}. (repository.pullRequest)\n`,
+      };
+    }
+    return { code: 0, out: JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: threadsGraphql(pr) } } } }) + "\n", err: "" };
+  }
+
+  return { code: 0, out: JSON.stringify({ data: {} }) + "\n", err: "" };
+}
+
+function prCommand(fs, argv, statePath) {
+  const verb = argv[1];
+  const s = readState(fs, statePath);
+  const byNumber = (n) => s.prs[String(n)];
+  const byBranch = (branch) =>
+    Object.values(s.prs)
+      .filter((p) => p.headRefName === branch)
+      .sort((x, y) => y.number - x.number)[0];
+  const resolve = (skip) => {
+    const ref = prRef(argv, skip);
+    if (ref.number != null) return { pr: byNumber(ref.number), label: `#${ref.number}`, ref };
+    if (ref.branch) return { pr: byBranch(ref.branch), label: ref.branch, ref };
+    return { pr: undefined, label: "", ref };
+  };
+  const notFound = (label) => ({
+    code: 1,
+    out: "",
+    err: label.startsWith("#")
+      ? `GraphQL: Could not resolve to a PullRequest with the number of ${label.slice(1)}. (repository.pullRequest)\n`
+      : `no pull requests found for branch "${label}"\n`,
+  });
+
+  if (verb === "list") {
+    const head = flag(argv, "--head", "-H");
+    const state = (flag(argv, "--state", "-s") ?? "open").toUpperCase();
+    const base = flag(argv, "--base", "-B");
+    const limit = Number(flag(argv, "--limit", "-L") ?? 30);
+    const jsonFields = (flag(argv, "--json") ?? "").split(",").map((f) => f.trim()).filter(Boolean);
+    let list = Object.values(s.prs)
+      .filter((p) => (head ? p.headRefName === head : true))
+      .filter((p) => (base ? (p.base ?? "main") === base : true))
+      .filter((p) => (state === "ALL" ? true : p.state === state))
+      .sort((x, y) => y.number - x.number)
+      .slice(0, Math.max(0, limit));
+    if (jsonFields.length) return { code: 0, out: JSON.stringify(list.map((p) => prJson(p, jsonFields))) + "\n", err: "" };
+    return { code: 0, out: list.map((p) => `#${p.number}\t${p.title ?? ""}\t${p.headRefName}\t${p.state}`).join("\n") + (list.length ? "\n" : ""), err: "" };
+  }
+
+  if (verb === "view") {
+    const { pr, label } = resolve(2);
+    if (!pr) return notFound(label || "#0");
+    const jsonFields = (flag(argv, "--json") ?? "").split(",").map((f) => f.trim()).filter(Boolean);
+    if (jsonFields.length) return { code: 0, out: JSON.stringify(prJson(pr, jsonFields)) + "\n", err: "" };
+    return { code: 0, out: `${pr.title ?? ""} #${pr.number}\n${pr.state} • ${pr.headRefName} → ${pr.base ?? "main"}\n\n${pr.body ?? ""}\n\nView this pull request on GitHub: ${pr.url}\n`, err: "" };
+  }
+
+  if (verb === "checks") {
+    const { pr, label } = resolve(2);
+    if (!pr) return notFound(label || "#0");
+    const checks = pr.checks ?? [];
+    const jsonFields = (flag(argv, "--json") ?? "").split(",").map((f) => f.trim()).filter(Boolean);
+    const rows = checks.map((c) => ({
+      name: c.name,
+      state: c.conclusion ?? "PENDING",
+      bucket: checkBucket(c),
+      link: `https://ci.example/${c.name}`,
+      description: "",
+      workflow: "ci",
+    }));
+    // gh's documented exit codes: 0 all pass, 8 any still pending, 1 any failure.
+    const code = rows.some((r) => r.bucket === "fail") ? 1 : rows.some((r) => r.bucket === "pending") ? 8 : 0;
+    if (jsonFields.length) return { code, out: JSON.stringify(rows.map((r) => Object.fromEntries(jsonFields.filter((f) => f in r).map((f) => [f, r[f]])))) + "\n", err: "" };
+    if (!rows.length) return { code: 0, out: "", err: `no checks reported on the '${pr.headRefName}' branch\n` };
+    return { code, out: rows.map((r) => `${r.name}\t${r.bucket}\t0s\t${r.link}`).join("\n") + "\n", err: "" };
+  }
+
+  if (verb === "create") return prCreate(fs, argv, statePath);
+
+  if (verb === "ready" || verb === "merge" || verb === "close" || verb === "reopen" || verb === "edit" || verb === "comment") {
+    const { pr, label } = resolve(2);
+    if (!pr) return notFound(label || "#0");
+    const n = pr.number;
+    const out = mutate(fs, statePath, (st) => {
+      const p = st.prs[String(n)];
+      if (verb === "ready") p.isDraft = false;
+      if (verb === "merge") {
+        p.state = "MERGED";
+        p.isDraft = false;
+      }
+      if (verb === "close") p.state = "CLOSED";
+      if (verb === "reopen") p.state = "OPEN";
+      if (verb === "edit") {
+        const title = flag(argv, "--title", "-t");
+        if (title != null) p.title = title;
+        const body = flag(argv, "--body", "-b");
+        if (body != null) p.body = body;
+        for (const l of multiFlag(argv, "--add-label", "--label", "-l")) if (!p.labels.includes(l)) p.labels.push(l);
+        for (const r of multiFlag(argv, "--add-reviewer", "--reviewer", "-r")) if (!p.reviewers.includes(r)) p.reviewers.push(r);
+        for (const x of multiFlag(argv, "--add-assignee", "--assignee", "-a")) if (!p.assignees.includes(x)) p.assignees.push(x);
+      }
+      return p.url;
+    });
+    return { code: 0, out: out + "\n", err: "" };
+  }
+
+  if (verb === "diff" || verb === "status") return { code: 0, out: "", err: "" };
+
+  return null; // unrecognised `pr` verb → `{}` exit 0
+}
+
+function prCreate(fs, argv, statePath) {
+  let head = flag(argv, "--head", "-H");
+  if (!head) head = process.env.HF_GH_HEAD || currentBranch();
+  if (!head) return { code: 1, out: "", err: "must be on a branch named differently than \"main\"\n" };
+  const title = flag(argv, "--title", "-t") ?? "";
+  let body = flag(argv, "--body", "-b") ?? "";
+  const bodyFile = flag(argv, "--body-file", "-F");
+  if (bodyFile) {
+    try {
+      body = fsSync.readFileSync(bodyFile, "utf8");
+    } catch {
+      return { code: 1, out: "", err: `could not read body file ${bodyFile}\n` };
+    }
+  }
+  const draft = hasFlag(argv, "--draft", "-d");
+  const base = flag(argv, "--base", "-B") ?? "main";
+  const labels = multiFlag(argv, "--label", "-l");
+  const reviewers = multiFlag(argv, "--reviewer", "-r");
+  const assignees = multiFlag(argv, "--assignee", "-a");
+
+  const existing = Object.values(readState(fs, statePath).prs).find((p) => p.headRefName === head && p.state === "OPEN");
+  if (existing) {
+    return {
+      code: 1,
+      out: "",
+      err: `a pull request for branch "${head}" into branch "${base}" already exists:\n${existing.url}\n`,
+    };
+  }
+
+  const url = mutate(fs, statePath, (s) => {
+    const number = s.nextNumber ?? 1;
+    s.nextNumber = number + 1;
+    const prUrl = `https://github.com/${s.repo}/pull/${number}`;
+    s.prs[String(number)] = {
+      number,
+      state: "OPEN",
+      url: prUrl,
+      isDraft: draft,
+      headRefName: head,
+      title,
+      body,
+      base,
+      labels,
+      reviewers,
+      assignees,
+      threads: [],
+      checks: [],
+    };
+    return prUrl;
+  });
+  return { code: 0, out: url + "\n", err: "" };
+}
+
+/** The `node:fs` namespace, set once in main() (see the header: no `require`, no top-level await). */
+let fsSync;
+
+/** cwd's checked-out branch, for a `gh pr create` with no `--head` (what a model agent tends to run).
+ *  Worktrees keep `.git` as a FILE pointing at the real gitdir, so follow it. */
+function currentBranch() {
+  try {
+    let dir = ".git";
+    const st = fsSync.statSync(dir);
+    if (st.isFile()) dir = /gitdir:\s*(.+)/.exec(fsSync.readFileSync(dir, "utf8"))?.[1]?.trim() ?? dir;
+    return fsSync.readFileSync(`${dir}/HEAD`, "utf8").trim().replace(/^ref:\s*refs\/heads\//, "") || "";
+  } catch {
+    return "";
+  }
+}
+
+// --- main --------------------------------------------------------------------
+
+async function main() {
+  const fs = await import("node:fs");
+  fsSync = fs;
+  const argv = process.argv.slice(2);
+  const subcommand = classify(argv);
+  const statePath = process.env.HF_GH_STATE;
+  const logPath = process.env.HF_GH_LOG;
+
+  const log = (exitCode) => {
+    if (!logPath) return;
+    try {
+      fs.appendFileSync(logPath, JSON.stringify({ ts: Date.now(), argv, subcommand, exitCode }) + "\n");
+    } catch {
+      /* the log is diagnostics; never let it break a run */
+    }
+  };
+  const finish = async (code, out, err) => {
+    log(code);
+    const sleepMs = Number(process.env.HF_GH_SLEEP_MS ?? 0);
+    const sleepFor = process.env.HF_GH_SLEEP;
+    // The log line is written BEFORE the sleep on purpose: a call killed by the engine's 60s exec
+    // timeout must still be visible to the suite (with the exit code it would have returned).
+    if (sleepMs > 0 && (!sleepFor || matches(sleepFor, subcommand))) await new Promise((r) => setTimeout(r, sleepMs));
+    if (out) process.stdout.write(out);
+    if (err) process.stderr.write(err);
+    process.exitCode = code;
+  };
+
+  if (!statePath) return finish(1, "", "gh-fake: HF_GH_STATE is not set\n");
+  if (!fs.existsSync(statePath)) return finish(1, "", `gh-fake: state file not found: ${statePath}\n`);
+
+  const failOnce = process.env.HF_GH_FAIL_ONCE;
+  if (failOnce && matches(failOnce, subcommand) && claimOnce(fs, logPath || statePath, subcommand)) {
+    return finish(1, "", `gh-fake: HF_GH_FAIL_ONCE injected a failure for "${subcommand}"\n`);
+  }
+  const fail = process.env.HF_GH_FAIL;
+  if (fail && matches(fail, subcommand)) return finish(1, "", `gh-fake: HF_GH_FAIL injected a failure for "${subcommand}"\n`);
+
+  let res;
+  try {
+    res = handle(fs, argv, statePath);
+  } catch (e) {
+    return finish(1, "", `gh-fake: ${e && e.message ? e.message : String(e)}\n`);
+  }
+  // Unrecognised argv: answer `{}` and exit 0 — a stray call from a model-driven agent must never
+  // hang or fail a run. Recognised-but-unservable argv already returned a non-zero code above.
+  if (!res) return finish(0, "{}\n", "");
+  return finish(res.code, res.out, res.err);
+}
+
+/** `HF_GH_FAIL=<sub>[,<sub>…]`, or `*` for every call. */
+function matches(spec, subcommand) {
+  return spec
+    .split(",")
+    .map((x) => x.trim())
+    .some((x) => x === "*" || x === subcommand);
+}
+
+/** Race-free "only the first caller fails": an exclusive-create marker file next to the log. */
+function claimOnce(fs, base, subcommand) {
+  try {
+    fs.writeFileSync(`${base}.failonce.${subcommand.replace(/\W+/g, "_")}`, "", { flag: "wx" });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+main().catch((e) => {
+  process.stderr.write(`gh-fake: ${e && e.stack ? e.stack : String(e)}\n`);
+  process.exitCode = 1;
+});

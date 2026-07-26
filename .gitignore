@@ -3,6 +3,8 @@ dist/
 *.tsbuildinfo
 *.log
 .DS_Store
+# End-to-end suite output (scripts/e2e): reports + per-scenario DBs, logs and transcripts.
+artifacts/
 # Factory-owned per-run working memory (prompts, handoffs, work docs) — never commit it: a
 # committed copy in a fresh worktree would shadow the real work doc (the engine scrubs it).
 .memory/

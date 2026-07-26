@@ -264,7 +264,17 @@ exit status to a status FILE the runner polls) and then, per pane, its agent
 (`agent start --kind --pane`, which blocks until herdr has detected the agent and marked it ready for
 input — preceded by polling `pane process-info` until the pane's shell is actually idle, since herdr
 refuses a pane that isn't). A failed setup or agent is reported (log + pane token + notification) but
-never tears down the built layout.
+never tears down the built layout. **An AGENT pane never carries the setup command as its process**:
+baking it in ends that pane's script with `exec $SHELL -i`, and herdr will not adopt an agent into the
+re-exec'd shell — `agent start` accepts the pane, launches nothing and times out, so every step
+targeting it burns its layout wait and parks (found end-to-end; `test/e2e/scenarios/layout-setup-on-agent-pane.e2e.ts`).
+The runner instead runs setup IN that pane with `pane run` as soon as it exists — through the same
+login+interactive shell a pane-process command gets, so an rc-hook toolchain (mise/asdf/nvm) resolves
+identically either way, but as a CHILD, never `exec`, so herdr's own shell — the thing `agent start`
+attaches to — survives. It is issued without blocking the remaining tabs (a non-blocking setup delayed
+nothing when it was the pane's process, and must not start delaying them now), and a pane that never
+reaches a prompt is reported as a setup failure rather than left to time out the 10-minute wait for a
+status file that will never be written.
 The hook is idempotent (a per-checkout-path filesystem claim + a fresh 1-tab/1-pane
 guard + a per-workspace "decided" cache) and sits behind a **lean entry** (`src/cli/layout-hook.ts`,
 routed by `bin/herdr-factory`) that lazy-loads the heavy graph, so the constantly-firing focus event
@@ -343,12 +353,15 @@ reverse-engineered during the bash prototype.
   - `agentStart({workspaceId, cwd, argv, name, kind, env}) → paneId` where
     **`argv = [command, ...flags, prompt]`** (first token is the executable — the configured
     `agent.command`, default `claude`). herdr 0.7.5's `agent start` ADOPTS an existing pane, so this
-    is two steps: `tab create` (carrying the cwd + the env that used to ride on `agent start`, incl.
-    herdr's `HERDR_AGENT` foreground hint), then `agent start <name> --kind <k> --pane <id>`, which
+    is two steps: `tab create` (carrying the cwd + the env that used to ride on `agent start`), then
+    `agent start <name> --kind <k> --pane <id>`, which
     blocks until the harness is ready for input — retiring the old "sleep and hope the shell is up"
     guesswork. A failed adoption CLOSES the pane it created and answers null. The kind comes from
     argv[0]'s basename (`agentKindForArgv`) or an explicit `agent.kind`; a harness herdr can't adopt
-    (absolute path, wrapper script) is typed into the pane instead (`spawnStrategyForArgv`). The
+    (absolute path, wrapper script) is typed into the pane instead (`spawnStrategyForArgv`) — and
+    ONLY that typed path carries herdr's `HERDR_AGENT` foreground hint, which names the integration
+    when the process tree can't: on the adopt path the same hint makes the pane read as one that
+    already hosts an agent, and `agent start` answers `agent_pane_busy: … not an available shell`. The
     harness is the resolved [`agent:` config](../README.md#agent-optional) (step over belt over repo
     over the default `claude --dangerously-skip-permissions`), threaded through `StepConfig.agent`.
   - `agentAdopt(pane, {name, kind, args, timeoutMs}) → ready?` — the same bring-up into a pane that
@@ -565,9 +578,12 @@ CREATE TABLE runs(                       -- ONE attempt at a work item (history 
   belt TEXT, step TEXT,                  -- which belt processes it + the active step (v7)
   ticket_key TEXT NOT NULL,
   summary TEXT, issue_type TEXT, branch TEXT, phase TEXT NOT NULL,
-  workspace_id TEXT, pane_id TEXT, worktree_path TEXT, pr_number INTEGER,
-  resolver_active INTEGER NOT NULL DEFAULT 0, -- reviewing run holds a slot only while resolving (v17; replaced watch_deadline)
-  last_thread_sig TEXT,
+  workspace_id TEXT, pane_id TEXT, worktree_path TEXT,
+  -- PR-WATCH STATE IS NOT HERE: pr_number / resolver_active (a reviewing run holds a slot only
+  -- while resolving — v17, replaced watch_deadline) / last_thread_sig moved to run_products in
+  -- v18, keyed by product, so a future plugin watch-product carries its own. `Run.prNumber` &c.
+  -- still read the same because store.ts joins them back; a raw SQL reader must join
+  -- run_products ON run_id AND product = 'pull_request'.
   focus_pending INTEGER NOT NULL DEFAULT 0, -- active step changed; focus shift deferred (v5)
   -- worker_done/review_done/review_pane/progress_* (migrations v2-v3) are superseded
   -- by run_steps and left in place for history only.
@@ -752,11 +768,14 @@ worktree, stay deduped, and still poll for a PR merge) but **no longer hold a cl
 pile of runs waiting on humans must not starve the belt of new claims. History is never deleted
 (we set `ended_at`), so the web UI can show attempts, outcomes, and durations.
 
-**event types:** `claimed · transition · worktree_created · step_spawned · step_done ·
-layout_wait_retry · bounced · signal_queued · signal_rejected ·
-capture_attempt · evidence_uploaded · evidence_upload_failed · stale · human_question · human_reply ·
-focus_applied · pr_opened · resolver_woken · merged · closed · torn_down · belt_reassigned ·
-belt_deleted · attention · resumed · error`
+**event types** (the `EventType` union in `src/types.ts`): `claimed · transition · worktree_created ·
+layout_applied · layout_apply_failed · step_spawned · step_done · layout_wait_retry · bounced ·
+signal_queued · signal_rejected · capture_attempt · evidence_uploaded · evidence_upload_failed ·
+stale · intent_fulfilled · intent_deadline · human_question · human_reply · focus_applied ·
+pr_opened · resolver_woken · torn_down · belt_reassigned · belt_deleted · attention · resumed ·
+error`. **`merged` and `closed` are declared but never recorded** — a merge appears as
+`transition {to:"merged"}` followed by `torn_down {outcome:"merged"}`, which is what a reader should
+match on (the e2e suite asserts exactly that).
 (plus legacy `worker_*` / `review_*` kept for old-run history). `belt_reassigned` / `belt_deleted`
 are repo-scoped (run-id-less) audit events from the belt rename/delete admin (§9).
 
@@ -1053,6 +1072,16 @@ Each step is an agent (`core/step.ts`) dispatched **by the reconciler, never by
 another agent**, through the shared `dispatchToLayout(tab, pane, prompt, …)` helper. Per
 step (`spawnStep`):
 
+0. **Record the active step FIRST.** `run.step` is written before the dispatch, never after: a
+   dispatch BLOCKS until herdr reports the agent ready for input, and the agent's prompt already rode
+   in on its argv, so it can be working — and can signal — while the call is still outstanding. A
+   signal naming a step the run isn't on is rejected, and the run would then wait for a signal that
+   never comes again until its budget expired. The forward advance in `reconcileStep` always did
+   this; `reconcileClaiming` now agrees. The phase stays `claiming` until the dispatch lands (the
+   layout-wait path needs that), so "is this run still claiming?" is read from `isPreDispatchClaim` —
+   has ANY step of this run ever had a pane — rather than from `run.step == null`. That question is
+   asked of the run, never of `firstStep(belt)`: belts are edited mid-flight, and keying on the
+   current first step would read a run parked at a later step as an un-dispatched claim.
 1. **Dispatch** — two modes, by whether the step has a configured `tab`/`pane` (from the step's
    `steps[]` entry, resolved onto its `StepConfig`):
    - **Configured** (a pane the belt's layout built — see [§4](#4-herdr-ownership-boundary)): find
@@ -1628,6 +1657,41 @@ and `viaServerOrLocal` against an ephemeral `node:http` server — asserting it 
 server when reachable, falls back to in-process on `NoServerError`, and propagates a
 reached-server error rather than masking it with a fallback.
 
+### The end-to-end harness (`test/e2e/`, `scripts/e2e`)
+
+The unit suite proves the reconciler against fakes; it cannot prove the **system**. `scripts/e2e`
+builds a container (`docker/Dockerfile.e2e`: the `.node-version`-pinned Node, the pinned herdr Linux
+binary, the repo + its deps) and runs scenarios inside it against a **real headless `herdr server`**
+— real worktrees, real PTY panes, real agent adoption — driving the real `serve` daemon over the
+real SQLite. Only the outside world is substituted: GitHub is a `gh` shim over a local bare `origin`,
+and the step agents are a **scripted agent** that reads the *rendered prompt* and executes the signal
+command it finds there (which makes the suite a live check of the §14 agent-CLI contract).
+
+- **Hermetic worlds.** One per scenario under a deliberately SHORT root (`/h/<id>`, because herdr's
+  socket lives in its config dir and a long path overflows `sun_path`): its own HOME, herdr config,
+  `HERDR_FACTORY_CONFIG_DIR`/`_STATE_ROOT`, port, target checkout + bare origin, briefs folder, and a
+  bin dir first on PATH holding the fake `gh`, the agent shims and a `herdr` wrapper that records
+  every argv (the only way to observe notifications and pane display metadata). Panes inherit the
+  herdr **server's** environment, which is what makes an agent's `step-done` reach that world.
+- **Two lanes, two tiers, two drivers** — real herdr vs a shim, a scripted agent vs a local model,
+  the resident `serve` vs discrete `tick` calls. Default: real + scripted + `serve`, because the auth
+  gate's one-shot notify, per-source poll cadence, `viaServerOrLocal`'s server branch, `/evidence`
+  serving, hot reload and the single-instance bind exist **only** under `serve`.
+- **Time is compressed with config, never a fake clock** (`tick_interval_seconds: 1`, small
+  `budget_seconds`/`stall_seconds`/`layout_wait_seconds`). `core/layout.ts:345` mixes `deps.now()*1000`
+  with `Date.now()`, so an injected clock is unsafe on the layout path; the un-compressible waits
+  (`RETRY_BASE_SECONDS` 60, `PANE_ABSENCE_CONFIRM_SECONDS` 45, tick-stale ≥900s) are handled with the
+  operator endpoints (`POST /intents/:id/retry`, `/intents/recover`) or marked slow.
+- **Assertion surface**, in order of preference: the SQLite rows (`runs` + `run_products`,
+  `run_steps`, `events`, `intents`, `guard_counters`, `work_items`) → `GET /repos/:repo/obligations`
+  → the filesystem (worktree reaped, branch deleted, evidence bytes, the human inbox) → the argv
+  traces. No CLI command emits JSON except `eligible`, so scenarios read the DB and the HTTP API.
+
+Coverage today is the core flows (`w2pr-happy`, `custom-belt`, `layouts`) plus a pinned known bug;
+the attention/human-loop, source-parity, scale and local-model milestones are listed in
+[`test/e2e/README.md`](../test/e2e/README.md), which also records what the harness has already found
+about the engine.
+
 ---
 
 ## 14. Invariants to preserve
@@ -1776,6 +1840,17 @@ Hard-won from the bash prototype — encode as types/tests/asserts:
   release still writes — **contract only a release after** the last writer is gone. And every
   migration must carry in-flight runs forward (the v6 `work_source` backfill / v7 phase-widening
   precedent), never leave them unreconcilable.
+- **A run's ACTIVE STEP is recorded before its dispatch, and a REJECTED signal exits non-zero.**
+  Dispatch blocks on herdr's readiness while the agent already has its prompt, so the window between
+  "the agent can signal" and "the engine knows which step it is on" must not exist (§8). And a signal
+  the engine refuses must fail loudly: it used to print a note and exit 0, so an agent believed a
+  dropped `step-done` had landed, stopped, and the run sat until its step budget expired. Because
+  `run.step` is now set during `claiming`, nothing may infer the phase from it — use
+  `isPreDispatchClaim` (has any step of this RUN ever been dispatched; not a question about the
+  belt's current first step, which mid-flight belt edits change).
+- **`HERDR_AGENT` is set only on the TYPED (`run`) spawn path.** It names the integration when the
+  process tree can't. On the adopt path `--kind` already declares the harness, and the hint instead
+  makes the pane read as already-occupied — `agent start` then refuses it (`agent_pane_busy`).
 - **The agent-facing CLI surface is a cross-release compatibility contract.** Rendered prompts bake
   the exact `step-done` / `bounce` / `ask-human` / `evidence-upload` command lines (flags included)
   into agents already running in panes — and those agents outlive any number of auto-update

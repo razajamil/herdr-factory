@@ -268,8 +268,12 @@ export class HerdrClient {
     const name = opts.name ?? kind;
     // HERDR_AGENT is herdr's foreground-process hint (0.7.5 added macOS support): it tells herdr
     // which integration owns the pane when the process tree doesn't say so on its own — exactly the
-    // wrapped-harness case the `run` strategy exists for. Harmless when adoption already declared it.
-    const env = { ...opts.env, ...(strategy.kind ? { HERDR_AGENT: strategy.kind } : {}) };
+    // wrapped-harness case the `run` strategy exists for, and ONLY that case. It is not harmless on
+    // the adopt path: `agent start --kind` already declares the kind, and a pane whose env carries
+    // the hint reads to herdr as one that ALREADY hosts an agent — `agent start` then answers
+    // `agent_pane_busy: agent target pane <id> is not an available shell` (verified against herdr
+    // 0.7.5 while building the e2e harness).
+    const env = { ...opts.env, ...(strategy.mode === "run" && strategy.kind ? { HERDR_AGENT: strategy.kind } : {}) };
 
     let paneId: string;
     try {

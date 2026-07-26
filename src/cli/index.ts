@@ -127,6 +127,20 @@ async function dispatchSignal(repo: string, name: string, body: SignalBody): Pro
   return data as SignalResult;
 }
 
+/** Report a REJECTED signal as a failure: on stderr, with a non-zero exit.
+ *
+ *  The exit code is the only channel an agent has. A rejected `step-done` used to print a note and
+ *  exit 0, so the agent believed it had finished, stopped, and the run sat until its step budget
+ *  expired — the worst possible failure shape. Additive with respect to the cross-release agent CLI
+ *  contract (ARCHITECTURE §14): no command, flag or accepted spelling changes; only a *failure* stops
+ *  masquerading as success. Returns true when the caller should stop. */
+function signalRejected(key: string, d: SignalResult, fallback: string): boolean {
+  if (d.ok !== false) return false;
+  console.error(`${key}: ${d.message ?? fallback}`);
+  process.exitCode = 1;
+  return true;
+}
+
 /** Print each source's credential presence (no network — env-var presence only). Driven by each
  *  source type's descriptor secrets manifest, so there are no per-type branches (jira: JIRA_EMAIL +
  *  JIRA_API_TOKEN; sentry: SENTRY_AUTH_TOKEN; local_markdown: none). github_issues has a gh-CLI
@@ -539,7 +553,7 @@ program
   .action(cliAction("step-done", async (key: string, step: string, opts: { source?: string; pass?: string }) => {
     try {
       const d = await dispatchSignal(requireRepo(), "step-done", { key, step, source: opts.source, pass: opts.pass });
-      if (d.ok === false) console.log(`${key}: ${d.message ?? "no active run"}`);
+      signalRejected(key, d, "no active run");
     } catch (e) {
       fail(e);
     }
@@ -555,10 +569,7 @@ program
     try {
       const question = humanQuestionText(opts);
       const d = await dispatchSignal(requireRepo(), "ask-human", { key, step, source: opts.source, question });
-      if (d.ok === false) {
-        console.log(`${key}: ${d.message ?? "no active run"}`);
-        return;
-      }
+      if (signalRejected(key, d, "no active run")) return;
       if (d.queued) {
         // The durable intent is recorded; the next reconcile pass posts it. Nothing else to do.
         console.log(`${key}: ${d.message}`);
@@ -583,10 +594,7 @@ program
     try {
       const reason = bounceReasonText(opts);
       const d = await dispatchSignal(requireRepo(), "bounce", { key, toStep, source: opts.source, reason, step: opts.step, pass: opts.pass });
-      if (d.ok === false) {
-        console.log(`${key}: ${d.message ?? "bounce failed"}`);
-        return;
-      }
+      if (signalRejected(key, d, "bounce failed")) return;
       if (d.queued) {
         // The durable intent is recorded; the next reconcile pass applies it. The agent can stop.
         console.log(`${key}: ${d.message}`);
@@ -609,10 +617,7 @@ program
   .action(cliAction("capture-attempt", async (key: string, step: string, opts: { source?: string }) => {
     try {
       const d = await dispatchSignal(requireRepo(), "capture-attempt", { key, step, source: opts.source });
-      if (d.ok === false) {
-        console.log(`${key}: ${d.message ?? "capture-attempt failed"}`);
-        return;
-      }
+      if (signalRejected(key, d, "capture-attempt failed")) return;
       if (d.escalated) {
         console.log(`${key}: ${d.message}`); // cap hit → parked for attention, NOT cleared to capture
         return;

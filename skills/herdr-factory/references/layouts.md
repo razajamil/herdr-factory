@@ -58,7 +58,7 @@ layouts:
 |---|---|---|---|
 | `id` | string, trimmed, min 1 | **required** | Unique across `layouts`; what a belt's `default_layout`/`layout_matching` references. |
 | `env` | map of scalars | `{}` | Environment for **every** pane in this layout (a pane's own `env` wins). |
-| `setup.command` | string, trimmed, min 1 | **required inside `setup`** | Runs once, in the single `setup: true` pane, **before** that pane's own `command`. |
+| `setup.command` | string, trimmed, min 1 | **required inside `setup`** | Runs once, in the single `setup: true` pane, **before** that pane's own `command`. On an **agent** pane it is executed *in* the pane (`pane run`, through the same login shell, as a child) instead of being baked into the pane's process — an agent can only be started in a pane that is sitting at herdr's own shell. If that pane never reaches a prompt the setup is reported as failed rather than silently waited out. |
 | `setup.blocking` | bool | `false` | The builder waits for it (cap `SETUP_TIMEOUT_MS` = 600 s) before **any** pane `command` or `agent` starts. (The topology is already fully built by then — see [what the builder issues](#what-the-builder-actually-issues).) |
 | `tabs[]` | array | **required**, min 1 | `a layout needs at least one tab` |
 | `tabs[].title` | string, trimmed, min 1 | *optional* | The herdr tab label. **Untitled ⇒ unaddressable by a step.** |

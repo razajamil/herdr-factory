@@ -2,7 +2,7 @@ import { describe, it, expect, afterEach } from "vitest";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { globMatch, resolveBeltLayout, tabTree, splitRatio, clampRatio, applyLayout, deriveAgentName, HAND_BACK } from "../src/core/layout.ts";
+import { globMatch, resolveBeltLayout, tabTree, splitRatio, clampRatio, applyLayout, deriveAgentName, setupScript, HAND_BACK } from "../src/core/layout.ts";
 import type { BeltConfig, LayoutAgent, LayoutConfig, LayoutPane, LayoutTab } from "../src/config.ts";
 import type { LayoutNode } from "../src/types.ts";
 import type { Deps } from "../src/core/deps.ts";
@@ -165,11 +165,21 @@ describe("tabTree — pane commands and agent panes", () => {
     expect(s.indexOf("/state/s.status")).toBeLessThan(s.indexOf("npm run dev"));
   });
 
-  it("an agent pane that also runs setup still ends at a prompt (agent start needs one)", () => {
+  it("an agent pane that also runs setup gets NO script — herdr can't adopt into a re-exec'd shell", () => {
+    // Baking setup in would make the pane's process a wrapper ending in `exec $SHELL -i`, which
+    // `agent start` accepts and then never launches an agent into (60s timeout → layout_wait_timeout
+    // park). The runner runs `setupScript` IN the pane instead; the pane itself stays a plain shell.
     const tab: LayoutTab = { panes: [pane({ agent: { kind: "claude", args: [] }, setup: true })] };
-    const s = script(tabTree(tab, { setup: { command: "npm ci", statusPath: "/s" } }))!;
-    expect(s.startsWith("npm ci; ")).toBe(true);
-    expect(s.endsWith(HAND_BACK)).toBe(true);
+    const tree = tabTree(tab, { setup: { command: "npm ci", statusPath: "/s" } });
+    expect(script(tree)).toBeUndefined();
+    // What gets RUN in the pane instead: the same login+interactive shell a pane-process command
+    // gets, so rc-hook toolchains (mise/asdf/nvm) resolve identically — but as a CHILD, never `exec`,
+    // because the pane's own shell is what `agent start` attaches to.
+    const line = setupScript({ command: "npm ci", statusPath: "/s" });
+    expect(line).toMatch(/^"\$\{SHELL:-\/bin\/sh\}" -lic /);
+    expect(line.startsWith("exec ")).toBe(false);
+    expect(line).toContain("npm ci");
+    expect(line).toContain("/s");
   });
 
   it("carries the pane's env and survives a command containing quotes", () => {
@@ -205,6 +215,7 @@ describe("applyLayout", () => {
         return { tabId: `TAB${tab++}`, paneIds: leaves };
       },
       paneAtShellPrompt: async () => true,
+      paneRun: async (id: string, cmd: string) => void rec.push(`paneRun ${id} ${cmd}`),
       agentAdopt: async (id: string, o: { name: string; kind: string; args?: readonly string[]; timeoutMs?: number }) => {
         rec.push(`agentAdopt ${id} name=${o.name} kind=${o.kind} args=${(o.args ?? []).join(" ")} timeout=${o.timeoutMs ?? ""}`);
         return true;
@@ -305,24 +316,66 @@ describe("applyLayout", () => {
     const root = mkdtempSync(join(tmpdir(), "hf-state-"));
     tmps.push(root);
     process.env.HERDR_FACTORY_STATE_ROOT = root;
-    // Stand in for the pane's script having finished: the status is already recorded when the runner
-    // looks (`uid1` is the stubbed build token).
+    // The status file appears BECAUSE the setup ran in the pane — the stub writes it when `pane run`
+    // is issued, which is the real sequence (an agent setup pane has no script of its own to write it).
     const statusPath = join(root, "layout-hook", "setup", "uid1.status");
     mkdirSync(join(root, "layout-hook", "setup"), { recursive: true });
-    writeFileSync(statusPath, "0");
 
     const rec: string[] = [];
     await applyLayout(
-      stubDeps(rec),
+      stubDeps(rec, {
+        paneRun: async (id: string, cmd: string) => {
+          rec.push(`paneRun ${id} ${cmd}`);
+          writeFileSync(statusPath, "0");
+        },
+      }),
       { workspaceId: "W", rootTabId: "T0" },
       { id: "p", setup: { command: "npm ci", blocking: false }, tabs: [{ title: "t", panes: [{ ...agentPane("a"), setup: true }] }] },
     );
+    // An AGENT setup pane is handed a plain shell and the setup command is RUN in it, so the pane
+    // stays adoptable; the run happens before the wait, and the agent only starts once setup exits.
+    const ran = rec.findIndex((r) => r.startsWith("paneRun t0 ") && r.includes("npm ci") && r.includes(statusPath));
+    expect(ran, "the setup command was run IN the pane").toBeGreaterThanOrEqual(0);
+    expect(ran).toBeLessThan(rec.indexOf(`display t0 {"hf_setup":null}`));
     // The pane is flagged while setup runs, and the token is cleared once it exits 0 — and the agent
     // is only started after that (herdr can't start one in a pane that is still running a command).
     expect(rec).toContain(`display t0 {"hf_setup":"running"}`);
     expect(rec).toContain(`display t0 {"hf_setup":null}`);
     expect(rec.indexOf(`display t0 {"hf_setup":null}`)).toBeLessThan(rec.findIndex((r) => r.startsWith("agentAdopt")));
     expect(existsSync(statusPath)).toBe(false); // consumed, so a later build can't read a stale status
+  });
+
+  it("runs a LATER tab's agent setup pane IN the pane, and a blocking setup still gates every agent", async () => {
+    // Covers the setupPaneId/setupRun interaction when the setup pane isn't in tab 0, and that the
+    // blocking wait still happens before ANY agent starts even though the command is no longer the
+    // pane's own process.
+    const root = mkdtempSync(join(tmpdir(), "hf-state-"));
+    tmps.push(root);
+    process.env.HERDR_FACTORY_STATE_ROOT = root;
+    const statusPath = join(root, "layout-hook", "setup", "uid1.status");
+    mkdirSync(join(root, "layout-hook", "setup"), { recursive: true });
+
+    const rec: string[] = [];
+    await applyLayout(
+      stubDeps(rec, {
+        paneRun: async (id: string) => {
+          rec.push(`paneRun ${id}`);
+          writeFileSync(statusPath, "0");
+        },
+      }),
+      { workspaceId: "W", rootTabId: "T0" },
+      {
+        id: "p",
+        setup: { command: "npm ci", blocking: true },
+        tabs: [
+          { title: "a", panes: [agentPane("first")] },
+          { title: "b", panes: [{ ...agentPane("second"), setup: true }] },
+        ],
+      },
+    );
+    expect(rec).toContain("paneRun t1"); // the setup pane is tab 1's pane, and it was run there
+    expect(rec.indexOf("layoutApply tab= ws=W label=b")).toBeLessThan(rec.indexOf("paneRun t1"));
+    expect(rec.indexOf("paneRun t1")).toBeLessThan(rec.findIndex((r) => r.startsWith("agentAdopt")));
   });
 
   it("reports a failed setup on the pane and notifies, without failing the build", async () => {

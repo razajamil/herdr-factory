@@ -859,6 +859,17 @@ async function reconcileClaiming(deps: Deps, run: Run, belt: BeltRuntime, src: S
   const first = firstStep(belt);
   if (!deps.store.getRunStep(run.id, first.name)?.paneId) {
     await materializeWork(deps, run, src);
+    // Record the ACTIVE STEP before dispatching, not after. `spawnStep` blocks until herdr reports
+    // the agent ready for input — and the prompt already rode in on its argv — so the agent can be
+    // working, and can even signal, while this call is still outstanding. A signal naming a step the
+    // run isn't on is rejected ("not the run's active step"), and the run then waits for a signal
+    // that never comes again until its budget expires. Every later step already sets `step` before
+    // its dispatch (see the forward advance in reconcileStep); this makes the first one agree.
+    // The PHASE stays `claiming` until the dispatch lands — the layout-wait path depends on it —
+    // so "still claiming" is now read from the first step's pane id (`isPreDispatchClaim`), which is
+    // what `run.step == null` used to stand for.
+    deps.store.updateRun(run.id, { step: first.name });
+    run = deps.store.getRun(run.id)!;
     const res = await spawnStep(deps, run, belt, src, first.name);
     if (res.status === "waiting") return handleLayoutWait(deps, run, belt, first);
     run = deps.store.getRun(run.id)!;
@@ -873,6 +884,21 @@ async function reconcileClaiming(deps: Deps, run: Run, belt: BeltRuntime, src: S
   // belt_start: entering the first step. Engine default in_development, overridable by a belt effect
   // on entering that step (e.g. a custom "picked up" status).
   await fireEffect(deps, run, belt, src, { on: "enter", step: first.name }, "in_development");
+}
+
+/** Is this run still in its INITIAL CLAIM — has NO step of it ever been dispatched?
+ *
+ *  `run.step` is now set before the first dispatch (so a fast agent's signal isn't rejected against an
+ *  empty active step), so it can no longer stand in for "is this run still claiming?". A pane id is
+ *  the durable marker of a dispatch: written by the first successful one and KEPT across re-entries,
+ *  so a bounce back to the first step reads as `running`, not as a fresh claim.
+ *
+ *  Asked of the RUN, never of the belt's current first step: belts are edited mid-flight (steps get
+ *  reordered, renamed, prepended — §7), and keying on `firstStep(belt)` would then read an advanced
+ *  run that is parked at a later step as an un-dispatched claim, re-materialize its work doc and
+ *  dispatch the new first step, abandoning the step it was actually parked on. */
+function isPreDispatchClaim(deps: Deps, run: Run): boolean {
+  return !deps.store.runStepsFor(run.id).some((s) => s.paneId);
 }
 
 /** Park a run for human attention: flip phase, record the reason, fire a notification, and put
@@ -1860,7 +1886,7 @@ async function reconcileAttention(deps: Deps, run: Run, belt: BeltRuntime, src: 
       // Re-arm the wait window: handleLayoutWait measures from started_at, so without this the
       // ancient clock would re-expire on the very next pass and burn the budget in a few ticks.
       deps.store.upsertRunStep(run.id, step.name, { startedAt: deps.now(), absentAt: null });
-      const phase: Run["phase"] = run.step ? "running" : "claiming";
+      const phase: Run["phase"] = isPreDispatchClaim(deps, run) ? "claiming" : "running";
       deps.store.updateRun(run.id, { phase, attentionReason: null });
       deps.store.recordEvent({
         runId: run.id,
@@ -1946,7 +1972,7 @@ export async function resumeRun(deps: Deps, run: Run): Promise<{ ok: boolean; ph
     // waiting with a fresh poll window instead.
     deps.store.resetHumanPollBackoff(pendingQuestion.id);
     phase = "waiting_for_human";
-  } else if (run.step && stepByName(belt, run.step)) {
+  } else if (run.step && stepByName(belt, run.step) && !isPreDispatchClaim(deps, run)) {
     // Fresh slate on human resume: re-base every watch clock that declares a resume rebase
     // (budget/heartbeat/read-only) AND reset every counter guard that declares a resume refund
     // (the flaky-capture cap, the layout-wait respawn budget) — a human just intervened, so a

@@ -117,8 +117,11 @@ describe("HerdrClient.agentStart — WE create the pane, herdr adopts the agent 
     expect(valueOf(tab, "--cwd")).toBe("/wt");
     expect(valueOf(tab, "--label")).toBe("work-k-1");
     expect(tab).toContain("--no-focus");
-    // The env that used to ride on `agent start` moves here — plus herdr's foreground-process hint.
-    expect(pairs(tab, "--env")).toEqual({ HERDR_FACTORY_TICKET: "K-1", HERDR_AGENT: "claude" });
+    // The env that used to ride on `agent start` moves here — and NOTHING else. herdr's
+    // HERDR_AGENT foreground-process hint must NOT be set on the adopt path: `--kind` already
+    // declares the harness, and a pane whose env carries the hint reads to herdr as one that already
+    // hosts an agent, so `agent start` refuses it (`agent_pane_busy: … not an available shell`).
+    expect(pairs(tab, "--env")).toEqual({ HERDR_FACTORY_TICKET: "K-1" });
 
     const start = invocation("agent start")!;
     expect(start.slice(0, 3)).toEqual(["agent", "start", "work-k-1"]); // herdr's agent NAME, not the kind
@@ -142,6 +145,15 @@ describe("HerdrClient.agentStart — WE create the pane, herdr adopts the agent 
     expect(pane).toBe("w1:p9");
     expect(invocation("agent start")).toBeUndefined();
     expect(invocation("pane run")).toEqual(["pane", "run", "w1:p9", `'bin/my-agent' '--go' 'P'`]);
+  });
+
+  it("sets herdr's HERDR_AGENT hint only for a TYPED harness — the case it exists for", async () => {
+    // An absolute path is typed into the pane (`run`), and its process tree doesn't tell herdr which
+    // integration owns it — the hint does. On the adopt path above the same hint would instead make
+    // the pane read as already-occupied, so it is set here and only here.
+    await new HerdrClient(bin).agentStart({ workspaceId: "w1", cwd: "/wt", argv: ["/opt/homebrew/bin/claude", "P"] });
+    expect(invocation("pane run")).toBeDefined(); // i.e. the `run` strategy
+    expect(pairs(invocation("tab create")!, "--env")).toEqual({ HERDR_AGENT: "claude" });
   });
 });
 

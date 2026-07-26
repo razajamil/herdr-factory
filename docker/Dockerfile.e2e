@@ -1,0 +1,52 @@
+# Image for the herdr-factory end-to-end harness (test/e2e). Built and run by scripts/e2e.
+#
+# The suite runs INSIDE this container: `serve` binds 127.0.0.1 only, and each scenario spawns a
+# real herdr server, real git worktrees and real PTY panes. Nothing here talks to the network at
+# test time — GitHub is a `gh` shim, Jira/Sentry are local HTTP fakes, `origin` is a bare repo.
+#
+# Pinned on purpose: the tag matches .node-version exactly (native type-stripping + node:sqlite
+# behaviour is version-sensitive), and HERDR_VERSION pins the herdr release whose CLI contract the
+# harness asserts. Do not float either.
+FROM node:26.4.0-bookworm-slim
+
+# git      — worktrees, the bare `origin`, src/version.ts, doctor's auto-update check
+# curl     — herdr download at build time; scenario probes of the resident server at test time
+# procps   — RSS/FD sampling in the resource-soak scenario
+# jq       — shell-side assertions and the fake `gh`/`herdr` shims
+# less     — git's default pager; without it some git plumbing complains under a PTY
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      git curl ca-certificates procps jq less \
+    && rm -rf /var/lib/apt/lists/* \
+    && npm i -g pnpm@11 --silent
+
+ARG HERDR_VERSION=0.7.5
+ENV HERDR_VERSION=${HERDR_VERSION}
+RUN set -eux; arch="$(uname -m)"; \
+    case "$arch" in aarch64|arm64) a=linux-aarch64 ;; x86_64|amd64) a=linux-x86_64 ;; *) echo "unsupported $arch" >&2; exit 1 ;; esac; \
+    curl -fsSL -o /usr/local/bin/herdr "https://github.com/ogulcancelik/herdr/releases/download/v${HERDR_VERSION}/herdr-${a}"; \
+    chmod +x /usr/local/bin/herdr; herdr --version
+
+WORKDIR /opt/hf
+
+# Dependencies first so an edit to src/ or test/ does not re-resolve the store.
+# pnpm 11 is required: pnpm-workspace.yaml uses the pnpm-11 `allowBuilds:` key.
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
+RUN pnpm install --frozen-lockfile
+
+COPY . /opt/hf
+
+# The CLI is normally reached through a symlink an install puts on PATH; do the same so scenarios
+# (and the agent shims they render into prompts) can call `herdr-factory` by bare name.
+RUN ln -sf /opt/hf/bin/herdr-factory /usr/local/bin/herdr-factory
+
+# Hermetic worlds live under /h — HOME=/h/<id>. It has to be SHORT: a long herdr config dir
+# overflows the unix-socket sun_path limit and the herdr server dies at boot.
+RUN mkdir -p /h && chmod 1777 /h
+
+# Never let the suite race an auto-update against itself; the panes are real PTYs, so give them a
+# terminfo entry that exists in bookworm-slim.
+ENV HERDR_FACTORY_AUTO_UPDATE=0 \
+    TERM=xterm-256color \
+    CI=1
+
+WORKDIR /opt/hf

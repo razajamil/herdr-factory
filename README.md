@@ -965,7 +965,8 @@ belt:
   agent — an `agent:` kind, or a `command` that launches one — which the config loader checks when you
   save. `split` is `vertical`/`right` or `horizontal`/`down`; `size` is a `"30%"` percentage, a `0<n<1`
   fraction, or an integer cell count. At most one pane may be `setup: true` — the layout-level
-  `setup.command` runs there first (`blocking: true` waits for it to finish before any other pane's
+  `setup.command` runs there first (on an **agent** pane it is executed *in* the pane rather than as the
+  pane's process, so herdr can still start the agent there) (`blocking: true` waits for it to finish before any other pane's
   command or agent starts; an agent on the setup pane always waits for it).
 - **Selection** — a belt builds its `default_layout`, unless an earlier `layout_matching` glob
   matches the worktree's branch. A hand-created worktree (no owning run) resolves by walking the
@@ -1289,10 +1290,33 @@ unchanged.
 ```sh
 git clone git@github.com:razajamil/herdr-factory.git && cd herdr-factory
 pnpm install                 # Node ≥ 26 (.node-version pins 26.4.0)
-npm test                     # vitest
+npm test                     # vitest — the fast unit suite
 npm run typecheck
 npm run schema               # regenerate the committed config.schema.json
+scripts/e2e                  # the end-to-end suite, in a container (see below)
 ```
+
+### The end-to-end suite
+
+`npm test` proves the reconciler against fakes. **`scripts/e2e`** proves the factory: it builds a
+container (pinned Node + pinned herdr Linux binary) and runs whole belts against a **real headless
+`herdr server`** — real worktrees, real PTY panes, real agents signalling through the real CLI, real
+`serve`, real SQLite. Only the outside world is substituted: GitHub is a `gh` shim over a local bare
+`origin`, and the step agents are a scripted agent that **reads the rendered prompt and runs the
+signal command it finds there** (so the suite also guards the agent-CLI contract). A full belt —
+brief → work → review → pr → merged → teardown — runs in about 17 seconds.
+
+```sh
+scripts/e2e                                   # everything; artifacts in artifacts/e2e/<ts>/
+scripts/e2e --scenario w2pr-happy --keep      # one scenario, keep its world
+scripts/e2e --no-build -- --reporter=verbose  # iterate without rebuilding
+```
+
+Results are machine-readable (`summary.md`, `results.json`, `junit.xml`) and every scenario keeps its
+SQLite DB, engine log, herdr server log, agent transcript, rendered prompts and `gh`/`herdr` argv
+traces for post-mortem. Nothing touches your real install: each scenario gets its own HOME, herdr
+config, config dir, state root and port. See [`test/e2e/README.md`](test/e2e/README.md) for the
+scenario list, how to write one, and what the harness has already found.
 
 The engine is TypeScript run directly via Node's native type-stripping (no build step), state in
 the built-in `node:sqlite` (no native modules). Design and invariants:

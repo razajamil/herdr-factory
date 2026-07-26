@@ -44,7 +44,7 @@ Sections, in order:
 4. `## This is a read-only step (no commits)` — **only** for a `custom` step with `read_only: true`. `evidence`/`review` describe their own posture in their base prompts, so the note is suppressed there. Names the enforcement: HEAD movement during the step parks the run as a read-only violation.
 5. `## Asking a human for guidance` — write `human-question-<step>.md`, run the ask-human command, stop; the dispatcher posts the question through the work source, writes the answer under `human-replies/`, and resumes the **same** step.
 6. `## Sending the work back for rework` — only when the step can bounce. Write `bounce-<step>.md`, run the bounce command, stop; names the target step and mentions the per-run bounce cap as a backstop.
-7. `## Finishing this step (required)` — (1) write `handoff-<step>.md` (what you did, key decisions and why, uncertainties, what the next step should verify); (2) run the step-done command and stop; "Do NOT change the work item's status — the dispatcher owns all status transitions."
+7. `## Finishing this step (required)` — (1) write `handoff-<step>.md` (what you did, key decisions and why, uncertainties, what the next step should verify); (2) run the step-done command and stop; "Do NOT change the work item's status — the dispatcher owns all status transitions." Plus: if the signal command exits non-zero it prints why on stderr — the agent is told to fix what it names and run it again rather than stop (a rejected signal is the one thing that can silently strand a finished step).
 
 ### The precedence rule the scaffold asserts
 

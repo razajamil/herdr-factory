@@ -1,0 +1,214 @@
+#!/usr/bin/env bash
+# One command for the herdr-factory end-to-end suite: build the container image, run the scenarios
+# inside it, collect artifacts back onto the host.
+#
+# The suite MUST run in the container — `serve` binds 127.0.0.1 only, herdr needs a Linux binary and
+# the panes are real PTYs — so this script's whole job is to get flags in and artifacts out.
+#
+# What actually executes is the image's own /opt/hf copy of the repo, baked at build time. Nothing is
+# bind-mounted over the source, so a scenario can never dirty the host working tree; the single mount
+# is the artifacts directory, going out. That also means an un-built source edit is invisible until
+# the next build — which is why --no-build is opt-in rather than the default.
+set -euo pipefail
+
+IMAGE_DEFAULT="hf-e2e:local"
+DOCKERFILE="docker/Dockerfile.e2e"
+ROOT="$(cd -P "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+usage() {
+  cat <<'EOF'
+Usage: scripts/e2e [options] [-- <extra vitest args>]
+
+Build the e2e image and run the end-to-end scenarios inside it.
+
+Options:
+  --scenario <name>   Run only scenarios whose name matches <name> (vitest -t filter).
+  --lane real|fake    Herdr lane. real = the real herdr binary (default); fake = the shim, for
+                      failure injection and scale. Exported as HF_E2E_LANE.
+  --tier scripted|ds4 Agent tier. scripted = the deterministic agent shim (default); ds4 = the
+                      local DeepSeek V4 model lane, non-gating. Exported as HF_E2E_TIER.
+  --keep              Keep each scenario's world directory (copied into the artifacts).
+                      Exported as HF_E2E_KEEP=1.
+  --no-build          Skip `docker build` and reuse the existing image.
+  --shell             Build, then drop into an interactive bash in the image instead of running the
+                      suite. /artifacts is still mounted.
+  --image <tag>       Image tag to build and run (default: hf-e2e:local).
+  --                  Everything after this is passed straight through to vitest.
+  -h, --help          This text.
+
+Environment overrides:
+  HERDR_VERSION       herdr release baked into the image (default: the Dockerfile's ARG).
+  HF_E2E_SLOW=1       Also run scenarios marked `slow` (ones that wait out an engine clock the
+                      config cannot compress). Forwarded into the container.
+  HF_DS4_BASE_URL     --tier ds4 endpoint (default http://host.docker.internal:8000/v1)
+  HF_DS4_MODEL        --tier ds4 model    (default deepseek-v4-flash)
+  HF_DS4_API_KEY      --tier ds4 key      (default dsv4-local)
+
+Artifacts land in artifacts/e2e/<UTC timestamp>/ with artifacts/e2e/latest pointing at the newest
+run: results.json, junit.xml, summary.md, suite.log and scenarios/<name>/.
+
+Examples:
+  scripts/e2e
+  scripts/e2e --scenario w2pr-happy --lane real --keep
+  scripts/e2e --tier ds4 --scenario ds4-w2pr
+  scripts/e2e --no-build -- --reporter=verbose
+EOF
+}
+
+# ---------------------------------------------------------------------------- flags
+
+scenario=""
+lane="real"
+tier="scripted"
+keep=0
+build=1
+shell_mode=0
+image="$IMAGE_DEFAULT"
+passthrough=()
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --scenario)
+      [ "$#" -ge 2 ] || { echo "e2e: --scenario needs a value" >&2; exit 2; }
+      scenario="$2"; shift 2 ;;
+    --scenario=*) scenario="${1#*=}"; shift ;;
+    --lane)
+      [ "$#" -ge 2 ] || { echo "e2e: --lane needs a value" >&2; exit 2; }
+      lane="$2"; shift 2 ;;
+    --lane=*) lane="${1#*=}"; shift ;;
+    --tier)
+      [ "$#" -ge 2 ] || { echo "e2e: --tier needs a value" >&2; exit 2; }
+      tier="$2"; shift 2 ;;
+    --tier=*) tier="${1#*=}"; shift ;;
+    --image)
+      [ "$#" -ge 2 ] || { echo "e2e: --image needs a value" >&2; exit 2; }
+      image="$2"; shift 2 ;;
+    --image=*) image="${1#*=}"; shift ;;
+    --keep) keep=1; shift ;;
+    --no-build) build=0; shift ;;
+    --shell) shell_mode=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    --) shift; passthrough=("$@"); break ;;
+    *) echo "e2e: unknown option '$1' (try --help)" >&2; exit 2 ;;
+  esac
+done
+
+case "$lane" in real|fake) ;; *) echo "e2e: --lane must be 'real' or 'fake', got '$lane'" >&2; exit 2 ;; esac
+case "$tier" in scripted|ds4) ;; *) echo "e2e: --tier must be 'scripted' or 'ds4', got '$tier'" >&2; exit 2 ;; esac
+
+# Preconditions first, before anything is created on disk — a rejected invocation must leave no
+# empty artifacts directory behind.
+command -v docker >/dev/null 2>&1 || { echo "e2e: docker is not on PATH" >&2; exit 127; }
+[ -f "$ROOT/$DOCKERFILE" ] || { echo "e2e: missing $DOCKERFILE" >&2; exit 1; }
+if [ "$build" -eq 0 ] && ! docker image inspect "$image" >/dev/null 2>&1; then
+  echo "e2e: --no-build but image '$image' does not exist (drop --no-build to build it)" >&2
+  exit 1
+fi
+
+# ---------------------------------------------------------------------------- artifacts
+
+stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+host_artifacts="$ROOT/artifacts/e2e/$stamp"
+mkdir -p "$host_artifacts/scenarios"
+# Relative target so the link survives the tree being moved or mounted elsewhere.
+ln -sfn "$stamp" "$ROOT/artifacts/e2e/latest"
+
+# Printed on every exit path, success or failure — a red run is exactly when you need the path.
+on_exit() {
+  local code=$?
+  echo ""
+  echo "e2e: artifacts -> $host_artifacts"
+  echo "e2e:              $ROOT/artifacts/e2e/latest (symlink)"
+  [ -f "$host_artifacts/summary.md" ] && echo "e2e: summary   -> $host_artifacts/summary.md"
+  exit "$code"
+}
+trap on_exit EXIT
+
+# ---------------------------------------------------------------------------- build
+
+herdr_version_arg="${HERDR_VERSION:-}"
+if [ "$build" -eq 1 ]; then
+  echo "e2e: building $image from $DOCKERFILE"
+  build_args=()
+  [ -n "$herdr_version_arg" ] && build_args+=(--build-arg "HERDR_VERSION=$herdr_version_arg")
+  docker build -f "$ROOT/$DOCKERFILE" -t "$image" ${build_args[@]+"${build_args[@]}"} "$ROOT"
+else
+  echo "e2e: reusing existing image $image (source edits since the last build are NOT in it)"
+fi
+
+image_id="$(docker image inspect "$image" --format '{{.Id}}' 2>/dev/null || echo unknown)"
+
+# Ask the image what it actually contains rather than restating the Dockerfile — the report footer
+# has to be honest about the versions under test.
+probe="$(docker run --rm "$image" bash -lc \
+  'printf "%s\t%s\n" "$(node --version)" "$(herdr --version 2>&1 | head -1)"' 2>/dev/null || true)"
+node_version="${probe%%$'\t'*}"
+herdr_version="${probe#*$'\t'}"
+[ "$node_version" = "$probe" ] && { node_version="unknown"; herdr_version="unknown"; }
+
+# ---------------------------------------------------------------------------- run
+
+run_args=(
+  --rm
+  --init
+  -e "HF_E2E_LANE=$lane"
+  -e "HF_E2E_TIER=$tier"
+  -e "HF_E2E_KEEP=$keep"
+  # Opt-in for scenarios that wait out an engine clock the config can't compress (the 60s first
+  # outbox retry, the 45s pane-absence confirmation). Forwarded from the caller's environment.
+  -e "HF_E2E_SLOW=${HF_E2E_SLOW:-0}"
+  -e "HF_E2E_ARTIFACTS=/artifacts"
+  -e "HF_E2E_IMAGE=$image"
+  -e "HF_E2E_IMAGE_ID=$image_id"
+  -e "HF_E2E_NODE_VERSION=$node_version"
+  -e "HF_E2E_HERDR_VERSION=$herdr_version"
+  -v "$host_artifacts:/artifacts"
+  -w /opt/hf
+)
+
+# Tier 2 reaches the user's local DeepSeek V4 endpoint on the host. host-gateway is what makes
+# host.docker.internal resolve on plain Linux engines as well as Docker Desktop.
+if [ "$tier" = "ds4" ]; then
+  run_args+=(
+    --add-host "host.docker.internal:host-gateway"
+    -e "HF_DS4_BASE_URL=${HF_DS4_BASE_URL:-http://host.docker.internal:8000/v1}"
+    -e "HF_DS4_MODEL=${HF_DS4_MODEL:-deepseek-v4-flash}"
+    -e "HF_DS4_API_KEY=${HF_DS4_API_KEY:-dsv4-local}"
+  )
+fi
+
+# A TTY makes the vitest default reporter readable — but only claim one when we have one.
+[ -t 0 ] && [ -t 1 ] && run_args+=(-it)
+
+if [ "$shell_mode" -eq 1 ]; then
+  echo "e2e: dropping into a shell in $image (the suite is NOT run)"
+  echo "e2e: inside, the suite is:  npx vitest run --config test/e2e/vitest.e2e.config.ts"
+  set +e
+  docker run "${run_args[@]}" "$image" bash -l
+  exit $?
+fi
+
+vitest_cmd=(npx vitest run --config test/e2e/vitest.e2e.config.ts)
+[ -n "$scenario" ] && vitest_cmd+=(-t "$scenario")
+vitest_cmd+=(${passthrough[@]+"${passthrough[@]}"})
+
+echo "e2e: lane=$lane tier=$tier keep=$keep scenario=${scenario:-<all>}"
+echo "e2e: node=$node_version herdr=$herdr_version image=$image"
+echo "e2e: ${vitest_cmd[*]}"
+
+# The suite's exit code is what this script returns, but summary.md is rendered either way — the
+# report matters most on a failure. Rendered inside the container so it runs on the image's Node 26
+# and sees the same paths the scenarios wrote.
+set +e
+docker run "${run_args[@]}" "$image" bash -lc '
+  set -o pipefail
+  "$@" 2>&1 | tee /artifacts/suite.log
+  code=$?
+  node test/e2e/harness/report.ts /artifacts >/dev/null 2>&1 \
+    || echo "e2e: warning: could not render summary.md" >&2
+  exit $code
+' _ "${vitest_cmd[@]}"
+suite_code=$?
+set -e
+
+exit "$suite_code"

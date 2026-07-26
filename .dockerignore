@@ -1,0 +1,31 @@
+# Build context for docker/Dockerfile.e2e (the e2e harness image).
+#
+# node_modules MUST stay out: the host tree is darwin-arm64 and carries mac-only optional deps
+# (@opentui/core-darwin-*, rolldown/oxc bindings). The image installs its own Linux set with
+# `pnpm install --frozen-lockfile`, and a copied-in mac tree would shadow it.
+node_modules
+**/node_modules
+
+# .git is deliberately NOT ignored. src/version.ts stamps the running version from `git rev-parse`
+# in the package dir, and `doctor`'s auto-update check runs git there too — a .git-less image
+# reports a bare version and fails that check, which the suite asserts on. It is ~11 MB.
+
+# Harness output and local scratch.
+artifacts
+*.log
+*.tsbuildinfo
+dist
+coverage
+
+# Per-run working memory the engine owns (see .gitignore).
+.memory
+
+# OS / editor junk.
+.DS_Store
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+*.swp
+.idea
+.vscode

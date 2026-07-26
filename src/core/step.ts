@@ -450,7 +450,15 @@ function scaffold(
     `\n## Finishing this step (required)\n` +
     `1. Write your handoff note to \`${MEMORY_DIR}/handoff-${step.name}.md\` — what you did, key decisions and why, ` +
     `anything uncertain, and what the next step should verify.\n` +
-    `2. Then run \`${stepDoneCmd}\` and stop. Do NOT change the work item's status — the dispatcher owns all status transitions.\n`
+    `2. Then run \`${stepDoneCmd}\` and stop. Do NOT change the work item's status — the dispatcher owns all status transitions.\n` +
+    // The signal is the only thing that advances the belt, and a REJECTED one exits non-zero with the
+    // reason (it used to exit 0, so an agent could stop believing a dropped signal had landed).
+    // Telling the agent to react is what makes that exit code worth anything — but only for the
+    // reasons it CAN act on: "no active run" / "not in belt" are terminal, and looping on them would
+    // be worse than stopping.
+    `   If that command fails (non-zero exit) it prints the reason on stderr. A stale pass, or a run that is busy, is retryable: ` +
+    `re-read this file for the current command and run that, or try again in a moment. If it says there is no active run, ` +
+    `or that this step is not in the belt, the run is gone — leave your handoff note and stop.\n`
   );
 }
 
