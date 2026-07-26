@@ -71,6 +71,11 @@ never reconstructs one. That makes the suite a live check of the agent-CLI contr
 | `bounce-cap` | rework bounces are counted, the oscillation parks at the cap, and `resume` refunds the budget |
 | `ask-human` | a blocked agent asks through the work source, frees its slot, and resumes on the answer |
 | `missing-api-key` | an uncredentialed source is never dialled and never claims, while its neighbour ships; credentials un-pause it |
+| `evidence` | the opt-in evidence station captures, publishes through the `local` publisher, and the resident server serves the bytes |
+| `evidence-publish-retry` | a failing publisher retries in the background, flags the run's `problem`, and delivers once `intents/recover` is called |
+| `capture-cap` | a flaky capture loop parks at the cap — and the station's own verdict still wins |
+| `pr-review-watch` | a draft PR keeps the step-done gate, a ready one hands off without it, and a new review thread wakes a resolver that holds a slot only while working |
+| `pr-closed-park` | a PR closed without merging parks for a human and keeps its worktree |
 
 ## Things the harness found — and what changed
 
@@ -120,7 +125,24 @@ comes back.
    collapse per-tick liveness polling), so a resume arriving seconds after an agent stopped could see
    "still working" and nudge nobody. **Fixed**: a fresh read for that one-shot operator action, and the
    observed state is recorded on the `resumed` event so `nudged:false` is diagnosable. → `bounce-cap`.
-9. **Documentation drift** (fixed): `runs.pr_number` / `resolver_active` / `last_thread_sig` moved to
+9. **A belt that MIXES layout panes with dedicated-pane steps silently loses its layout.**
+   The layout hook only builds into a *fresh* (1-tab/1-pane) worktree, and the engine's first
+   dedicated-pane spawn adds a tab — so if the first step has no `tab`/`pane`, the hook finds a
+   two-tab workspace and skips. Every later step that DOES target a layout pane then waits for a pane
+   that will never exist, burns its layout wait and parks `layout_wait_timeout`. Config-load can't see
+   it today (it only checks that targeted panes exist in the layout). **Found, not fixed** — the fix is
+   a design call (reject the mix at load, make the hook tolerant of factory-created tabs, or hold the
+   first dedicated spawn until the layout decision lands). Every layout scenario here gives all of its
+   steps a pane, which is the shape to recommend meanwhile.
+10. **An inline evidence publish leaves no trace in the timeline.** `evidence-upload` publishes
+   inline and marks its ledger intent delivered; `evidence_uploaded` is recorded only by the LEDGER
+   delivery, i.e. only when the publish was deferred and retried. The happy path is observable through
+   the intent row and the bytes, not the event log. **Not fixed** (a one-line addition if you want the
+   event on both paths).
+11. **Teardown drops an undelivered evidence publish** — deliberately (the bytes live in the worktree
+   it is removing), which a `work_to_pull_request` belt never notices because the PR watch keeps the
+   run alive, but a short belt can. The evidence scenarios carry a `pr` step for exactly this reason.
+12. **Documentation drift** (fixed): `runs.pr_number` / `resolver_active` / `last_thread_sig` moved to
    `run_products` in v18 but ARCHITECTURE §6 still showed them on `runs`; the §6 event list named
    `merged`/`closed`, which nothing emits, and omitted `layout_applied`, `layout_apply_failed`,
    `intent_deadline`, `intent_fulfilled`.

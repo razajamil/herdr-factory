@@ -58,6 +58,13 @@ layouts:
 |---|---|---|---|
 | `id` | string, trimmed, min 1 | **required** | Unique across `layouts`; what a belt's `default_layout`/`layout_matching` references. |
 | `env` | map of scalars | `{}` | Environment for **every** pane in this layout (a pane's own `env` wins). |
+> **Give EVERY step of a layout belt a `tab`/`pane`.** The hook builds a layout only into a *fresh*
+> (1-tab/1-pane) worktree, and a step with no `tab`/`pane` spawns its own pane immediately — adding a
+> tab that makes the worktree non-fresh, so the layout is skipped entirely. The symptom is the
+> opposite of where the mistake is: the steps that DO name panes sit in
+> `<step> waiting for layout pane <tab>/<pane>` until they park `layout_wait_timeout`. Config-load does
+> not catch this yet. (Reproduced by `test/e2e/scenarios/evidence.e2e.ts`.)
+
 | `setup.command` | string, trimmed, min 1 | **required inside `setup`** | Runs once, in the single `setup: true` pane, **before** that pane's own `command`. On an **agent** pane it is executed *in* the pane (`pane run`, through the same login shell, as a child) instead of being baked into the pane's process — an agent can only be started in a pane that is sitting at herdr's own shell. If that pane never reaches a prompt the setup is reported as failed rather than silently waited out. |
 | `setup.blocking` | bool | `false` | The builder waits for it (cap `SETUP_TIMEOUT_MS` = 600 s) before **any** pane `command` or `agent` starts. (The topology is already fully built by then — see [what the builder issues](#what-the-builder-actually-issues).) |
 | `tabs[]` | array | **required**, min 1 | `a layout needs at least one tab` |

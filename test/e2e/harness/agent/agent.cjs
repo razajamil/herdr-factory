@@ -96,9 +96,17 @@ function behaviourFor(step, pass) {
 }
 
 // ── prompt parsing ──────────────────────────────────────────────────────────────────────────────
+// A turn arrives one of two ways. Normally it is the dispatch pointer, which names the rendered
+// prompt file outright. But the engine also nudges an EXISTING conversation — after a human reply,
+// or after a `resume` — and those messages name the step in prose instead ("continue the work step"),
+// because a real agent is mid-conversation and already knows where its brief is. A scripted agent is
+// stateless per turn, so it recovers the same thing from the step name.
 function promptRelFor(text) {
-  const m = /\.memory\/herdr-factory\/prompt-([a-z0-9_-]+)\.md/i.exec(text || "");
-  return m ? { rel: m[0], step: m[1] } : null;
+  const direct = /\.memory\/herdr-factory\/prompt-([a-z0-9_-]+)\.md/i.exec(text || "");
+  if (direct) return { rel: direct[0], step: direct[1] };
+  const named = /continue the ([a-z0-9_-]+) step/i.exec(text || "");
+  if (named) return { rel: `.memory/herdr-factory/prompt-${named[1]}.md`, step: named[1] };
+  return null;
 }
 
 /** Extract the rendered signal command lines. A candidate carrying a `<placeholder>` is prose, not
@@ -170,7 +178,12 @@ function handle(text) {
   const cwd = process.cwd();
   const found = promptRelFor(text);
   if (!found) {
-    log(`no prompt pointer in: ${JSON.stringify((text || "").slice(0, 200))}`);
+    // Still take a turn: a real harness starts working on ANY prompt, and callers like the PR-watch
+    // resolver wake use a confirmed submission (`--until working`) to decide whether the agent woke.
+    log(`no prompt pointer — taking an empty turn: ${JSON.stringify((text || "").slice(0, 160))}`);
+    setState("working");
+    sleep(1500);
+    setState("idle");
     return;
   }
   const promptPath = path.join(cwd, found.rel);
@@ -240,9 +253,13 @@ function handle(text) {
   if (wantsPr) {
     const branch = git(["rev-parse", "--abbrev-ref", "HEAD"], cwd);
     const ghRepo = process.env.HF_GH_REPO || "acme/app";
+    // The belt's `pr:` policy reaches the agent as prompt text, so honour it the way a real agent
+    // would — by reading it. `--draft` is the one that changes the ENGINE's behaviour (a draft PR
+    // keeps the step-done gate instead of handing straight off to the review watch).
+    const draft = /--draft/.test(prompt) ? " --draft" : "";
     sh(`git push -u origin ${branch}`, cwd);
     sh(
-      `gh pr create --repo ${ghRepo} --head ${branch} --base main ` +
+      `gh pr create --repo ${ghRepo} --head ${branch} --base main${draft} ` +
         `--title ${JSON.stringify(`[harness] ${branch}`)} --body ${JSON.stringify(`Opened by the scripted agent for step ${step}.`)}`,
       cwd,
     );

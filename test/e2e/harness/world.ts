@@ -369,6 +369,10 @@ export class World {
         const p = join(this.paths.home, ".config", "herdr", name);
         if (existsSync(p)) copyFileSync(p, join(this.paths.art, `herdr-${name}`));
       }
+      // herdr's own plugin command logs — the only place a layout hook that DECLINED to build says
+      // why (the engine log only ever sees a hook that got as far as applying).
+      const pluginLogs = join(this.paths.home, ".config", "herdr", "plugins");
+      if (existsSync(pluginLogs)) cpSync(pluginLogs, join(this.paths.art, "herdr-plugins"), { recursive: true });
       writeFileSync(join(this.paths.art, "state-dump.txt"), this.db.dump());
       writeFileSync(join(this.paths.art, "plugin-log.txt"), this.herdr.pluginLog());
     } catch (e) {
