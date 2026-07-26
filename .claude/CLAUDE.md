@@ -29,6 +29,26 @@ primitives (`work`, `evidence`, `review`, `pr`, `custom`) — and come out as
 merged PRs. The engine is TypeScript run directly via Node's native
 type-stripping (no build step), with all state in the built-in `node:sqlite`.
 
+## Keep the docs and the skill in sync — every functional change
+
+Any change to how the factory behaves ships **with** its documentation, in the
+same commit. Whenever you change functionality, update all three:
+
+1. `README.md` — the user-facing surface: config keys, CLI commands, the
+   belt/step model, sources, layouts, prompts, workflow.
+2. `docs/ARCHITECTURE.md` — the engine internals: reconciler phases, locking,
+   the outbox, rate limits, invariants.
+3. `skills/herdr-factory/` — the shipped consumer skill (`SKILL.md` +
+   `references/`), which is how users and agents actually operate the factory.
+
+This is not optional polish. The skill is symlinked into installed agent configs
+and auto-updates from this checkout, so a merge that leaves it stale immediately
+gives users confidently wrong answers. Treat a functional change with
+out-of-date docs as an incomplete change.
+
+If a change genuinely touches none of the three, say so explicitly rather than
+silently skipping the step.
+
 ## Working in this repo
 
 ```sh
