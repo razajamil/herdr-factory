@@ -66,6 +66,8 @@ export interface ScenarioRow {
   failureDetail: string | null;
   /** Artifact paths, relative to the artifacts dir. */
   artifacts: string[];
+  /** The scenario's own `metrics.json`, when it recorded one (World.recordMetrics). */
+  metrics: Record<string, string | number> | null;
 }
 
 export interface ReportModel {
@@ -145,6 +147,18 @@ async function readJson(path: string): Promise<{ value: unknown; note: string | 
 }
 
 /** Every file under `dir`, as paths relative to `base`, sorted, depth-limited and count-capped. */
+/** A scenario's recorded numbers. Malformed or absent ⇒ null: a summary must never fail to render
+ *  because a measurement file is unreadable. */
+async function readMetrics(path: string): Promise<Record<string, string | number> | null> {
+  const { value } = await readJson(path);
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const out: Record<string, string | number> = {};
+  for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+    if (typeof v === "number" || typeof v === "string") out[k] = v;
+  }
+  return Object.keys(out).length ? out : null;
+}
+
 async function listFiles(dir: string, base: string, depth = 4, cap = 60): Promise<string[]> {
   if (depth < 0) return [];
   let entries: Dirent[];
@@ -278,6 +292,7 @@ export async function collect(artifactsDir: string): Promise<ReportModel> {
         failure: detail ? firstLine(detail) : null,
         failureDetail: detail,
         artifacts: dirKey ? await listFiles(scenarioDirs.get(dirKey)!, dir) : [],
+        metrics: dirKey ? await readMetrics(join(scenarioDirs.get(dirKey)!, "metrics.json")) : null,
       });
     }
 
@@ -298,6 +313,7 @@ export async function collect(artifactsDir: string): Promise<ReportModel> {
           failure: firstLine(msg),
           failureDetail: msg,
           artifacts: [],
+          metrics: null,
         });
       }
     }
@@ -316,6 +332,7 @@ export async function collect(artifactsDir: string): Promise<ReportModel> {
       failure: "no result recorded in results.json (worker crashed or the run was interrupted?)",
       failureDetail: null,
       artifacts: await listFiles(path, dir),
+      metrics: await readMetrics(join(path, "metrics.json")),
     });
   }
 
@@ -398,6 +415,18 @@ export function render(model: ReportModel): string {
       );
     }
     L.push("");
+  }
+
+  // Measured numbers, not just pass/fail: a performance scenario that still passes while its p95
+  // doubles is exactly the thing a summary should show without being asked.
+  const measured = model.scenarios.filter((s) => s.metrics);
+  if (measured.length) {
+    L.push("## Measurements");
+    L.push("");
+    for (const s of measured) {
+      L.push(`**\`${cell(s.name)}\`** — ${Object.entries(s.metrics!).map(([k, v]) => `${k}: \`${cell(String(v))}\``).join(", ")}`);
+      L.push("");
+    }
   }
 
   const failed = model.scenarios.filter((s) => s.status === "failed" && s.failureDetail);

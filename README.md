@@ -1313,12 +1313,17 @@ scripts/e2e --no-build -- --reporter=verbose  # iterate without rebuilding
 scripts/e2e --lane fake                       # only the no-herdr lane (failure injection + scale)
 ```
 
-28 scenarios, ~18 minutes: the core belts, layouts, every attention park and the human loop, the
-evidence station, the PR lifecycle, source parity for Jira and Sentry, belt/config breadth, a herdr
-outage — and four performance measures that record real numbers into each scenario's `metrics.json`
-(external-call budget, throughput at 60 items, per-pass latency under load, and a ~900-pass resource
-soak). A second lane swaps herdr for a shim, which is how an unreachable herdr and 60 concurrent runs
-get tested without 60 PTYs.
+29 scenarios, ~6 minutes in the container: the core belts, layouts, every attention park and the human
+loop, the evidence station, the PR lifecycle, source parity for Jira and Sentry, belt/config breadth, a
+herdr outage, a live TUI boot in a real PTY — and four performance measures that record real numbers
+into each scenario's `metrics.json` (external-call budget, throughput at 60 items, per-pass latency
+under load, and a ~900-pass resource soak). A second lane swaps herdr for a shim, which is how an
+unreachable herdr and 60 concurrent runs get tested without 60 PTYs.
+
+One tier is opt-in: `--tier ds4` hands the **shipped prompts** to a local model (opencode against a
+DeepSeek V4 endpoint on `:8000`) and asks whether the work reaches a PR. It costs nothing per run, and
+it is the only check on the part of the system a human never reviews at runtime — what the factory
+actually says to agents. Non-gating, because a model having an off day must not turn a build red.
 
 Results are machine-readable (`summary.md`, `results.json`, `junit.xml`) and every scenario keeps its
 SQLite DB, engine log, herdr server log, agent transcript, rendered prompts and `gh`/`herdr` argv

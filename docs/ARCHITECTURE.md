@@ -1708,9 +1708,10 @@ command it finds there (which makes the suite a live check of the §14 agent-CLI
   refuses a fake-lane scenario that declares `layouts`; layout coverage is real-lane only.
 
 Coverage today is the core flows, the attention/human loop, the evidence station, the PR lifecycle,
-source parity for `jira` and `sentry`, belt/config breadth, a herdr outage, and the four performance
-measures (call budgets, scale drain, tick latency, resource soak). `github_issues` parity waits on a
-`GITHUB_API_URL` seam, and the local-model tier is the remaining milestone. The scenario table, what
+source parity for `jira` and `sentry`, belt/config breadth, a herdr outage, the four performance
+measures (call budgets, scale drain, tick latency, resource soak), a live TUI boot in a real PTY, and an
+opt-in tier that hands the SHIPPED prompts to a local model. `github_issues` parity waits on a
+`GITHUB_API_URL` seam. The scenario table, what
 the harness has already found about the engine, and the traps in the harness itself are all in
 [`test/e2e/README.md`](../test/e2e/README.md).
 

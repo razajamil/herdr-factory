@@ -6,7 +6,7 @@
 // a black-box system is useless.
 import { describe, test } from "vitest";
 import { World } from "./world.ts";
-import type { Lane, ScenarioSpec } from "./types.ts";
+import type { Lane, ScenarioSpec, Tier } from "./types.ts";
 
 export { World } from "./world.ts";
 export * from "./assert.ts";
@@ -29,7 +29,13 @@ function selected(spec: ScenarioSpec): { run: boolean; why: string } {
   const lane = spec.lane ?? "real";
   if (wantLane && wantLane !== lane) return { run: false, why: `lane=${lane} (filtered to ${wantLane})` };
   if (spec.slow && process.env.HF_E2E_SLOW !== "1") return { run: false, why: "slow (set HF_E2E_SLOW=1)" };
-  if (spec.tier === "ds4" && (process.env.HF_E2E_TIER ?? "scripted") !== "ds4") return { run: false, why: "tier=ds4 (set --tier ds4)" };
+  // The tier filter defaults to `scripted`, which is what keeps the model tier out of an ordinary run
+  // (it needs a local model server and is non-deterministic). `--tier ds4` selects the model scenarios
+  // and ONLY those — a focused ten-minute run, not the whole suite re-run through a model. A scenario
+  // always runs as the tier it declares; the filter decides whether it runs at all.
+  const wantTier = (process.env.HF_E2E_TIER?.trim() || "scripted") as Tier;
+  const tier = spec.tier ?? "scripted";
+  if (wantTier !== tier) return { run: false, why: `tier=${tier} (filtered to ${wantTier})` };
   return { run: true, why: "" };
 }
 

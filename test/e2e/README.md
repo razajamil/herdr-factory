@@ -23,7 +23,7 @@ server log, the agent transcript, every rendered prompt, and the `gh`/`herdr` ar
 | **Lane** | `real` (default) — a headless `herdr server` per world | the herdr contract, layouts, agent adoption, prompt delivery |
 | | `fake` — a shim on `HERDR_BIN_PATH` (`harness/herdr-fake/`) | failure injection herdr won't do on request, and scale without PTYs |
 | **Tier** | `scripted` (default) — the harness's agent | determinism: every scenario and edge case, in seconds |
-| | `ds4` — a local model via opencode *(M5, not yet built)* | that a real model can follow the **shipped** prompts |
+| | `ds4` — a local model via opencode (`--tier ds4`) | that a real model can follow the **shipped** prompts |
 | **Driver** | `serve` (default) — the resident server ticks itself | the production shape: auth gate, poll cadence, `/evidence`, hot reload |
 | | `tick` — one pass per call | pass-by-pass determinism when a scenario needs it |
 
@@ -86,17 +86,20 @@ never reconstructs one. That makes the suite a live check of the agent-CLI contr
 | `perf-scale-drain` | 60 briefs through a cap of 5: one run per item, the cap never exceeded (sampled continuously), every item terminal |
 | `perf-call-budgets` | 12 watched PRs cost **one** batched GraphQL query per pass — no per-run `pr view`, no re-discovery by `pr list` |
 | `perf-tick-latency` | p50/p95 of a full pass with 20 active runs, and that one slow `gh` costs its own call rather than the loop |
+| `tui-boot` | the real launcher in a real PTY: opentui's FFI resolves, `app_ready` inside its budget, no stack trace on screen |
+| `ds4-w2pr` | *(tier ds4)* a real local model, the **shipped** prompts, no harness hints: does the work reach a PR? |
 | `perf-resource-soak` | ~900 passes (six full lifecycles, then a long idle tail): RSS, FDs, DB and worktrees stay flat, and the server is still healthy |
 
-What they measure today, on one dev machine (recorded per run in each scenario's `metrics.json`, so a
-regression shows up as a number, not a feeling):
+What they measure, from the container run (every scenario records its numbers into `metrics.json`, and
+`summary.md` reprints them — so a regression shows up as a number, not a feeling):
 
 | | measured |
 |---|---|
 | 12 watched PRs over 5 passes | **5** GraphQL calls, **0** `pr view`, **0** `pr list` — one batched query per pass, flat in the number of PRs |
-| a full pass with 20 active runs | p50 **49ms**, p95 **54ms**; a 3s-sleeping `gh` costs its own pass (**3065ms**) and the next is **56ms** |
-| 60 items, source cap 5 | drained in **76s** (~1.3s/item), cap reached and never exceeded across ~380 samples |
-| ~900 passes | RSS **+23%**, FDs **24 → 27** (peak 30), DB **+200KB**, worktrees back to **1** |
+| a full pass with 20 active runs | p50 **36ms**, p95 **43ms**; a 3s-sleeping `gh` costs its own pass (**3046ms**) and the next is **50ms** |
+| 60 items, source cap 5 | drained in **62s** (~1.0s/item), cap reached and never exceeded across ~300 samples |
+| ~900 passes | RSS **+54%** (under the 2× tripwire, and the number to watch), FDs **24 → 24** (peak 27), DB **+200KB**, worktrees back to **1** |
+| TUI boot in a real PTY | node **25ms** → modules **41ms** → `app_ready` **61ms** |
 
 ## Things the harness found — and what changed
 
@@ -232,9 +235,12 @@ under `harness/sources/` are stateful, not route tables: `jira-fake.ts` parses t
 really moves statuses, `sentry-fake.ts` serves the issue/event shapes the materializer renders — each
 documented in its own `.md`, each verified by driving the ENGINE'S OWN client against it.
 
-M5 is the remaining milestone: the **DS4 tier** (opencode against a local model, running the shipped
-prompts, non-gating) and the TUI boot assertion (`--experimental-ffi` +
-`HERDR_FACTORY_TUI_TIMING=1`).
+The **ds4 tier** runs on the HOST, not in the image: `opencode` isn't installed in the container and
+the model server lives on the developer's machine. Run it with `HF_E2E_TIER=ds4 npx vitest run --config
+test/e2e/vitest.e2e.config.ts` (or `scripts/e2e --tier ds4` once opencode is added to the image), with
+the local server up on `:8000`. The tier filter defaults to `scripted`, so `--tier ds4` selects the
+model scenarios and only those; a scenario always runs as the tier it declares. Preflight fails fast
+and says which of the two prerequisites is missing rather than letting a scenario time out.
 
 One design question is open rather than covered: a belt that mixes layout panes with dedicated-pane
 steps loses its layout, because the first dedicated spawn adds a tab before the hook runs and the hook

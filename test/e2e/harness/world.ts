@@ -13,6 +13,7 @@ import { Db } from "./db.ts";
 import { Factory } from "./factory.ts";
 import { HerdrServer, delay, tail } from "./herdr.ts";
 import { FakeHerdr } from "./herdr-fake/state.ts";
+import { ds4DataHome, ds4Preflight, resolveOpencode, writeOpencodeConfig } from "./ds4.ts";
 import { GhFake, initialGhState } from "./gh-fake/state.ts";
 import type { AgentScript, Driver, Lane, ScenarioSpec, Tier, WorldPaths } from "./types.ts";
 
@@ -112,7 +113,10 @@ export class World {
     this.id = `w${(process.pid % 1000).toString(36)}${(seq++).toString(36)}`;
     this.repoName = spec.repoName ?? "app";
     this.lane = spec.lane ?? "real";
-    this.tier = (process.env.HF_E2E_TIER as Tier) || spec.tier || "scripted";
+    // A scenario runs as the tier it declares — the env var is a SELECTION filter (see index.ts), not
+    // an override. Forcing it here made `--tier ds4` demand a model server for all 28 scripted
+    // scenarios and swap their agent shim out from under them.
+    this.tier = spec.tier ?? "scripted";
     this.driver = spec.driver ?? "serve";
 
     const home = join(shortRoot(), this.id);
@@ -262,6 +266,24 @@ export class World {
     // kind's own name rather than copied to it — which also keeps the implementation editable in
     // place instead of duplicated into every world.
     for (const kind of ["claude", "opencode"]) {
+      // The ds4 tier replaces ONE of them with the real model CLI: `opencode` becomes a wrapper that
+      // records the argv herdr built (the interesting part — how a prompt reaches that kind is herdr's
+      // manifest's business) and execs the real binary. `claude` stays scripted, so a ds4 scenario can
+      // still put a deterministic agent on a step it isn't measuring.
+      if (this.tier === "ds4" && kind === "opencode") {
+        writeFileSync(
+          join(b, kind),
+          [
+            "#!/usr/bin/env bash",
+            "# ds4 tier: record what herdr launched, then run the real opencode.",
+            `printf '%s\\n' "$*" >> "${join(this.files.agentLogDir, "opencode-argv.log")}" 2>/dev/null || true`,
+            `exec -a ${kind} "${resolveOpencode()}" "$@"`,
+            "",
+          ].join("\n"),
+        );
+        chmodSync(join(b, kind), 0o755);
+        continue;
+      }
       writeFileSync(
         join(b, kind),
         ["#!/usr/bin/env bash", `export HF_AGENT_KIND=${kind}`, `exec -a ${kind} ${process.execPath} ${agentImpl} "$@"`, ""].join("\n"),
@@ -379,6 +401,16 @@ export class World {
 
   async start(): Promise<void> {
     this.layout();
+    if (this.tier === "ds4") {
+      // Before anything expensive: a model server that isn't answering must say so here, not as a step
+      // that never signalled twenty minutes in.
+      const pre = ds4Preflight();
+      writeOpencodeConfig(this.paths.home);
+      // Set on the world env AFTER construction, since it is tier-specific: opencode's provider package
+      // lives here, and a fresh dir means installing it before the first turn.
+      this.env.XDG_DATA_HOME = ds4DataHome(this.paths.home);
+      writeFileSync(join(this.paths.art, "ds4.json"), JSON.stringify({ ...pre, startedAt: new Date().toISOString() }, null, 2));
+    }
     this.buildTargetRepo();
     this.writeShims();
     // Before the config is rendered: a scenario's stub backend must be listening for its URL to exist.
