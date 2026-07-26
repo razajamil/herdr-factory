@@ -1697,10 +1697,22 @@ command it finds there (which makes the suite a live check of the §14 agent-CLI
   → the filesystem (worktree reaped, branch deleted, evidence bytes, the human inbox) → the argv
   traces. No CLI command emits JSON except `eligible`, so scenarios read the DB and the HTTP API.
 
-Coverage today is the core flows (`w2pr-happy`, `custom-belt`, `layouts`) plus a pinned known bug;
-the attention/human-loop, source-parity, scale and local-model milestones are listed in
-[`test/e2e/README.md`](../test/e2e/README.md), which also records what the harness has already found
-about the engine.
+- **What the pane's environment decides.** herdr maps `--kind claude` to the command `claude` and
+  resolves it in the pane's shell, and the engine's launcher execs whatever `node` resolves to (and
+  refuses Node < 26). Both are therefore decided by PATH *inside a login shell*, which a system profile
+  may reorder (macOS `path_helper` appends what it inherited). The harness pins both with world
+  dotfiles + shims and refuses to start if a real agent CLI or an old node would win — the failure
+  mode otherwise is a real agent adopted into the pane, reporting `idle`, never signalling.
+- **The fake lane's blind spot is layouts.** `layout.apply` is socket-only *and* the layout is built by
+  a herdr plugin hook, so with no host there is nothing to fire `worktree.created`. `World.start()`
+  refuses a fake-lane scenario that declares `layouts`; layout coverage is real-lane only.
+
+Coverage today is the core flows, the attention/human loop, the evidence station, the PR lifecycle,
+source parity for `jira` and `sentry`, belt/config breadth, a herdr outage, and the four performance
+measures (call budgets, scale drain, tick latency, resource soak). `github_issues` parity waits on a
+`GITHUB_API_URL` seam, and the local-model tier is the remaining milestone. The scenario table, what
+the harness has already found about the engine, and the traps in the harness itself are all in
+[`test/e2e/README.md`](../test/e2e/README.md).
 
 ---
 

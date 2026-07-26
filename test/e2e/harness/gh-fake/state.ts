@@ -42,6 +42,20 @@ export interface GhPr {
   checks: GhCheck[];
 }
 
+/** Runtime failure/latency injection. The shim re-reads this on every invocation, so unlike the
+ *  HF_GH_* env vars (fixed when `serve` spawned the shim's parent) a scenario can turn these on and
+ *  off mid-run. `sleepFor`/`fail`/`failOnce` take a subcommand name, a comma-separated list, or `*`. */
+export interface GhInject {
+  /** Delay every matching call by this many ms — after the log line is written, so a call the engine
+   *  kills on its 60s exec timeout is still visible to the suite. */
+  sleepMs?: number;
+  sleepFor?: string;
+  /** Fail every matching call. */
+  fail?: string;
+  /** Fail the FIRST matching call per subcommand, then behave normally. */
+  failOnce?: string;
+}
+
 export interface GhState {
   /** What `gh api user --jq .login` prints (the evidence publisher's per-user folder). */
   login: string;
@@ -51,6 +65,8 @@ export interface GhState {
   nextNumber: number;
   /** Keyed by PR number as a string. */
   prs: Record<string, GhPr>;
+  /** Absent = no injection. */
+  inject?: GhInject;
 }
 
 /** One line of the JSONL call log ($HF_GH_LOG) — how the suite asserts call budgets. */
@@ -159,6 +175,11 @@ export class GhFake {
       out.push(call);
     }
     return out;
+  }
+
+  /** Turn runtime injection on (merged over whatever is already set) or, with `null`, off. */
+  inject(i: GhInject | null): void {
+    this.patch((s) => void (s.inject = i == null ? undefined : { ...s.inject, ...i }));
   }
 
   graphqlCallCount(): number {

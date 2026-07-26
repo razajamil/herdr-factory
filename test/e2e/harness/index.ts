@@ -12,6 +12,18 @@ export { World } from "./world.ts";
 export * from "./assert.ts";
 export type { AgentBehaviour, AgentScript, Driver, Lane, ScenarioSpec, Tier, WorldPaths } from "./types.ts";
 
+// The suite runs the REAL engine, which needs Node >= 26 for native type-stripping — and the agents
+// inherit the harness's own node through the world's shim. Refuse up front: under 24 everything starts
+// normally and then every `step-done` fails inside a pane with a version error, which surfaces two
+// minutes later as an inscrutable "awaiting step-done" timeout.
+const NODE_MAJOR = Number(process.versions.node.split(".")[0]);
+if (NODE_MAJOR < 26) {
+  throw new Error(
+    `the e2e harness needs Node >= 26 (running ${process.version}). The repo pins 26.4.0 in .node-version — ` +
+      `activate it (mise/fnm/nvm) before \`npm run test:e2e\`, or run the suite in its container via \`scripts/e2e\`.`,
+  );
+}
+
 function selected(spec: ScenarioSpec): { run: boolean; why: string } {
   const wantLane = process.env.HF_E2E_LANE?.trim() as Lane | undefined;
   const lane = spec.lane ?? "real";

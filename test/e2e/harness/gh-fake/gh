@@ -539,10 +539,22 @@ async function main() {
       /* the log is diagnostics; never let it break a run */
     }
   };
+  // Failure/latency injection comes from EITHER the env or the state file. The env form is set once,
+  // when the world starts; the state form is the only one a running scenario can change, because the
+  // shim's env was fixed when `serve` spawned it — see GhFake.inject().
+  let injected = {};
+  if (statePath && fs.existsSync(statePath)) {
+    try {
+      injected = readState(fs, statePath).inject ?? {};
+    } catch {
+      /* a torn state file must not turn into a mystery gh failure */
+    }
+  }
+
   const finish = async (code, out, err) => {
     log(code);
-    const sleepMs = Number(process.env.HF_GH_SLEEP_MS ?? 0);
-    const sleepFor = process.env.HF_GH_SLEEP;
+    const sleepMs = Number(process.env.HF_GH_SLEEP_MS ?? injected.sleepMs ?? 0);
+    const sleepFor = process.env.HF_GH_SLEEP ?? injected.sleepFor;
     // The log line is written BEFORE the sleep on purpose: a call killed by the engine's 60s exec
     // timeout must still be visible to the suite (with the exit code it would have returned).
     if (sleepMs > 0 && (!sleepFor || matches(sleepFor, subcommand))) await new Promise((r) => setTimeout(r, sleepMs));
@@ -554,11 +566,11 @@ async function main() {
   if (!statePath) return finish(1, "", "gh-fake: HF_GH_STATE is not set\n");
   if (!fs.existsSync(statePath)) return finish(1, "", `gh-fake: state file not found: ${statePath}\n`);
 
-  const failOnce = process.env.HF_GH_FAIL_ONCE;
+  const failOnce = process.env.HF_GH_FAIL_ONCE ?? injected.failOnce;
   if (failOnce && matches(failOnce, subcommand) && claimOnce(fs, logPath || statePath, subcommand)) {
     return finish(1, "", `gh-fake: HF_GH_FAIL_ONCE injected a failure for "${subcommand}"\n`);
   }
-  const fail = process.env.HF_GH_FAIL;
+  const fail = process.env.HF_GH_FAIL ?? injected.fail;
   if (fail && matches(fail, subcommand)) return finish(1, "", `gh-fake: HF_GH_FAIL injected a failure for "${subcommand}"\n`);
 
   let res;

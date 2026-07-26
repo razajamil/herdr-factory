@@ -21,7 +21,7 @@ server log, the agent transcript, every rendered prompt, and the `gh`/`herdr` ar
 |  | choice | what it buys |
 |---|---|---|
 | **Lane** | `real` (default) — a headless `herdr server` per world | the herdr contract, layouts, agent adoption, prompt delivery |
-| | `fake` — a shim on `HERDR_BIN_PATH` *(M4, not yet built)* | failure injection herdr won't do on request, and scale without PTYs |
+| | `fake` — a shim on `HERDR_BIN_PATH` (`harness/herdr-fake/`) | failure injection herdr won't do on request, and scale without PTYs |
 | **Tier** | `scripted` (default) — the harness's agent | determinism: every scenario and edge case, in seconds |
 | | `ds4` — a local model via opencode *(M5, not yet built)* | that a real model can follow the **shipped** prompts |
 | **Driver** | `serve` (default) — the resident server ticks itself | the production shape: auth gate, poll cadence, `/evidence`, hot reload |
@@ -82,6 +82,21 @@ never reconstructs one. That makes the suite a live check of the agent-CLI contr
 | `jira-ask-human` | the reply channel as comments, including the marker filter that stops the factory answering itself |
 | `jira-stale-item` | a ticket that vanishes is `stale`, not an infinite retry |
 | `sentry-parity` | the mirror image: internal ledger, Sentry never moved for lifecycle, the `on_merge` note, and a release regression reopening the work |
+| `herdr-unreachable` | an outage injected into the world's wrapper: liveness DEFERS while herdr can't be asked, judges once it can, and never respawns a second agent |
+| `perf-scale-drain` | 60 briefs through a cap of 5: one run per item, the cap never exceeded (sampled continuously), every item terminal |
+| `perf-call-budgets` | 12 watched PRs cost **one** batched GraphQL query per pass — no per-run `pr view`, no re-discovery by `pr list` |
+| `perf-tick-latency` | p50/p95 of a full pass with 20 active runs, and that one slow `gh` costs its own call rather than the loop |
+| `perf-resource-soak` | ~900 passes (six full lifecycles, then a long idle tail): RSS, FDs, DB and worktrees stay flat, and the server is still healthy |
+
+What they measure today, on one dev machine (recorded per run in each scenario's `metrics.json`, so a
+regression shows up as a number, not a feeling):
+
+| | measured |
+|---|---|
+| 12 watched PRs over 5 passes | **5** GraphQL calls, **0** `pr view`, **0** `pr list` — one batched query per pass, flat in the number of PRs |
+| a full pass with 20 active runs | p50 **49ms**, p95 **54ms**; a 3s-sleeping `gh` costs its own pass (**3065ms**) and the next is **56ms** |
+| 60 items, source cap 5 | drained in **76s** (~1.3s/item), cap reached and never exceeded across ~380 samples |
+| ~900 passes | RSS **+23%**, FDs **24 → 27** (peak 30), DB **+200KB**, worktrees back to **1** |
 
 ## Things the harness found — and what changed
 
@@ -166,6 +181,38 @@ comes back.
    `merged`/`closed`, which nothing emits, and omitted `layout_applied`, `layout_apply_failed`,
    `intent_deadline`, `intent_fulfilled`.
 
+15. **Concurrency is capped at two levels, and the source's is the tighter default.** The first
+   `perf-scale-drain` set `limits.max_active_workspaces: 5`, asked for 60 items, and drained the whole
+   backlog **two at a time** — a work source's own `max_active_workspaces` defaults to 2, and nothing
+   logs "at capacity" when the source cap is what binds. Both defaults are documented (README, and the
+   skill's config reference); the scenario now sets both and asserts *which one* binds. Setting only the
+   repo-wide limit is the trap: it looks like the throughput knob and isn't. Fixing it took the same
+   drain from 60 items in 180s to 60 in 76s.
+
+## Traps in the harness itself (each now fails loud instead of lying)
+
+A fake that lies is worse than no fake. Three of these cost real time, and all three presented as "the
+agent never signalled" 120 seconds later — so each now has a guard that fires at world start.
+
+- **A pane's login shell reorders PATH.** macOS's `/etc/zprofile` runs `path_helper`, which rebuilds
+  PATH from `/etc/paths[.d]` and *appends* what it inherited — so the world bin landed behind
+  `/opt/homebrew/bin` and herdr's `--kind claude` launched **real Claude Code** into the pane. It
+  adopted as `claude`, reported `idle`, and never signalled. Fixed with world dotfiles that re-prepend
+  the bin after the system profile, and `assertShimsWin()`, which resolves every shim through
+  `$SHELL -lic` and refuses to start if anything but the world's own binary wins.
+- **The engine's launcher needs Node ≥ 26.** A real-lane pane happened to find homebrew's 26; a
+  fake-lane agent (a direct child, no login shell) found mise's 24, and every `step-done` died with a
+  version error that the agent correctly reported as "not a rejection, not retrying". The world now
+  ships a `node` shim pointing at the harness's own node, the harness refuses to run below 26, and
+  `assertShimsWin()` runs `herdr-factory --version` through a pane's shell before any scenario starts.
+- **`date +%s%3N` is GNU-only.** On macOS the wrapper wrote `{"ts":17850611963N,…}` — invalid JSON —
+  so `calls()` silently degraded and `notifications()` always answered "none fired", making every
+  notification assertion vacuously true. The timestamp now falls back to whole seconds, and `calls()`
+  THROWS on a malformed line (only a torn final line, which a live append can produce, is skipped).
+- **Injection knobs must be file-backed, not env.** A resident `serve` never sees an env change, so
+  `GhFake.inject()` / `FakeHerdr`'s knobs write to their state file, which the shims re-read per call.
+  `HerdrServer.unreachable` is the same idea: a flag file the wrapper checks.
+
 ## Container notes (learned the hard way)
 
 - The world root is **short** (`/h/<id>`): herdr's socket lives under its config dir and a long path
@@ -179,11 +226,17 @@ comes back.
 
 ## Not built yet (the plan's later milestones)
 
-M2 remainder: the evidence station (capture cap, `local` publisher, a failing `command` publisher's
-retry) and the PR lifecycle (draft gate, closed → park, resolver wake) · M3 is done except `github_issues`, which hardcodes
-api.github.com and needs a `GITHUB_API_URL` seam before it can be covered the way jira/sentry are
-(both reachable because they take a configurable `base_url`). The fakes under `harness/sources/` are
-stateful, not route tables: `jira-fake.ts` parses the pickup JQL and really moves statuses,
-`sentry-fake.ts` serves the issue/event shapes the materializer renders — each documented in its own
-`.md`, each verified by driving the ENGINE'S OWN client against it · M4 the fake-herdr lane and the performance scenarios (call budgets, scale drain, tick
-latency, resource soak) · M5 the DS4 tier and the TUI boot assertion.
+`github_issues` hardcodes `api.github.com`, so it cannot get the source-parity treatment jira and
+sentry get (both take a configurable `base_url`); it needs a `GITHUB_API_URL` seam first. The fakes
+under `harness/sources/` are stateful, not route tables: `jira-fake.ts` parses the pickup JQL and
+really moves statuses, `sentry-fake.ts` serves the issue/event shapes the materializer renders — each
+documented in its own `.md`, each verified by driving the ENGINE'S OWN client against it.
+
+M5 is the remaining milestone: the **DS4 tier** (opencode against a local model, running the shipped
+prompts, non-gating) and the TUI boot assertion (`--experimental-ffi` +
+`HERDR_FACTORY_TUI_TIMING=1`).
+
+One design question is open rather than covered: a belt that mixes layout panes with dedicated-pane
+steps loses its layout, because the first dedicated spawn adds a tab before the hook runs and the hook
+requires a fresh single-tab workspace. Scenarios work around it by giving every step a pane; the fix
+(reject at config load / make the hook tolerant / hold the first dedicated spawn) is a product call.

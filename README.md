@@ -1310,7 +1310,15 @@ brief → work → review → pr → merged → teardown — runs in about 17 se
 scripts/e2e                                   # everything; artifacts in artifacts/e2e/<ts>/
 scripts/e2e --scenario w2pr-happy --keep      # one scenario, keep its world
 scripts/e2e --no-build -- --reporter=verbose  # iterate without rebuilding
+scripts/e2e --lane fake                       # only the no-herdr lane (failure injection + scale)
 ```
+
+28 scenarios, ~18 minutes: the core belts, layouts, every attention park and the human loop, the
+evidence station, the PR lifecycle, source parity for Jira and Sentry, belt/config breadth, a herdr
+outage — and four performance measures that record real numbers into each scenario's `metrics.json`
+(external-call budget, throughput at 60 items, per-pass latency under load, and a ~900-pass resource
+soak). A second lane swaps herdr for a shim, which is how an unreachable herdr and 60 concurrent runs
+get tested without 60 PTYs.
 
 Results are machine-readable (`summary.md`, `results.json`, `junit.xml`) and every scenario keeps its
 SQLite DB, engine log, herdr server log, agent transcript, rendered prompts and `gh`/`herdr` argv

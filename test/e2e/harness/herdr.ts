@@ -9,7 +9,7 @@
 //     (world bin first on PATH, HERDR_FACTORY_* , HF_AGENT_*) — that is what lets a step agent's
 //     `herdr-factory step-done` reach this world's config and state rather than the real install.
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
-import { createWriteStream, existsSync, mkdirSync, readFileSync } from "node:fs";
+import { createWriteStream, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 export interface HerdrCall {
@@ -55,13 +55,35 @@ export class HerdrServer {
   private readonly env: Record<string, string>;
   private readonly logPath: string;
   private readonly callLog: string;
+  private readonly downFlag: string | null;
   private proc: ChildProcess | null = null;
 
-  constructor(opts: { bin: string; env: Record<string, string>; logPath: string; callLog: string }) {
+  constructor(opts: { bin: string; env: Record<string, string>; logPath: string; callLog: string; downFlag?: string }) {
     this.bin = opts.bin;
     this.env = opts.env;
     this.logPath = opts.logPath;
     this.callLog = opts.callLog;
+    this.downFlag = opts.downFlag ?? null;
+  }
+
+  /** Make herdr unreachable **to the factory**, on cue.
+   *
+   *  The engine's notion of "unreachable" is precisely `herdr agent list` failing (`HerdrClient.agents`
+   *  wraps any non-zero/unparseable result in `HerdrUnreachableError`), so the injection point is the
+   *  world's `herdr` wrapper: while the flag file exists it refuses every call the way a herdr with no
+   *  server does. The real server keeps running — killing it would also destroy the panes, which is a
+   *  DIFFERENT failure (confirmed-gone) and would make a defer-vs-park assertion meaningless.
+   *
+   *  The harness's own queries bypass the wrapper (this class runs the binary directly), so the world
+   *  stays fully observable throughout the outage. */
+  set unreachable(down: boolean) {
+    if (!this.downFlag) throw new Error("HerdrServer: no downFlag configured — cannot inject an outage");
+    if (down) writeFileSync(this.downFlag, "");
+    else rmSync(this.downFlag, { force: true });
+  }
+
+  get unreachable(): boolean {
+    return this.downFlag != null && existsSync(this.downFlag);
   }
 
   /** Run a herdr CLI command with the world env. `allowFail` mirrors the engine's own posture. */
@@ -161,15 +183,22 @@ export class HerdrServer {
   }
 
   /** Every pane's screen + process in a workspace — the layout post-mortem. */
-  screens(workspaceId: string): string {
+  screens(workspaceId: string, lines = 20): string {
     const tabs = new Map(this.tabs(workspaceId).map((t) => [t.tab_id, t.label ?? "?"]));
     return this.panes(workspaceId)
       .map(
         (p) =>
           `··· ${tabs.get(p.tab_id) ?? "?"}/${p.label ?? "?"} (${p.pane_id}, agent_status=${p.agent_status ?? "-"}) ···\n` +
-          `${this.processInfo(p.pane_id)}\n${this.readPane(p.pane_id)}`,
+          `${this.processInfo(p.pane_id)}\n${this.readPane(p.pane_id, lines)}`,
       )
       .join("\n");
+  }
+
+  /** Every pane of every workspace — the whole terminal state of the world in one string. */
+  allScreens(lines = 200): string {
+    const ws = this.workspaces();
+    if (ws.length === 0) return "(no workspaces)";
+    return ws.map((w) => `═══ workspace ${w.workspace_id} (${w.label ?? "?"}) ═══\n${this.screens(w.workspace_id, lines)}`).join("\n\n");
   }
 
   /** Create a worktree by hand — the "someone made a worktree outside the factory" layout path. */
@@ -193,16 +222,21 @@ export class HerdrServer {
   /** Every herdr invocation the FACTORY made, from the world's `herdr` wrapper. */
   calls(): HerdrCall[] {
     if (!existsSync(this.callLog)) return [];
-    return readFileSync(this.callLog, "utf8")
-      .split("\n")
-      .filter(Boolean)
-      .map((l) => {
-        try {
-          return JSON.parse(l) as HerdrCall;
-        } catch {
-          return { ts: 0, argv: [l] };
-        }
-      });
+    const lines = readFileSync(this.callLog, "utf8").split("\n").filter(Boolean);
+    const out: HerdrCall[] = [];
+    for (const [i, l] of lines.entries()) {
+      try {
+        out.push(JSON.parse(l) as HerdrCall);
+      } catch {
+        // A live process may be mid-append, so the LAST line is allowed to be torn. Anything else is
+        // a broken wrapper, and must not be swallowed: silently degrading here once turned every
+        // notification assertion into a no-op (`date +%s%3N` is GNU-only, so on macOS every line was
+        // unparseable and `notifications()` always answered "none fired").
+        if (i === lines.length - 1) continue;
+        throw new Error(`herdr call log has an unparseable line (${this.callLog}:${i + 1}): ${l}`);
+      }
+    }
+    return out;
   }
 
   /** Desktop notifications the engine fired — only observable through the wrapper. */

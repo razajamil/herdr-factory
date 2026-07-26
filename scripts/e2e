@@ -23,8 +23,8 @@ Build the e2e image and run the end-to-end scenarios inside it.
 
 Options:
   --scenario <name>   Run only scenarios whose name matches <name> (vitest -t filter).
-  --lane real|fake    Herdr lane. real = the real herdr binary (default); fake = the shim, for
-                      failure injection and scale. Exported as HF_E2E_LANE.
+  --lane real|fake    Run ONLY that lane. Default: both — real (a real headless herdr) and fake (the
+                      shim, for failure injection and scale). Exported as HF_E2E_LANE.
   --tier scripted|ds4 Agent tier. scripted = the deterministic agent shim (default); ds4 = the
                       local DeepSeek V4 model lane, non-gating. Exported as HF_E2E_TIER.
   --keep              Keep each scenario's world directory (copied into the artifacts).
@@ -58,7 +58,9 @@ EOF
 # ---------------------------------------------------------------------------- flags
 
 scenario=""
-lane="real"
+# Empty = every lane. A default of "real" here would have quietly skipped every fake-lane scenario on a
+# plain `scripts/e2e` — the runner must never narrow coverage without being asked to.
+lane=""
 tier="scripted"
 keep=0
 build=1
@@ -93,7 +95,7 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
-case "$lane" in real|fake) ;; *) echo "e2e: --lane must be 'real' or 'fake', got '$lane'" >&2; exit 2 ;; esac
+case "$lane" in ""|real|fake) ;; *) echo "e2e: --lane must be 'real' or 'fake', got '$lane'" >&2; exit 2 ;; esac
 case "$tier" in scripted|ds4) ;; *) echo "e2e: --tier must be 'scripted' or 'ds4', got '$tier'" >&2; exit 2 ;; esac
 
 # Preconditions first, before anything is created on disk — a rejected invocation must leave no
@@ -192,7 +194,7 @@ vitest_cmd=(npx vitest run --config test/e2e/vitest.e2e.config.ts)
 [ -n "$scenario" ] && vitest_cmd+=(-t "$scenario")
 vitest_cmd+=(${passthrough[@]+"${passthrough[@]}"})
 
-echo "e2e: lane=$lane tier=$tier keep=$keep scenario=${scenario:-<all>}"
+echo "e2e: lane=${lane:-<all>} tier=$tier keep=$keep scenario=${scenario:-<all>}"
 echo "e2e: node=$node_version herdr=$herdr_version image=$image"
 echo "e2e: ${vitest_cmd[*]}"
 

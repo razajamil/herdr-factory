@@ -147,16 +147,29 @@ Two deliberately different failure modes:
   from "no PR exists", because every engine call site wraps `runJson` in `.catch()` — a broken fake
   would read as a legitimately absent PR. Fail loud.
 
-## Failure injection (env)
+## Failure injection
 
-| env | effect |
-|---|---|
-| `HF_GH_FAIL=<subcommand>[,<subcommand>…]` \| `*` | every matching call exits 1 with `gh-fake: HF_GH_FAIL injected a failure for "<sub>"` |
-| `HF_GH_FAIL_ONCE=<subcommand>[,…]` | only the **first** matching call fails (an exclusive-create marker file next to the log makes it race-free across concurrent invocations; `GhFake.reset()` clears the markers) |
-| `HF_GH_SLEEP_MS=<n>` | sleep `n` ms before answering — used to prove the engine's 60 s `DEFAULT_EXEC_TIMEOUT_MS` kills the child rather than wedging the tick |
-| `HF_GH_SLEEP=<subcommand>[,…]` | scope the sleep to those subcommands (default: all) |
-| `HF_GH_TOKEN` | what `gh auth token` prints |
-| `HF_GH_HEAD` | fallback head branch for a `gh pr create` with no `--head` |
+Two ways in, with the same vocabulary and the same meanings. **Env** (set once, when the world is
+built) covers "this whole scenario runs against a broken gh". **State file** — `inject` in the JSON,
+written with `GhFake.inject({...})` and cleared with `GhFake.inject(null)` — is the only form a
+*running* scenario can change, because the shim's environment was fixed when `serve` spawned it. The
+shim re-reads the state file on every invocation, so an `inject()` is visible to the very next call;
+env wins over state when both are set.
+
+```ts
+w.gh.inject({ sleepMs: 3000, sleepFor: "api graphql" }); // this call gets slow…
+await w.factory.tickTimed();
+w.gh.inject(null); // …and the next tick is normal again
+```
+
+| env | state key | effect |
+|---|---|---|
+| `HF_GH_FAIL=<subcommand>[,<subcommand>…]` \| `*` | `fail` | every matching call exits 1 with `gh-fake: HF_GH_FAIL injected a failure for "<sub>"` |
+| `HF_GH_FAIL_ONCE=<subcommand>[,…]` | `failOnce` | only the **first** matching call fails (an exclusive-create marker file next to the log makes it race-free across concurrent invocations; `GhFake.reset()` clears the markers) |
+| `HF_GH_SLEEP_MS=<n>` | `sleepMs` | sleep `n` ms before answering — used to prove the engine's 60 s `DEFAULT_EXEC_TIMEOUT_MS` kills the child rather than wedging the tick |
+| `HF_GH_SLEEP=<subcommand>[,…]` | `sleepFor` | scope the sleep to those subcommands (default: all) |
+| `HF_GH_TOKEN` | — | what `gh auth token` prints |
+| `HF_GH_HEAD` | — | fallback head branch for a `gh pr create` with no `--head` |
 
 Values use the same frozen vocabulary as the log's `subcommand`.
 

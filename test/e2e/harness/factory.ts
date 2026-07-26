@@ -76,6 +76,19 @@ export class Factory {
     return !!this.proc && this.proc.exitCode === null;
   }
 
+  /** The resident server's pid — what the resource-soak scenario samples RSS and open FDs from. */
+  get pid(): number | undefined {
+    return this.proc?.pid;
+  }
+
+  /** One pass, timed. The number is the whole round trip an operator would feel, which is what the
+   *  latency budget is about — not an internal span. */
+  async tickTimed(): Promise<number> {
+    const started = Date.now();
+    await this.tick();
+    return Date.now() - started;
+  }
+
   async health(): Promise<Record<string, unknown> | null> {
     try {
       const res = await fetch(`http://127.0.0.1:${this.port}/health`, { signal: AbortSignal.timeout(3000) });

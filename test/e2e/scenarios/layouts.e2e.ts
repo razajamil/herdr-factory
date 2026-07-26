@@ -111,11 +111,14 @@ scenario(
     // ── a HAND-created worktree gets a layout too (no owning run) ──────────────────────────────
     const manual = w.herdr.worktreeCreate(w.paths.repo, "manual/spike");
     expect(manual, "herdr created the manual worktree").toBeTruthy();
-    await w.waitFor(() => w.herdr.paneLabels(manual!.workspaceId).includes("work/agent"), {
+    const built = ["review/agent", "work/agent", "work/logs"];
+    // Wait for the WHOLE layout, not just its first pane: the hook applies tab 0, then tab 1, then
+    // starts each tab's agent, so a wait that stops at `work/agent` asserts the pane list mid-build.
+    await w.waitFor(() => built.every((l) => w.herdr.paneLabels(manual!.workspaceId).includes(l)), {
       label: "the hook builds a layout into a hand-created worktree",
       timeoutMs: 120_000,
     });
-    expect(w.herdr.paneLabels(manual!.workspaceId)).toEqual(["review/agent", "work/agent", "work/logs"]);
+    expect(w.herdr.paneLabels(manual!.workspaceId)).toEqual(built);
     expect(w.herdr.pluginLog(), "the plugin log records the build").toMatch(/app-dev|applied/i);
   },
 );

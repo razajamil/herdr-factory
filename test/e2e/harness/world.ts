@@ -4,7 +4,7 @@
 //
 // The root is short on purpose (`/h/<id>` in the container): herdr's unix socket lives under the
 // herdr config dir, and a long path overflows sun_path and kills the server at boot.
-import { chmodSync, copyFileSync, cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -12,6 +12,7 @@ import { stringify as yamlStringify } from "yaml";
 import { Db } from "./db.ts";
 import { Factory } from "./factory.ts";
 import { HerdrServer, delay, tail } from "./herdr.ts";
+import { FakeHerdr } from "./herdr-fake/state.ts";
 import { GhFake, initialGhState } from "./gh-fake/state.ts";
 import type { AgentScript, Driver, Lane, ScenarioSpec, Tier, WorldPaths } from "./types.ts";
 
@@ -66,6 +67,11 @@ function mergeConfig(base: Record<string, unknown>, over: Record<string, unknown
   return out;
 }
 
+/** What a scenario gets as `world.herdr`. The fake lane's control class mirrors `HerdrServer`'s public
+ *  surface exactly (including `unreachable`), so both lanes are driven and asserted through one type —
+ *  a scenario only needs `lane: "fake"` and the same calls keep working. */
+export type HerdrHandle = HerdrServer | FakeHerdr;
+
 export interface WaitOpts {
   /** Shown in the timeout message — always phrase it as the thing you expected to happen. */
   label?: string;
@@ -84,7 +90,7 @@ export class World {
   readonly driver: Driver;
   readonly paths: WorldPaths;
   readonly env: Record<string, string>;
-  readonly herdr: HerdrServer;
+  readonly herdr: HerdrHandle;
   readonly factory: Factory;
   readonly gh: GhFake;
   readonly db: Db;
@@ -97,6 +103,7 @@ export class World {
     ghState: string;
     ghLog: string;
     herdrLog: string;
+    herdrDown: string;
   };
   private started = false;
 
@@ -122,7 +129,11 @@ export class World {
     };
 
     const port = 8800 + (seq % 100) + (process.pid % 500) * 2;
-    const realHerdr = resolveRealHerdr();
+    // The fake lane must run with no herdr installed at all, so resolution is lane-gated: the shim IS
+    // the binary, and HF_HERDR_REAL points at it too (the scripted agent resolves that first, and a
+    // real herdr there would answer questions about panes this lane never created).
+    const fakeBin = join(this.paths.bin, "herdr");
+    const realHerdr = this.lane === "fake" ? fakeBin : resolveRealHerdr();
     this.files = {
       agentScript: join(home, "agent-script.json"),
       agentLogDir: join(this.paths.art, "agent"),
@@ -130,6 +141,7 @@ export class World {
       ghState: join(home, "gh-state.json"),
       ghLog: join(this.paths.art, "gh-calls.jsonl"),
       herdrLog: join(this.paths.art, "herdr-calls.jsonl"),
+      herdrDown: join(home, "herdr-down"),
     };
     this.env = {
       ...(process.env as Record<string, string>),
@@ -137,6 +149,10 @@ export class World {
       XDG_CONFIG_HOME: join(home, ".config"),
       PATH: `${this.paths.bin}:${process.env.PATH ?? ""}`,
       TERM: "xterm-256color",
+      // Explicit, because it decides two things: which shell herdr spawns in a pane, and which rc file
+      // the world's PATH prepend has to live in. In a container SHELL is usually unset, which would
+      // otherwise leave the checks below on /bin/sh (dash) while the panes ran something else.
+      SHELL: process.env.SHELL || (existsSync("/bin/bash") ? "/bin/bash" : "/bin/sh"),
       HERDR_FACTORY_CONFIG_DIR: this.paths.configDir,
       HERDR_FACTORY_STATE_ROOT: this.paths.stateRoot,
       HERDR_FACTORY_PORT: String(port),
@@ -146,6 +162,7 @@ export class World {
       HERDR_SOCKET_PATH: join(home, ".config", "herdr", "herdr.sock"),
       HF_HERDR_REAL: realHerdr,
       HF_HERDR_LOG: this.files.herdrLog,
+      HF_HERDR_DOWN: this.files.herdrDown,
       HF_AGENT_SCRIPT: this.files.agentScript,
       HF_AGENT_LOG_DIR: this.files.agentLogDir,
       HF_AGENT_STATE_DIR: this.files.agentStateDir,
@@ -160,12 +177,13 @@ export class World {
       ...(spec.processEnv ?? {}),
     };
 
-    this.herdr = new HerdrServer({
+    const herdrOpts = {
       bin: realHerdr,
       env: this.env,
       logPath: join(this.paths.art, "herdr-server.log"),
       callLog: this.files.herdrLog,
-    });
+    };
+    this.herdr = this.lane === "fake" ? new FakeHerdr(herdrOpts) : new HerdrServer({ ...herdrOpts, downFlag: this.files.herdrDown });
     this.factory = new Factory({
       repoRoot: REPO_ROOT,
       repo: this.repoName,
@@ -250,17 +268,57 @@ export class World {
       );
       chmodSync(join(b, kind), 0o755);
     }
+    // Panes run the user's shell as a LOGIN shell, and a login shell reorders PATH: macOS's
+    // /etc/zprofile runs `path_helper`, which rebuilds PATH from /etc/paths[.d] and APPENDS whatever
+    // it inherited — so the world bin lands behind /opt/homebrew/bin, where a REAL `claude` outranks
+    // the scripted agent. (That is not hypothetical: it silently launched actual Claude Code into the
+    // panes, which adopted as `claude`, reported `idle`, and never signalled.) These dotfiles run
+    // AFTER the system profile and put the world bin back in front, for both zsh and bash.
+    const prepend = [
+      "# Harness world: a login shell's path_helper moves this bin behind the system dirs, where a",
+      "# real agent CLI would outrank the scripted one. Re-prepend it, unconditionally and last.",
+      `export PATH="${b}:$PATH"`,
+      "",
+    ].join("\n");
+    for (const rc of [".zshenv", ".zprofile", ".zshrc", ".bash_profile", ".bashrc", ".profile"]) {
+      writeFileSync(join(this.paths.home, rc), prepend);
+    }
+
+    // `node` too, and for the same reason: the engine's launcher (`bin/herdr-factory`) execs whatever
+    // `node` PATH resolves to, and refuses to run below 26. Whose node that is must not depend on the
+    // shell — in the real lane a pane's login shell found homebrew's 26 and worked, while a fake-lane
+    // agent (a direct child, no login shell) found mise's 24 and every `step-done` died with a version
+    // error the agent reported as "not a rejection, not retrying". One shim, one node, both lanes.
+    writeFileSync(join(b, "node"), ["#!/usr/bin/env bash", `exec ${process.execPath} "$@"`, ""].join("\n"));
+    chmodSync(join(b, "node"), 0o755);
+
     const ghSrc = join(HARNESS_DIR, "gh-fake", "gh");
     copyFileSync(ghSrc, join(b, "gh"));
     chmodSync(join(b, "gh"), 0o755);
 
+    if (this.lane === "fake") {
+      // The fake lane's shim IS herdr: it serves every argv in-process and logs `{ts,argv}` itself, so
+      // wrapping it would double-log and there is no real binary to exec.
+      FakeHerdr.install(b);
+      return;
+    }
     writeFileSync(
       join(b, "herdr"),
       [
         "#!/usr/bin/env bash",
         "# Harness wrapper: record the argv the factory issued, then run the real herdr.",
         'if [ -n "${HF_HERDR_LOG:-}" ]; then',
-        '  printf \'{"ts":%s,"argv":%s}\\n\' "$(date +%s%3N)" "$(printf \'%s\\n\' "$@" | jq -R . | jq -s -c .)" >> "$HF_HERDR_LOG" 2>/dev/null || true',
+        // `date +%s%3N` is GNU-only: BSD date (macOS) prints a literal "N", which made every logged
+        // line invalid JSON and silently emptied calls()/notifications(). Fall back to whole seconds.
+        '  ms=$(date +%s%3N 2>/dev/null)',
+        '  case "$ms" in *[!0-9]*|"") ms="$(date +%s)000";; esac',
+        '  printf \'{"ts":%s,"argv":%s}\\n\' "$ms" "$(printf \'%s\\n\' "$@" | jq -R . | jq -s -c .)" >> "$HF_HERDR_LOG" 2>/dev/null || true',
+        "fi",
+        "# Injected outage (HerdrServer.unreachable): refuse the way a herdr with no server does. The",
+        "# call is logged FIRST, so what the engine attempted during the outage stays observable.",
+        'if [ -n "${HF_HERDR_DOWN:-}" ] && [ -e "$HF_HERDR_DOWN" ]; then',
+        '  echo "herdr: failed to connect to the herdr server (harness-injected outage)" >&2',
+        "  exit 1",
         "fi",
         'exec "${HF_HERDR_REAL:-herdr}" "$@"',
         "",
@@ -327,21 +385,73 @@ export class World {
     await this.spec.beforeStart?.(this.paths);
     this.writeConfig();
 
-    if (this.lane !== "real") throw new Error(`lane "${this.lane}" is not implemented yet (M4)`);
-    // Link before boot so the one-shot [[startup]] hook is registered too; if linking needs the
-    // socket, retry once the server is up (a fresh world has no stale claims for the startup hook
-    // to reap, so post-boot linking is equivalent for our purposes).
-    const linkedEarly = this.herdr.linkPlugin(REPO_ROOT);
-    await this.herdr.start();
-    if (!linkedEarly && !this.herdr.linkPlugin(REPO_ROOT)) {
-      throw new Error(`herdr plugin link failed:\n${this.herdr.cli(["plugin", "link", REPO_ROOT]).stderr}`);
+    if (this.lane === "fake") {
+      // No server and no plugin host: `start()` only prepares the state the shim serves. A fake-lane
+      // scenario therefore never gets a layout (`worktree.created` has nothing to fire it), which is
+      // why layout coverage is real-lane only.
+      if (this.spec.config && JSON.stringify(this.spec.config(this.paths)).includes('"layouts"')) {
+        throw new Error(`scenario "${this.spec.name}" declares layouts on the fake lane — no plugin host exists there, so no layout would ever be built`);
+      }
+      await this.herdr.start();
+    } else {
+      // Link before boot so the one-shot [[startup]] hook is registered too; if linking needs the
+      // socket, retry once the server is up (a fresh world has no stale claims for the startup hook
+      // to reap, so post-boot linking is equivalent for our purposes).
+      const linkedEarly = this.herdr.linkPlugin(REPO_ROOT);
+      await this.herdr.start();
+      if (!linkedEarly && !this.herdr.linkPlugin(REPO_ROOT)) {
+        throw new Error(`herdr plugin link failed:\n${this.herdr.cli(["plugin", "link", REPO_ROOT]).stderr}`);
+      }
     }
     if (this.driver === "serve") await this.factory.serve();
+    this.assertShimsWin();
     this.started = true;
+  }
+
+  /** A pane's agent must be OUR shim. herdr maps `--kind claude` to the command `claude` and resolves
+   *  it in the pane's shell, so this is decided entirely by PATH inside a login shell — and when a real
+   *  agent CLI wins, every symptom is a lie: herdr adopts it, reports `idle`, and the scenario dies 120s
+   *  later on a step that "never signalled". Fail here instead, with the resolution that beat us. */
+  private assertShimsWin(): void {
+    for (const kind of ["claude", "opencode", "gh", "herdr", "node"]) {
+      const r = spawnSync(this.env.SHELL || "/bin/sh", ["-lic", `command -v ${kind}`], { env: this.env, encoding: "utf8", timeout: 20_000 });
+      const resolved = (r.stdout ?? "").trim().split("\n").filter(Boolean).pop() ?? "";
+      if (resolved !== join(this.paths.bin, kind)) {
+        throw new Error(
+          `world shim for "${kind}" is not what a pane would run: a login shell resolves it to ` +
+            `${resolved || "(nothing)"} instead of ${join(this.paths.bin, kind)}. ` +
+            `The world dotfiles are meant to re-prepend ${this.paths.bin} after the system profile — check them and $SHELL (${this.env.SHELL}).`,
+        );
+      }
+    }
+    // And the agent's own escape hatch has to work: every signal is `bin/herdr-factory …` run from a
+    // pane, so if the launcher cannot start there, no step ever completes — 90 seconds later, as an
+    // "awaiting step-done" timeout that says nothing about why.
+    const cli = spawnSync(this.env.SHELL || "/bin/sh", ["-lic", `"${join(REPO_ROOT, "bin", "herdr-factory")}" --version`], {
+      env: this.env,
+      encoding: "utf8",
+      timeout: 60_000,
+    });
+    if ((cli.status ?? -1) !== 0) {
+      throw new Error(`the factory CLI does not run in a pane's shell — every step-done would fail:\n${(cli.stderr || cli.stdout || "").trim()}`);
+    }
   }
 
   async stop(): Promise<void> {
     if (!this.started) return;
+    // Pane scrollback dies with the server, and it is the ONLY place an agent that failed to start
+    // says why (node's own startup errors go to the PTY, not to any log the harness owns). Capture it
+    // while the panes are still alive — this is diagnosis, so never let it fail a scenario.
+    try {
+      mkdirSync(this.paths.art, { recursive: true });
+      writeFileSync(join(this.paths.art, "panes.txt"), this.herdr.allScreens(400));
+    } catch (e) {
+      try {
+        writeFileSync(join(this.paths.art, "panes.txt"), `(pane capture failed: ${String(e)})`);
+      } catch {
+        /* the artifact dir may be gone; nothing more to do */
+      }
+    }
     try {
       await this.factory.stop();
     } finally {
@@ -458,6 +568,48 @@ export class World {
     ];
     return parts.join("\n");
   }
+
+  /** Record numbers the run should REPORT rather than only assert on: they land beside the scenario's
+   *  other artifacts as metrics.json, so a trend (drain time, tick p95, RSS growth) is reviewable even
+   *  when every assertion passed. */
+  recordMetrics(metrics: Record<string, number | string>): void {
+    writeFileSync(join(this.paths.art, "metrics.json"), JSON.stringify(metrics, null, 2));
+  }
+
+  /** A point-in-time sample of what the resident server is holding: RSS, open file descriptors, the
+   *  DB file, and how many worktrees exist. Linux-only (/proc), which is where the suite runs. */
+  sample(): { rssKb: number; fds: number; dbBytes: number; worktrees: number } {
+    const pid = this.factory.pid;
+    let rssKb = 0;
+    let fds = 0;
+    if (pid) {
+      // procfs in the container; `ps`/`lsof` on a dev mac. Measuring BOTH matters more than it looks:
+      // with a procfs-only reader every sample on macOS is 0, and "FDs never grew" then passes without
+      // ever having looked — a leak assertion that cannot fail is worse than no assertion.
+      if (existsSync(`/proc/${pid}/status`)) {
+        rssKb = Number(/VmRSS:\s+(\d+)/.exec(readFileSync(`/proc/${pid}/status`, "utf8"))?.[1] ?? 0);
+        try {
+          fds = readdirSync(`/proc/${pid}/fd`).length;
+        } catch {
+          fds = 0;
+        }
+      } else {
+        const ps = spawnSync("ps", ["-o", "rss=", "-p", String(pid)], { encoding: "utf8" });
+        rssKb = Number((ps.stdout ?? "").trim()) || 0;
+        const lsof = spawnSync("lsof", ["-p", String(pid)], { encoding: "utf8" });
+        fds = (lsof.stdout ?? "").split("\n").filter(Boolean).length - 1; // minus the header
+      }
+    }
+    let dbBytes = 0;
+    try {
+      dbBytes = statSync(this.db.path).size;
+    } catch {
+      dbBytes = 0;
+    }
+    const worktrees = this.git(["worktree", "list"]).split("\n").filter(Boolean).length;
+    return { rssKb, fds: Math.max(0, fds), dbBytes, worktrees };
+  }
+
 
   /** The scripted agent's transcript: every turn, every command it ran, and every rejection it saw. */
   agentLog(lines = 500): string {

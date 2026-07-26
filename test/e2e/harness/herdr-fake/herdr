@@ -1,0 +1,1188 @@
+#!/usr/bin/env node
+// The E2E harness's FAKE `herdr` CLI — the `fake` LANE (test/e2e/README.md has the lane/tier/driver
+// model; ./README.md has this lane's argv surface, its injection knobs and what it cannot cover).
+//
+// The REAL lane runs a headless `herdr server` per world. That proves the herdr contract, but it costs
+// a PTY, an agent process and a server per world, and it cannot be asked to misbehave. This file is
+// the other half: it answers every argv `src/clients/herdr.ts` issues with the exact `{result:{…}}`
+// envelope that client parses, out of a JSON state file — while keeping REAL what the engine actually
+// depends on being real:
+//   * `worktree create` runs `git worktree add`, because the heartbeat and the read-only watch run
+//     `git rev-parse HEAD` in the checkout and materialize writes `.memory/herdr-factory/` into it;
+//   * `agent start` / `pane run` launch the configured executable as a DETACHED child (no terminal —
+//     that is the point of this lane), so liveness is a real process that can really die;
+//   * `agent prompt` delivers the text to that process's stdin, through a per-pane FIFO.
+//
+// PLAIN JavaScript on purpose: this file has a shebang and no extension, and node cannot strip types
+// from an extensionless file. It also avoids `require` and top-level `await` so it behaves the same
+// whether node decides the file is CommonJS or ESM (only dynamic `import()` is used, legal in both).
+//
+// State file:   $HF_HERDR_STATE   (JSON; default <HOME>/herdr-fake-state.json)
+// Call log:     $HF_HERDR_LOG     (JSONL `{ts,argv}` — the SAME shape the real lane's wrapper writes)
+// Injection:    $HF_HERDR_INJECT  (JSON; default <HOME>/herdr-fake-inject.json) + env fallbacks
+
+const VERSION = "0.7.5";
+const PROTOCOL = "17";
+/** herdr's agent-name rule, enforced so a bad `name` fails here the way it fails against herdr
+ *  (`invalid_agent_name`) instead of silently working only in this lane. */
+const AGENT_NAME_RE = /^[a-z][a-z0-9_-]{0,31}$/;
+/** herdr kinds `pane run`'s command is auto-detected as (the typed-harness path). Mirrors
+ *  HERDR_AGENT_KINDS in src/types.ts — kept short here: only what a harness world ever types. */
+const AUTODETECT_KINDS = ["claude", "opencode", "codex", "gemini", "cursor", "amp", "droid"];
+/** What `--wait` waits for when no `--until` is given (herdr's default: the turn finished). */
+const DEFAULT_UNTIL = ["idle", "done", "blocked"];
+const READY_STATES = ["idle", "done", "working", "blocked"];
+
+// Set once in main(): see the header (no `require`, no top-level await).
+let FS;
+let CP;
+let P;
+
+// --- argv helpers ------------------------------------------------------------
+
+/** Value of `--name v` / `--name=v` (last wins), or undefined. */
+function flag(argv, ...names) {
+  let found;
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    for (const n of names) {
+      if (a === n) found = argv[i + 1] ?? "";
+      else if (a.startsWith(n + "=")) found = a.slice(n.length + 1);
+    }
+  }
+  return found;
+}
+
+function hasFlag(argv, ...names) {
+  return argv.some((a) => names.some((n) => a === n || a.startsWith(n + "=")));
+}
+
+/** Every value of a repeatable flag, in order (`--env A=1 --env B=2`, `--until working --until idle`).
+ *  Deliberately NOT comma-splitting: an env value or a pane label may legitimately contain a comma. */
+function repeated(argv, name) {
+  const out = [];
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === name) {
+      if (argv[i + 1] != null) out.push(argv[i + 1]);
+    } else if (a.startsWith(name + "=")) {
+      out.push(a.slice(name.length + 1));
+    }
+  }
+  return out;
+}
+
+/** `--env K=V` pairs as an object. */
+function pairs(argv, name) {
+  const out = {};
+  for (const v of repeated(argv, name)) {
+    const eq = v.indexOf("=");
+    if (eq > 0) out[v.slice(0, eq)] = v.slice(eq + 1);
+  }
+  return out;
+}
+
+/** Everything after a bare `--` — `agent start … -- <agent args…>`. */
+function afterDoubleDash(argv) {
+  const i = argv.indexOf("--");
+  return i < 0 ? [] : argv.slice(i + 1);
+}
+
+/** Stable classification for the injection knobs and for reading the log by eye: the first two argv
+ *  tokens ("agent list", "worktree create", "pane report-metadata"), or just the first. */
+function classify(argv) {
+  const a = argv[0] ?? "";
+  const b = argv[1] ?? "";
+  return b && !b.startsWith("-") ? `${a} ${b}` : a;
+}
+
+// --- paths -------------------------------------------------------------------
+// Every default is derived from HOME (the world root), so the lane works with no new env at all; each
+// one is overridable for a world that wants its state somewhere else.
+
+function home() {
+  return process.env.HOME || "/tmp";
+}
+function statePath() {
+  return process.env.HF_HERDR_STATE || P.join(home(), "herdr-fake-state.json");
+}
+function injectPath() {
+  return process.env.HF_HERDR_INJECT || P.join(home(), "herdr-fake-inject.json");
+}
+/** Where `worktree create` puts checkouts (herdr owns this location in the real lane). */
+function worktreeRoot() {
+  return process.env.HF_HERDR_WORKTREES || P.join(home(), "worktrees");
+}
+/** Per-pane FIFOs (agent stdin) and output logs (what `pane read` returns). */
+function runtimeDir() {
+  return process.env.HF_HERDR_RUNTIME || P.join(home(), ".herdr-fake");
+}
+function fifoPath(paneId) {
+  return P.join(runtimeDir(), `${safe(paneId)}.in`);
+}
+function paneLogPath(paneId) {
+  return P.join(runtimeDir(), `${safe(paneId)}.out`);
+}
+/** The scripted agent's own status file — `agent_status` comes from here and nowhere else. */
+function statusPath(paneId) {
+  const dir = process.env.HF_AGENT_STATE_DIR;
+  return dir ? P.join(dir, `${paneId}.status`) : null;
+}
+function safe(s) {
+  return String(s).replace(/[^A-Za-z0-9._-]+/g, "_");
+}
+function slug(branch) {
+  return String(branch).replace(/[^A-Za-z0-9._-]+/g, "-");
+}
+
+// --- failure injection -------------------------------------------------------
+// Read fresh on every invocation, from a FILE first (so a scenario can flip a knob mid-run — the
+// resident `serve` was started with a fixed env and would never see an env change) and from env as the
+// static fallback (a scenario's `processEnv`). Anything present in the file wins for that key.
+
+function list(v) {
+  if (v == null) return [];
+  if (Array.isArray(v)) return v.map(String).filter(Boolean);
+  return String(v)
+    .split(",")
+    .map((x) => x.trim())
+    .filter(Boolean);
+}
+
+function injection() {
+  let j = {};
+  try {
+    j = JSON.parse(FS.readFileSync(injectPath(), "utf8")) || {};
+  } catch {
+    /* no file = no dynamic injection; env still applies */
+  }
+  return {
+    fail: list(j.fail != null ? j.fail : process.env.HF_HERDR_FAIL),
+    hidden: list(j.hiddenPanes != null ? j.hiddenPanes : process.env.HF_HERDR_HIDE_PANES),
+    stall: list(j.promptStall != null ? j.promptStall : process.env.HF_HERDR_PROMPT_STALL),
+    sleepMs: Number(j.sleepMs != null ? j.sleepMs : (process.env.HF_HERDR_SLEEP_MS ?? 0)) || 0,
+    sleep: list(j.sleep != null ? j.sleep : process.env.HF_HERDR_SLEEP),
+  };
+}
+
+/** `*` matches everything; otherwise an exact match against the classification / pane id. */
+function matches(spec, value) {
+  return spec.some((x) => x === "*" || x === value);
+}
+
+function sleepSync(ms) {
+  if (!(ms > 0)) return;
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+// --- state -------------------------------------------------------------------
+
+function blankState() {
+  return { seq: 0, workspaces: {}, tabs: {}, panes: {}, plugins: [] };
+}
+
+/** Auto-creating on read: unlike the gh fake there is nothing a scenario must seed, and refusing to
+ *  answer without a pre-written file would only add a wiring trap. */
+function readState() {
+  try {
+    const s = JSON.parse(FS.readFileSync(statePath(), "utf8"));
+    return Object.assign(blankState(), s);
+  } catch {
+    return blankState();
+  }
+}
+
+function writeState(s) {
+  FS.mkdirSync(P.dirname(statePath()), { recursive: true });
+  const tmp = `${statePath()}.${process.pid}.tmp`;
+  FS.writeFileSync(tmp, JSON.stringify(s, null, 2));
+  FS.renameSync(tmp, statePath());
+}
+
+/** Read-modify-write behind a coarse mkdir lock. Load-bearing at scale: 60–100 concurrent runs mean
+ *  many shim processes racing on one file, and a lost id allocation would hand two runs the same pane.
+ *  Holds are ~1ms (parse + write a small JSON); slow work (git, launching) stays OUTSIDE. */
+function mutate(fn) {
+  const lock = `${statePath()}.lock`;
+  const deadline = Date.now() + 10_000;
+  let held = false;
+  for (;;) {
+    try {
+      FS.mkdirSync(P.dirname(lock), { recursive: true });
+      FS.mkdirSync(lock);
+      held = true;
+      break;
+    } catch (e) {
+      if (e.code !== "EEXIST") throw e;
+      if (Date.now() > deadline) break; // stale lock: proceed rather than wedge the tick
+      sleepSync(15);
+    }
+  }
+  try {
+    const s = readState();
+    const r = fn(s);
+    writeState(s);
+    return r;
+  } finally {
+    if (held) {
+      try {
+        FS.rmdirSync(lock);
+      } catch {
+        /* already gone */
+      }
+    }
+  }
+}
+
+/** Reserve n ids at once (one lock hold), so the caller can build a whole tab+pane without racing. */
+function nextIds(n) {
+  return mutate((s) => {
+    const out = [];
+    for (let i = 0; i < n; i++) out.push(++s.seq);
+    return out;
+  });
+}
+
+// --- process + agent liveness ------------------------------------------------
+
+function alive(pid) {
+  if (!pid) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return e.code === "EPERM"; // exists, not ours
+  }
+}
+
+/** SIGTERM then SIGKILL the whole process GROUP: the launcher is detached (its own group leader), so
+ *  a group signal reaps the agent and anything it spawned, not just the shell that exec'd it. */
+function killPid(pid) {
+  if (!pid) return;
+  for (const sig of ["SIGTERM", "SIGKILL"]) {
+    try {
+      process.kill(-pid, sig);
+    } catch {
+      try {
+        process.kill(pid, sig);
+      } catch {
+        /* already gone */
+      }
+    }
+    if (!alive(pid)) return;
+    sleepSync(60);
+  }
+}
+
+/** The agent's self-reported state, from ITS OWN status file — the fake never invents a status, which
+ *  is what keeps `working` (the state that vetoes the budget/stall watchdogs) honest. */
+function agentStatus(paneId) {
+  const p = statusPath(paneId);
+  if (!p) return "unknown";
+  try {
+    return FS.readFileSync(p, "utf8").trim() || "unknown";
+  } catch {
+    return "unknown";
+  }
+}
+
+function statusSnapshot(paneId) {
+  const p = statusPath(paneId);
+  let mtimeMs = 0;
+  try {
+    mtimeMs = FS.statSync(p).mtimeMs;
+  } catch {
+    /* not written yet */
+  }
+  return { value: agentStatus(paneId), mtimeMs };
+}
+
+function livePaneProcess(pane) {
+  if (pane.agent && alive(pane.agent.pid)) return pane.agent.pid;
+  if (pane.command && alive(pane.command.pid)) return pane.command.pid;
+  return null;
+}
+
+/** Panes herdr would list as hosting an agent: a live process AND not hidden by injection. */
+function liveAgentPanes(s) {
+  const hidden = injection().hidden;
+  return Object.values(s.panes)
+    .filter((p) => p.agent && alive(p.agent.pid))
+    .filter((p) => !matches(hidden, p.pane_id));
+}
+
+function agentJson(pane) {
+  const status = agentStatus(pane.pane_id);
+  return {
+    pane_id: pane.pane_id,
+    workspace_id: pane.workspace_id,
+    tab_id: pane.tab_id,
+    agent: pane.agent.kind,
+    name: pane.agent.name,
+    agent_status: status,
+    interactive_ready: status === "idle" || status === "done",
+    cwd: pane.cwd || "",
+    agent_session: { value: pane.agent.session_id },
+  };
+}
+
+/** `hidden` is passed in rather than read here: `pane list` projects every pane in a workspace, and at
+ *  60 runs re-reading the injection file per pane would be 60 reads per call. */
+function paneJson(pane, hidden) {
+  const agent = pane.agent && alive(pane.agent.pid) && !matches(hidden, pane.pane_id);
+  return {
+    pane_id: pane.pane_id,
+    tab_id: pane.tab_id,
+    workspace_id: pane.workspace_id,
+    label: pane.label ?? null,
+    cwd: pane.cwd || "",
+    focused: !!pane.focused,
+    agent_status: agent ? agentStatus(pane.pane_id) : "gone",
+    title: pane.metadata?.title ?? null,
+  };
+}
+
+function workspaceJson(s, ws) {
+  const tabs = Object.values(s.tabs).filter((t) => t.workspace_id === ws.workspace_id);
+  const panes = Object.values(s.panes).filter((p) => p.workspace_id === ws.workspace_id);
+  return {
+    workspace_id: ws.workspace_id,
+    label: ws.label ?? null,
+    active_tab_id: ws.active_tab_id ?? tabs[0]?.tab_id ?? null,
+    tab_count: tabs.length,
+    pane_count: panes.length,
+    worktree: ws.worktree ?? undefined,
+  };
+}
+
+// --- git ---------------------------------------------------------------------
+
+function git(args, cwd) {
+  const r = CP.spawnSync("git", args, { cwd, encoding: "utf8", timeout: 120_000 });
+  return { code: r.status ?? -1, stdout: r.stdout ?? "", stderr: r.stderr ?? "" };
+}
+
+function gitTopLevel(cwd) {
+  const r = git(["rev-parse", "--show-toplevel"], cwd);
+  return r.code === 0 ? r.stdout.trim() : null;
+}
+
+/** herdr refuses to create a worktree from a LINKED worktree (ARCHITECTURE §5: "only from the main
+ *  checkout"), so the fake refuses too — otherwise a regression there would only show in production. */
+function isLinkedWorktree(cwd) {
+  const r = git(["rev-parse", "--git-common-dir", "--git-dir"], cwd);
+  if (r.code !== 0) return false;
+  const [common, own] = r.stdout.trim().split("\n");
+  return !!common && !!own && P.resolve(cwd, common) !== P.resolve(cwd, own);
+}
+
+function branchExists(repoRoot, branch) {
+  return git(["show-ref", "--verify", "--quiet", `refs/heads/${branch}`], repoRoot).code === 0;
+}
+
+/** Serialize `git worktree add` PER REPO, and make each attempt re-decide how to add.
+ *
+ *  git's own bookkeeping is not concurrency-safe, and this lane exists partly to run 60–100 claims at
+ *  once. Verified with 30 parallel adds without this: two thirds failed, because a contended
+ *  `worktree add -b <branch>` still CREATES the branch before dying — after which every retry dies on
+ *  `a branch named <branch> already exists`, and a partially-created directory makes git refuse the
+ *  target too. So: one add at a time, and each attempt re-reads whether the branch and the checkout
+ *  already exist instead of trusting the plan it started with. */
+function withRepoLock(repoRoot, fn) {
+  const lock = P.join(runtimeDir(), `git-${safe(P.basename(repoRoot))}.lock`);
+  FS.mkdirSync(P.dirname(lock), { recursive: true });
+  const deadline = Date.now() + 120_000; // still inside the engine's 180s worktree budget
+  let held = false;
+  for (;;) {
+    try {
+      FS.mkdirSync(lock);
+      held = true;
+      break;
+    } catch (e) {
+      if (e.code !== "EEXIST") throw e;
+      if (Date.now() > deadline) break; // stale lock: proceed rather than fail the claim
+      sleepSync(25);
+    }
+  }
+  try {
+    return fn();
+  } finally {
+    if (held) {
+      try {
+        FS.rmdirSync(lock);
+      } catch {
+        /* already gone */
+      }
+    }
+  }
+}
+
+function worktreeAdd(repoRoot, dir, branch, base) {
+  return withRepoLock(repoRoot, () => {
+    let last = { code: -1, stdout: "", stderr: "" };
+    for (let attempt = 0; attempt < 3; attempt++) {
+      if (git(["rev-parse", "--git-dir"], dir).code === 0) return { code: 0, stdout: "", stderr: "" }; // already there
+      if (FS.existsSync(dir)) FS.rmSync(dir, { recursive: true, force: true }); // partial add: git refuses a non-empty target
+      const have = branchExists(repoRoot, branch);
+      last = have ? git(["worktree", "add", dir, branch], repoRoot) : git(["worktree", "add", "-b", branch, dir, base], repoRoot);
+      if (last.code === 0) return last;
+      git(["worktree", "prune"], repoRoot);
+      sleepSync(100 * (attempt + 1));
+    }
+    return last;
+  });
+}
+
+// --- launching a pane's process ----------------------------------------------
+
+/** Recreate the pane's stdin FIFO. Recreated (not reused) so a new agent never inherits keystrokes
+ *  queued for the one before it. */
+function makeFifo(paneId) {
+  const fifo = fifoPath(paneId);
+  FS.mkdirSync(P.dirname(fifo), { recursive: true });
+  try {
+    FS.unlinkSync(fifo);
+  } catch {
+    /* wasn't there */
+  }
+  const r = CP.spawnSync("mkfifo", [fifo], { encoding: "utf8" });
+  if ((r.status ?? -1) !== 0) throw new Error(`mkfifo ${fifo} failed: ${r.stderr || r.stdout}`);
+  return fifo;
+}
+
+/**
+ * Launch `command args…` in a pane as a DETACHED child, with the pane's cwd and env, stdin wired to
+ * the pane's FIFO and stdout/stderr appended to the pane's output log (what `pane read` returns).
+ *
+ * The launcher is `sh -c 'exec 3<> "$1"; shift; exec "$@" <&3'`:
+ *   * `3<>` opens the FIFO READ-WRITE, so the shell is itself a writer and the reader NEVER sees EOF
+ *     when a one-shot `agent prompt` writer closes — without this the scripted agent would exit
+ *     ("stdin closed") after its first prompt;
+ *   * both `exec`s mean the recorded pid IS the agent's pid (no wrapper process in between), which is
+ *     what makes `killAgent()` and this lane's liveness answers refer to the real thing.
+ */
+function launch(pane, command, args) {
+  const fifo = makeFifo(pane.pane_id);
+  const logPath = paneLogPath(pane.pane_id);
+  FS.mkdirSync(P.dirname(logPath), { recursive: true });
+  const fd = FS.openSync(logPath, "a");
+  try {
+    const child = CP.spawn(
+      "/bin/sh",
+      ["-c", 'exec 3<> "$1"; shift; exec "$@" <&3', "herdr-fake", fifo, command, ...args],
+      {
+        cwd: pane.cwd || undefined,
+        // Panes inherit the SERVER's environment in the real lane; here the shim's own env is that
+        // environment (it was spawned by the engine, which runs with the whole world env), plus the
+        // pane's `--env` and the ambient HERDR_* a real pane carries.
+        env: {
+          ...process.env,
+          ...(pane.env || {}),
+          HERDR_PANE_ID: pane.pane_id,
+          HERDR_TAB_ID: pane.tab_id,
+          HERDR_WORKSPACE_ID: pane.workspace_id,
+          // Marks calls this process (or its children) make back into the shim as PANE-originated, so
+          // they stay out of the factory's argv log — see the log step in main(). Our own marker
+          // rather than HERDR_PANE_ID, which a developer running the suite from inside a real herdr
+          // pane would already have in the environment.
+          HF_HERDR_FAKE_PANE: "1",
+        },
+        detached: true,
+        stdio: ["ignore", fd, fd],
+      },
+    );
+    child.unref();
+    return child.pid;
+  } finally {
+    FS.closeSync(fd);
+  }
+}
+
+/** Write one submission to a pane's FIFO. O_NONBLOCK so a pane whose reader is gone fails with ENXIO
+ *  instead of blocking this process forever. */
+function deliver(paneId, text) {
+  const fifo = fifoPath(paneId);
+  // The scripted agent (and any line-oriented harness) reads one submission per LINE, while herdr's
+  // `agent prompt` is atomic — types the text and presses Enter itself. Collapsing newlines keeps a
+  // multi-line prompt one submission instead of N turns.
+  const line = `${String(text).replace(/[\r\n]+/g, " ")}\n`;
+  let fd;
+  try {
+    fd = FS.openSync(fifo, FS.constants.O_WRONLY | FS.constants.O_NONBLOCK);
+  } catch (e) {
+    return `no reader on ${fifo} (${e.code || e.message})`;
+  }
+  try {
+    for (let attempt = 0; attempt < 50; attempt++) {
+      try {
+        FS.writeSync(fd, line);
+        return null;
+      } catch (e) {
+        if (e.code !== "EAGAIN") return `write failed (${e.code || e.message})`;
+        sleepSync(20); // pipe momentarily full — the agent is mid-turn
+      }
+    }
+    return "pipe stayed full";
+  } finally {
+    FS.closeSync(fd);
+  }
+}
+
+function resolveOnPath(name) {
+  if (name.includes("/")) return FS.existsSync(name) ? name : null;
+  for (const dir of (process.env.PATH || "").split(":")) {
+    if (!dir) continue;
+    const p = P.join(dir, name);
+    try {
+      FS.accessSync(p, FS.constants.X_OK);
+      return p;
+    } catch {
+      /* next */
+    }
+  }
+  return null;
+}
+
+// --- handler results ---------------------------------------------------------
+
+function ok(result) {
+  return { code: 0, out: `${JSON.stringify({ result })}\n`, err: "" };
+}
+function text(s) {
+  return { code: 0, out: s, err: "" };
+}
+/** A recognised argv this fake cannot serve (unknown pane, busy pane, git refused). Non-zero with a
+ *  herdr-like machine-readable code first — the engine logs it as `lastAgentError`. */
+function fail(message, code = 1) {
+  return { code, out: "", err: `herdr-fake: ${message}\n` };
+}
+
+// --- worktree / workspace ----------------------------------------------------
+
+function findWorkspaceByBranch(s, repoRoot, branch) {
+  return Object.values(s.workspaces).find(
+    (w) => w.worktree?.branch === branch && (!repoRoot || w.worktree?.repo_root === repoRoot),
+  );
+}
+
+function worktreeResult(s, ws) {
+  const rootPane = Object.values(s.panes)
+    .filter((p) => p.workspace_id === ws.workspace_id)
+    .sort((a, b) => a.seq - b.seq)[0];
+  return ok({
+    type: "worktree_open",
+    workspace: workspaceJson(s, ws),
+    root_pane: rootPane
+      ? { pane_id: rootPane.pane_id, workspace_id: rootPane.workspace_id, tab_id: rootPane.tab_id, cwd: rootPane.cwd }
+      : null,
+  });
+}
+
+/** Register a workspace + its first tab + root pane over an existing checkout dir. */
+function adoptCheckout(opts) {
+  const [wsN, tabN, paneN] = nextIds(3);
+  const wsId = `w${wsN}`;
+  const tabId = `${wsId}:t${tabN}`;
+  const paneId = `${wsId}:p${paneN}`;
+  return mutate((s) => {
+    s.workspaces[wsId] = {
+      workspace_id: wsId,
+      label: opts.branch,
+      active_tab_id: tabId,
+      worktree: {
+        checkout_path: opts.dir,
+        repo_root: opts.repoRoot,
+        repo_name: P.basename(opts.repoRoot),
+        is_linked_worktree: true,
+        branch: opts.branch,
+      },
+    };
+    s.tabs[tabId] = { tab_id: tabId, workspace_id: wsId, label: opts.branch, seq: tabN };
+    s.panes[paneId] = {
+      pane_id: paneId,
+      tab_id: tabId,
+      workspace_id: wsId,
+      label: null,
+      cwd: opts.dir,
+      env: {},
+      focused: false,
+      shell_pid: 900_000 + paneN,
+      seq: paneN,
+      agent: null,
+      command: null,
+      metadata: {},
+    };
+    return worktreeResult(s, s.workspaces[wsId]);
+  });
+}
+
+function worktreeCreateOrOpen(argv, mode) {
+  const repoCwd = flag(argv, "--cwd") || process.cwd();
+  const branch = flag(argv, "--branch");
+  const base = flag(argv, "--base") || "HEAD";
+  if (!branch) return fail("worktree_invalid_args: --branch is required");
+  const repoRoot = gitTopLevel(repoCwd);
+  if (!repoRoot) return fail(`worktree_no_repo: ${repoCwd} is not a git checkout`);
+  if (isLinkedWorktree(repoCwd)) return fail(`worktree_linked_source: ${repoCwd} is a linked worktree — herdr only creates from the main checkout`);
+
+  const existing = findWorkspaceByBranch(readState(), repoRoot, branch);
+  if (existing) return worktreeResult(readState(), existing); // idempotent, like herdr's open
+
+  const dir = P.join(worktreeRoot(), P.basename(repoRoot), slug(branch));
+  FS.mkdirSync(P.dirname(dir), { recursive: true });
+  if (mode === "open" && !branchExists(repoRoot, branch) && git(["rev-parse", "--git-dir"], dir).code !== 0) {
+    return fail(`worktree_branch_not_found: ${branch}`);
+  }
+  const r = worktreeAdd(repoRoot, dir, branch, base);
+  if (r.code !== 0) return fail(`worktree_add_failed: ${(r.stderr || r.stdout).trim().slice(0, 400)}`);
+  // A concurrent create for the same branch may have registered the workspace while we waited for the
+  // repo lock — answer that one rather than a second workspace over the same checkout.
+  const raced = findWorkspaceByBranch(readState(), repoRoot, branch);
+  if (raced) return worktreeResult(readState(), raced);
+  return adoptCheckout({ dir, repoRoot, branch });
+}
+
+function worktreeRemove(argv) {
+  const wsId = flag(argv, "--workspace");
+  const s = readState();
+  const ws = wsId ? s.workspaces[wsId] : undefined;
+  if (!ws) return fail(`workspace_not_found: ${wsId}`);
+  for (const pane of Object.values(s.panes)) {
+    if (pane.workspace_id === wsId) killPid(livePaneProcess(pane));
+  }
+  const dir = ws.worktree?.checkout_path;
+  const repoRoot = ws.worktree?.repo_root;
+  if (dir && repoRoot) {
+    git(["worktree", "remove", "--force", dir], repoRoot);
+    FS.rmSync(dir, { recursive: true, force: true });
+    git(["worktree", "prune"], repoRoot); // deregister whatever `remove` didn't
+  }
+  dropWorkspace(wsId);
+  return ok({ type: "worktree_remove", workspace_id: wsId, removed: true });
+}
+
+function dropWorkspace(wsId) {
+  mutate((s) => {
+    for (const [id, pane] of Object.entries(s.panes)) {
+      if (pane.workspace_id === wsId) {
+        delete s.panes[id];
+        try {
+          FS.unlinkSync(fifoPath(id));
+        } catch {
+          /* never created / already gone */
+        }
+      }
+    }
+    for (const [id, tab] of Object.entries(s.tabs)) if (tab.workspace_id === wsId) delete s.tabs[id];
+    delete s.workspaces[wsId];
+  });
+}
+
+/** `worktree list` from GIT (the authority on registrations), cross-referenced with our workspaces. */
+function worktreeList(argv) {
+  const s = readState();
+  const wsId = flag(argv, "--workspace");
+  const roots = new Set();
+  if (wsId && s.workspaces[wsId]?.worktree?.repo_root) roots.add(s.workspaces[wsId].worktree.repo_root);
+  else for (const w of Object.values(s.workspaces)) if (w.worktree?.repo_root) roots.add(w.worktree.repo_root);
+  const byPath = new Map(
+    Object.values(s.workspaces)
+      .filter((w) => w.worktree?.checkout_path)
+      .map((w) => [w.worktree.checkout_path, w.workspace_id]),
+  );
+  const worktrees = [];
+  for (const root of roots) {
+    const r = git(["worktree", "list", "--porcelain"], root);
+    if (r.code !== 0) continue;
+    let cur = null;
+    for (const line of r.stdout.split("\n")) {
+      if (line.startsWith("worktree ")) {
+        cur = { path: line.slice(9).trim(), branch: null, open_workspace_id: null };
+        worktrees.push(cur);
+      } else if (line.startsWith("branch ") && cur) {
+        cur.branch = line.slice(7).trim().replace(/^refs\/heads\//, "");
+      }
+    }
+  }
+  for (const w of worktrees) w.open_workspace_id = byPath.get(w.path) ?? null;
+  return ok({ type: "worktree_list", worktrees });
+}
+
+// --- handlers ----------------------------------------------------------------
+
+function handleWorktree(argv) {
+  switch (argv[1]) {
+    case "create":
+      return worktreeCreateOrOpen(argv, "create");
+    case "open":
+      return worktreeCreateOrOpen(argv, "open");
+    case "remove":
+      return worktreeRemove(argv);
+    case "list":
+      return worktreeList(argv);
+    default:
+      return null;
+  }
+}
+
+function handleWorkspace(argv) {
+  const s = readState();
+  if (argv[1] === "list") {
+    return ok({ type: "workspace_list", workspaces: Object.values(s.workspaces).map((w) => workspaceJson(s, w)) });
+  }
+  if (argv[1] === "get") {
+    const ws = s.workspaces[argv[2] ?? ""];
+    if (!ws) return fail(`workspace_not_found: ${argv[2]}`);
+    return ok({ type: "workspace_get", workspace: workspaceJson(s, ws) });
+  }
+  if (argv[1] === "close") {
+    const id = argv[2] ?? "";
+    if (!s.workspaces[id]) return fail(`workspace_not_found: ${id}`);
+    for (const pane of Object.values(s.panes)) if (pane.workspace_id === id) killPid(livePaneProcess(pane));
+    dropWorkspace(id); // the git worktree stays: `workspace close` is independent of git state
+    return ok({ type: "workspace_close", workspace_id: id, closed: true });
+  }
+  return null;
+}
+
+function handleTab(argv) {
+  if (argv[1] === "create") {
+    const wsId = flag(argv, "--workspace");
+    const s = readState();
+    const ws = wsId ? s.workspaces[wsId] : undefined;
+    if (!ws) return fail(`workspace_not_found: ${wsId}`);
+    const [tabN, paneN] = nextIds(2);
+    const tabId = `${wsId}:t${tabN}`;
+    const paneId = `${wsId}:p${paneN}`;
+    const label = flag(argv, "--label") ?? null;
+    const cwd = flag(argv, "--cwd") || ws.worktree?.checkout_path || "";
+    const env = pairs(argv, "--env");
+    return mutate((st) => {
+      // Re-check under the lock: a concurrent teardown could have closed the workspace since the read
+      // above, and writing a tab into a gone workspace would leak an unreachable pane.
+      if (!st.workspaces[wsId]) return fail(`workspace_not_found: ${wsId}`);
+      st.tabs[tabId] = { tab_id: tabId, workspace_id: wsId, label, seq: tabN };
+      st.panes[paneId] = {
+        pane_id: paneId,
+        tab_id: tabId,
+        workspace_id: wsId,
+        // A tab's root pane inherits the tab's label — that is what `tabPaneByLabel` resolves a
+        // step's dedicated pane by, and what `paneLabels()` prints.
+        label,
+        cwd,
+        env,
+        focused: false,
+        shell_pid: 900_000 + paneN,
+        seq: paneN,
+        agent: null,
+        command: null,
+        metadata: {},
+      };
+      if (!hasFlag(argv, "--no-focus")) st.workspaces[wsId].active_tab_id = tabId;
+      return ok({
+        type: "tab_create",
+        tab: { tab_id: tabId, workspace_id: wsId, label },
+        root_pane: { pane_id: paneId, workspace_id: wsId, tab_id: tabId, cwd },
+      });
+    });
+  }
+  if (argv[1] === "rename") {
+    const tabId = argv[2] ?? "";
+    const label = argv[3] ?? "";
+    return mutate((s) => {
+      const tab = s.tabs[tabId];
+      if (!tab) return fail(`tab_not_found: ${tabId}`);
+      tab.label = label;
+      return ok({ type: "tab_rename", tab: { tab_id: tabId, label } });
+    });
+  }
+  if (argv[1] === "list") {
+    const s = readState();
+    const wsId = flag(argv, "--workspace");
+    const tabs = Object.values(s.tabs)
+      .filter((t) => !wsId || t.workspace_id === wsId)
+      .sort((a, b) => a.seq - b.seq)
+      .map((t) => ({
+        tab_id: t.tab_id,
+        workspace_id: t.workspace_id,
+        label: t.label ?? null,
+        pane_count: Object.values(s.panes).filter((p) => p.tab_id === t.tab_id).length,
+      }));
+    return ok({ type: "tab_list", tabs });
+  }
+  return null;
+}
+
+function handlePane(argv) {
+  const s = readState();
+  const verb = argv[1];
+
+  if (verb === "list") {
+    const wsId = flag(argv, "--workspace");
+    const hidden = injection().hidden;
+    const panes = Object.values(s.panes)
+      .filter((p) => !wsId || p.workspace_id === wsId)
+      .sort((a, b) => a.seq - b.seq)
+      .map((p) => paneJson(p, hidden));
+    return ok({ type: "pane_list", panes });
+  }
+
+  if (verb === "layout") {
+    const paneId = paneArg(argv);
+    const pane = s.panes[paneId];
+    if (!pane) return fail(`pane_not_found: ${paneId}`);
+    // `layout.area` is the whole TAB's cell area (what the layout planner divides), not the pane rect.
+    const siblings = Object.values(s.panes).filter((p) => p.tab_id === pane.tab_id);
+    return ok({
+      type: "pane_layout",
+      layout: {
+        tab_id: pane.tab_id,
+        area: { width: 177, height: 48 },
+        panes: siblings.map((p) => ({ pane_id: p.pane_id, rect: { width: Math.floor(177 / siblings.length), height: 48 } })),
+      },
+    });
+  }
+
+  if (verb === "process-info") {
+    const paneId = paneArg(argv);
+    const pane = s.panes[paneId];
+    if (!pane) return fail(`pane_not_found: ${paneId}`);
+    // isAtShellPrompt(): the pane is "available" only when its SHELL alone owns the foreground. With
+    // no live child that is true immediately (there is no rc-sourcing window without a real shell);
+    // with one, the child owns the foreground and the pane is busy — which is what makes the engine's
+    // awaitShellPrompt loop mean something here.
+    const fg = livePaneProcess(pane) ?? pane.shell_pid;
+    return ok({
+      type: "pane_process_info",
+      process_info: {
+        shell_pid: pane.shell_pid,
+        foreground_process_group_id: fg,
+        foreground_processes: [{ pid: fg, command: fg === pane.shell_pid ? "sh" : pane.agent?.kind || "command" }],
+      },
+    });
+  }
+
+  if (verb === "run") {
+    const paneId = argv[2] ?? "";
+    const command = argv[3] ?? "";
+    const pane = s.panes[paneId];
+    if (!pane) return fail(`pane_not_found: ${paneId}`);
+    if (livePaneProcess(pane)) return fail(`pane_busy: ${paneId} already has a live process`);
+    if (!command) return fail("pane_run_invalid_args: a command is required");
+    const pid = launch(pane, "/bin/sh", ["-c", command]);
+    // herdr's integrations auto-detect an agent typed into a pane — that is how the `run` spawn
+    // strategy is tracked at all. Mirror it: the pane's HERDR_AGENT hint, else a recognised argv[0].
+    const kind = pane.env?.HERDR_AGENT || autodetectKind(command);
+    return mutate((st) => {
+      const p = st.panes[paneId];
+      if (!p) return fail(`pane_not_found: ${paneId}`);
+      if (kind) p.agent = { name: kind, kind, pid, session_id: sessionId(), started_at: Date.now() };
+      else p.command = { pid, command };
+      return ok({ type: "pane_run", pane_id: paneId, pid });
+    });
+  }
+
+  if (verb === "close") {
+    const paneId = argv[2] ?? "";
+    const pane = s.panes[paneId];
+    if (!pane) return fail(`pane_not_found: ${paneId}`);
+    killPid(livePaneProcess(pane));
+    return mutate((st) => {
+      delete st.panes[paneId];
+      try {
+        FS.unlinkSync(fifoPath(paneId));
+      } catch {
+        /* never created */
+      }
+      return ok({ type: "pane_close", pane_id: paneId, closed: true });
+    });
+  }
+
+  if (verb === "read") {
+    const paneId = argv[2] ?? "";
+    if (!s.panes[paneId]) return fail(`pane_not_found: ${paneId}`);
+    return readOutput(paneId, argv);
+  }
+
+  if (verb === "report-metadata") {
+    const paneId = argv[2] ?? "";
+    if (!s.panes[paneId]) return fail(`pane_not_found: ${paneId}`);
+    const seq = Number(flag(argv, "--seq") || 0);
+    return mutate((st) => {
+      const p = st.panes[paneId];
+      if (!p) return fail(`pane_not_found: ${paneId}`);
+      const m = p.metadata || (p.metadata = {});
+      if (seq && m.seq && seq < m.seq) return ok({ type: "pane_report_metadata", pane_id: paneId, stale: true });
+      m.seq = seq;
+      m.source = flag(argv, "--source") ?? null;
+      const agentName = flag(argv, "--display-agent");
+      if (agentName != null) m.display_agent = agentName;
+      const title = flag(argv, "--title");
+      if (title != null) m.title = title;
+      if (hasFlag(argv, "--clear-title")) m.title = null;
+      m.tokens = m.tokens || {};
+      for (const [k, v] of Object.entries(pairs(argv, "--token"))) m.tokens[k] = v;
+      for (const k of repeated(argv, "--clear-token")) delete m.tokens[k];
+      return ok({ type: "pane_report_metadata", pane_id: paneId, metadata: m });
+    });
+  }
+
+  return null;
+}
+
+/** The pane a `pane layout` / `pane process-info` call names: herdr takes it as `--pane <id>`, but a
+ *  positional is accepted too (and a leading `-` is never a pane id). */
+function paneArg(argv) {
+  const named = flag(argv, "--pane");
+  if (named) return named;
+  const positional = argv[2] ?? "";
+  return positional.startsWith("-") ? "" : positional;
+}
+
+function autodetectKind(command) {
+  // `pane run` gets ONE shell-quoted command line (shellQuoteArgv), so argv[0] is the first token
+  // with its single quotes stripped.
+  const first = (command.trim().match(/^'([^']*)'|^(\S+)/) || [])[1] ?? (command.trim().split(/\s+/)[0] || "");
+  const base = P.basename(first.replace(/^'|'$/g, ""));
+  return AUTODETECT_KINDS.includes(base) ? base : null;
+}
+
+function sessionId() {
+  return `sess_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
+}
+
+/** `pane read` / `agent read`: the tail of the pane's captured output. `--format text` (what the
+ *  harness and a human post-mortem use) prints raw text; anything else answers the JSON envelope. */
+function readOutput(paneId, argv) {
+  const lines = Number(flag(argv, "--lines") || 40);
+  let all = [];
+  try {
+    all = FS.readFileSync(paneLogPath(paneId), "utf8").split("\n");
+  } catch {
+    /* nothing written yet */
+  }
+  const tail = all.slice(Math.max(0, all.length - lines));
+  if ((flag(argv, "--format") ?? "text") === "text") return text(tail.join("\n"));
+  return ok({ type: "pane_read", pane_id: paneId, lines: tail });
+}
+
+function handleAgent(argv) {
+  const verb = argv[1];
+  const s = readState();
+
+  if (verb === "list") {
+    return ok({ type: "agent_list", agents: liveAgentPanes(s).map((p) => agentJson(p)) });
+  }
+
+  if (verb === "start") {
+    const name = argv[2] ?? "";
+    const kind = flag(argv, "--kind") || "claude";
+    const paneId = flag(argv, "--pane") || "";
+    const timeout = Math.min(Number(flag(argv, "--timeout") || 120_000), 300_000);
+    if (!AGENT_NAME_RE.test(name)) return fail(`invalid_agent_name: "${name}" must match ${AGENT_NAME_RE}`);
+    if (liveAgentPanes(s).some((p) => p.agent.name === name)) return fail(`agent_name_in_use: ${name}`);
+    const pane = s.panes[paneId];
+    if (!pane) return fail(`agent_pane_not_found: ${paneId}`);
+    if (livePaneProcess(pane)) return fail(`agent_pane_busy: agent target pane ${paneId} is not an available shell`);
+    // Verified against herdr 0.7.5 (test/e2e/README.md #3): a pane whose env carries the HERDR_AGENT
+    // foreground hint reads as one that ALREADY hosts an agent, and adoption is refused. The engine
+    // sets that hint only on the typed (`pane run`) path — modelled so a regression fails here too.
+    if (pane.env?.HERDR_AGENT) return fail(`agent_pane_busy: agent target pane ${paneId} is not an available shell (HERDR_AGENT is set in its env)`);
+    const exe = resolveOnPath(kind);
+    if (!exe) return fail(`unknown_agent_kind: no "${kind}" executable on PATH`);
+    // Guard rather than block for the whole adoption timeout: without the status dir there is nothing
+    // that could ever report readiness, and a 120s hang would surface as an exec timeout instead.
+    if (!statusPath(paneId)) return fail("agent_status_unavailable: HF_AGENT_STATE_DIR is not set — this lane reads agent_status from <dir>/<paneId>.status");
+
+    const pid = launch(pane, exe, afterDoubleDash(argv));
+    mutate((st) => {
+      const p = st.panes[paneId];
+      if (p) p.agent = { name, kind, pid, session_id: sessionId(), started_at: Date.now() };
+    });
+    // Adoption BLOCKS until herdr has detected the agent and it is ready for input; the engine leans
+    // on that (the prompt already rode in on the argv). Here "detected" is the agent having written
+    // its own status file — the same signal `agent list` reports.
+    const deadline = Date.now() + timeout;
+    for (;;) {
+      const status = agentStatus(paneId);
+      if (READY_STATES.includes(status)) {
+        return ok({ type: "agent_start", agent: { name, kind, pane_id: paneId, agent_status: status } });
+      }
+      if (!alive(pid)) return fail(`agent_exited: "${kind}" exited before reporting a status in pane ${paneId}`);
+      if (Date.now() >= deadline) {
+        return fail(`agent_start_timeout: "${kind}" did not report a status within ${timeout}ms in pane ${paneId}`);
+      }
+      sleepSync(25);
+    }
+  }
+
+  if (verb === "prompt") {
+    const target = argv[2] ?? "";
+    const body = argv[3] ?? "";
+    const wait = hasFlag(argv, "--wait");
+    const until = repeated(argv, "--until");
+    const timeout = Number(flag(argv, "--timeout") || 20_000);
+    const pane = liveAgentPanes(s).find((p) => p.pane_id === target || p.agent.name === target);
+    if (!pane) return fail(`agent_not_found: ${target}`);
+    const inject = injection();
+    // A DROPPED submission: herdr typed the text and observed no state change. Modelled by not
+    // delivering at all — the engine must treat the dispatch as not having happened.
+    if (matches(inject.stall, pane.pane_id) || matches(inject.stall, target)) {
+      return fail(`agent_prompt_stalled: injected for ${pane.pane_id} (HF_HERDR_PROMPT_STALL)`);
+    }
+    const before = statusSnapshot(pane.pane_id);
+    const problem = deliver(pane.pane_id, body);
+    if (problem) return fail(`agent_prompt_undeliverable: ${problem}`);
+    if (!wait) return ok({ type: "agent_prompt", pane_id: pane.pane_id, delivered: true });
+
+    const wanted = until.length ? until : DEFAULT_UNTIL;
+    const deadline = Date.now() + timeout;
+    for (;;) {
+      const now = statusSnapshot(pane.pane_id);
+      // A state CHANGE is required, not merely a matching value: `--until idle --until done` is asked
+      // of an agent that is ALREADY idle, and answering instantly would report a submission landed
+      // that the agent never reacted to (herdr's `agent_prompt_stalled` is exactly "no state change
+      // followed the submission").
+      const changed = now.value !== before.value || now.mtimeMs !== before.mtimeMs;
+      if (changed && wanted.includes(now.value)) {
+        return ok({ type: "agent_prompt", pane_id: pane.pane_id, delivered: true, state: now.value });
+      }
+      if (Date.now() >= deadline) {
+        return fail(
+          `agent_prompt_stalled: ${pane.pane_id} did not reach ${wanted.join("/")} within ${timeout}ms (status=${now.value})`,
+        );
+      }
+      sleepSync(25);
+    }
+  }
+
+  if (verb === "focus") {
+    const target = argv[2] ?? "";
+    const pane = Object.values(s.panes).find((p) => p.pane_id === target || (p.agent && p.agent.name === target));
+    if (!pane) return fail(`pane_not_found: ${target}`);
+    return mutate((st) => {
+      for (const p of Object.values(st.panes)) p.focused = p.pane_id === pane.pane_id;
+      if (st.workspaces[pane.workspace_id]) st.workspaces[pane.workspace_id].active_tab_id = pane.tab_id;
+      return ok({ type: "agent_focus", pane_id: pane.pane_id, focused: true });
+    });
+  }
+
+  if (verb === "read") {
+    const target = argv[2] ?? "";
+    const pane = Object.values(s.panes).find((p) => p.pane_id === target || (p.agent && p.agent.name === target));
+    if (!pane) return fail(`agent_not_found: ${target}`);
+    return readOutput(pane.pane_id, argv);
+  }
+
+  return null;
+}
+
+/** The plugin surface answers success and does NOTHING: there is no herdr host here to fire
+ *  `worktree.created`, so no layout is ever built (see ./README.md — fake-lane scenarios must not
+ *  declare `layouts`). Answering success keeps `World.start()`'s link step from failing the world. */
+function handlePlugin(argv) {
+  if (argv[1] === "link") {
+    const path = argv[2] ?? "";
+    return mutate((s) => {
+      if (!s.plugins.includes(path)) s.plugins.push(path);
+      return ok({ type: "plugin_link", plugin: "herdr-factory", path, linked: true, events_registered: 0 });
+    });
+  }
+  if (argv[1] === "list") {
+    return ok({ type: "plugin_list", plugins: readState().plugins.map((path) => ({ id: "herdr-factory", path, enabled: true })) });
+  }
+  if (argv[1] === "log") {
+    return ok({ type: "plugin_log_list", entries: [] });
+  }
+  return null;
+}
+
+function handle(argv) {
+  const [a, b] = argv;
+
+  if (hasFlag(argv, "--version") || a === "version") return text(`herdr ${VERSION} (herdr-factory e2e fake)\n`);
+  if (a === "status" && b === "server") {
+    // doctor --deep parses `^<key>:\s*(.+)$` out of this.
+    return text(`version: ${VERSION}\nprotocol: ${PROTOCOL}\ncompatible: yes\nrunning: yes (herdr-factory e2e fake)\n`);
+  }
+  if (a === "server" && b === "stop") return ok({ type: "server_stop", stopped: true });
+  if (a === "server") {
+    // Loud on purpose: a scenario that tries to BOOT a server on this lane is a wiring bug, and a
+    // silent success would hand it a herdr that never answers.
+    return fail("no server on the fake lane — FakeHerdr.start() is a no-op and every call is served in-process", 2);
+  }
+
+  if (a === "worktree") return handleWorktree(argv);
+  if (a === "workspace") return handleWorkspace(argv);
+  if (a === "tab") return handleTab(argv);
+  if (a === "pane") return handlePane(argv);
+  if (a === "agent") return handleAgent(argv);
+  if (a === "plugin") return handlePlugin(argv);
+  if (a === "notification" && b === "show") {
+    // Same degradation the real lane shows in a container: the argv log is how the suite asserts a
+    // notification fired at all (HerdrServer.notifications() / FakeHerdr.notifications()).
+    return ok({ type: "notification_show", shown: false, reason: "disabled" });
+  }
+  return null;
+}
+
+// --- main --------------------------------------------------------------------
+
+async function main() {
+  FS = await import("node:fs");
+  CP = await import("node:child_process");
+  P = await import("node:path");
+
+  const argv = process.argv.slice(2);
+  const subcommand = classify(argv);
+
+  // The log is "every herdr invocation the FACTORY made" (HerdrServer.calls()), which is what the
+  // call-budget assertions count. A call from inside a PANE is not the factory's — and in the real lane
+  // it never reaches the recording wrapper anyway (the scripted agent invokes HF_HERDR_REAL directly),
+  // so logging it here would make the same scenario count differently per lane. HF_HERDR_LOG_PANES=1
+  // records them anyway, for debugging what an agent asked herdr.
+  const fromPane = process.env.HF_HERDR_FAKE_PANE === "1" && process.env.HF_HERDR_LOG_PANES !== "1";
+  const logPath = fromPane ? null : process.env.HF_HERDR_LOG;
+  if (logPath) {
+    try {
+      FS.mkdirSync(P.dirname(logPath), { recursive: true });
+      // EXACTLY the real lane's wrapper shape — `{ts, argv}` and nothing else — so every
+      // calls()/notifications()/paneMetadata() assertion works unchanged across both lanes.
+      FS.appendFileSync(logPath, `${JSON.stringify({ ts: Date.now(), argv })}\n`);
+    } catch {
+      /* the log is diagnostics; never let it break a run */
+    }
+  }
+
+  const inject = injection();
+  if (matches(inject.fail, subcommand)) {
+    process.stderr.write(`herdr-fake: HF_HERDR_FAIL injected a failure for "${subcommand}"\n`);
+    process.exitCode = 1;
+    return;
+  }
+  if (inject.sleepMs > 0 && (!inject.sleep.length || matches(inject.sleep, subcommand))) sleepSync(inject.sleepMs);
+
+  let res;
+  try {
+    res = handle(argv);
+  } catch (e) {
+    process.stderr.write(`herdr-fake: ${e && e.stack ? e.stack : String(e)}\n`);
+    process.exitCode = 1;
+    return;
+  }
+  // Unknown argv is a FAILURE carrying the argv, never a bland success: a new engine call this fake
+  // does not implement must break the scenario that needs it instead of passing as "worked".
+  if (!res) {
+    process.stderr.write(`herdr-fake: unsupported argv: ${JSON.stringify(argv)}\n`);
+    process.exitCode = 2;
+    return;
+  }
+  if (res.out) process.stdout.write(res.out);
+  if (res.err) process.stderr.write(res.err);
+  process.exitCode = res.code;
+}
+
+main().catch((e) => {
+  process.stderr.write(`herdr-fake: ${e && e.stack ? e.stack : String(e)}\n`);
+  process.exitCode = 1;
+});

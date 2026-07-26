@@ -78,6 +78,12 @@ reports:
   first turn, so anything gating on readiness accepts `idle` OR `done` (`isReadyForInput`).
 - **The CLI runs in YOUR directory.** The launchers do not `cd`, because the signal commands the
   prompts render carry relative file paths that only resolve inside the worktree.
+- **A pane's PATH is not the PATH you set.** Panes run a LOGIN shell, and a system profile can reorder
+  what it inherited (macOS `path_helper` rebuilds PATH from `/etc/paths[.d]` and appends the rest). So
+  `--kind claude` can resolve to a real agent CLI, and the launcher's `node` to a version below the 26
+  it requires. Symptoms are identical and misleading: an agent adopts, reports `idle`, and no step ever
+  completes. Pin it in a shell rc the pane actually reads, and verify with
+  `herdr pane run <pane> -- 'command -v claude; node -v'`.
 - **A read-only gate's baseline freezes only once the engine has SEEN its agent working** (it tracks
   HEAD until then, so a prior step's trailing commit can't false-park it), and that observation comes
   from a ~5s-memoized agent list — so a gate that commits within its first few seconds is not caught.
