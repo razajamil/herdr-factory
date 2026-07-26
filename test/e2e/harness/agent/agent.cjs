@@ -143,9 +143,12 @@ function signalWithRetry(cmd, cwd) {
   for (let attempt = 1; attempt <= MAX; attempt++) {
     const r = sh(cmd, cwd);
     const out = `${r.stdout || ""}${r.stderr || ""}`;
-    // A rejected signal now exits non-zero (that is the fix); the text match keeps the harness honest
-    // against an engine that regressed to exiting 0.
-    if (r.status === 0 && !/signal ignored|is not the run's active step/.test(out)) return r;
+    // Match the REJECTION TEXT, not merely a non-zero exit: flag errors (a missing --reason-file, a
+    // bad argument) also exit 1, and retrying those just hides the harness's own mistake eight times.
+    if (!/signal ignored|is not the run's active step/.test(out)) {
+      if (r.status !== 0) log(`  signal command FAILED (rc=${r.status}) — not a rejection, not retrying`);
+      return r;
+    }
     log(`  signal rejected — the engine has not recorded the dispatch yet (attempt ${attempt}/${MAX})`);
     sleep(1000);
   }
@@ -198,6 +201,10 @@ function handle(text) {
     setState(b.status || "idle");
     return; // never signals: the run must be rescued by a watchdog / resume / human
   }
+
+  // Let the engine SEE this agent working before anything happens (watches that arm on an observed
+  // `working` state need at least one reconcile pass in between).
+  if (b.preWorkMs) sleep(Number(b.preWorkMs));
 
   const commits = b.commit === undefined ? (COMMIT_STEPS.has(step) ? 1 : 0) : b.commit === true ? 1 : b.commit === false ? 0 : Number(b.commit);
   for (let i = 0; i < commits; i++) {
@@ -283,6 +290,7 @@ function writeIn(cwd, rel, body) {
   const p = path.isAbsolute(rel) ? rel : path.join(cwd, rel);
   fs.mkdirSync(path.dirname(p), { recursive: true });
   fs.writeFileSync(p, `${body}\n`);
+  log(`  wrote ${p} (${body.length} bytes)`);
 }
 
 /** Sit idle for a beat before the first turn — a real harness's boot window, and load-bearing here.

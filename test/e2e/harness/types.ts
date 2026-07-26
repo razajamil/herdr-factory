@@ -23,6 +23,12 @@ export interface AgentBehaviour {
   /** Sit doing nothing instead of signalling: a number of ms, or "forever" (until the pane dies).
    *  This is how budget/stall parks are provoked. */
   hangMs?: number | "forever";
+  /** Hold `working` for this long BEFORE doing anything else (committing, capturing, signalling).
+   *  Some watches only arm once the engine has OBSERVED the agent working — the read-only baseline
+   *  tracks HEAD until then, so a gate that commits within milliseconds of starting is indistinguish-
+   *  able from the previous step's trailing commit. A real agent takes minutes; this is the dwell that
+   *  makes a scripted one behave like one. */
+  preWorkMs?: number;
   /** How long to hold the herdr-observed `working` state before signalling (default 1200ms).
    *  Load-bearing: herdr needs to observe the transition for `agent prompt --wait --until working`
    *  to confirm, and `working` vetoes the budget/stall watchdogs. */
@@ -106,6 +112,11 @@ export interface ScenarioSpec {
    *  inherit the herdr server's env) the agents. E.g. `HF_AGENT_STARTUP_MS: "0"` for an agent that
    *  starts work the instant it is exec'd. */
   processEnv?: Record<string, string>;
+  /** Runs after the world's directories exist but BEFORE its `config.yml` is written and anything is
+   *  started — where a scenario brings up a stub backend whose URL the config then references. */
+  beforeStart?: (p: WorldPaths) => Promise<void> | void;
+  /** Runs after everything is stopped (tear down what `beforeStart` brought up). */
+  afterStop?: () => Promise<void> | void;
   /** Factory repo config name (what `--repo` takes). Default "app". */
   repoName?: string;
 }

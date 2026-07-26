@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Launcher for the herdr-factory CLI. Resolves its own location (through symlinks),
-# runs from the package dir so src/ resolves regardless of caller cwd.
+# Launcher for the herdr-factory CLI. Resolves its own location (through symlinks) and runs the entry
+# by ABSOLUTE path — deliberately WITHOUT changing directory.
 set -euo pipefail
 
 src="${BASH_SOURCE[0]}"
@@ -11,7 +11,13 @@ while [ -h "$src" ]; do
 done
 pkg="$(cd -P "$(dirname "$src")/.." && pwd)"
 
-cd "$pkg"
+# NEVER `cd "$pkg"`. The CLI must honour the CALLER's cwd: every step prompt renders its signal
+# commands with RELATIVE file arguments (`--reason-file .memory/herdr-factory/bounce-<step>.md`,
+# `--question-file …`) that the agent writes in its worktree, so a cd to the package dir made the
+# CLI resolve them against the checkout instead — ENOENT for every bounce and every ask-human, i.e.
+# the rework loop and the human loop both silently broken. Nothing here needs the package dir as
+# cwd: src/ resolves from the entry's own path, and version.ts / the updater already run git against
+# the package dir explicitly (ARCHITECTURE §14).
 
 # With no arguments, launch the TUI instead of the CLI. It has its own launcher because it renders
 # through opentui's native core (Node >= 26 + --experimental-ffi), unlike the Node 24 engine.
@@ -38,7 +44,7 @@ node_major() { local v; v="$("$1" -v 2>/dev/null)" || return 1; v="${v#v}"; prin
 
 m="$(node_major node || true)"
 if [ -n "$m" ] && [ "$m" -ge 26 ]; then
-  exec node "$entry" "$@"
+  exec node "$pkg/$entry" "$@"
 fi
 
 baked="${HERDR_FACTORY_STATE_ROOT:-${HOME:-}/.local/state/herdr-factory}/node-path"
@@ -47,7 +53,7 @@ if [ -r "$baked" ]; then
   if [ -n "$bnode" ] && [ -x "$bnode" ]; then
     bm="$(node_major "$bnode" || true)"
     if [ -n "$bm" ] && [ "$bm" -ge 26 ]; then
-      exec "$bnode" "$entry" "$@"
+      exec "$bnode" "$pkg/$entry" "$@"
     fi
   fi
 fi

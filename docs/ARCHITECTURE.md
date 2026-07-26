@@ -1220,10 +1220,16 @@ since the human has judged the rework loop worth continuing and the next bounce 
 re-park at cap+1 immediately), to the PR watch
 (fresh deadline, cleared thread signature), or to `claiming` (with the first step's wait clock +
 respawn budget likewise refreshed), and it reconciles on the same pass. A step resume also
-**re-prompts the step's own idle agent** — the commonest watchdog park is an agent that finished
-without running `step-done`, which un-parking alone would leave idle until the fresh budget
-re-parked it (resume was a dead end for exactly the case it exists to heal); a `working` pane is
-left mid-turn, and a dead one is respawned by the liveness path.
+**re-prompts the step's own agent when that agent is at its prompt** — the commonest watchdog park is
+an agent that finished without running `step-done`, which un-parking alone would leave sitting there
+until the fresh budget re-parked it (resume was a dead end for exactly the case it exists to heal).
+"At its prompt" is `idle` OR **`done`** (`isReadyForInput` in types.ts): herdr latches `done` once an
+agent has completed a turn, which is precisely the state such a park leaves behind, so gating on
+`idle` alone nudged nobody in the common case. The pane state is read FRESH (bypassing the ~5s
+agent-list memo, which exists to collapse per-tick liveness polling): a human resume is a one-shot
+action arriving just after the agent stopped, and deciding from a stale snapshot silently skips the
+nudge. The observed state is recorded on the `resumed` event, so a `nudged:false` is diagnosable.
+A `working` pane is left mid-turn, and a dead one is respawned by the liveness path.
 Parked runs hold **no claim slot** (§6). Teardown remains the abandon path.
 
 The capture lock stays **machine-global** (one dev-server / browser across all
@@ -1825,6 +1831,13 @@ Hard-won from the bash prototype — encode as types/tests/asserts:
   error with guidance only if neither is available. The supervisor service + the `serve` it
   spawns run under `resolvedNodePath`, so a `.node-version` bump takes effect on the next spawn
   without reinstalling the service.
+- **The launchers never change directory.** `bin/herdr-factory` runs `node <pkg>/src/cli/index.ts`
+  by absolute path from wherever it was invoked, because every step prompt renders its signal commands
+  with RELATIVE file arguments (`--reason-file .memory/herdr-factory/bounce-<step>.md`) that the agent
+  writes in its worktree. A `cd` to the package dir made the CLI resolve those against the checkout —
+  ENOENT for every `bounce` and every `ask-human`, i.e. the rework loop and the human loop both
+  silently broken (found by test/e2e's `bounce-cap` / `ask-human`). That is also why the rule below is
+  load-bearing rather than stylistic.
 - **Self-update + `VERSION` resolve against the package dir, never the caller's cwd.** A worker
   invokes the CLI from another repo's worktree, so `version.ts` (git HEAD sha → `VERSION`) and
   `watchers/updater.ts` (`git fetch` + hard reset to the channel target — `@{u}` on `main`, the

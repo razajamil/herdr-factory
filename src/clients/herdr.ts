@@ -1,7 +1,7 @@
 import { basename } from "node:path";
 import { run, runJson } from "./exec.ts";
 import { HerdrUnreachableError, type LivenessOpts } from "../core/deps.ts";
-import { HERDR_AGENT_KINDS, type Agent, type FocusedPane, type LayoutDescription, type LayoutDescriptionNode, type LayoutNode, type PaneBox, type PaneDisplay, type WorkspaceInfo, type WorktreeResult } from "../types.ts";
+import { HERDR_AGENT_KINDS, isReadyForInput, type Agent, type FocusedPane, type LayoutDescription, type LayoutDescriptionNode, type LayoutNode, type PaneBox, type PaneDisplay, type WorkspaceInfo, type WorktreeResult } from "../types.ts";
 import { herdrSocketCall } from "./herdr-socket.ts";
 
 /** The herdr agent KIND (`herdr agent start --kind`) for a spawn argv. herdr uses it to pick the
@@ -29,6 +29,10 @@ export function spawnStrategyForArgv(argv: readonly string[], explicitKind?: str
   if (!command.includes("/") && HERDR_AGENT_KINDS.includes(kind)) return { mode: "adopt", kind };
   return { mode: "run", kind: HERDR_AGENT_KINDS.includes(kind) ? kind : undefined };
 }
+
+// The pane-readiness predicate lives in the pure types leaf (core/ must not import a client), and is
+// re-exported here because this module is where herdr's agent vocabulary is otherwise interpreted.
+export { isReadyForInput };
 
 /** Quote an argv into a single POSIX shell command line for `pane run` (which hands its argument to
  *  the pane's shell, unlike the arg-array `agent start`). Single-quote wrapping with `'\''` breaks

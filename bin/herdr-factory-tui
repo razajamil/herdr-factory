@@ -16,7 +16,8 @@ while [ -h "$src" ]; do
 done
 pkg="$(cd -P "$(dirname "$src")/.." && pwd)"
 
-cd "$pkg"
+# No `cd "$pkg"` here either, for the same reason as bin/herdr-factory: the launchers must leave the
+# caller's cwd alone. The TUI takes no path arguments, so this is consistency rather than a fix.
 
 entry="src/tui/main.ts"
 # --disable-warning keeps Node's experimental-FFI notice off the alternate screen.
@@ -32,7 +33,7 @@ node_major() { local v; v="$("$1" -v 2>/dev/null)" || return 1; v="${v#v}"; prin
 # 1. Active node, if >= 26.
 m="$(node_major node || true)"
 if [ -n "$m" ] && [ "$m" -ge 26 ]; then
-  exec node "${node_flags[@]}" "$entry" "$@"
+  exec node "${node_flags[@]}" "$pkg/$entry" "$@"
 fi
 
 # 2. Baked node, if it's >= 26 (in a managed install, the vendored runtime/current/bin/node).
@@ -42,7 +43,7 @@ if [ -r "$baked" ]; then
   if [ -n "$bnode" ] && [ -x "$bnode" ]; then
     bm="$(node_major "$bnode" || true)"
     if [ -n "$bm" ] && [ "$bm" -ge 26 ]; then
-      exec "$bnode" "${node_flags[@]}" "$entry" "$@"
+      exec "$bnode" "${node_flags[@]}" "$pkg/$entry" "$@"
     fi
   fi
 fi

@@ -74,3 +74,10 @@ reports:
 - **A rejected signal exits 1** and prints to stderr, so an agent can tell. The engine also records a
   run's active step *before* dispatching it, so an agent that finishes faster than herdr's readiness
   handshake still has its `step-done` accepted.
+- **`done` means "finished its turn, ready for input"**, not "gone": herdr latches it after an agent's
+  first turn, so anything gating on readiness accepts `idle` OR `done` (`isReadyForInput`).
+- **The CLI runs in YOUR directory.** The launchers do not `cd`, because the signal commands the
+  prompts render carry relative file paths that only resolve inside the worktree.
+- **A read-only gate's baseline freezes only once the engine has SEEN its agent working** (it tracks
+  HEAD until then, so a prior step's trailing commit can't false-park it), and that observation comes
+  from a ~5s-memoized agent list — so a gate that commits within its first few seconds is not caught.

@@ -323,6 +323,8 @@ export class World {
     this.layout();
     this.buildTargetRepo();
     this.writeShims();
+    // Before the config is rendered: a scenario's stub backend must be listening for its URL to exist.
+    await this.spec.beforeStart?.(this.paths);
     this.writeConfig();
 
     if (this.lane !== "real") throw new Error(`lane "${this.lane}" is not implemented yet (M4)`);
@@ -345,6 +347,7 @@ export class World {
     } finally {
       await this.herdr.stop();
       this.db.close();
+      await this.spec.afterStop?.();
     }
     this.started = false;
   }
@@ -469,6 +472,17 @@ export class World {
     return existsSync(p) ? readFileSync(p, "utf8") : null;
   }
 
+  /** Wait for the operator-facing note a park posts to the work source. `escalateAttention` flips the
+   *  phase BEFORE it posts, so a scenario that asserts the note the instant it sees `attention` races
+   *  the write. */
+  async waitForNote(key: string, match?: RegExp): Promise<string> {
+    await this.waitFor(() => {
+      const note = this.humanInbox(`${key}-notes.md`);
+      return note !== null && (match === undefined || match.test(note));
+    }, { label: `an operator note for ${key}${match ? ` matching ${match}` : ""}` });
+    return this.humanInbox(`${key}-notes.md`)!;
+  }
+
   answerHumanQuestion(key: string, answer: string): void {
     const dir = join(this.paths.briefs, ".herdr-factory-human");
     const q = this.db.humanQuestions().find((h) => h.ticket_key === key && h.status === "pending") as
@@ -477,6 +491,18 @@ export class World {
     const file = q?.external_id ?? join(dir, `${key}-q${q?.id ?? 1}.md`);
     const body = readFileSync(file, "utf8");
     writeFileSync(file, `${body.replace(/_Write the answer below this line[\s\S]*?_/, "")}\n${answer}\n`);
+  }
+
+  /** Un-park a run the way an operator does. Returns the CLI result so a scenario can assert on it. */
+  resume(key: string): { code: number; stdout: string; stderr: string } {
+    return this.factory.cli(["resume", key]);
+  }
+
+  /** Write (or replace) the repo's `env` file mid-scenario — how a missing credential gets supplied. */
+  writeRepoEnv(env: Record<string, string>): void {
+    const p = join(this.paths.repoConfigDir, "env");
+    writeFileSync(p, `${Object.entries(env).map(([k, v]) => `${k}=${v}`).join("\n")}\n`);
+    chmodSync(p, 0o600);
   }
 
   /** Local git facts about the target repo (branch cleanup, pushed refs, commits). */

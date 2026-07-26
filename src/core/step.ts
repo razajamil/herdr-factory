@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 import type { StepConfig } from "../config.ts";
 import type { BeltRuntime, Deps, SourceRuntime } from "./deps.ts";
 import type { AgentConfig, Run, RunStep, SourceType } from "../types.ts";
-import { DEFAULT_AGENT_CONFIG } from "../types.ts";
+import { DEFAULT_AGENT_CONFIG, isReadyForInput } from "../types.ts";
 import { renderWorkVars } from "./branch.ts";
 import { productActiveFor, type PromptStepContext, stripInactiveProductBlocks, validatePromptBody } from "../prompts/contract.ts";
 import { guardsResetOn } from "../steps/guards.ts";
@@ -279,7 +279,9 @@ async function dispatchToLayoutImpl(
     }
     if (!target) return { status: "waiting" }; // the layout hasn't created this tab/pane yet
     const state = await deps.herdr.paneState(target);
-    if (!reused && state !== "idle") return { status: "waiting" }; // no agent, or still busy starting up
+    // Ready = sitting at its prompt (`idle`, or `done` having finished a turn — see isReadyForInput).
+    // Anything else is no agent yet, one still starting up, one mid-turn, or one blocked on a prompt.
+    if (!reused && !isReadyForInput(state)) return { status: "waiting" };
     // A re-entry pane is NORMALLY idle-at-prompt (it finished its prior pass) — but not always: a
     // later agent may have `agent send`-ed it an on-demand question (§7's handoff+query protocol)
     // and it's mid-answer, or a human is driving it. Queueing the re-dispatch into a busy turn

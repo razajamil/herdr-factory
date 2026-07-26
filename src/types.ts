@@ -693,6 +693,22 @@ export interface PaneDisplay {
  *  harness twice. An `agent.kind` config key overrides the derivation from `command`, which is how a
  *  WRAPPED harness (`bin/my-claude`) still gets adopted. Lives here (an import-free leaf) so both
  *  the zod schema and the herdr client can name it without a cycle. */
+/** Is a pane's agent sitting at its prompt, ready to receive one?
+ *
+ *  herdr's `agent_status` vocabulary is `idle | working | done | blocked | unknown` (plus our own
+ *  "gone" when the pane holds no agent). `idle` is an agent that has not worked yet; **`done` is one
+ *  that FINISHED ITS TURN** — both are waiting for input, which is why herdr's own settle wait is
+ *  `--until idle --until done`. `working` is mid-turn, `blocked` is sitting on a permission prompt,
+ *  and `unknown`/`gone` mean we cannot tell — none of those may be prompted into.
+ *
+ *  Treating only `idle` as ready is what the e2e `budget-park` scenario caught: the commonest
+ *  watchdog park is an agent that finished its work without running `step-done`, which herdr reports
+ *  as `done`, so `resume` silently declined to re-prompt the very agent it exists to nudge — leaving
+ *  the run to burn a fresh budget and re-park. */
+export function isReadyForInput(agentStatus: string): boolean {
+  return agentStatus === "idle" || agentStatus === "done";
+}
+
 export const HERDR_AGENT_KINDS: readonly string[] = [
   "pi", "claude", "codex", "gemini", "cursor", "devin", "agy", "cline", "omp", "mastracode",
   "opencode", "copilot", "kimi", "kiro", "droid", "amp", "grok", "hermes", "kilo", "qodercli", "maki",

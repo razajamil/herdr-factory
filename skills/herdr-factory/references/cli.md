@@ -183,6 +183,8 @@ Rendered form (single source of truth, `src/signals/registry.ts`): `<abs path to
 
 **Cross-release compatibility.** A rendered prompt outlives the engine that rendered it — an agent may still be sitting on a command string from before the last auto-update or restart. So this surface is **additive only**: new arguments arrive as *optional* flags (`--pass` and `bounce --step` are both marked "optional for upgrade safety" in the registry), never as new required positionals, and an unstamped signal is still accepted. When constructing a signal by hand, pass only what you need; omitting `--source`/`--pass` is always valid.
 
+File arguments (`--reason-file`, `--question-file`) resolve against **your** current directory — the launcher deliberately does not change directory, so the relative paths the prompts render (`.memory/herdr-factory/bounce-<step>.md`) resolve inside the agent's worktree, where the agent was told to write them.
+
 All four dispatcher signals go through the same `applySignal` engine function on both the server and the local path, so the two can't drift. **A rejected signal prints to stderr and exits 1** — the exit code is an agent's only feedback, and a rejection that exited 0 used to leave the agent believing it had finished while the run sat until its step budget expired. Success (including the idempotent `already recorded done`) still exits 0:
 
 | signal | success output | rejection messages (stderr, **exit 1**) |

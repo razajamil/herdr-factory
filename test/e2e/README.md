@@ -65,6 +65,12 @@ never reconstructs one. That makes the suite a live check of the agent-CLI contr
 | `layouts` | plugin hook, `layout.apply` per tab, blocking setup, splits, step→pane dispatch, pane display metadata, hand-created worktrees |
 | `layout-setup-on-agent-pane` | regression: an agent pane that also runs the layout's setup still gets its agent |
 | `fast-signal` | regression: a `step-done` that beats its own dispatch is accepted, not dropped |
+| `budget-park` | an agent that finishes without signalling is parked, reported three ways, and healed by `resume` re-prompting it |
+| `stall-park` | an agent that stops committing trips the heartbeat, and recovers when it commits again |
+| `read-only-violation` | a gate that commits is caught with its evidence — and still honoured if it completed |
+| `bounce-cap` | rework bounces are counted, the oscillation parks at the cap, and `resume` refunds the budget |
+| `ask-human` | a blocked agent asks through the work source, frees its slot, and resumes on the answer |
+| `missing-api-key` | an uncredentialed source is never dialled and never claims, while its neighbour ships; credentials un-pause it |
 
 ## Things the harness found — and what changed
 
@@ -99,7 +105,22 @@ comes back.
 5. **`pane report-agent` takes agent authority over a pane**: calling it during startup knocks out
    herdr's own adoption record and `agent start` then fails on `agent.get`. Real harnesses don't call
    it; neither does the scripted agent.
-6. **Documentation drift** (fixed): `runs.pr_number` / `resolver_active` / `last_thread_sig` moved to
+6. **`bounce` and `ask-human` could never read their own arguments.** `bin/herdr-factory` did
+   `cd "$pkg"`, so the CLI resolved the RELATIVE file paths the prompts render
+   (`--reason-file .memory/herdr-factory/bounce-<step>.md`) against the factory checkout instead of the
+   agent's worktree: ENOENT every time, i.e. the rework loop and the human loop both silently broken
+   for any agent that ran the command it was given. **Fixed**: the launchers run the entry by absolute
+   path and leave the caller's cwd alone (nothing in `src/` depended on it — §14 already required
+   that). → `bounce-cap`, `ask-human`.
+7. **A finished agent (`done`) was treated as not ready.** herdr latches `done` once an agent has
+   completed a turn — exactly the state the commonest park leaves behind — so `resume` declined to
+   re-prompt it and the layout dispatch would have declined to use it. **Fixed**: `isReadyForInput`
+   (`idle` or `done`) at both gates. → `budget-park`.
+8. **`resume` decided on a stale pane state.** The nudge read the ~5s agent-list memo (which exists to
+   collapse per-tick liveness polling), so a resume arriving seconds after an agent stopped could see
+   "still working" and nudge nobody. **Fixed**: a fresh read for that one-shot operator action, and the
+   observed state is recorded on the `resumed` event so `nudged:false` is diagnosable. → `bounce-cap`.
+9. **Documentation drift** (fixed): `runs.pr_number` / `resolver_active` / `last_thread_sig` moved to
    `run_products` in v18 but ARCHITECTURE §6 still showed them on `runs`; the §6 event list named
    `merged`/`closed`, which nothing emits, and omitted `layout_applied`, `layout_apply_failed`,
    `intent_deadline`, `intent_fulfilled`.
@@ -117,8 +138,10 @@ comes back.
 
 ## Not built yet (the plan's later milestones)
 
-M2 attention + human loop (budget/stall/read-only/bounce-cap/ask-human/missing-API-key/evidence
-retry/PR-closed/resolver-wake) · M3 source parity (fake Jira + Sentry over their configurable
-`base_url`; `github_issues` needs a `GITHUB_API_URL` seam) + belt/config breadth · M4 the fake-herdr
-lane and the performance scenarios (call budgets, scale drain, tick latency, resource soak) ·
-M5 the DS4 tier and the TUI boot assertion.
+M2 remainder: the evidence station (capture cap, `local` publisher, a failing `command` publisher's
+retry) and the PR lifecycle (draft gate, closed → park, resolver wake) · M3 source parity — the
+`HttpStub` under `harness/sources/` is the first brick; it grows into a Jira board that transitions
+issues and a Sentry project, both reachable because those sources take a configurable `base_url`
+(`github_issues` hardcodes api.github.com and needs a `GITHUB_API_URL` seam) — plus belt/config
+breadth · M4 the fake-herdr lane and the performance scenarios (call budgets, scale drain, tick
+latency, resource soak) · M5 the DS4 tier and the TUI boot assertion.

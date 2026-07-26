@@ -6,7 +6,7 @@ import { runEffect } from "../runtime/effect.ts";
 import { HerdrUnreachableError, type BeltRuntime, type Deps, type SourceRuntime } from "./deps.ts";
 import type { StepConfig } from "../config.ts";
 import type { BeltEffectTrigger, GuardSpec, HumanQuestion, HumanReply, MatchItem, Outcome, PrInfo, PrSnapshot, Run, RunStep, Ticket, TransitionIntent, WorkState } from "../types.ts";
-import { EFFECT_PRODUCE_PRODUCTS, effectRank, outcomeToWorkState, StaleItemError, ticketOf, type TransitionContext } from "../types.ts";
+import { EFFECT_PRODUCE_PRODUCTS, effectRank, isReadyForInput, outcomeToWorkState, StaleItemError, ticketOf, type TransitionContext } from "../types.ts";
 import { isUniqueViolation } from "../db/store.ts";
 import { notifyDue } from "../schedule.ts";
 import { branchName } from "./branch.ts";
@@ -2004,17 +2004,24 @@ export async function resumeRun(deps: Deps, run: Run): Promise<{ ok: boolean; ph
   // a signal the pane never receives on its own, and the commonest watchdog park is an agent that
   // finished (or drifted off) WITHOUT running step-done — un-parking alone left that agent idle
   // until the fresh budget expired and re-parked the run, making resume a dead end for exactly the
-  // case it exists to heal. Only an IDLE pane is nudged: a `working` pane is mid-turn (its own
+  // case it exists to heal. Only a pane at its PROMPT is nudged (idle, or done having finished a
+  // turn — isReadyForInput): a `working` pane is mid-turn (its own
   // work, an on-demand question, or human-driven — injecting a foreign turn interleaves two
   // conversations), and a dead pane is the respawn machinery's job (absence confirmation →
   // spawnStep). The nudge points at the pass's rendered prompt file, whose baked step-done command
   // carries the still-valid --pass stamp (resume never bumps the pass).
   let nudged = false;
+  let worker: string | undefined;
   if (phase === "running" && run.step) {
     const paneId = deps.store.getRunStep(run.id, run.step)?.paneId;
     if (paneId) {
       try {
-        if ((await deps.herdr.paneState(paneId)) === "idle") {
+        // FRESH, not the ~5s agent-list memo: that memo exists to collapse O(runs) liveness polling
+        // inside one tick, and a human resume is a one-shot interactive action arriving right after
+        // the agent finished. Deciding "still working, don't nudge" from a snapshot taken seconds
+        // before the operator acted is how a resume silently nudges nobody.
+        worker = await deps.herdr.paneState(paneId, { fresh: true });
+        if (isReadyForInput(worker)) {
           nudged = await deps.herdr.agentSend(
             paneId,
             `A human resumed ${run.ticketKey} after it was parked (${run.attentionReason ?? "attention"}). ` +
@@ -2029,7 +2036,9 @@ export async function resumeRun(deps: Deps, run: Run): Promise<{ ok: boolean; ph
       }
     }
   }
-  deps.store.recordEvent({ runId: run.id, repo, ticketKey: run.ticketKey, type: "resumed", detail: { phase, step: run.step, nudged } });
+  // `worker` rides along so an unexplained `nudged:false` is diagnosable: it names the state the
+  // resume actually saw (working ⇒ left mid-turn by design, gone ⇒ the respawn path owns it).
+  deps.store.recordEvent({ runId: run.id, repo, ticketKey: run.ticketKey, type: "resumed", detail: { phase, step: run.step, nudged, worker } });
   // Clear the ⚠ cue (best-effort; a re-spawn would re-publish it anyway).
   if (run.paneId) await showRunPane(deps, run.paneId, { key: run.ticketKey, step: run.step, state: run.step ? "running" : "watching" });
   deps.log("info", `${run.ticketKey}: resumed from attention -> ${phase}${run.step ? ` (${run.step})` : ""}`);

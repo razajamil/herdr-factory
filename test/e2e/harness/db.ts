@@ -198,6 +198,18 @@ export class Db {
     return this.all<IntentRow>(`SELECT * FROM intents WHERE ${where.join(" AND ")} ORDER BY id`, ...params);
   }
 
+  /** Make a run's intents of `kind` due immediately — the harness's way past an engine backoff the
+   *  config can't compress (the human-reply poll's first miss costs 60s). The engine's own operator
+   *  endpoint only covers `pending` rows, and the poll clock is a `waiting` one, so this writes the
+   *  clock the same way the reconciler would. Returns how many rows it moved. */
+  dueNow(kind: string, runId: number): number {
+    if (!this.exists()) return 0;
+    const info = this.db()
+      .prepare("UPDATE intents SET next_attempt_at = 0 WHERE repo = ? AND kind = ? AND run_id = ? AND resolved_at IS NULL")
+      .run(this.repo, kind, runId);
+    return Number(info.changes);
+  }
+
   workItem(source: string, key: string): WorkItemRow | undefined {
     return this.one<WorkItemRow>("SELECT * FROM work_items WHERE repo = ? AND source = ? AND key = ?", this.repo, source, key);
   }
