@@ -818,6 +818,19 @@ human to `aws sso login`; and when a row is auth-stuck the flush cheaply probes 
 stuck row — the happy path never probes) and, the moment they're live again, resets every auth-stuck
 row due-now (`requeueIntentsByCause` on `publisher:<type>`, mirroring `retryTransitionsForSource`) so
 the same pass uploads it instead of waiting out the up-to-1h backoff — no manual retry, no waiting.
+
+Two things make that recovery actually reachable from a **resident** process, both easy to regress:
+`evidenceClient` builds its credential provider with **`ignoreCache: true`** (`evidenceCredentialInit`,
+test-pinned), because `@smithy/core`'s shared-ini loader memoizes `~/.aws/config` in a module-level
+map — without it the server resolves against the snapshot it read on its first upload *forever*, so a
+profile added or repointed mid-life reads as a permanently broken credential (the unknown profile
+classifies as `auth`) and only a restart heals it. A fresh `S3Client` per upload is NOT sufficient:
+the cache is per-process, not per client. (The SSO *token* cache is read uncached by
+`getSSOTokenFromFile`, so a plain `aws sso login` was always picked up — it was only the config file.)
+And the hint every auth surface prints comes from one place, `credsRefreshHint`, which names the
+`~/.aws` visibility trap: the server is launchd-spawned, so a credential helper that exports into an
+interactive shell or caches tokens elsewhere (granted's macOS keychain) needs `credential_process` on
+the profile — telling such a user only "run `aws sso login`" sends them in a circle.
 A non-retryable error or a vanished capture dir is marked permanently failed —
 there's no source-stale two-phase, as evidence has no "gone at source". **Phase A** advances every active run one idempotent step, **in parallel
 with bounded concurrency** (`limits.reconcile_concurrency`, default 8, via `Effect.forEach` —

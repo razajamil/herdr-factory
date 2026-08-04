@@ -116,6 +116,20 @@ export async function resolveGithubUsername(ev: EvidenceConfig, currentLogin: ()
 
 // ── S3 + CloudFront ───────────────────────────────────────────────────────────────────────────────
 
+/**
+ * The one hint every auth-stuck surface prints (doctor, the dashboard light, the notification), so
+ * they can't drift. `aws sso login` is the common case but NOT the whole story, and saying only that
+ * sends a user in a circle when their credential helper doesn't write `~/.aws`: the resident server
+ * is launchd-spawned, so a helper that exports temporary credentials into an interactive shell — or
+ * caches its SSO token somewhere the AWS SDK doesn't read, like granted's macOS keychain — is
+ * invisible to it no matter how many times you log in. `credential_process` on the profile is what
+ * bridges that (a dedicated profile: with `sso_session` present, SSO resolves first and wins).
+ */
+export function credsRefreshHint(profile?: string): string {
+  const p = profile ? ` --profile ${profile}` : "";
+  return `refresh AWS credentials (\`aws sso login${p}\`) — and note the background server reads ~/.aws, so a helper that only exports creds into your shell needs \`credential_process\` on the profile`;
+}
+
 /** Map an AWS SDK error to a kind + a short, actionable reason (the single source of truth for the S3
  *  taxonomy — `doctor.explainS3Error` delegates to `.reason`). */
 export function classifyS3Error(e: unknown): EvidenceClassification {
@@ -124,7 +138,7 @@ export function classifyS3Error(e: unknown): EvidenceClassification {
   const status = err.$metadata?.httpStatusCode;
   const msg = err.message ?? String(e);
   if (/Credential|Token|SSO|ExpiredToken/i.test(name) || /could not load credentials|credential|sso session|token.*expired|expired.*token/i.test(msg)) {
-    return { kind: "auth", retryable: true, reason: "AWS SSO/credentials expired or unresolved — run `aws sso login`" };
+    return { kind: "auth", retryable: true, reason: "AWS credentials expired or unresolved" };
   }
   if (name === "NoSuchBucket") return { kind: "permanent", retryable: false, reason: "bucket does not exist" };
   if (name === "PermanentRedirect" || /AuthorizationHeaderMalformed|the bucket is in this region|expecting.*region/i.test(msg)) {
@@ -139,15 +153,41 @@ export function classifyS3Error(e: unknown): EvidenceClassification {
 
 type S3EvidenceConfig = Extract<EvidenceConfig, { publisher: "s3" }>;
 
+/**
+ * The credential-provider init the evidence client resolves AWS credentials with.
+ *
+ * `ignoreCache: true` is load-bearing in the RESIDENT SERVER and is why this is its own exported
+ * function (test-pinned): `@smithy/core`'s shared-ini loader memoizes `~/.aws/config` in a
+ * module-level `filePromises` map, so without it a long-lived process resolves credentials against
+ * the snapshot it read on its FIRST upload — forever. A profile added or repointed while the server
+ * is up then looks like a permanently broken credential (the SDK reports the unknown profile, which
+ * classifies as `auth`), so the SSO auto-resume can never recover and only a restart fixes it. The
+ * outbox's contract is "retry until the backend accepts", which has to include re-reading where the
+ * credentials come from. Building a fresh client per upload is not enough on its own — the cache is
+ * global to the process, not per client (that's what made this look like the earlier client-reuse
+ * bug coming back).
+ *
+ * The SSO *token* cache (`~/.aws/sso/cache/*.json`) is read uncached by `getSSOTokenFromFile`, so a
+ * plain `aws sso login` was always picked up by a running server; it's the config file that wasn't.
+ */
+export function evidenceCredentialInit(profile: string | undefined, logger: SdkLogger): { ignoreCache: true; logger: SdkLogger; profile?: string } {
+  return { ignoreCache: true, logger, ...(profile ? { profile } : {}) };
+}
+
+/** The subset of the SDK's `Logger` the silencer implements. */
+type SdkLogger = { debug(): void; info(): void; warn(): void; error(): void };
+
 /** Build an S3 client for an evidence bucket. `maxAttempts:1` so callers own retry/backoff (the outbox),
- *  and the SDK's own console chatter is silenced. */
+ *  and the SDK's own console chatter is silenced. Credentials always come from an explicitly-built node
+ *  provider chain (the same chain the client would build itself) so the cache-busting above applies
+ *  whether or not a `profile` is configured. */
 function evidenceClient(ev: S3EvidenceConfig): S3Client {
   const silent = { debug() {}, info() {}, warn() {}, error() {} };
   return new S3Client({
     region: ev.region,
     maxAttempts: 1,
     logger: silent,
-    ...(ev.profile ? { credentials: fromNodeProviderChain({ profile: ev.profile, logger: silent }) } : {}),
+    credentials: fromNodeProviderChain(evidenceCredentialInit(ev.profile, silent)),
   });
 }
 

@@ -290,7 +290,8 @@ herdr-factory --repo <r> timeline <KEY> | grep -E 'evidence_uploaded|evidence_up
 
 | Branch | Signature | Fix |
 |---|---|---|
-| AWS SSO expired | `doctor`: `<n> stuck — AWS SSO/creds expired; run \`aws sso login[ --profile <p>]\``; intent `error_class = 'auth'` | `aws sso login[ --profile <p>]`. Recovery is automatic (the publish kind's pre-pass probes liveness and re-queues: `evidence publish: creds recovered — re-queued N stuck upload(s) for immediate retry`). To force it: `POST /repos/<r>/intents/recover` `{"causeScope":"publisher:s3"}` |
+| AWS creds expired | `doctor`: `<n> stuck on AWS creds — refresh AWS credentials …`; intent `error_class = 'auth'` | Refresh them. Recovery is automatic (the publish kind's pre-pass probes liveness every tick — even while the row is backed off — and re-queues: `evidence publish: creds recovered — re-queued N stuck upload(s) for immediate retry`). To force it: `POST /repos/<r>/intents/recover` `{"causeScope":"publisher:s3"}` |
+| **You logged in and it's STILL auth-stuck** | `doctor --deep` says the publisher is **writable** (a fresh process resolves creds fine) while the server keeps deferring the same row | The server can't see your credentials, or is holding a stale view of where they come from. Two distinct causes — check both:<br>1. **A credential helper the SDK can't read.** The resident server is launchd-spawned: creds `assume`/`aws-vault` export into your *shell*, and granted's SSO token in the **macOS keychain**, are both invisible to it. Prove it with `env -u AWS_ACCESS_KEY_ID -u AWS_SESSION_TOKEN aws sts get-caller-identity --profile <p>` — "Token has expired and refresh failed" means the server sees the same. Fix: a **dedicated** `credential_process` profile (below) and point `evidence.profile` at it.<br>2. **A pre-`ignoreCache` server.** Builds before that fix memoized `~/.aws/config` for the process's whole life, so a profile added/repointed while it ran never resolved. `herdr-factory restart` (and `update` to get the fix). |
 | Permanent failure | `error_class = 'permanent'`, event `evidence_upload_failed`, notify `herdr-factory: <key> evidence publish failed`, amber `⚠` on the run's TUI dashboard card. **The run is untouched — this is never a park** | `doctor --deep` shows the real reason (bucket/region/access-denied/command exit) |
 | Transient retrying | `<n> pending — retrying (last: …)`, notify is deliberately **silent** | Backoff is 60 s doubling to a 3600 s cap and **never gives up** |
 | Dropped at teardown | `<KEY>: N evidence upload(s) dropped at teardown — bytes never reached S3 (likely SSO was down through merge)` | Unrecoverable; the worktree is gone. Fix creds before the next run |
@@ -851,13 +852,28 @@ curl -s -X POST 127.0.0.1:8765/repos/<r>/intents/recover \
 
 - `retry` only touches `status='pending'` rows — a `failed`/`abandoned` row **cannot** be retried
   this way; the engine re-opens it on the next natural trigger.
-- **AWS SSO recovery path**: `aws sso login[ --profile <p>]`, then either wait (the publish kind's
+- **AWS creds recovery path**: refresh the credentials, then either wait (the publish kind's
   pre-pass probes liveness and re-queues automatically) or force it with
   `intents/recover {"causeScope":"publisher:s3"}`. Cause strings are `source:<sourceName>` and
   `publisher:s3|local|command`. Note `resume` does **not** make a backed-off upload due now — no
   shipped kind opts into that.
 - A source-auth recovery re-queues that source's held write-backs automatically the moment any call
   to it succeeds.
+- **Making a credential helper visible to the server.** A dedicated profile whose ONLY credential
+  source is the helper — do not add `credential_process` to a profile that already has `sso_session`
+  (the AWS CLI resolves SSO first and fails on the stale `~/.aws/sso/cache` token):
+
+  ```ini
+  # ~/.aws/config
+  [profile my-app-factory]
+  credential_process = granted credential-process --profile my-app
+  region = ap-southeast-2
+  ```
+
+  Point `evidence.profile` at `my-app-factory` and `herdr-factory reload`. No `--auto-login` — a
+  background server must never pop a browser; when the helper's session lapses the factory notifies
+  and resumes on the next tick after you log in again. Verify with `doctor --deep` (a real S3
+  round-trip) and the credential config is re-read on every attempt, so no restart is needed.
 
 ---
 

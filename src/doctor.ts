@@ -6,7 +6,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { createEvidencePublisher } from "./clients/evidence.ts";
+import { createEvidencePublisher, credsRefreshHint } from "./clients/evidence.ts";
 import { run } from "./clients/exec.ts";
 import { assertMainCheckout, globalDbPath, isManagedNode } from "./config.ts";
 import { descriptorFor } from "./sources/registry.ts";
@@ -273,7 +273,7 @@ export async function repoGroup(repo: string, deep = false): Promise<DoctorGroup
       if (pending.length === 0) {
         checks.push({ name: "evidence uploads", ok: true, detail: "none pending" });
       } else if (pending.some((u) => u.errorKind === "auth")) {
-        checks.push({ name: "evidence uploads", ok: false, detail: `${pending.length} stuck — AWS SSO/creds expired; run \`aws sso login${profile ? ` --profile ${profile}` : ""}\`` });
+        checks.push({ name: "evidence uploads", ok: false, detail: `${pending.length} stuck on AWS creds — ${credsRefreshHint(profile)}` });
       } else {
         checks.push({ name: "evidence uploads", ok: true, detail: `${pending.length} pending — retrying (last: ${pending[pending.length - 1]!.lastError ?? "not yet attempted"})` });
       }

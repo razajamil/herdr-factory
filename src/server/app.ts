@@ -18,7 +18,7 @@ import { claimTicket, reconcileRepo, reconcileRun, resumeRun, teardownTicket, wi
 import { runObligations } from "../core/obligations.ts";
 import { intentKindFor } from "../intents/registry.ts";
 import { applySignal } from "../core/signals.ts";
-import { createEvidencePublisher } from "../clients/evidence.ts";
+import { createEvidencePublisher, credsRefreshHint } from "../clients/evidence.ts";
 import { evidenceServeDir } from "../config-paths.ts";
 import { getAuthFailure } from "../auth/gate.ts";
 import { resolveActiveRun, resolveBeltName } from "../resolve.ts";
@@ -101,7 +101,7 @@ async function evidenceSsoStatus(rt: RepoRuntime, refresh = false): Promise<{ st
   if (!publisher.probeLiveness) return { state: "ok" };
   const profile = ev.publisher === "s3" ? ev.profile : undefined;
   if (rt.deps.store.authStuckIntents(cfg.repoName, "evidence_publish")) {
-    return { state: "down", detail: `an evidence upload is stuck on expired AWS creds — run \`aws sso login${profile ? ` --profile ${profile}` : ""}\`` };
+    return { state: "down", detail: `an evidence upload is stuck on AWS creds — ${credsRefreshHint(profile)}` };
   }
   const now = rt.deps.now();
   let cached = ssoProbeCache.get(cfg.repoName);

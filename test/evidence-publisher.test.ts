@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createEvidencePublisher } from "../src/clients/evidence.ts";
+import { createEvidencePublisher, credsRefreshHint, evidenceCredentialInit } from "../src/clients/evidence.ts";
 import { flushOutbox } from "../src/core/outbox.ts";
 import { ledgerFlow } from "../src/core/ledger.ts";
 import { EVIDENCE_PUBLISH_LEASE_SECONDS } from "../src/intents/kinds/evidence-publish.ts";
@@ -206,5 +206,38 @@ describe("server /evidence/* static serve", () => {
       const res = await app().request(p);
       expect(res.status).toBe(404);
     }
+  });
+});
+
+// The resident server is a LONG-LIVED process, and @smithy/core's shared-ini loader memoizes
+// ~/.aws/config in a module-level map. Without `ignoreCache` the server resolves credentials against
+// the snapshot it read on its first upload forever: a profile added or repointed while it runs reads
+// as a permanently broken credential (classified `auth`), so the SSO auto-resume can never recover it
+// and only a restart helps. Cost us a day of "I logged in and the uploads still don't land" — hence a
+// test on the init object rather than trusting a comment.
+describe("evidence credential init — a running server must re-read ~/.aws/config", () => {
+  const silent = { debug() {}, info() {}, warn() {}, error() {} };
+
+  it("always busts the SDK's shared-config file cache", () => {
+    expect(evidenceCredentialInit("my-profile", silent).ignoreCache).toBe(true);
+    expect(evidenceCredentialInit(undefined, silent).ignoreCache).toBe(true);
+  });
+
+  it("passes the configured profile through, and omits the key entirely when there is none", () => {
+    expect(evidenceCredentialInit("my-profile", silent).profile).toBe("my-profile");
+    expect("profile" in evidenceCredentialInit(undefined, silent)).toBe(false);
+  });
+});
+
+// Every auth-stuck surface (doctor, the dashboard light, the notification) prints this one hint, so
+// they can't drift — and it must not send a credential-helper user in a circle by naming only
+// `aws sso login`, which is exactly what happened when granted's keychain-stored token was invisible
+// to the launchd-spawned server.
+describe("credsRefreshHint", () => {
+  it("names the profile when there is one, and always points at the ~/.aws visibility trap", () => {
+    const hint = credsRefreshHint("reckonone-dev-factory");
+    expect(hint).toContain("aws sso login --profile reckonone-dev-factory");
+    expect(hint).toContain("credential_process");
+    expect(credsRefreshHint()).not.toContain("--profile"); // no profile configured ⇒ no dangling flag
   });
 });

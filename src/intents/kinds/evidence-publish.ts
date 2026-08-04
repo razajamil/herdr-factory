@@ -20,7 +20,7 @@ import { existsSync } from "node:fs";
 import type { Deps } from "../../core/deps.ts";
 import type { Intent } from "../../types.ts";
 import type { IntentKindDef, IntentOutcome } from "../registry.ts";
-import { createEvidencePublisher } from "../../clients/evidence.ts";
+import { createEvidencePublisher, credsRefreshHint } from "../../clients/evidence.ts";
 import { OUTBOX_BACKOFF_CAP_SECONDS } from "../../schedule.ts";
 
 /** Enqueue lease seconds — see the module doc. Exported for the CLI's enqueue. */
@@ -97,7 +97,7 @@ export const evidencePublishKind: IntentKindDef = {
       const profile = ev?.publisher === "s3" ? ev.profile : undefined;
       return {
         title: "herdr-factory: AWS SSO expired",
-        body: `Evidence publish for ${row.ticketKey} is blocked on AWS creds — run \`aws sso login${profile ? ` --profile ${profile}` : ""}\`. It uploads automatically on the next tick.`,
+        body: `Evidence publish for ${row.ticketKey} is blocked on AWS creds — ${credsRefreshHint(profile)}. It uploads automatically on the next tick after they resolve.`,
       };
     }
     if (failure.errorClass === "permanent") {

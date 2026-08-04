@@ -441,9 +441,23 @@ brief's front-matter). Route bugs to one belt and stories to another, programmat
   status write-backs **and evidence uploads** are persisted intents, retried in the background
   until the backend confirms — an upload survives an AWS SSO session expiring mid-run (or any
   transient backend outage) instead of shipping a PR with broken evidence links. For the `s3`
-  publisher a persistent auth failure pings you to `aws sso login`, and the next tick auto-retries
-  the moment credentials come back — it re-queues due-now instead of waiting out the backoff, so
-  there's nothing to press.
+  publisher a persistent auth failure pings you to refresh your AWS credentials, and the next tick
+  auto-retries the moment they come back — it re-queues due-now instead of waiting out the backoff,
+  so there's nothing to press (and the credential *config* is re-read every attempt, so repointing a
+  profile never needs a server restart). One catch worth knowing: the resident server resolves
+  credentials from `~/.aws`, so a helper that only exports them into your interactive shell — or
+  caches its SSO token somewhere the AWS SDK doesn't read, like [granted](https://granted.dev)'s
+  keychain — stays invisible to it however many times you log in. Bridge it with a
+  `credential_process` profile:
+
+  ```ini
+  # ~/.aws/config — a dedicated profile: with sso_session present, SSO resolves FIRST and wins
+  [profile my-app-factory]
+  credential_process = granted credential-process --profile my-app
+  region = ap-southeast-2
+  ```
+
+  …and point `evidence.profile` at it.
 - **Built to scale.** Active runs reconcile in parallel under per-run locks; Jira and GitHub
   traffic flows through token buckets (GitHub's is a process-wide budget) with
   `Retry-After`-honoring retries; all watched PRs share one batched

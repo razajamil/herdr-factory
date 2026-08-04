@@ -341,7 +341,7 @@ evidence:
   # key_prefix: acme-frontend
 ```
 
-AWS credentials come from the ambient chain (`aws sso login`), **never** from config. `local` needs the resident server running to serve the URLs. Verify either with `doctor --repo <n> --deep`, which does a real round-trip (the s3 probe leaves one tiny `.herdr-doctor` object behind by design).
+AWS credentials come from the ambient chain (`aws sso login`), **never** from config — and the chain that matters is the **resident server's**, not your shell's: a helper that exports creds into an interactive session (`assume`, `aws-vault`) or caches its SSO token outside `~/.aws/sso/cache` (granted's keychain) needs a dedicated `credential_process` profile, or every upload sits auth-stuck while you're "logged in" ([troubleshooting.md](./troubleshooting.md) §evidence uploads). `local` needs the resident server running to serve the URLs. Verify either with `doctor --repo <n> --deep`, which does a real round-trip (the s3 probe leaves one tiny `.herdr-doctor` object behind by design).
 
 ### 2g. Terminal status write-back
 
