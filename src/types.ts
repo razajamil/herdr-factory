@@ -99,6 +99,7 @@ export type EventType =
   | "intent_fulfilled" // a waiting external-trigger intent was fulfilled (POST /intents/:id/fulfil)
   | "intent_deadline" // a waiting intent's deadline expired (kernel sweep; run-scoped ⇒ may park)
   | "human_question"
+  | "human_question_moot" // the asking step reached a terminal itself; its pending question was closed unanswered
   | "human_reply"
   | "focus_applied"
   | "merged"

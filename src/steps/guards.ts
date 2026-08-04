@@ -6,7 +6,9 @@
 // The union of guards with autoRescueOnDone===true is STEP_WATCHDOG_ATTENTION (a genuine terminal
 // signal — step-done OR bounce — from the parked step un-parks a run a watchdog parked; the park
 // is a backstop against a stuck agent, never a veto on its decision); bounce_limit / pr_closed /
-// source_item_stale / human / config parks are not here. layout_wait is the one guard that trips
+// source_item_stale / human_poll_failing / config parks are not here. Nor is the ask-human park —
+// it isn't a guard at all (the PHASE is the park) — but it IS rescued by the same terminal signals,
+// routed by reconcile's `rescuablePark`. layout_wait is the one guard that trips
 // BEFORE the step's agent exists (the pane never came up ⇒ no agent ⇒ no terminal signal can ever
 // arrive), so terminal-signal rescue is categorically wrong for it: it declares
 // autoRescueOnDone:false and recovers by RE-ATTEMPTING THE SPAWN instead — `autoRespawnLimit`

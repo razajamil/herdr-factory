@@ -2748,15 +2748,12 @@ describe("heartbeat lock loss is loud, never silent", () => {
   });
 });
 
-describe("human-reply resume — a stray step-done can never skip the reply", () => {
-  it("clears a done recorded while waiting_for_human and re-bases the budget clock; the belt advances only on a fresh signal", async () => {
+describe("human-reply resume — a reply never auto-advances an unfinished step", () => {
+  it("re-bases the budget clock and re-prompts; the belt advances only on the agent's own fresh signal", async () => {
     const { deps, store, state, worktree, calls, setNow } = build();
     const run = seed(store, worktree, "K-HD", "running", "fix");
     await requestHumanInput(deps, run, "fix", "Which flag wins?");
     expect(store.getRun(run.id)!.phase).toBe("waiting_for_human");
-    // The out-of-order agent signal: a step-done recorded while the question is pending (applySignal
-    // accepts it — "fix" is still the active step — so the flag lands exactly like this).
-    store.markStepDone(run.id, "fix");
 
     state.humanReply = { body: "Do B.", externalId: "a-1", author: "PM" };
     setNow(1000 + 61);
@@ -2764,9 +2761,8 @@ describe("human-reply resume — a stray step-done can never skip the reply", ()
 
     const got = store.getRun(run.id)!;
     expect(got.phase).toBe("running");
-    expect(got.step).toBe("fix"); // NOT auto-advanced on the stale done the moment the reply landed
-    const rs = store.getRunStep(run.id, "fix")!;
-    expect(rs.done).toBe(false); // cleared for the continuation
+    expect(got.step).toBe("fix"); // the reply resumes the SAME step — it never advances the belt itself
+    expect(store.getRunStep(run.id, "fix")!.done).toBe(false);
     expect(store.getWatchState(run.id, "fix", "budget")!.basedAt).toBe(1061); // budget clock re-based to the resume, not the pre-ask dispatch
     expect(calls.agentSend.at(-1)?.[1]).toContain("Human guidance has arrived");
 
@@ -2777,6 +2773,90 @@ describe("human-reply resume — a stray step-done can never skip the reply", ()
     const res = await applySignal(deps, "step-done", { key: "K-HD", step: "fix" });
     expect(res.ok).toBe(true);
     expect(store.getRun(run.id)!.step).toBe("review");
+  });
+});
+
+// RWR-18609: an evidence step blocked on a local login asked a human, unblocked itself an hour
+// later, and signalled step-done — which recorded rs.done and then sat in waiting_for_human forever,
+// because the only exits were a reply, a merge, a stale item, or a failing poll. A terminal from the
+// parked step is not something the human wait may veto.
+describe("ask-human park — a terminal from the parked step rescues the run", () => {
+  it("step-done un-parks and advances the belt, closing the moot question unanswered", async () => {
+    const { deps, store, state, worktree, calls } = build();
+    const run = seed(store, worktree, "K-HR1", "running", "fix");
+    await requestHumanInput(deps, run, "fix", "Which flag wins?");
+    expect(store.getRun(run.id)!.phase).toBe("waiting_for_human");
+    const q = store.pendingHumanQuestionForRun(run.id)!;
+    calls.humanPoll.length = 0;
+
+    // The agent got past the blocker on its own and signalled its terminal.
+    const res = await applySignal(deps, "step-done", { key: "K-HR1", step: "fix" });
+    expect(res.ok).toBe(true);
+
+    const got = store.getRun(run.id)!;
+    expect(got.phase).toBe("running");
+    expect(got.step).toBe("review"); // advanced, not wedged
+    // The question can never be usefully answered — closed, so the poller stops chasing it and a
+    // later resume can't be sent back into waiting_for_human on it.
+    const closed = store.getHumanQuestion(q.id)!;
+    expect(closed.status).toBe("answered");
+    expect(closed.answer).toContain("no human reply needed");
+    expect(store.pendingHumanQuestionForRun(run.id)).toBeUndefined();
+    expect(calls.humanPoll).toHaveLength(0); // never polled for a reply to a finished step
+    // The question's poll clock lives on the intent ledger — closing the question must close the
+    // ledger row too, or a waiting intent outlives the question and can hit its deadline.
+    const clocks = store.listIntents("demo", { runId: run.id, kind: "human_reply_poll" });
+    expect(clocks.some((i) => i.status === "waiting" || i.status === "pending")).toBe(false);
+    // Audited both ways: the closure and the un-park.
+    const timeline = store.timeline("demo", "K-HR1");
+    expect(timeline.some((e) => e.type === "human_question_moot")).toBe(true);
+    expect(timeline.filter((e) => e.type === "resumed").map((e) => e.detail)).toContainEqual(
+      expect.stringContaining("step_done_after_human_park"),
+    );
+    // And the human staring at the posted thread is told it needs no answer.
+    expect(calls.postNotes.at(-1)?.[1]).toContain("no answer needed");
+    // A later tick is a plain no-op pass on the advanced run, not a re-park.
+    state.humanReply = { body: "too late", externalId: "a-9", author: "PM" };
+    await reconcileRun(deps, store.getRun(run.id)!);
+    expect(store.getRun(run.id)!.step).toBe("review");
+  });
+
+  it("a bounce from the parked step un-parks and rewinds, closing the moot question", async () => {
+    const { deps, store, worktree, calls } = build();
+    const run = seed(store, worktree, "K-HR2", "running", "review");
+    store.upsertRunStep(run.id, "fix", { done: true });
+    await requestHumanInput(deps, run, "review", "Is the flag rename in scope?");
+    expect(store.getRun(run.id)!.phase).toBe("waiting_for_human");
+    const q = store.pendingHumanQuestionForRun(run.id)!;
+
+    // The reviewer decided it doesn't need the answer to send the work back.
+    const res = await applySignal(deps, "bounce", { key: "K-HR2", step: "review", toStep: "fix", reason: "flag rename is wrong" });
+    expect(res.ok).toBe(true);
+
+    const got = store.getRun(run.id)!;
+    expect(got.phase).toBe("running");
+    expect(got.step).toBe("fix"); // rewound to the bounce target
+    expect(store.getRunStep(run.id, "fix")!.done).toBe(false);
+    expect(store.getHumanQuestion(q.id)!.status).toBe("answered");
+    expect(store.pendingHumanQuestionForRun(run.id)).toBeUndefined();
+    expect(store.timeline("demo", "K-HR2").filter((e) => e.type === "resumed").map((e) => e.detail)).toContainEqual(
+      expect.stringContaining("bounce_after_human_park"),
+    );
+    expect(calls.postNotes.at(-1)?.[1]).toContain("no answer needed");
+  });
+
+  it("a park that needs a human is NOT rescued by a step-done (the reply poll continues)", async () => {
+    const { deps, store, state, worktree, calls } = build();
+    // A pr_closed park: a hard gate that only a human resolves — its step's done flag must not
+    // un-park it, unlike the watchdog/ask-human parks.
+    const run = seed(store, worktree, "K-HR3", "attention", "fix", { attentionReason: "PR closed without merging" });
+    store.recordEvent({ runId: run.id, repo: "demo", ticketKey: "K-HR3", type: "attention", detail: { reason: "pr_closed" } });
+    store.markStepDone(run.id, "fix");
+    state.humanReply = null;
+    calls.notify = 0;
+    await reconcileRun(deps, store.getRun(run.id)!);
+    expect(store.getRun(run.id)!.phase).toBe("attention"); // still parked for the human
+    expect(store.getRun(run.id)!.step).toBe("fix");
   });
 });
 

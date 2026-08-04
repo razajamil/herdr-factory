@@ -70,6 +70,7 @@ never reconstructs one. That makes the suite a live check of the agent-CLI contr
 | `read-only-violation` | a gate that commits is caught with its evidence — and still honoured if it completed |
 | `bounce-cap` | rework bounces are counted, the oscillation parks at the cap, and `resume` refunds the budget |
 | `ask-human` | a blocked agent asks through the work source, frees its slot, and resumes on the answer |
+| `ask-human-self-resolved` | an agent that asks and then unblocks itself: its `step-done` un-parks the run and closes the moot question |
 | `missing-api-key` | an uncredentialed source is never dialled and never claims, while its neighbour ships; credentials un-pause it |
 | `evidence` | the opt-in evidence station captures, publishes through the `local` publisher, and the resident server serves the bytes |
 | `evidence-publish-retry` | a failing publisher retries in the background, flags the run's `problem`, and delivers once `intents/recover` is called |

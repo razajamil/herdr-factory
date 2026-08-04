@@ -1048,10 +1048,12 @@ async function resumeAfterHumanReply(deps: Deps, run: Run, belt: BeltRuntime, sr
   }
 
   // Re-base the step for the continuation. Two halves, both load-bearing:
-  //  - done:false — clear any step-done recorded while the question was pending. An out-of-order
-  //    agent signal (ask-human then step-done, or a replay) must not auto-advance the step the
-  //    instant the reply lands, when the agent is being told below to CONTINUE and only run
-  //    step-done once the step is actually complete — the reply would be silently skipped.
+  //  - done:false — clear a step-done that landed CONCURRENTLY with this pass. Since the ask-human
+  //    park is rescued by a step-done (reconcileWaitingForHuman advances instead of polling), a done
+  //    recorded before this pass never reaches here — but `markStepDone` runs OUTSIDE the run lock
+  //    (applySignal), so one can still land while we hold it. This pass has already told the agent
+  //    below to CONTINUE and only step-done when the step is actually complete, so the flag must not
+  //    survive to auto-advance the step out from under that instruction.
   //  - fresh budget/absence clocks — the run may have waited on the human far past the step
   //    budget; without a re-base the next watchdog pass reads the pre-ask clock and re-parks the
   //    freshly-resumed step. The "reply_resume" rebase is deliberately NARROW (budget only): the
@@ -1116,9 +1118,10 @@ function writeBounceNote(run: Run, fromStep: string, toStep: string, reason: str
  *   2. Re-dispatch the TARGET step's own pane (getRunStep(toStep).paneId) — NOT run.paneId, which is
  *      the bouncer's (latest-dispatched) pane.
  *   3. Bump + cap a per-target bounce counter, escalating to attention past limits.maxBounces.
- * Guarded: only from a `running` step, only to an earlier step the current step declares in
- * `canBounceTo`. The bouncer does NOT step-done, so after the target re-completes the pipeline runs
- * forward and re-enters the (still-not-done) bouncer cleanly.
+ * Guarded: only from a `running` step (or one whose park a terminal may rescue — see rescuablePark),
+ * only to an earlier step the current step declares in `canBounceTo`. The bouncer does NOT step-done,
+ * so after the target re-completes the pipeline runs forward and re-enters the (still-not-done)
+ * bouncer cleanly.
  */
 export async function bounceStep(
   deps: Deps,
@@ -1129,15 +1132,14 @@ export async function bounceStep(
   reason: string,
 ): Promise<{ ok: boolean; escalated?: boolean; message?: string }> {
   const fromStep = run.step;
-  // A step has three legal terminals: step-done, bounce, ask-human. A step-execution watchdog park
-  // (budget / stall / capture cap) is a backstop against a STUCK agent, never a veto on its
-  // decision — a genuine step-done from the parked step un-parks the run (reconcileAttention's
-  // auto-rescue), and a genuine BOUNCE must land the same way: the agent finished its assessment
-  // and concluded the work has to go back. Every other park (source stale, PR closed, bounce cap,
-  // human loop, config error) stays a hard gate — those need a human decision.
-  const watchdogParked =
-    run.phase === "attention" && STEP_WATCHDOG_ATTENTION.has(deps.store.lastAttentionReasonCode(run.id) ?? "");
-  if ((run.phase !== "running" && !watchdogParked) || !fromStep) {
+  // A bounce is one of the step's three legal terminals, so it lands from a RESCUABLE park exactly
+  // as a step-done does (rescuablePark): the agent finished its assessment and concluded the work
+  // has to go back — whether a watchdog had parked the run as a stuck-agent backstop, or the agent
+  // had asked a human and then decided it doesn't need the answer to send the work back. Every
+  // other park (source stale, PR closed, bounce cap, failing reply poll, config error) stays a hard
+  // gate — those need a human decision.
+  const parked = rescuablePark(deps, run);
+  if ((run.phase !== "running" && !parked) || !fromStep) {
     return { ok: false, message: "no running step to bounce from" };
   }
   const from = stepByName(belt, fromStep);
@@ -1153,6 +1155,11 @@ export async function bounceStep(
   }
 
   const repo = deps.config.repoName;
+  // Close a moot question BEFORE the cap check, not with the un-park bookkeeping below: the bounce is
+  // valid from here on, so the agent has moved past its question either way — and if the cap escalates
+  // to attention, a question left pending would send the eventual `resume` straight back to
+  // waiting_for_human on a reply that is never coming.
+  if (parked === "human") await closePendingQuestionAsMoot(deps, run, "bounce");
   // Safety backstop only: the loop is meant to end when the later step passes (aligned) or the fix
   // agent asks a human — this cap just catches oscillation. Per-belt override wins over the repo limit.
   const maxBounces = belt.maxBounces ?? deps.config.limits.maxBounces;
@@ -1167,19 +1174,20 @@ export async function bounceStep(
     return { ok: true, escalated: true, message: `bounce limit exceeded — escalated to attention` };
   }
 
-  // Un-park bookkeeping for a bounce that rescues a watchdog park (the rewind below flips the
-  // phase back to running anyway): record the rescue and clear the "⚠ ATTENTION …" cue the
-  // escalation published — mirrors reconcileAttention's step-done rescue.
-  if (watchdogParked) {
+  // Un-park bookkeeping for a bounce that rescues a park (the rewind below flips the phase back to
+  // running anyway): record the rescue and clear the "⚠ ATTENTION …" cue the escalation published —
+  // mirrors reconcileAttention's / reconcileWaitingForHuman's step-done rescues.
+  if (parked) {
+    const reason = parked === "human" ? "bounce_after_human_park" : "bounce_after_watchdog_park";
     deps.store.recordEvent({
       runId: run.id,
       repo: deps.config.repoName,
       ticketKey: run.ticketKey,
       type: "resumed",
-      detail: { reason: "bounce_after_watchdog_park", step: fromStep },
+      detail: { reason, step: fromStep },
     });
     if (run.paneId) await showRunPane(deps, run.paneId, { key: run.ticketKey, step: fromStep, state: "running" });
-    deps.log("info", `${run.ticketKey}: ${fromStep} bounced after a watchdog park — un-parking`);
+    deps.log("info", `${run.ticketKey}: ${fromStep} bounced after a ${parked === "human" ? "human" : "watchdog"} park — un-parking`);
   }
 
   releaseStepLocks(deps, run, from); // bouncing away from this step → free any exclusive_resource it held
@@ -1331,15 +1339,17 @@ const HUMAN_POLL_ERROR_ESCALATE = 20;
  *  genuine BOUNCE from it lands the same way (bounceStep accepts a watchdog-parked bouncer). The
  *  layout-pane wait is NOT here: it trips BEFORE the agent exists (no pane ⇒ no agent ⇒ no terminal
  *  signal can ever arrive), so it is rescued by re-attempting the spawn instead — see
- *  STEP_RESPAWN_ATTENTION. Every OTHER park — source item gone, PR closed, bounce oscillation,
- *  human loop, config error — needs a human decision and is never auto-rescued. */
+ *  STEP_RESPAWN_ATTENTION. The ask-human park is rescued the same way but does not need a reason
+ *  code (the PHASE is the park) — see rescuablePark, which routes both. Every OTHER park — source
+ *  item gone, PR closed, bounce oscillation, a failing reply poll, config error — needs a human
+ *  decision and is never auto-rescued. */
 // The union of every registered step primitive's guards whose `autoRescueOnDone` is true — a plugin
 // guard participates automatically, no edit to a literal Set. `read_only_violation` arrives via
 // READ_ONLY_GUARD on the read-only primitives (its evaluate() lives in core/watches.ts, run by the
 // pre-advance watch harness; the guard is the declaration the rescue routing derives from). A completed
 // read-only step must never wedge forever on a commit it didn't make (RWR-18204: an evidence step
 // parked permanently after the PRIOR work step's still-alive agent committed a trailing lint fix).
-// source_item_stale / pr_closed / bounce_limit / human / config parks stay non-auto-rescued.
+// source_item_stale / pr_closed / bounce_limit / human_poll_failing / config parks stay non-auto-rescued.
 const STEP_WATCHDOG_ATTENTION = new Set(
   STEP_DESCRIPTORS.flatMap((d) => d.guards)
     .filter((g) => g.autoRescueOnDone)
@@ -1357,6 +1367,73 @@ const STEP_RESPAWN_ATTENTION = new Set(
     .filter((g) => (g.autoRespawnLimit ?? 0) > 0)
     .map((g) => g.escalationReason),
 );
+
+/**
+ * Is this run PARKED in a way a genuine terminal signal from the parked step may RESCUE?
+ *
+ * A step has three legal terminals: step-done, bounce, ask-human. Two kinds of park are backstops
+ * around a step whose agent is still alive and can still reach one of them, so a terminal that
+ * arrives afterwards must be honored rather than vetoed:
+ *   - `"watchdog"` — a step-execution watchdog park (budget / stall / flaky-capture cap /
+ *     read-only HEAD move): a backstop against a STUCK agent. An agent that reaches a terminal is
+ *     by definition not looping.
+ *   - `"human"` — the ask-human park. The agent asked a question and then got past the blocker on
+ *     its own (or concluded the work has to go back regardless). Without this, a step that
+ *     finished after asking sat in `waiting_for_human` forever: `step-done` recorded `rs.done`,
+ *     and reconcileWaitingForHuman — which only ever exits on a reply — ignored it (RWR-18609:
+ *     an evidence step blocked on a local login asked a human, unblocked itself an hour later,
+ *     signalled step-done, and the run never advanced to review).
+ *
+ * Every OTHER park needs a human decision and is never auto-rescued: source item gone, PR closed,
+ * bounce oscillation, a failing reply poll, config error. The layout-pane wait is also excluded —
+ * it trips BEFORE the agent exists (no pane ⇒ no agent ⇒ no terminal can ever arrive), so it is
+ * rescued by re-attempting the spawn instead (STEP_RESPAWN_ATTENTION).
+ */
+function rescuablePark(deps: Deps, run: Run): "watchdog" | "human" | null {
+  if (run.phase === "waiting_for_human") return "human";
+  if (run.phase === "attention" && STEP_WATCHDOG_ATTENTION.has(deps.store.lastAttentionReasonCode(run.id) ?? "")) return "watchdog";
+  return null;
+}
+
+/**
+ * The step that asked a human reached a terminal on its own, so its pending question can never be
+ * usefully answered — close it. Three reasons this is not optional bookkeeping:
+ *   1. the reply poller runs off `pendingHumanQuestionForRun`, so a row left pending keeps polling
+ *      the source for an answer to a dead question;
+ *   2. `resumeRun` sends any run holding a pending question straight back to `waiting_for_human`,
+ *      so a later attention-resume would re-wedge the very run this rescue just freed;
+ *   3. a human staring at the posted comment deserves to know it no longer needs an answer.
+ * Closed the way requestHumanInput supersedes a stale ask (`answered` + a synthetic answer), so no
+ * new HumanQuestionStatus — and the note is best-effort + only when the question was actually
+ * posted. A no-op when nothing is pending, so the rescue paths can call it unconditionally.
+ */
+async function closePendingQuestionAsMoot(deps: Deps, run: Run, terminal: "step-done" | "bounce"): Promise<void> {
+  const q = deps.store.pendingHumanQuestionForRun(run.id);
+  if (!q) return;
+  const step = q.step ?? run.step ?? "step";
+  deps.store.updateHumanQuestion(q.id, {
+    status: "answered",
+    answer: `(no human reply needed — the ${step} agent resolved this itself and signalled ${terminal})`,
+    answeredAt: deps.now(),
+  });
+  deps.store.recordEvent({
+    runId: run.id,
+    repo: deps.config.repoName,
+    ticketKey: run.ticketKey,
+    type: "human_question_moot",
+    detail: { questionId: q.id, step: q.step, terminal },
+  });
+  deps.log("info", `${run.ticketKey}: question #${q.id} closed unanswered — the ${step} step signalled ${terminal} on its own`);
+  if (!q.externalId) return; // never posted ⇒ nothing for a human to be looking at
+  const src = deps.resolveSource(run.workSource);
+  if (!src) return;
+  await src.client
+    .postNote(
+      run.ticketKey,
+      `✅ herdr-factory: no answer needed for the question above — the ${step} step resolved it itself and moved on (${terminal}). Leaving this thread here for the record.`,
+    )
+    .catch((e) => deps.log("warn", `${run.ticketKey}: moot-question note not posted to ${src.name}: ${err(e)}`));
+}
 
 /** The item backing a pending human question is gone (deleted/transferred) — the reply can never
  *  arrive. Park for a human; no source note (the item it would go to is what's gone). */
@@ -1379,6 +1456,36 @@ async function reconcileWaitingForHuman(deps: Deps, run: Run, belt: BeltRuntime,
   if (belt.watchPr && run.prNumber) {
     const pr = ctx.prSnapshots?.get(run.prNumber) ?? (await currentPr(deps, run));
     if (pr?.state === "MERGED") return teardown(deps, run, "merged", src);
+  }
+
+  // The parked step FINISHED while its question was pending: the agent got past whatever blocked it
+  // and signalled step-done, which set rs.done while the run sat here. The ask-human park is a wait
+  // for guidance the agent no longer needs, never a veto on a completed step (rescuablePark) — so
+  // honor the step-done: close the moot question, un-park, and delegate to reconcileStep, which sees
+  // rs.done and advances forward normally (evidence → review, etc.). Placed BEFORE the reply poll so
+  // a finished step is never polled for again. Fires on the step-done nudge AND on any later tick, so
+  // a nudge dropped on run-lock contention still heals here (RWR-18609).
+  //
+  // The mirror case — a reply landing on a step that already recorded done — stays
+  // resumeAfterHumanReply's: `markStepDone` runs OUTSIDE the run lock (applySignal), so a done can
+  // still land while this pass holds the lock, and there the human's answer wins.
+  if (run.step) {
+    const step = stepByName(belt, run.step);
+    const rs = deps.store.getRunStep(run.id, run.step);
+    if (step && rs?.done) {
+      await closePendingQuestionAsMoot(deps, run, "step-done");
+      deps.store.updateRun(run.id, { phase: "running", attentionReason: null });
+      deps.store.recordEvent({
+        runId: run.id,
+        repo: deps.config.repoName,
+        ticketKey: run.ticketKey,
+        type: "resumed",
+        detail: { reason: "step_done_after_human_park", step: run.step },
+      });
+      if (run.paneId) await showRunPane(deps, run.paneId, { key: run.ticketKey, step: run.step, state: "running" });
+      deps.log("info", `${run.ticketKey}: ${run.step} finished while waiting for a human — un-parking and advancing`);
+      return reconcileStep(deps, deps.store.getRun(run.id)!, belt, src, step);
+    }
   }
 
   let q = deps.store.pendingHumanQuestionForRun(run.id);
@@ -1846,7 +1953,11 @@ async function reconcileAttention(deps: Deps, run: Run, belt: BeltRuntime, src: 
   if (run.step) {
     const step = stepByName(belt, run.step);
     const rs = deps.store.getRunStep(run.id, run.step);
-    if (step && rs?.done && STEP_WATCHDOG_ATTENTION.has(deps.store.lastAttentionReasonCode(run.id) ?? "")) {
+    if (step && rs?.done && rescuablePark(deps, run) === "watchdog") {
+      // A run parked OUT of waiting_for_human (a failing reply poll) can reach here still holding its
+      // question. Advancing with it pending would leave the poller chasing a dead thread and would send
+      // a later `resume` back to waiting_for_human — so close it, exactly as the human-park rescue does.
+      await closePendingQuestionAsMoot(deps, run, "step-done");
       deps.store.updateRun(run.id, { phase: "running", attentionReason: null });
       // A read_only_violation park heals by ADVANCING the completed step. Clear its enforcement
       // baseline so the pre-advance watch skips the read-only HEAD check (which would otherwise

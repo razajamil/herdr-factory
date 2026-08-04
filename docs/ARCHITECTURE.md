@@ -781,7 +781,7 @@ pile of runs waiting on humans must not starve the belt of new claims. History i
 **event types** (the `EventType` union in `src/types.ts`): `claimed · transition · worktree_created ·
 layout_applied · layout_apply_failed · step_spawned · step_done · layout_wait_retry · bounced ·
 signal_queued · signal_rejected · capture_attempt · evidence_uploaded · evidence_upload_failed ·
-stale · intent_fulfilled · intent_deadline · human_question · human_reply · focus_applied ·
+stale · intent_fulfilled · intent_deadline · human_question · human_question_moot · human_reply · focus_applied ·
 pr_opened · resolver_woken · torn_down · belt_reassigned · belt_deleted · attention · resumed ·
 error`. **`merged` and `closed` are declared but never recorded** — a merge appears as
 `transition {to:"merged"}` followed by `torn_down {outcome:"merged"}`, which is what a reader should
@@ -930,8 +930,22 @@ agent ⇒ its `step-done` can never arrive), so a `layout_wait_timeout` park is 
 **re-attempting the spawn**: the guard's bounded respawn budget (`autoRespawnLimit`, 3) re-arms an
 expired wait window in place — and auto-un-parks + re-dispatches an already-parked run — until the
 budget is exhausted, after which the park is a genuine human park (a successful dispatch or a human
-`resume` refunds the budget). A
-source-stale / PR-closed / bounce-limit / human / config park stays put for a human. The `pr` step hands off to
+`resume` refunds the budget).
+
+The **ask-human park is rescued identically** — `rescuablePark` routes both kinds. A step that asked a
+question and then got past the blocker on its own signals `step-done`, and
+`reconcileWaitingForHuman` honors it *before* the reply poll: it closes the now-moot question
+(`answered`, with a synthetic answer, plus a `human_question_moot` event and a courtesy note to the
+source so a human isn't answering into the void), un-parks, and delegates to `reconcileStep`, which
+advances on `rs.done`. A **bounce** from a human-parked step lands the same way. Without this a
+finished step waited forever on a reply nobody was going to send (RWR-18609: an evidence step blocked
+on a local login asked a human, unblocked itself an hour later, signalled `step-done` — the flag was
+recorded and every later tick went straight back to polling for a reply). The *mirror* ordering —
+a reply landing on a step that has just recorded `done` — stays `resumeAfterHumanReply`'s: it clears
+the flag so the human's guidance wins, which still matters because `markStepDone` runs outside the run
+lock and can land concurrently with the pass that consumes a reply.
+
+A source-stale / PR-closed / bounce-limit / failing-reply-poll / config park stays put for a human. The `pr` step hands off to
 the `reviewing` human-review watch (watches the PR, wakes a resolver) **the moment it opens a
 review-ready PR — it need not signal `step-done`**: once the PR exists the run's job is to watch it,
 so a `pr` agent that keeps working, blocks on a question, or is abandoned can't strand a mergeable PR

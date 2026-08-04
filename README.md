@@ -417,6 +417,9 @@ brief's front-matter). Route bugs to one belt and stories to another, programmat
   markdown sources), parks
   the run as `waiting_for_human` — **freeing its concurrency slot** — polls for the reply with
   backoff, then writes the answer into the worktree and resumes the same step automatically.
+  The wait is never a trap: an agent that gets past the blocker on its own and signals `step-done`
+  (or bounces the work back) un-parks the run and moves the belt on, closing the now-moot question
+  with a note on the ticket so nobody answers into the void.
 - **Bounce-back rework.** Evidence and review send flawed work _backward_ with written findings
   instead of patching around it; the work agent re-runs against the feedback file. The
   `max_bounces` backstop keeps a disagreement loop from running forever.

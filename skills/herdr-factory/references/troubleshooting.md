@@ -246,6 +246,13 @@ Poll backoff is `min(60 × 2^(misses-1), 300)` seconds — log line
 | Parked `human_wait_missing_question` | phase says waiting, no pending question row | Fix `run.step` or `teardown` |
 | Pending question with **no** `human_reply_poll` intent (Q9 `poll_intent_id IS NULL`) | the clock's only home is missing: `nextPollAt` reads 0, so it polls every pass and the miss bookkeeping throws — you see a repeating `error` event `recordHumanPollMiss: question N has no poll clock` | A real human reply still lands and resolves it. Otherwise `teardown` and re-claim; `resume` cannot re-arm a missing clock |
 | PR merged while parked | merge outranks the park — the run tears down `merged` | Normal |
+| **The step already finished** — `run_steps.<step>.done = 1` while the phase still says waiting | log `step-done <step> recorded` followed by more `waiting for human reply` lines | **Should self-heal**: the next pass un-parks and advances (`resumed` event, reason `step_done_after_human_park`, plus `human_question_moot`). If it does *not*, the factory is running code older than that rescue — `herdr-factory update`, then `tick` |
+
+A terminal signal from the parked step **outranks the wait**: a `step-done` (or a `bounce`) from the
+step that asked means the agent got past the blocker on its own, so the run un-parks and follows it,
+closing the question as `answered` with a synthetic answer + a `human_question_moot` event and a
+"no answer needed" note on the item. A reply that arrives afterwards is never read — check
+`human_questions.answer` before assuming the human's guidance was applied.
 
 A run parked out of the human loop with its question still pending returns to `waiting_for_human`
 on `resume` (with the backoff reset), not to `running` — resuming to `running` would orphan the reply.

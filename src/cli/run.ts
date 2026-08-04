@@ -35,6 +35,7 @@ const EVENT_LABEL: Record<string, string> = {
   evidence_upload_failed: "evidence upload failed",
   stale: "source item gone (stale)",
   human_question: "⏸ asked a human",
+  human_question_moot: "question closed (step resolved it itself)",
   human_reply: "▶ human replied",
   pr_opened: "PR opened",
   resolver_woken: "resolver woken (review changed)",
