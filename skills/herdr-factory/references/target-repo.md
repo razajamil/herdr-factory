@@ -109,7 +109,9 @@ exact assets named, and what each one changes.
 |---|---|---|
 | `CLAUDE.md` / `AGENTS.md` — **including nested, directory-level ones** covering the code being touched | every step: `work` (all source variants), `evidence`, `review`, `pr`, and the PR-watch `resolver` | The baseline for everything below; nested files are explicitly in scope, so per-package/per-app instructions are honoured |
 | `.claude/skills/` and the repo's agent commands | `work` (all variants), `resolver` | Bootstrap/setup, patterns to reuse, the repo's own workflows the agent should invoke instead of improvising |
-| A `playwright-cli` / browser-automation **or** dev-server skill under `.claude/` | `evidence` | How to drive the browser, viewport and resolution, video/screenshot settings, selectors, any auth shortcut. Without it the prompt falls back to `playwright-cli` directly at ≈1920×1080 |
+| A `playwright-cli` / browser-automation, dev-server, **or login/auth** skill — the prompt lists `.claude/skills/`, `.agents/skills/`, `.opencode/skill*/`, `.claude/commands/` **and their symlink targets** | `evidence` | How to start (or detect) the dev server, how to sign in, how to drive the browser, viewport and resolution, video/screenshot settings, selectors. The prompt is told to read each relevant `SKILL.md` **and every `references/` file by path** — it must not assume its harness auto-loaded them. Without such a skill it falls back to `playwright-cli` directly at ≈1920×1080 |
+| A **gitignored repo-local memory dir** (`.memory/`, or a cross-worktree copy under `~/.local/share/<repo>/`) holding dev-server URLs, browser session state, or test credentials | `evidence` | The prompt is told that `glob`/`grep` routinely hide ignored files, so a search miss is **not** proof of absence: it reads the exact paths the repo's docs name. Document those paths or the agent cannot find your credentials |
+| An **executable helper** — a script or task that probes/ensures the dev server, logs in, seeds data, or drives the browser | `evidence` | The prompt prefers running the repo's helper (with its documented subcommands, flags, and a generous timeout for a cold build) over hand-rolling the steps, and respects the helper's prohibitions (don't launch the bundler directly, don't start a second server, don't type secrets with a naive `fill`) |
 | A `code-review` skill under `.claude/` | `review` | Replaces the prompt's generic checklist with the repo's own review procedure |
 | A review checklist, engineering standards, or **definition-of-done** under `docs/` | `review` | Architectural rules, test-coverage expectations, what counts as acceptable complexity, how the repo wants its own checks run |
 | The repo's **PR or release skills/commands** under `.claude/`, and any **PR runbook** under `docs/` | `pr` | Description shape and required sections, title convention, and anything the repo requires *in* the change before a PR opens (changelog entry, docs update, checklist) |
@@ -139,16 +141,34 @@ Called out separately because **undocumented environment/credentials is the most
 **fabricate credentials or guess a persona**: it records the gap in its handoff and, if that blocks a
 faithful demonstration, bounces or takes the ask-human path.
 
+Its opening section is a hard "step zero": read the repo's agent instructions, its skill/command dirs
+(by path, symlinks followed, `references/` included), and its gitignored local memory **before**
+starting the app — then prefer the repo's own executable helpers over improvising. If your repo
+documents a dev-server helper and a login script and the agent still hand-rolls a login, the gap is
+almost always discoverability: name the exact paths in `CLAUDE.md`/`AGENTS.md`, or restate them in the
+repo's `guidelines-prompt.md` (§ [config-reference](./config-reference.md)), which is appended to
+every step prompt.
+
 Document these in the repo (`CLAUDE.md`, a runbook under `docs/`, or a dev-server skill):
 
 1. **How to run it deterministically** — the correct dev-server command, the ports it binds, required
    env vars, and any **seed / reset / fixture** step that puts data into a known state.
-2. **Who to sign in as** — the documented **test credentials / seeded accounts**, and **which persona,
+2. **How to sign in** — the login path itself, which is where evidence runs most often die. A redirect
+   to a separate **identity provider / SSO screen (with MFA)** is expected and the prompt is told so
+   explicitly: it is neither a failure nor a bounce. Document, and the prompt will use in this order:
+   the **login helper** (script/task, its subcommands, and the browser **session** it establishes — the
+   capture then reuses that same session), where the **credentials live** (a file under repo-local
+   memory, a documented env var, a seeded account), and any rule about **how** they must be entered.
+   That last one matters: some identity forms corrupt values entered by naive typing/autocomplete,
+   which presents as a wrong password. The prompt reads such a failure as *the flow was driven
+   wrongly*, re-reads your reference instead of trying credential variations, and — if it still can't
+   sign in — takes the **ask-human** path rather than bouncing the work or grinding the budget.
+3. **Who to sign in as** — the documented **test credentials / seeded accounts**, and **which persona,
    role, or tenant** a given kind of item implies. The prompt gates on this: an admin-only feature must
    be shown as an admin, per-tenant behaviour in its tenant, a gated view from an account that holds the
    permission (and, when the item is *about* the gating, also one that lacks it). Capturing logged out,
    as the wrong role, or on a login wall / permission-denied / empty state is scored **not proven**.
-3. **Capture tooling and its settings** — the browser skill, the deterministic viewport, and the video
+4. **Capture tooling and its settings** — the browser skill, the deterministic viewport, and the video
    recording size. Where the repo sets a recording size the agent uses it; otherwise it records at the
    viewport's native size. (Video zoom/resolution belongs to the target repo's capture skill, not to
    factory config.)
@@ -232,11 +252,13 @@ changes output quality.
 | — | — | — |
 | 8 | `CLAUDE.md` (or `AGENTS.md`) at the root, naming: bootstrap/install, the exact lint + type-check + test commands, where tests live, and the patterns to prefer | Open a worktree by hand and ask the agent to run the documented commands from a clean checkout — they must pass with no guessing |
 | 9 | *(if the belt has an `evidence` step)* document the dev-server command + ports + env, the seed/reset/fixture step, the test credentials / seeded accounts, and which persona/role/tenant applies | A fresh reader can boot the app and sign in as the right user using only the repo's docs |
-| 10 | *(evidence)* add or point at a `playwright-cli` / browser-automation skill under `.claude/skills/`, including the viewport and recording size | `ls <repo>/.claude/skills`; the skill states a deterministic viewport |
-| 11 | *(if the belt has a `review` step)* add a `code-review` skill under `.claude/` and/or a review checklist / definition-of-done under `docs/`, with any PR-only mechanics separated from the checklist | `ls <repo>/.claude/skills <repo>/docs`; the checklist is judgeable without a PR |
-| 12 | Add a PR template at one of the paths in §2.1, plus PR/release conventions in `CONTRIBUTING.md` or a `docs/` runbook | The first non-blank match in the §2.1 order is the one that will be used; check `.memory/herdr-factory/prompt-pr.md` in a live worktree to see it inlined |
-| 13 | Decide commit conventions: leave `conventions.commits` unset to follow the repo, or set it to override (§5) | The rendered `prompt-work.md` contains the **Commit-message conventions** block only when the key is set |
-| 14 | Optional: move prompt ownership into the repo via `.herdr/prompts/<slug>.md` (§2.2) | The next step render picks it up — no reload; confirm by reading `.memory/herdr-factory/prompt-<step>.md` in the worktree |
+| 10 | *(evidence)* document the **login** path end to end: the login helper (and its session name), where the credentials live, how they must be entered, and every screen of the journey (identity provider, MFA, tenant/account picker) | Run the helper by hand in a fresh worktree: one command gets you to the signed-in app shell, printing no secrets |
+| 11 | *(evidence)* if credentials/session state live in a **gitignored** dir, name the exact paths in the repo's docs — and make sure they're actually populated in a **fresh worktree** (a setup task that copies from a cross-worktree permanent copy) | `ls <worktree>/<that path>` in a factory worktree, not just your main checkout |
+| 12 | *(evidence)* add or point at a `playwright-cli` / browser-automation skill under `.claude/skills/` (or `.agents/skills/` + symlink), including the viewport and recording size | `ls -L <repo>/.claude/skills`; the skill states a deterministic viewport |
+| 13 | *(if the belt has a `review` step)* add a `code-review` skill under `.claude/` and/or a review checklist / definition-of-done under `docs/`, with any PR-only mechanics separated from the checklist | `ls <repo>/.claude/skills <repo>/docs`; the checklist is judgeable without a PR |
+| 14 | Add a PR template at one of the paths in §2.1, plus PR/release conventions in `CONTRIBUTING.md` or a `docs/` runbook | The first non-blank match in the §2.1 order is the one that will be used; check `.memory/herdr-factory/prompt-pr.md` in a live worktree to see it inlined |
+| 15 | Decide commit conventions: leave `conventions.commits` unset to follow the repo, or set it to override (§5) | The rendered `prompt-work.md` contains the **Commit-message conventions** block only when the key is set |
+| 16 | Optional: move prompt ownership into the repo via `.herdr/prompts/<slug>.md` (§2.2) | The next step render picks it up — no reload; confirm by reading `.memory/herdr-factory/prompt-<step>.md` in the worktree |
 
 To inspect what an agent actually received, read
 `<worktree>/.memory/herdr-factory/prompt-<step>.md` — it is the fully rendered prompt, including the

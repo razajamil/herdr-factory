@@ -900,7 +900,7 @@ herdr agent in its own tab/pane, dispatched and gated by the reconciler. The run
 | Step | Does | Hands off |
 |---|---|---|
 | **work** | read the work doc + attachments → implement → lint/type/tests → commit | `handoff-work.md` + `step-done work` |
-| **evidence** *(opt-in)* | derive a test plan from acceptance criteria → run the app via the repo's dev-server/credentials skills (right persona) → capture before/after screenshots+video (`capture-attempt` signals each try) → publish via `evidence.publisher` (s3/local/command) → per-criterion verdict: pass forward or **bounce to work** | `handoff-evidence.md` + `step-done` / `bounce` |
+| **evidence** *(opt-in)* | derive a test plan from acceptance criteria → read the repo's guidance/skills/local memory *first* (by path) → run the app and **sign in** via the repo's own dev-server/login helpers and credentials (right persona; an SSO+MFA redirect is expected, an un-completable login is ask-human, not a bounce) → capture before/after screenshots+video (`capture-attempt` signals each try) → publish via `evidence.publisher` (s3/local/command) → per-criterion verdict: pass forward or **bounce to work** | `handoff-evidence.md` + `step-done` / `bounce` |
 | **review** | fresh-eyes **read-only** gate — never edits or commits (enforced: a commit parks the run): pass forward, or **bounce to work** with findings | `handoff-review.md` + `step-done` / `bounce` |
 | **pr** | push + open the PR (evidence URLs embedded) → drive the automated round (CI green + bot comments) | `step-done pr` → human review |
 

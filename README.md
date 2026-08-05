@@ -319,7 +319,14 @@ review }, { type: pr }]` — the engine ships each primitive's prompt:
   following the target repo's own guidelines/skills for setup, patterns, and how its tests are run
   (see [Prompts](#prompts)).
 - **evidence** _(opt-in)_ — derives a test plan from the work item's acceptance criteria, then films
-  the running app to prove each one. It follows the repo's own skills/runbooks for the dev-server
+  the running app to prove each one. Its "step zero" is to go and read the repo's own guidance before
+  starting the app — its agent instructions, its skill/command directories (read by path, symlinks
+  followed, `references/` included), and its gitignored local memory (where dev-server URLs, browser
+  sessions and test credentials usually live) — and to run the repo's own helpers rather than
+  improvise. Signing in is treated as part of the setup: an SSO/identity-provider redirect with MFA is
+  expected, the repo's login helper and session are preferred over a hand-rolled flow, and a login it
+  genuinely cannot complete goes to **ask-human** rather than bouncing the work. It follows the repo's
+  own skills/runbooks for the dev-server
   workflow **and** the login/test account so it exercises the flow as the right persona, drives
   `playwright-cli` for before/after screenshots and video, publishes the captures via the configured
   [`evidence.publisher`](#evidence-optional-repo-wide) (S3, the local server, or a custom command),

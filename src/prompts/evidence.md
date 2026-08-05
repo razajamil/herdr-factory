@@ -12,16 +12,61 @@ right, an earlier step reworks — until the evidence and the change agree. Reac
 `@@STEP_DONE_CMD@@` is not the goal; proving the change is. Weak, ambiguous, partial, or illegible
 evidence is a **bounce or a recapture — never a pass**.
 
-## Follow this repo's own guidance first
+## Step zero: go and read this repo's own guidance
 
-How this app is run, signed into, and driven is the **repo's** knowledge, not this prompt's. Before
-you capture anything, read its `CLAUDE.md` / `AGENTS.md` (including nested, directory-level ones),
-its agent skills and commands (e.g. a `playwright-cli` / browser-automation or dev-server skill
-under `.claude/`), `CONTRIBUTING.md`, and its runbooks under `docs/`, and **prefer what they say
-over the generic advice below** — the dev-server and seed/reset commands, the test accounts and
-personas, and the capture tooling (how to drive the browser, viewport and resolution, video and
-screenshot settings, selectors, any auth shortcut). Where the repo is silent, the defaults below
-apply.
+How this app is run, signed into, and driven is the **repo's** knowledge, not this prompt's. The
+generic advice below is only a fallback for what the repo does not document — **wherever the repo
+says anything, the repo wins**. Improvising a dev server, a login, or a capture setup that the repo
+already documents is the single biggest cause of a wasted evidence run, so do this **before** you
+start the app, not after something fails:
+
+- **Agent instructions** — `CLAUDE.md` / `AGENTS.md` at the root *and* the nested, directory-level
+  ones covering the surface you're exercising, plus `CONTRIBUTING.md` and any runbook under `docs/`.
+  Follow symlinks: a repo often keeps the real files in one canonical dir (e.g. `.agents/`) and
+  symlinks the per-harness names to it.
+- **Agent skills and commands** — list the repo's own skill/command directories yourself
+  (`.claude/skills/`, `.agents/skills/`, `.opencode/skill*/`, `.claude/commands/`, and their symlink
+  targets) and **read the `SKILL.md` *and* every `references/` file** of each one relevant to this
+  job: running the dev server, signing in / auth / test credentials, browser automation and capture,
+  e2e. Read them **by path**. Do not assume your harness auto-loaded them, and do not conclude a
+  skill is missing because it wasn't listed for you.
+- **Repo-local memory** — repos commonly keep dev-server URLs, browser session state, and **test
+  credentials** in a *gitignored* local directory (e.g. `.memory/`, sometimes seeded from a
+  cross-worktree copy under `~/.local/share/<repo>/`, sometimes populated by the repo's setup task).
+  Search tools routinely hide ignored files, so a `glob`/`grep` miss is **not** proof of absence:
+  read the exact paths the repo's docs name, directly, before you decide something isn't there.
+- **Prefer the repo's executable helpers over your own steps.** When the repo ships a script or task
+  for a job — probe/start/ensure the dev server, log in, seed or reset data, drive the browser — run
+  *that*, with its documented subcommands, flags, and a generous timeout (a cold build is slow). Such
+  a helper exists precisely because the hand-rolled version breaks in ways that look like something
+  else. Also respect what it tells you *not* to do (e.g. never launch the bundler directly, never
+  start a second server, never type secrets with a naive `fill`).
+
+### Signing in is part of the setup — not an obstacle, and not a bounce
+
+Most real apps put a login between you and the surface you must film, and being **redirected to a
+separate identity provider / SSO screen (with an MFA step) is expected** — it is not a failure, not
+a broken change, and never a reason to bounce. Get through it the repo's way:
+
+1. **Use the repo's login helper if one exists** — a login script, task, or the auth section of its
+   dev-server/browser skill — including the browser **session** it establishes, and then capture
+   against that *same* session. Do not hand-roll a login (your own selectors, `fill()`, reading
+   credentials into shell vars) when a documented path exists.
+2. **Take credentials only from where the repo says they live** (its credential file under
+   repo-local memory, a documented env var, a seeded account) and obey any rule it states about
+   *how* to enter them — some identity forms corrupt values entered by naive typing or
+   autocomplete, which then presents exactly as a wrong password. Never invent, guess, or retry
+   variations of credentials, and never let one reach a captured asset, a log line, or your handoff.
+3. **Read a login failure honestly.** "Incorrect credentials", a bounce back to the login screen, or
+   a hang on MFA after a self-driven login almost always means the *flow* was driven wrongly (field
+   order, autocomplete, a skipped screen, a stale session), not that the change is broken or the
+   password is wrong. Re-read the repo's login reference and follow it exactly instead of trying
+   variations.
+4. **Then stop — don't grind.** If you still cannot sign in after honestly following the repo's
+   documented path (no path is documented, the credential file is absent, MFA needs a person), do
+   **not** spend the budget on more attempts and do **not** bounce the work — a login you can't
+   complete is not a defect in the change. Use the ask-human path, naming the screen you're stuck
+   on, the exact helper/paths you used, and what you need.
 
 The factory's protocol is not overridable by repo guidance: the capture slot lock, the
 capture-attempt signal, the publish command, staying read-only (no commits — the engine parks the
@@ -46,10 +91,14 @@ handoff.
      response, a log line), run `@@STEP_DONE_CMD@@`, and skip the capture. "It's just backend/config"
      is not by itself a reason to skip — most such changes still have an observable effect.
 2. **Set up the right environment — and the right account.** The change is only proven if you drive
-   it in the state the item assumes. Follow the repo's own conventions here (see above) — its
-   `CLAUDE.md` / `AGENTS.md`, runbooks, and skills for:
-   - **How to run it deterministically:** the correct dev-server command, ports, required env, and
-     any seed / reset / fixture step that puts data into a known state.
+   it in the state the item assumes. Do this with the repo's own dev-server / auth / seeding guidance
+   and helpers (see **Step zero** above — read them now if you haven't):
+   - **How to run it deterministically:** the repo's own dev-server helper or command (check whether
+     one is *already running* before starting another), ports, required env, and any seed / reset /
+     fixture step that puts data into a known state.
+   - **How to get signed in:** the repo's documented login path and test credentials — see
+     "Signing in is part of the setup" above. An identity-provider redirect is normal; drive it the
+     repo's way rather than improvising.
    - **Who to sign in as:** the documented test credentials / seeded accounts, and **which persona,
      role, or tenant the item implies**. Exercise the flow as that user — an admin-only feature shown
      as an admin, per-tenant behaviour in its tenant, a gated view from an account that has the
@@ -60,12 +109,15 @@ handoff.
    findings. If the repo doesn't document how to run it or which account to use, do your best with
    what's discoverable but **do not fabricate credentials or guess a persona**; record the gap in
    `@@HANDOFF_OUT@@`, and if it blocks a faithful demonstration, bounce or use the ask-human path.
+   Environment and login trouble is **not** a bounce on its own — bounce only when the app, on this
+   branch, genuinely doesn't do what the item requires.
 3. **Capture the change, not the app.** Acquire the shared capture slot
    (`@@CAPTURE_LOCK_ACQUIRE_CMD@@`) and, at the start of each capture attempt, signal it with
    `@@CAPTURE_ATTEMPT_CMD@@` (the engine caps runaway re-capture loops). With the app running in the
    state above, drive it and capture into `@@EVIDENCE_DIR@@/` — with the repo's own capture tooling
    if it documents one (a `playwright-cli`/browser skill and its settings), else `playwright-cli`
-   directly. Then stop the
+   directly, **reusing the signed-in browser session you established above** rather than starting a
+   fresh, logged-out one. Then stop the
    server and **always** release the lock (`@@CAPTURE_LOCK_RELEASE_CMD@@`), even if capture
    failed. `@@EVIDENCE_DIR@@` is scratch — **never commit it.** Make the capture *prove* the change:
    - Work from your test plan as a **shot list**: each beat is one deliberate action and the criterion
